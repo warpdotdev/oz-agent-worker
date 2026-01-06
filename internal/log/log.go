@@ -16,6 +16,24 @@ func init() {
 	})
 }
 
+// SetLevel configures the global log level
+func SetLevel(level string) {
+	var logLevel zerolog.Level
+	switch level {
+	case "debug":
+		logLevel = zerolog.DebugLevel
+	case "info":
+		logLevel = zerolog.InfoLevel
+	case "warn":
+		logLevel = zerolog.WarnLevel
+	case "error":
+		logLevel = zerolog.ErrorLevel
+	default:
+		logLevel = zerolog.InfoLevel
+	}
+	zerolog.SetGlobalLevel(logLevel)
+}
+
 func Debugf(ctx context.Context, format string, args ...any) {
 	log.Debug().Msgf(format, args...)
 }

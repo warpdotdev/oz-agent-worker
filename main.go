@@ -7,7 +7,6 @@ import (
 	"syscall"
 
 	"github.com/alecthomas/kong"
-	"github.com/rs/zerolog"
 	"github.com/warpdotdev/warp-agent-worker/internal/log"
 	"github.com/warpdotdev/warp-agent-worker/internal/worker"
 )
@@ -30,7 +29,7 @@ func main() {
 		kong.Vars{},
 	)
 
-	configureLogging(CLI.LogLevel)
+	log.SetLevel(CLI.LogLevel)
 
 	config := worker.Config{
 		APIKey:        CLI.APIKey,
@@ -63,22 +62,5 @@ func main() {
 	w.Shutdown()
 
 	log.Infof(ctx, "Worker shutdown complete")
-}
-
-func configureLogging(level string) {
-	var logLevel zerolog.Level
-	switch level {
-	case "debug":
-		logLevel = zerolog.DebugLevel
-	case "info":
-		logLevel = zerolog.InfoLevel
-	case "warn":
-		logLevel = zerolog.WarnLevel
-	case "error":
-		logLevel = zerolog.ErrorLevel
-	default:
-		logLevel = zerolog.InfoLevel
-	}
-	zerolog.SetGlobalLevel(logLevel)
 }
 

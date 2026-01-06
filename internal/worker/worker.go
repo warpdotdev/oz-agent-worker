@@ -384,6 +384,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		}
 	}()
 
+	// The image pull doesn't actually happen until you read from this stream, but we don't need the output.
 	_, err = io.Copy(io.Discard, reader)
 	if err != nil {
 		return fmt.Errorf("failed to read image pull output: %w", err)
@@ -394,12 +395,11 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		return fmt.Errorf("no sidecar image specified in assignment")
 	}
 
-	log.Infof(ctx, "Checking if sidecar image %s exists locally", assignment.SidecarImage)
+	log.Debugf(ctx, "Checking if sidecar image %s exists locally", assignment.SidecarImage)
 	_, err = dockerClient.ImageInspect(ctx, assignment.SidecarImage)
 	if err == nil {
-		log.Infof(ctx, "Sidecar image %s already exists locally, skipping pull", assignment.SidecarImage)
+		log.Debugf(ctx, "Sidecar image %s already exists locally, skipping pull", assignment.SidecarImage)
 	} else {
-		log.Infof(ctx, "Sidecar image not found locally (error: %v), will pull", err)
 		log.Infof(ctx, "Pulling sidecar image: %s", assignment.SidecarImage)
 
 		sidecarReader, err := dockerClient.ImagePull(ctx, assignment.SidecarImage, pullOptions)
@@ -417,11 +417,11 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	}
 
 	volumeName := sanitizeImageNameForVolume(assignment.SidecarImage)
-	log.Infof(ctx, "Using shared volume: %s for sidecar image: %s", volumeName, assignment.SidecarImage)
+	log.Debugf(ctx, "Using shared volume: %s for sidecar image: %s", volumeName, assignment.SidecarImage)
 
 	_, err = dockerClient.VolumeInspect(ctx, volumeName)
 	if err == nil {
-		log.Infof(ctx, "Reusing existing volume %s (already populated from sidecar)", volumeName)
+		log.Debugf(ctx, "Reusing existing volume %s (already populated from sidecar)", volumeName)
 	} else {
 		log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
 		volumeResp, err := dockerClient.VolumeCreate(ctx, volume.CreateOptions{
@@ -430,9 +430,9 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		if err != nil {
 			return fmt.Errorf("failed to create volume: %w", err)
 		}
-		log.Infof(ctx, "Created volume: %s at %s", volumeName, volumeResp.Mountpoint)
+		log.Debugf(ctx, "Created volume: %s at %s", volumeName, volumeResp.Mountpoint)
 
-		log.Infof(ctx, "Copying warp agent from sidecar to volume (first time)")
+		log.Debugf(ctx, "Copying warp agent from sidecar to volume (first time)")
 
 		if err := w.copySidecarToVolume(ctx, dockerClient, assignment.SidecarImage, volumeName); err != nil {
 			return fmt.Errorf("failed to copy sidecar to volume: %w", err)
@@ -471,7 +471,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 
 	cmd = common.AugmentArgsForTask(task, cmd)
 
-	log.Infof(ctx, "Creating Docker container with image=%s", imageName)
+	log.Debugf(ctx, "Creating Docker container with image=%s", imageName)
 
 	containerConfig := &container.Config{
 		Image:      imageName,
@@ -493,7 +493,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	}
 
 	containerID := resp.ID
-	log.Infof(ctx, "Created Docker container: %s", containerID)
+	log.Debugf(ctx, "Created Docker container: %s", containerID)
 
 	defer func() {
 		if containerID != "" {
@@ -507,7 +507,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
-	log.Infof(ctx, "Started Docker container: %s", containerID)
+	log.Debugf(ctx, "Started Docker container: %s", containerID)
 
 	statusCh, errCh := dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
@@ -516,7 +516,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 			return fmt.Errorf("error waiting for container: %w", err)
 		}
 	case status := <-statusCh:
-		log.Infof(ctx, "Container exited with status code: %d", status.StatusCode)
+		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
 		logOutput, logErr := w.getContainerLogs(ctx, dockerClient, containerID)
 		if logErr != nil {
