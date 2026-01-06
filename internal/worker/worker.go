@@ -68,7 +68,9 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	defer pingCancel()
 
 	if _, err := dockerClient.Ping(pingCtx); err != nil {
-		dockerClient.Close()
+		if closeErr := dockerClient.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
+		}
 		cancel()
 		return nil, fmt.Errorf("failed to reach Docker daemon: %w", err)
 	}
@@ -157,7 +159,9 @@ func (w *Worker) run() {
 
 	w.connMutex.Lock()
 	if w.conn != nil {
-		w.conn.Close()
+		if err := w.conn.Close(); err != nil {
+			log.Warnf(w.ctx, "Error closing connection: %v", err)
+		}
 		w.conn = nil
 	}
 	w.connected = false
@@ -184,7 +188,10 @@ func (w *Worker) readLoop(done chan struct{}) {
 			return
 		}
 
-		conn.SetReadDeadline(time.Now().Add(PongWait))
+		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
+			log.Errorf(w.ctx, "Failed to set read deadline: %v", err)
+			return
+		}
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -217,7 +224,10 @@ func (w *Worker) writeLoop(done chan struct{}) {
 
 			log.Infof(w.ctx, "WebSocket sending: %s", string(message))
 
-			conn.SetWriteDeadline(time.Now().Add(WriteWait))
+			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
+				log.Errorf(w.ctx, "Failed to set write deadline: %v", err)
+				return
+			}
 			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				log.Errorf(w.ctx, "WebSocket write error: %v", err)
 				return
@@ -245,7 +255,10 @@ func (w *Worker) heartbeatLoop(done chan struct{}) {
 				return
 			}
 
-			conn.SetWriteDeadline(time.Now().Add(WriteWait))
+			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
+				log.Errorf(w.ctx, "Failed to set write deadline: %v", err)
+				return
+			}
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Errorf(w.ctx, "Failed to send ping: %v", err)
 				return
@@ -369,7 +382,11 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	if err != nil {
 		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
 	}
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			log.Warnf(ctx, "Failed to close image pull reader: %v", err)
+		}
+	}()
 
 	_, err = io.Copy(io.Discard, reader)
 	if err != nil {
@@ -394,7 +411,9 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 			return fmt.Errorf("failed to pull sidecar image %s: %w", assignment.SidecarImage, err)
 		}
 		_, err = io.Copy(io.Discard, sidecarReader)
-		sidecarReader.Close()
+		if closeErr := sidecarReader.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close sidecar reader: %v", closeErr)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to read sidecar image pull output: %w", err)
 		}
@@ -536,7 +555,11 @@ func (w *Worker) getContainerLogs(ctx context.Context, dockerClient *client.Clie
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
+	defer func() {
+		if err := out.Close(); err != nil {
+			log.Warnf(ctx, "Failed to close container logs reader: %v", err)
+		}
+	}()
 
 	logBytes, err := io.ReadAll(out)
 	if err != nil {
@@ -572,7 +595,11 @@ func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.C
 	if err != nil {
 		return fmt.Errorf("failed to export sidecar container: %w", err)
 	}
-	defer tarReader.Close()
+	defer func() {
+		if err := tarReader.Close(); err != nil {
+			log.Warnf(ctx, "Failed to close tar reader: %v", err)
+		}
+	}()
 
 	log.Infof(ctx, "Extracting sidecar filesystem to volume")
 
@@ -581,8 +608,12 @@ func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.C
 	if err != nil {
 		return fmt.Errorf("failed to pull alpine image: %w", err)
 	}
-	io.Copy(io.Discard, alpineReader)
-	alpineReader.Close()
+	if _, err := io.Copy(io.Discard, alpineReader); err != nil {
+		log.Warnf(ctx, "Error reading alpine image pull output: %v", err)
+	}
+	if err := alpineReader.Close(); err != nil {
+		log.Warnf(ctx, "Failed to close alpine reader: %v", err)
+	}
 
 	extractConfig := &container.Config{
 		Image:        alpineImage,
@@ -628,8 +659,14 @@ func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.C
 	}
 
 	go func() {
-		defer attachResp.CloseWrite()
-		io.Copy(attachResp.Conn, tarReader)
+		defer func() {
+			if err := attachResp.CloseWrite(); err != nil {
+				log.Warnf(ctx, "Failed to close write side of attach: %v", err)
+			}
+		}()
+		if _, err := io.Copy(attachResp.Conn, tarReader); err != nil {
+			log.Warnf(ctx, "Error copying tar data: %v", err)
+		}
 	}()
 
 	statusCh, errCh := dockerClient.ContainerWait(ctx, extractContainerID, container.WaitConditionNotRunning)
@@ -735,13 +772,19 @@ func (w *Worker) Shutdown() {
 	w.cancel()
 
 	if w.dockerClient != nil {
-		w.dockerClient.Close()
+		if err := w.dockerClient.Close(); err != nil {
+			log.Warnf(w.ctx, "Failed to close Docker client: %v", err)
+		}
 	}
 
 	w.connMutex.Lock()
 	if w.conn != nil {
-		w.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		w.conn.Close()
+		if err := w.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
+			log.Warnf(w.ctx, "Failed to send close message: %v", err)
+		}
+		if err := w.conn.Close(); err != nil {
+			log.Warnf(w.ctx, "Failed to close connection: %v", err)
+		}
 		w.conn = nil
 	}
 	w.connMutex.Unlock()
