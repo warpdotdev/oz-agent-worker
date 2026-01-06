@@ -48,7 +48,6 @@ type Worker struct {
 	cancel         context.CancelFunc
 	reconnectDelay time.Duration
 	lastHeartbeat  time.Time
-	connected      bool
 	sendChan       chan []byte
 	activeTasks    map[string]context.CancelFunc
 	tasksMutex     sync.Mutex
@@ -100,10 +99,7 @@ func (w *Worker) Start() error {
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
 			time.Sleep(w.reconnectDelay)
 
-			w.reconnectDelay = time.Duration(float64(w.reconnectDelay) * ReconnectBackoffRate)
-			if w.reconnectDelay > MaxReconnectDelay {
-				w.reconnectDelay = MaxReconnectDelay
-			}
+			w.reconnectDelay = min(time.Duration(float64(w.reconnectDelay)*ReconnectBackoffRate), MaxReconnectDelay)
 			continue
 		}
 
@@ -135,7 +131,6 @@ func (w *Worker) connect() error {
 
 	w.connMutex.Lock()
 	w.conn = conn
-	w.connected = true
 	w.connMutex.Unlock()
 
 	log.Infof(w.ctx, "Successfully connected to server")
@@ -164,7 +159,6 @@ func (w *Worker) run() {
 		}
 		w.conn = nil
 	}
-	w.connected = false
 	w.connMutex.Unlock()
 
 	log.Warnf(w.ctx, "Connection closed, will attempt to reconnect")
@@ -276,6 +270,7 @@ func (w *Worker) handleMessage(message []byte) {
 		return
 	}
 
+	// Currently there is only one message type, but we anticipate needing more in the future.
 	switch msg.Type {
 	case types.MessageTypeTaskAssignment:
 		var assignment types.TaskAssignmentMessage
@@ -334,17 +329,18 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	var imageName string
 	if assignment.DockerImage != "" {
 		imageName = assignment.DockerImage
-		log.Infof(ctx, "Using Docker image from assignment: %s", imageName)
-	} else if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
-		imageName = "ubuntu:22.04"
-		log.Warnf(ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
-			*task.AgentConfigSnapshot.EnvironmentID, imageName)
+		log.Debugf(ctx, "Using Docker image from assignment: %s", imageName)
 	} else {
 		imageName = "ubuntu:22.04"
-		log.Infof(ctx, "No environment specified, using default image: %s", imageName)
+		if task.AgentConfigSnapshot.EnvironmentID != nil {
+			log.Warnf(ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
+				*task.AgentConfigSnapshot.EnvironmentID, imageName)
+		} else {
+			log.Infof(ctx, "No environment specified, using default image: %s", imageName)
+		}
 	}
 
-	log.Infof(ctx, "Pulling Docker image: %s", imageName)
+	log.Debugf(ctx, "Pulling Docker image: %s", imageName)
 
 	cfg, err := cliconfig.Load("")
 	if err != nil {

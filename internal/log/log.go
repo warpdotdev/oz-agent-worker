@@ -10,27 +10,29 @@ import (
 )
 
 func init() {
-	// Ensure zerolog writes to stderr in a human-readable format
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	log.Logger = log.Output(zerolog.ConsoleWriter{
+		Out:        os.Stderr,
+		TimeFormat: "15:04:05.000",
+	})
 }
 
-func Debugf(ctx context.Context, format string, args ...interface{}) {
+func Debugf(ctx context.Context, format string, args ...any) {
 	log.Debug().Msgf(format, args...)
 }
 
-func Infof(ctx context.Context, format string, args ...interface{}) {
+func Infof(ctx context.Context, format string, args ...any) {
 	log.Info().Msgf(format, args...)
 }
 
-func Warnf(ctx context.Context, format string, args ...interface{}) {
+func Warnf(ctx context.Context, format string, args ...any) {
 	log.Warn().Msgf(format, args...)
 }
 
-func Errorf(ctx context.Context, format string, args ...interface{}) {
+func Errorf(ctx context.Context, format string, args ...any) {
 	log.Error().Msgf(format, args...)
 }
 
-func Fatalf(ctx context.Context, format string, args ...interface{}) {
+func Fatalf(ctx context.Context, format string, args ...any) {
 	log.Fatal().Msgf(format, args...)
 	panic(fmt.Sprintf(format, args...))
 }
