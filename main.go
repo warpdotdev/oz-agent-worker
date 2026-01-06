@@ -66,8 +66,6 @@ func main() {
 }
 
 func configureLogging(level string) {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-
 	var logLevel zerolog.Level
 	switch level {
 	case "debug":
@@ -83,3 +81,4 @@ func configureLogging(level string) {
 	}
 	zerolog.SetGlobalLevel(logLevel)
 }
+
