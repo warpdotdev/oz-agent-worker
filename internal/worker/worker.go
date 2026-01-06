@@ -17,6 +17,7 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog"
 	"github.com/warpdotdev/warp-agent-worker/internal/common"
 	"github.com/warpdotdev/warp-agent-worker/internal/log"
 	"github.com/warpdotdev/warp-agent-worker/internal/types"
@@ -66,6 +67,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer pingCancel()
 
+	// Ping the Docker daemon to ensure it's reachable, as we depend on this.
 	if _, err := dockerClient.Ping(pingCtx); err != nil {
 		if closeErr := dockerClient.Close(); closeErr != nil {
 			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
@@ -99,6 +101,7 @@ func (w *Worker) Start() error {
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
 			time.Sleep(w.reconnectDelay)
 
+			// Compute exponential back-off.
 			w.reconnectDelay = min(time.Duration(float64(w.reconnectDelay)*ReconnectBackoffRate), MaxReconnectDelay)
 			continue
 		}
@@ -288,6 +291,7 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 
+	// It's important to update the task state to claimed as the task lifecycle treats this as a dependency to advance to further states.
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
@@ -349,6 +353,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 
 	var authStr string
 	if cfg != nil {
+		// This is the default registry if not specified in the `imageName`.
 		registryURL := "https://index.docker.io/v1/"
 
 		if strings.Contains(imageName, "/") {
@@ -434,7 +439,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 
 		log.Debugf(ctx, "Copying warp agent from sidecar to volume (first time)")
 
-		if err := w.copySidecarToVolume(ctx, dockerClient, assignment.SidecarImage, volumeName); err != nil {
+		if err := w.copySidecarFilesystemToVolume(ctx, dockerClient, assignment.SidecarImage, volumeName); err != nil {
 			return fmt.Errorf("failed to copy sidecar to volume: %w", err)
 		}
 	}
@@ -519,10 +524,12 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
 		logOutput, logErr := w.getContainerLogs(ctx, dockerClient, containerID)
-		if logErr != nil {
-			log.Warnf(ctx, "Failed to get container logs: %v", logErr)
-		} else if logOutput != "" {
-			log.Infof(ctx, "Container output:\n%s", logOutput)
+		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
+			if logErr != nil {
+				log.Warnf(ctx, "Failed to get container logs: %v", logErr)
+			} else if logOutput != "" {
+				log.Debugf(ctx, "Container output:\n%s", logOutput)
+			}
 		}
 
 		if status.StatusCode != 0 {
@@ -538,7 +545,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		}
 	}
 
-	log.Infof(ctx, "Task execution completed successfully")
+	log.Infof(ctx, "Task %s execution completed successfully", task.ID)
 	return nil
 }
 
@@ -565,7 +572,11 @@ func (w *Worker) getContainerLogs(ctx context.Context, dockerClient *client.Clie
 	return string(logBytes), nil
 }
 
-func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.Client, sidecarImage, volumeName string) error {
+// copySidecarFilesystemToVolume takes an image and creates a volume from its filesystem.
+// We mount this volume into the image for each task as a means of predictably injecting dependencies.
+// This is basically the `sidecar_volume` concept in `namespace.so`:
+// https://buf.build/namespace/cloud/docs/main:namespace.cloud.compute.v1beta#namespace.cloud.compute.v1beta.ContainerRequest
+func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient *client.Client, sidecarImage, volumeName string) error {
 	log.Infof(ctx, "Creating temporary container from sidecar image")
 	sidecarConfig := &container.Config{
 		Image: sidecarImage,
@@ -586,7 +597,7 @@ func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.C
 
 	log.Infof(ctx, "Created sidecar container: %s", sidecarContainerID)
 
-	log.Infof(ctx, "Exporting sidecar filesystem")
+	// Export the full filesystem of the sidecar.
 	tarReader, err := dockerClient.ContainerExport(ctx, sidecarContainerID)
 	if err != nil {
 		return fmt.Errorf("failed to export sidecar container: %w", err)
@@ -599,6 +610,7 @@ func (w *Worker) copySidecarToVolume(ctx context.Context, dockerClient *client.C
 
 	log.Infof(ctx, "Extracting sidecar filesystem to volume")
 
+	// Use an arbitrary image to copy the exported filesystem onto a volume.
 	alpineImage := "alpine:latest"
 	alpineReader, err := dockerClient.ImagePull(ctx, alpineImage, image.PullOptions{})
 	if err != nil {

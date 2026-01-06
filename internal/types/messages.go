@@ -20,9 +20,10 @@ type WebSocketMessage struct {
 
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
-	TaskID       string `json:"task_id"`
-	Task         *Task  `json:"task"`
-	DockerImage  string `json:"docker_image,omitempty"`
+	TaskID      string `json:"task_id"`
+	Task        *Task  `json:"task"`
+	DockerImage string `json:"docker_image,omitempty"`
+	// The "sidecar image" contains the warp agent binary and a couple other dependencies.
 	SidecarImage string `json:"sidecar_image,omitempty"`
 	GitHubToken  string `json:"github_token,omitempty"`
 }
