@@ -6,10 +6,11 @@ import "encoding/json"
 type MessageType string
 
 const (
-	MessageTypeTaskAssignment MessageType = "task_assignment"
-	MessageTypeTaskClaimed    MessageType = "task_claimed"
-	MessageTypeTaskFailed     MessageType = "task_failed"
-	MessageTypeHeartbeat      MessageType = "heartbeat"
+	MessageTypeTaskAssignment   MessageType = "task_assignment"
+	MessageTypeTaskClaimed      MessageType = "task_claimed"
+	MessageTypeTaskFailed       MessageType = "task_failed"
+	MessageTypeTaskCancellation MessageType = "task_cancellation"
+	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
 // WebSocketMessage is the base structure for all WebSocket messages
@@ -38,4 +39,9 @@ type TaskClaimedMessage struct {
 type TaskFailedMessage struct {
 	TaskID  string `json:"task_id"`
 	Message string `json:"message"`
+}
+
+// TaskCancellationMessage is sent from server to worker to cancel a running task
+type TaskCancellationMessage struct {
+	TaskID string `json:"task_id"`
 }

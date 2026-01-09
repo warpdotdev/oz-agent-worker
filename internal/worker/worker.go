@@ -273,7 +273,6 @@ func (w *Worker) handleMessage(message []byte) {
 		return
 	}
 
-	// Currently there is only one message type, but we anticipate needing more in the future.
 	switch msg.Type {
 	case types.MessageTypeTaskAssignment:
 		var assignment types.TaskAssignmentMessage
@@ -282,6 +281,14 @@ func (w *Worker) handleMessage(message []byte) {
 			return
 		}
 		w.handleTaskAssignment(&assignment)
+
+	case types.MessageTypeTaskCancellation:
+		var cancellation types.TaskCancellationMessage
+		if err := json.Unmarshal(msg.Data, &cancellation); err != nil {
+			log.Errorf(w.ctx, "Failed to unmarshal task cancellation: %v", err)
+			return
+		}
+		w.handleTaskCancellation(cancellation.TaskID)
 
 	default:
 		log.Warnf(w.ctx, "Unknown message type: %s", msg.Type)
@@ -303,6 +310,20 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	w.tasksMutex.Unlock()
 
 	go w.executeTask(taskCtx, assignment)
+}
+
+func (w *Worker) handleTaskCancellation(taskID string) {
+	w.tasksMutex.Lock()
+	cancelFunc, exists := w.activeTasks[taskID]
+	w.tasksMutex.Unlock()
+
+	if !exists {
+		log.Warnf(w.ctx, "Cannot cancel task %s: task not found or already completed", taskID)
+		return
+	}
+
+	log.Infof(w.ctx, "Cancelling task: %s", taskID)
+	cancelFunc()
 }
 
 func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
