@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/warpdotdev/warp-agent-worker/internal/sources"
 	"github.com/warpdotdev/warp-agent-worker/internal/types"
 )
 
@@ -69,13 +68,6 @@ func AugmentArgsForTask(task *types.Task, args []string) []string {
 		if env != "" {
 			args = append(args, "--environment", env)
 		}
-	}
-
-	// Keep the agent alive after task completion to allow followups.
-	// This is disabled for scheduled agents, since they may run frequently,
-	// and we do not expect a user to be present.
-	if _, ok := task.TaskSource.(*sources.ScheduledAgentTaskSource); !ok {
-		args = append(args, "--idle-on-complete")
 	}
 
 	return args

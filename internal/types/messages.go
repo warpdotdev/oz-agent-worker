@@ -1,6 +1,9 @@
 package types
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // MessageType represents the type of WebSocket message
 type MessageType string
@@ -38,4 +41,26 @@ type TaskClaimedMessage struct {
 type TaskFailedMessage struct {
 	TaskID  string `json:"task_id"`
 	Message string `json:"message"`
+}
+
+type TaskDefinition struct {
+	Prompt string `json:"prompt"`
+}
+
+// AmbientAgentConfig represents the agent configuration
+type AmbientAgentConfig struct {
+	EnvironmentID *string           `json:"environment_id,omitempty"`
+	BasePrompt    *string           `json:"base_prompt,omitempty"`
+	ModelID       *string           `json:"model_id,omitempty"`
+	MCPServers    []json.RawMessage `json:"mcp_servers,omitempty"`
+}
+
+// Task represents an ambient agent job.
+type Task struct {
+	ID                  string               `json:"id"`
+	Title               string               `json:"title"`
+	Definition          TaskDefinition       `json:"task_definition"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
+	AgentConfigSnapshot *AmbientAgentConfig  `json:"agent_config_snapshot,omitempty"`
 }
