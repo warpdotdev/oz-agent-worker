@@ -40,3 +40,8 @@ type TaskFailedMessage struct {
 	TaskID  string `json:"task_id"`
 	Message string `json:"message"`
 }
+
+// TaskCancellationMessage is sent from server to worker to cancel a running task
+type TaskCancellationMessage struct {
+	TaskID string `json:"task_id"`
+}
