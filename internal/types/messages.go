@@ -6,10 +6,11 @@ import "encoding/json"
 type MessageType string
 
 const (
-	MessageTypeTaskAssignment MessageType = "task_assignment"
-	MessageTypeTaskClaimed    MessageType = "task_claimed"
-	MessageTypeTaskFailed     MessageType = "task_failed"
-	MessageTypeHeartbeat      MessageType = "heartbeat"
+	MessageTypeTaskAssignment   MessageType = "task_assignment"
+	MessageTypeTaskClaimed      MessageType = "task_claimed"
+	MessageTypeTaskFailed       MessageType = "task_failed"
+	MessageTypeTaskCancellation MessageType = "task_cancellation"
+	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
 // WebSocketMessage is the base structure for all WebSocket messages
