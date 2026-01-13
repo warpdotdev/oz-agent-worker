@@ -610,22 +610,14 @@ func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient
 
 	log.Infof(ctx, "Extracting sidecar filesystem to volume")
 
-	// Use an arbitrary image to copy the exported filesystem onto a volume.
-	alpineImage := "alpine:latest"
-	alpineReader, err := dockerClient.ImagePull(ctx, alpineImage, image.PullOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to pull alpine image: %w", err)
-	}
-	if _, err := io.Copy(io.Discard, alpineReader); err != nil {
-		log.Warnf(ctx, "Error reading alpine image pull output: %v", err)
-	}
-	if err := alpineReader.Close(); err != nil {
-		log.Warnf(ctx, "Failed to close alpine reader: %v", err)
-	}
-
+	// Use the sidecar image itself to extract the exported filesystem onto the volume.
+	// Override the entrypoint to ensure we only run tar, not the sidecar's default command.
+	// Run as root to ensure we have permissions to write to the volume.
 	extractConfig := &container.Config{
-		Image:        alpineImage,
-		Cmd:          []string{"tar", "-x", "-C", "/target"},
+		Image:        sidecarImage,
+		User:         "root",
+		Entrypoint:   []string{"/bin/sh", "-c"},
+		Cmd:          []string{"tar -x -C /target"},
 		StdinOnce:    true,
 		OpenStdin:    true,
 		AttachStdin:  true,
