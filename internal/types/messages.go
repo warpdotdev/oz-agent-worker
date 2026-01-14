@@ -29,6 +29,8 @@ type TaskAssignmentMessage struct {
 	// The "sidecar image" contains the warp agent binary and a couple other dependencies.
 	SidecarImage string `json:"sidecar_image,omitempty"`
 	GitHubToken  string `json:"github_token,omitempty"`
+	// APIKey is the API key for the sidecar to authenticate with the server (for UpdateAgentTask, etc.)
+	APIKey string `json:"api_key,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
