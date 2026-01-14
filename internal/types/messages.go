@@ -28,9 +28,8 @@ type TaskAssignmentMessage struct {
 	DockerImage string `json:"docker_image,omitempty"`
 	// The "sidecar image" contains the warp agent binary and a couple other dependencies.
 	SidecarImage string `json:"sidecar_image,omitempty"`
-	GitHubToken  string `json:"github_token,omitempty"`
-	// APIKey is the API key for the sidecar to authenticate with the server (for UpdateAgentTask, etc.)
-	APIKey string `json:"api_key,omitempty"`
+	// EnvVars contains environment variables to set in the container (e.g. WARP_API_KEY, GITHUB_ACCESS_TOKEN)
+	EnvVars map[string]string `json:"env_vars,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
