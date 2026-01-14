@@ -197,7 +197,7 @@ func (w *Worker) readLoop(done chan struct{}) {
 			return
 		}
 
-		log.Infof(w.ctx, "WebSocket received: %s", string(message))
+		log.Debugf(w.ctx, "WebSocket received: %s", string(message))
 
 		w.handleMessage(message)
 	}
@@ -219,7 +219,7 @@ func (w *Worker) writeLoop(done chan struct{}) {
 				return
 			}
 
-			log.Infof(w.ctx, "WebSocket sending: %s", string(message))
+			log.Debugf(w.ctx, "WebSocket sending: %s", string(message))
 
 			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
 				log.Errorf(w.ctx, "Failed to set write deadline: %v", err)
@@ -482,7 +482,6 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	}
 
 	hostConfig := &container.HostConfig{
-		AutoRemove: true,
 		Binds: []string{
 			fmt.Sprintf("%s:/agent:ro", volumeName),
 		},
@@ -520,24 +519,20 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
 		logOutput, logErr := w.getContainerLogs(ctx, dockerClient, containerID)
-		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
+		if zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0 {
 			if logErr != nil {
 				log.Warnf(ctx, "Failed to get container logs: %v", logErr)
 			} else if logOutput != "" {
-				log.Debugf(ctx, "Container output:\n%s", logOutput)
+				if status.StatusCode != 0 {
+					log.Infof(ctx, "Container output:\n%s", logOutput)
+				} else {
+					log.Debugf(ctx, "Container output:\n%s", logOutput)
+				}
 			}
 		}
 
 		if status.StatusCode != 0 {
-			errorMsg := fmt.Sprintf("container exited with non-zero status: %d", status.StatusCode)
-			if logOutput != "" {
-				lines := strings.Split(logOutput, "\n")
-				if len(lines) > 10 {
-					lines = lines[len(lines)-10:]
-				}
-				errorMsg = fmt.Sprintf("%s. Last output:\n%s", errorMsg, strings.Join(lines, "\n"))
-			}
-			return fmt.Errorf("%s", errorMsg)
+			return fmt.Errorf("container exited with non-zero status: %d", status.StatusCode)
 		}
 	}
 
@@ -579,17 +574,16 @@ func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient
 		Cmd:   []string{"true"},
 	}
 
-	sidecarResp, err := dockerClient.ContainerCreate(ctx, sidecarConfig, nil, nil, nil, "")
+	sidecarHostConfig := &container.HostConfig{
+		AutoRemove: true,
+	}
+
+	sidecarResp, err := dockerClient.ContainerCreate(ctx, sidecarConfig, sidecarHostConfig, nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("failed to create sidecar container: %w", err)
 	}
 
 	sidecarContainerID := sidecarResp.ID
-	defer func() {
-		if removeErr := dockerClient.ContainerRemove(ctx, sidecarContainerID, container.RemoveOptions{Force: true}); removeErr != nil {
-			log.Warnf(ctx, "Failed to remove sidecar container %s: %v", sidecarContainerID, removeErr)
-		}
-	}()
 
 	log.Infof(ctx, "Created sidecar container: %s", sidecarContainerID)
 
@@ -622,6 +616,7 @@ func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient
 	}
 
 	extractHostConfig := &container.HostConfig{
+		AutoRemove: true,
 		Binds: []string{
 			fmt.Sprintf("%s:/target", volumeName),
 		},
@@ -633,11 +628,6 @@ func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient
 	}
 
 	extractContainerID := extractResp.ID
-	defer func() {
-		if removeErr := dockerClient.ContainerRemove(ctx, extractContainerID, container.RemoveOptions{Force: true}); removeErr != nil {
-			log.Warnf(ctx, "Failed to remove extraction container %s: %v", extractContainerID, removeErr)
-		}
-	}()
 
 	log.Infof(ctx, "Created extraction container: %s", extractContainerID)
 
