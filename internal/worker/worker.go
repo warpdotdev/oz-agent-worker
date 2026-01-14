@@ -444,8 +444,15 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		}
 	}
 
+	// Use task-specific API key if provided, otherwise fall back to worker's API key
+	apiKey := assignment.APIKey
+	if apiKey == "" {
+		apiKey = w.config.APIKey
+		log.Warnf(ctx, "No task-specific API key provided for task %s, falling back to worker API key", task.ID)
+	}
+
 	envVars := []string{
-		fmt.Sprintf("WARP_API_KEY=%s", w.config.APIKey),
+		fmt.Sprintf("WARP_API_KEY=%s", apiKey),
 		fmt.Sprintf("TASK_ID=%s", task.ID),
 		"GIT_TERMINAL_PROMPT=0",
 		"GH_PROMPT_DISABLED=1",
