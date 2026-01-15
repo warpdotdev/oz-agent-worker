@@ -29,6 +29,10 @@ func main() {
 		kong.Vars{},
 	)
 
+	if CLI.WorkerID == "warp" {
+		log.Fatalf(ctx, "Invalid worker-id: 'warp' is a reserved value and cannot be used")
+	}
+
 	log.SetLevel(CLI.LogLevel)
 
 	config := worker.Config{
