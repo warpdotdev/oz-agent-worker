@@ -127,8 +127,11 @@ func (w *Worker) connect() error {
 
 	log.Infof(w.ctx, "Connecting to %s", u.String())
 
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
+	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("failed to dial WebSocket: %w\n%s", err, resp.Status)
+		}
 		return fmt.Errorf("failed to dial WebSocket: %w", err)
 	}
 
@@ -140,6 +143,9 @@ func (w *Worker) connect() error {
 
 	conn.SetPongHandler(func(string) error {
 		w.lastHeartbeat = time.Now()
+		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
+			log.Warnf(w.ctx, "Failed to set read deadline in pong handler: %v", err)
+		}
 		return nil
 	})
 
