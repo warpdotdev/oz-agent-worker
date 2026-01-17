@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/alecthomas/kong"
@@ -28,6 +29,10 @@ func main() {
 		kong.UsageOnError(),
 		kong.Vars{},
 	)
+
+	if strings.HasPrefix(CLI.WorkerID, "warp") {
+		log.Fatalf(ctx, "Invalid worker-id: values starting with 'warp' are reserved and cannot be used")
+	}
 
 	log.SetLevel(CLI.LogLevel)
 
