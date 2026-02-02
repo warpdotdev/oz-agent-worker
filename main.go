@@ -18,6 +18,7 @@ var CLI struct {
 	WebSocketURL  string `default:"wss://app.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
 	ServerRootURL string `default:"https://app.warp.dev" hidden:""`
 	LogLevel      string `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
+	NoCleanup     bool   `help:"Do not remove containers after execution (for debugging)"`
 }
 
 func main() {
@@ -42,6 +43,7 @@ func main() {
 		WebSocketURL:  CLI.WebSocketURL,
 		ServerRootURL: CLI.ServerRootURL,
 		LogLevel:      CLI.LogLevel,
+		NoCleanup:     CLI.NoCleanup,
 	}
 
 	w, err := worker.New(ctx, config)

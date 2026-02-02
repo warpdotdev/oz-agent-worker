@@ -39,6 +39,7 @@ type Config struct {
 	WebSocketURL  string
 	ServerRootURL string
 	LogLevel      string
+	NoCleanup     bool
 }
 
 type Worker struct {
@@ -502,7 +503,7 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	log.Debugf(ctx, "Created Docker container: %s", containerID)
 
 	defer func() {
-		if containerID != "" {
+		if containerID != "" && !w.config.NoCleanup {
 			if removeErr := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); removeErr != nil {
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			}
