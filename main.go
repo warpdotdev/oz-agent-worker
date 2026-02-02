@@ -15,7 +15,7 @@ import (
 var CLI struct {
 	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID      string   `help:"Worker host identifier" required:""`
-	WebSocketURL  string   `default:"wss://app.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
+	WebSocketURL  string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
 	ServerRootURL string   `default:"https://app.warp.dev" hidden:""`
 	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
 	NoCleanup     bool     `help:"Do not remove containers after execution (for debugging)"`
