@@ -40,6 +40,7 @@ type Config struct {
 	ServerRootURL string
 	LogLevel      string
 	NoCleanup     bool
+	Volumes       []string
 }
 
 type Worker struct {
@@ -488,10 +489,14 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		WorkingDir: "/workspace",
 	}
 
+	binds := []string{
+		fmt.Sprintf("%s:/agent:ro", volumeName),
+	}
+	// Add user-configured volumes
+	binds = append(binds, w.config.Volumes...)
+
 	hostConfig := &container.HostConfig{
-		Binds: []string{
-			fmt.Sprintf("%s:/agent:ro", volumeName),
-		},
+		Binds: binds,
 	}
 
 	resp, err := dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")

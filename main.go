@@ -13,12 +13,13 @@ import (
 )
 
 var CLI struct {
-	APIKey        string `help:"API key for authentication" env:"WARP_API_KEY" required:""`
-	WorkerID      string `help:"Worker host identifier" required:""`
-	WebSocketURL  string `default:"wss://app.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
-	ServerRootURL string `default:"https://app.warp.dev" hidden:""`
-	LogLevel      string `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
-	NoCleanup     bool   `help:"Do not remove containers after execution (for debugging)"`
+	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
+	WorkerID      string   `help:"Worker host identifier" required:""`
+	WebSocketURL  string   `default:"wss://app.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
+	ServerRootURL string   `default:"https://app.warp.dev" hidden:""`
+	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
+	NoCleanup     bool     `help:"Do not remove containers after execution (for debugging)"`
+	Volumes       []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 }
 
 func main() {
@@ -44,6 +45,7 @@ func main() {
 		ServerRootURL: CLI.ServerRootURL,
 		LogLevel:      CLI.LogLevel,
 		NoCleanup:     CLI.NoCleanup,
+		Volumes:       CLI.Volumes,
 	}
 
 	w, err := worker.New(ctx, config)
@@ -70,4 +72,3 @@ func main() {
 
 	log.Infof(ctx, "Worker shutdown complete")
 }
-
