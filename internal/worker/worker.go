@@ -11,11 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/registry"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/warp-agent-worker/internal/common"
@@ -334,6 +336,72 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 	log.Infof(ctx, "Task container started successfully: taskID=%s", taskID)
 }
 
+// pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
+// Docker only downloads changed layers, so this is efficient even if the image exists locally.
+func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string) error {
+	log.Infof(ctx, "Pulling image: %s", imageName)
+	pullOptions := image.PullOptions{
+		Platform:     "linux/amd64",
+		RegistryAuth: authStr,
+	}
+	reader, err := w.dockerClient.ImagePull(ctx, imageName, pullOptions)
+	if err != nil {
+		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
+	}
+	defer func() {
+		if closeErr := reader.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close image pull reader: %v", closeErr)
+		}
+	}()
+
+	// The image pull doesn't actually happen until you read from this stream, but we don't need the output.
+	if _, err = io.Copy(io.Discard, reader); err != nil {
+		return fmt.Errorf("failed to read image pull output: %w", err)
+	}
+	log.Infof(ctx, "Successfully pulled image: %s", imageName)
+	return nil
+}
+
+// getRegistryAuth returns the auth string for the registry of the given image, or empty string if not found.
+func (w *Worker) getRegistryAuth(ctx context.Context, imageName string) string {
+	cfg, err := cliconfig.Load("")
+	if err != nil {
+		log.Warnf(ctx, "Failed to load Docker config: %v. Attempting pull without auth.", err)
+		return ""
+	}
+	if cfg == nil {
+		return ""
+	}
+
+	ref, err := reference.ParseNormalizedNamed(imageName)
+	if err != nil {
+		log.Warnf(ctx, "Failed to parse image name %s: %v", imageName, err)
+		return ""
+	}
+
+	// Get the registry hostname (e.g., "docker.io", "gcr.io").
+	repoInfo, err := registry.ParseRepositoryInfo(ref)
+	if err != nil {
+		log.Warnf(ctx, "Failed to parse repository info: %v", err)
+		return ""
+	}
+
+	authKey := registry.GetAuthConfigKey(repoInfo.Index)
+
+	authConfig, err := cfg.GetAuthConfig(authKey)
+	if err != nil {
+		log.Warnf(ctx, "Failed to get auth config for registry %s: %v", authKey, err)
+		return ""
+	}
+	if authConfig.Username == "" {
+		return ""
+	}
+
+	authJSON, _ := json.Marshal(authConfig)
+	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", authKey, authConfig.Username)
+	return base64.URLEncoding.EncodeToString(authJSON)
+}
+
 func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.TaskAssignmentMessage) error {
 	task := assignment.Task
 	dockerClient := w.dockerClient
@@ -352,87 +420,24 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		}
 	}
 
-	log.Debugf(ctx, "Pulling Docker image: %s", imageName)
-
-	cfg, err := cliconfig.Load("")
-	if err != nil {
-		log.Warnf(ctx, "Failed to load Docker config: %v. Attempting pull without auth.", err)
+	authStr := w.getRegistryAuth(ctx, imageName)
+	if err := w.pullImage(ctx, imageName, authStr); err != nil {
+		return err
 	}
-
-	var authStr string
-	if cfg != nil {
-		// This is the default registry if not specified in the `imageName`.
-		registryURL := "https://index.docker.io/v1/"
-
-		if strings.Contains(imageName, "/") {
-			parts := strings.SplitN(imageName, "/", 2)
-			if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
-				registryURL = parts[0]
-			}
-		}
-
-		authConfig, err := cfg.GetAuthConfig(registryURL)
-		if err != nil {
-			log.Warnf(ctx, "Failed to get auth config for registry %s: %v", registryURL, err)
-		} else if authConfig.Username != "" {
-			authJSON, _ := json.Marshal(authConfig)
-			authStr = base64.URLEncoding.EncodeToString(authJSON)
-			log.Infof(ctx, "Using Docker credentials for registry %s (username: %s)", registryURL, authConfig.Username)
-		} else {
-			log.Warnf(ctx, "No username found in auth config for registry %s", registryURL)
-		}
-	}
-
-	pullOptions := image.PullOptions{
-		Platform:     "linux/amd64",
-		RegistryAuth: authStr,
-	}
-	reader, err := dockerClient.ImagePull(ctx, imageName, pullOptions)
-	if err != nil {
-		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
-	}
-	defer func() {
-		if err := reader.Close(); err != nil {
-			log.Warnf(ctx, "Failed to close image pull reader: %v", err)
-		}
-	}()
-
-	// The image pull doesn't actually happen until you read from this stream, but we don't need the output.
-	_, err = io.Copy(io.Discard, reader)
-	if err != nil {
-		return fmt.Errorf("failed to read image pull output: %w", err)
-	}
-	log.Infof(ctx, "Successfully pulled Docker image: %s", imageName)
 
 	if assignment.SidecarImage == "" {
 		return fmt.Errorf("no sidecar image specified in assignment")
 	}
 
-	log.Debugf(ctx, "Checking if sidecar image %s exists locally", assignment.SidecarImage)
-	_, err = dockerClient.ImageInspect(ctx, assignment.SidecarImage)
-	if err == nil {
-		log.Debugf(ctx, "Sidecar image %s already exists locally, skipping pull", assignment.SidecarImage)
-	} else {
-		log.Infof(ctx, "Pulling sidecar image: %s", assignment.SidecarImage)
-
-		sidecarReader, err := dockerClient.ImagePull(ctx, assignment.SidecarImage, pullOptions)
-		if err != nil {
-			return fmt.Errorf("failed to pull sidecar image %s: %w", assignment.SidecarImage, err)
-		}
-		_, err = io.Copy(io.Discard, sidecarReader)
-		if closeErr := sidecarReader.Close(); closeErr != nil {
-			log.Warnf(ctx, "Failed to close sidecar reader: %v", closeErr)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read sidecar image pull output: %w", err)
-		}
-		log.Infof(ctx, "Successfully pulled sidecar image: %s", assignment.SidecarImage)
+	// Sidecar images are public, so no auth is needed
+	if err := w.pullImage(ctx, assignment.SidecarImage, ""); err != nil {
+		return err
 	}
 
 	volumeName := sanitizeImageNameForVolume(assignment.SidecarImage)
 	log.Debugf(ctx, "Using shared volume: %s for sidecar image: %s", volumeName, assignment.SidecarImage)
 
-	_, err = dockerClient.VolumeInspect(ctx, volumeName)
+	_, err := dockerClient.VolumeInspect(ctx, volumeName)
 	if err == nil {
 		log.Debugf(ctx, "Reusing existing volume %s (already populated from sidecar)", volumeName)
 	} else {
