@@ -58,10 +58,10 @@ type AmbientAgentConfig struct {
 
 // Task represents an ambient agent job.
 type Task struct {
-	ID                  string               `json:"id"`
-	Title               string               `json:"title"`
-	Definition          TaskDefinition       `json:"task_definition"`
-	CreatedAt           time.Time            `json:"created_at"`
-	UpdatedAt           time.Time            `json:"updated_at"`
-	AgentConfigSnapshot *AmbientAgentConfig  `json:"agent_config_snapshot,omitempty"`
+	ID                  string              `json:"id"`
+	Title               string              `json:"title"`
+	Definition          TaskDefinition      `json:"task_definition"`
+	CreatedAt           time.Time           `json:"created_at"`
+	UpdatedAt           time.Time           `json:"updated_at"`
+	AgentConfigSnapshot *AmbientAgentConfig `json:"agent_config_snapshot,omitempty"`
 }
