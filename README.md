@@ -12,33 +12,34 @@ Self-hosted worker for Warp ambient agents.
 - Service account API key with team scope
 - Network egress to warp-server
 
-## Installation
+## Usage
+
+### Docker (Recommended)
+
+The worker needs access to the Docker daemon to spawn task containers. Mount the host's Docker socket into the container:
+
+```bash
+docker run -v /var/run/docker.sock:/var/run/docker.sock \
+  -e WARP_API_KEY="wk-abc123" \
+  warpdotdev/warp-agent-worker --worker-id "my-worker"
+```
+
+> **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+### Go Install
 
 ```bash
 go install github.com/warpdotdev/warp-agent-worker@latest
+warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
-Or build from source:
+### Build from Source
 
 ```bash
 git clone https://github.com/warpdotdev/warp-agent-worker.git
 cd warp-agent-worker
 go build -o warp-agent-worker
-```
-
-## Usage
-
-### Basic Usage
-
-```bash
-warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
-```
-
-### Using Environment Variable
-
-```bash
-export WARP_API_KEY="wk-abc123"
-warp-agent-worker --worker-id "my-worker"
+./warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
 ## Docker Connectivity
