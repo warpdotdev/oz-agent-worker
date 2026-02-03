@@ -350,6 +350,7 @@ func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string
 		}
 	}()
 
+	// The image pull doesn't actually happen until you read from this stream, but we don't need the output.
 	if _, err = io.Copy(io.Discard, reader); err != nil {
 		return fmt.Errorf("failed to read image pull output: %w", err)
 	}
@@ -362,6 +363,9 @@ func (w *Worker) getRegistryAuth(ctx context.Context, imageName string) string {
 	cfg, err := cliconfig.Load("")
 	if err != nil {
 		log.Warnf(ctx, "Failed to load Docker config: %v. Attempting pull without auth.", err)
+		return ""
+	}
+	if cfg == nil {
 		return ""
 	}
 
@@ -386,7 +390,7 @@ func (w *Worker) getRegistryAuth(ctx context.Context, imageName string) string {
 	}
 
 	authJSON, _ := json.Marshal(authConfig)
-	log.Infof(ctx, "Using Docker credentials for registry %s (username: %s)", registryURL, authConfig.Username)
+	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", registryURL, authConfig.Username)
 	return base64.URLEncoding.EncodeToString(authJSON)
 }
 
