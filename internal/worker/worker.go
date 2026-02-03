@@ -471,8 +471,6 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		"team:edit",
 		"--task-id",
 		task.ID,
-		"--prompt",
-		common.EffectivePromptForTask(task),
 		"--sandboxed",
 		"--server-root-url",
 		w.config.ServerRootURL,

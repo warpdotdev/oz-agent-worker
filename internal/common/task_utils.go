@@ -7,39 +7,6 @@ import (
 	"github.com/warpdotdev/warp-agent-worker/internal/types"
 )
 
-// EffectivePromptForTask returns the prompt that should be passed to `warp agent run --prompt`.
-//
-// If the task has a BasePrompt in AgentConfigSnapshot, we prepend it to the task prompt.
-// This is a best-effort approximation of a separate "system/base prompt" channel, since the
-// CLI only accepts a single prompt string.
-func EffectivePromptForTask(task *types.Task) string {
-	if task == nil {
-		return ""
-	}
-
-	taskPrompt := task.Definition.Prompt
-	if task.AgentConfigSnapshot == nil || task.AgentConfigSnapshot.BasePrompt == nil {
-		return taskPrompt
-	}
-
-	basePrompt := strings.TrimSpace(*task.AgentConfigSnapshot.BasePrompt)
-	if basePrompt == "" {
-		return taskPrompt
-	}
-
-	// If the task prompt is empty, the base prompt becomes the whole prompt.
-	if strings.TrimSpace(taskPrompt) == "" {
-		return basePrompt
-	}
-
-	// Avoid duplicating the base prompt for scheduled tasks where taskPrompt is already basePrompt.
-	if strings.TrimSpace(taskPrompt) == basePrompt {
-		return taskPrompt
-	}
-
-	return basePrompt + "\n\n" + taskPrompt
-}
-
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
 // Uses task.AgentConfigSnapshot as the source of truth when available.
 func AugmentArgsForTask(task *types.Task, args []string) []string {
