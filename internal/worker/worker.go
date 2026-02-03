@@ -11,11 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/registry"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/warp-agent-worker/internal/common"
@@ -369,28 +371,32 @@ func (w *Worker) getRegistryAuth(ctx context.Context, imageName string) string {
 		return ""
 	}
 
-	// This is the default registry if not specified in the `imageName`.
-	registryURL := "https://index.docker.io/v1/"
-
-	if strings.Contains(imageName, "/") {
-		parts := strings.SplitN(imageName, "/", 2)
-		if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
-			registryURL = parts[0]
-		}
+	ref, err := reference.ParseNormalizedNamed(imageName)
+	if err != nil {
+		log.Warnf(ctx, "Failed to parse image name %s: %v", imageName, err)
+		return ""
 	}
 
-	authConfig, err := cfg.GetAuthConfig(registryURL)
+	// Get the registry hostname (e.g., "docker.io", "gcr.io").
+	repoInfo, err := registry.ParseRepositoryInfo(ref)
 	if err != nil {
-		log.Warnf(ctx, "Failed to get auth config for registry %s: %v", registryURL, err)
+		log.Warnf(ctx, "Failed to parse repository info: %v", err)
+		return ""
+	}
+
+	authKey := registry.GetAuthConfigKey(repoInfo.Index)
+
+	authConfig, err := cfg.GetAuthConfig(authKey)
+	if err != nil {
+		log.Warnf(ctx, "Failed to get auth config for registry %s: %v", authKey, err)
 		return ""
 	}
 	if authConfig.Username == "" {
-		log.Warnf(ctx, "No username found in auth config for registry %s", registryURL)
 		return ""
 	}
 
 	authJSON, _ := json.Marshal(authConfig)
-	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", registryURL, authConfig.Username)
+	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", authKey, authConfig.Username)
 	return base64.URLEncoding.EncodeToString(authJSON)
 }
 
