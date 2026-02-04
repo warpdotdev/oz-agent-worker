@@ -434,10 +434,16 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		return err
 	}
 
-	volumeName := sanitizeImageNameForVolume(assignment.SidecarImage)
-	log.Debugf(ctx, "Using shared volume: %s for sidecar image: %s", volumeName, assignment.SidecarImage)
+	// Get the concrete image digest to ensure volume is rebuilt when the image changes
+	sidecarDigest, err := w.getImageDigest(ctx, assignment.SidecarImage)
+	if err != nil {
+		return fmt.Errorf("failed to get sidecar image digest: %w", err)
+	}
 
-	_, err := dockerClient.VolumeInspect(ctx, volumeName)
+	volumeName := sanitizeVolumeName(assignment.SidecarImage, sidecarDigest)
+	log.Debugf(ctx, "Using shared volume: %s", volumeName)
+
+	_, err = dockerClient.VolumeInspect(ctx, volumeName)
 	if err == nil {
 		log.Debugf(ctx, "Reusing existing volume %s (already populated from sidecar)", volumeName)
 	} else {
@@ -746,10 +752,59 @@ func (w *Worker) sendMessage(message []byte) error {
 	}
 }
 
-func sanitizeImageNameForVolume(imageName string) string {
-	sanitized := strings.ReplaceAll(imageName, "/", "-")
-	sanitized = strings.ReplaceAll(sanitized, ":", "-")
-	return sanitized
+// sanitizeVolumeName creates a volume name from the image name and digest.
+// The digest ensures uniqueness when the image tag points to different content.
+func sanitizeVolumeName(imageName, digest string) string {
+	var repoName string
+	ref, err := reference.ParseNormalizedNamed(imageName)
+	if err == nil {
+		// Use FamiliarName with TrimNamed to get the repository without tag/digest
+		// e.g., "namespace/warp-agent:latest" -> "namespace/warp-agent"
+		repoName = reference.FamiliarName(reference.TrimNamed(ref))
+	} else {
+		// Fallback to original image name if parsing fails
+		repoName = imageName
+	}
+
+	// Sanitize the repository name for use in volume name
+	baseName := strings.ReplaceAll(repoName, "/", "-")
+
+	// digest format is typically "sha256:abc123..."
+	parts := strings.Split(digest, ":")
+	if len(parts) == 2 {
+		// Use first 12 chars of the hash
+		hash := parts[1]
+		if len(hash) > 12 {
+			hash = hash[:12]
+		}
+		return baseName + "-" + hash
+	}
+	// Fallback if digest format is unexpected
+	return baseName + "-" + strings.ReplaceAll(digest, ":", "-")
+}
+
+// getImageDigest returns the digest (sha256 hash) of a pulled image.
+func (w *Worker) getImageDigest(ctx context.Context, imageName string) (string, error) {
+	inspect, err := w.dockerClient.ImageInspect(ctx, imageName)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect image %s: %w", imageName, err)
+	}
+
+	// RepoDigests contains the digest from the registry. It's in the format "repo@sha256:hash"
+	if len(inspect.RepoDigests) > 0 {
+		// Extract just the digest part (sha256:hash)
+		parts := strings.Split(inspect.RepoDigests[0], "@")
+		if len(parts) == 2 {
+			return parts[1], nil
+		}
+	}
+
+	// Fallback to the image ID if RepoDigests is not available (this can happen for locally built images)
+	if inspect.ID != "" {
+		return inspect.ID, nil
+	}
+
+	return "", fmt.Errorf("no digest found for image %s", imageName)
 }
 
 func (w *Worker) Shutdown() {
