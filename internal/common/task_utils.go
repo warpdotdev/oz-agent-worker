@@ -21,7 +21,18 @@ func AugmentArgsForTask(task *types.Task, args []string) []string {
 			}
 		}
 
-		// Prefer emitting a single JSON blob for all MCP servers.
+		if task.AgentConfigSnapshot.ProfileID != nil {
+			if profileID := strings.TrimSpace(*task.AgentConfigSnapshot.ProfileID); profileID != "" {
+				args = append(args, "--profile", profileID)
+			}
+		}
+
+		if task.AgentConfigSnapshot.SkillSpec != nil {
+			if skillSpec := strings.TrimSpace(*task.AgentConfigSnapshot.SkillSpec); skillSpec != "" {
+				args = append(args, "--skill", skillSpec)
+			}
+		}
+
 		if len(task.AgentConfigSnapshot.MCPServers) > 0 {
 			b, err := json.Marshal(task.AgentConfigSnapshot.MCPServers)
 			if err == nil {
@@ -36,6 +47,9 @@ func AugmentArgsForTask(task *types.Task, args []string) []string {
 			args = append(args, "--environment", env)
 		}
 	}
+
+	// Keep the agent alive after task completion to allow followups.
+	args = append(args, "--idle-on-complete")
 
 	return args
 }
