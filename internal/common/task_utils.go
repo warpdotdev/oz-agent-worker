@@ -39,6 +39,15 @@ func AugmentArgsForTask(task *types.Task, args []string) []string {
 				args = append(args, "--mcp", string(b))
 			}
 		}
+
+		// Pass computer use setting if explicitly configured.
+		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
+			if *task.AgentConfigSnapshot.ComputerUseEnabled {
+				args = append(args, "--computer-use")
+			} else {
+				args = append(args, "--no-computer-use")
+			}
+		}
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
