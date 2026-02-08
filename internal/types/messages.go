@@ -21,6 +21,13 @@ type WebSocketMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// SidecarMount describes an additional sidecar image to mount into the task container.
+type SidecarMount struct {
+	Image     string `json:"image"`      // Docker image to pull.
+	MountPath string `json:"mount_path"` // Path to mount the sidecar filesystem in the task container.
+	ReadWrite bool   `json:"read_write"` // If false (default), the mount is read-only.
+}
+
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
 	TaskID      string `json:"task_id"`
@@ -30,6 +37,8 @@ type TaskAssignmentMessage struct {
 	SidecarImage string `json:"sidecar_image,omitempty"`
 	// EnvVars contains environment variables to set in the container (e.g. WARP_API_KEY, GITHUB_ACCESS_TOKEN)
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
+	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
