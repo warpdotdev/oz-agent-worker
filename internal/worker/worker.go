@@ -463,6 +463,12 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 		}
 	}
 
+	// Prepare additional sidecar volumes (e.g., xvfb for computer use).
+	additionalSidecarBinds, err := w.prepareAdditionalSidecars(ctx, dockerClient, assignment.AdditionalSidecars)
+	if err != nil {
+		return err
+	}
+
 	envVars := []string{
 		fmt.Sprintf("TASK_ID=%s", task.ID),
 		"GIT_TERMINAL_PROMPT=0",
@@ -501,7 +507,9 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	binds := []string{
 		fmt.Sprintf("%s:/agent:ro", volumeName),
 	}
-	// Add user-configured volumes
+	// Add additional sidecar volumes.
+	binds = append(binds, additionalSidecarBinds...)
+	// Add user-configured volumes.
 	binds = append(binds, w.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
@@ -691,6 +699,67 @@ func (w *Worker) copySidecarFilesystemToVolume(ctx context.Context, dockerClient
 	}
 
 	return nil
+}
+
+// prepareAdditionalSidecars pulls each additional sidecar image, creates a Docker volume
+// from its filesystem, and returns the list of bind mount strings to add to the container.
+func (w *Worker) prepareAdditionalSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
+	var binds []string
+	seenMountPaths := make(map[string]bool)
+
+	for _, sidecar := range sidecars {
+		if sidecar.Image == "" {
+			return nil, fmt.Errorf("additional sidecar has empty image")
+		}
+		if sidecar.MountPath == "" {
+			return nil, fmt.Errorf("additional sidecar %s has empty mount path", sidecar.Image)
+		}
+		if seenMountPaths[sidecar.MountPath] {
+			return nil, fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
+		}
+		seenMountPaths[sidecar.MountPath] = true
+
+		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
+
+		// Additional sidecar images are public, so no auth is needed.
+		if err := w.pullImage(ctx, sidecar.Image, ""); err != nil {
+			return nil, fmt.Errorf("failed to pull additional sidecar image %s: %w", sidecar.Image, err)
+		}
+
+		digest, err := w.getImageDigest(ctx, sidecar.Image)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get digest for additional sidecar image %s: %w", sidecar.Image, err)
+		}
+
+		volumeName := sanitizeVolumeName(sidecar.Image, digest)
+		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
+
+		_, err = dockerClient.VolumeInspect(ctx, volumeName)
+		if err == nil {
+			log.Debugf(ctx, "Reusing existing volume %s for additional sidecar", volumeName)
+		} else {
+			log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
+			if _, err := dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: volumeName}); err != nil {
+				return nil, fmt.Errorf("failed to create volume for additional sidecar %s: %w", sidecar.Image, err)
+			}
+
+			if err := w.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName); err != nil {
+				// Clean up the empty volume so it isn't silently reused on retry.
+				if removeErr := dockerClient.VolumeRemove(ctx, volumeName, false); removeErr != nil {
+					log.Warnf(ctx, "Failed to clean up volume %s after copy failure: %v", volumeName, removeErr)
+				}
+				return nil, fmt.Errorf("failed to copy additional sidecar %s to volume: %w", sidecar.Image, err)
+			}
+		}
+
+		mode := ":ro"
+		if sidecar.ReadWrite {
+			// Docker defaults to read-write when no mode suffix is provided.
+			mode = ""
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s%s", volumeName, sidecar.MountPath, mode))
+	}
+	return binds, nil
 }
 
 func (w *Worker) sendTaskClaimed(taskID string) error {
