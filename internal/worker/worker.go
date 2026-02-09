@@ -362,7 +362,7 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 // pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
 // Docker only downloads changed layers, so this is efficient even if the image exists locally.
 func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string) error {
-	log.Infof(ctx, "Pulling image: %s for platform %s", imageName, w.platform)
+	log.Infof(ctx, "Pulling image: %s", imageName)
 	pullOptions := image.PullOptions{
 		Platform:     w.platform,
 		RegistryAuth: authStr,
