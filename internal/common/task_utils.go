@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/warpdotdev/warp-agent-worker/internal/types"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.

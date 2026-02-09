@@ -1,4 +1,4 @@
-# warp-agent-worker
+# oz-agent-worker
 
 Self-hosted worker for Oz cloud agents.
 
@@ -6,7 +6,7 @@ Self-hosted worker for Oz cloud agents.
 
 ## Overview
 
-`warp-agent-worker` is a daemon that connects to Oz via WebSocket to receive and execute cloud agent tasks on self-hosted infrastructure.
+`oz-agent-worker` is a daemon that connects to Oz via WebSocket to receive and execute cloud agent tasks on self-hosted infrastructure.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ The worker needs access to the Docker daemon to spawn task containers. Mount the
 ```bash
 docker run -v /var/run/docker.sock:/var/run/docker.sock \
   -e WARP_API_KEY="wk-abc123" \
-  warpdotdev/warp-agent-worker --worker-id "my-worker"
+  warpdotdev/oz-agent-worker --worker-id "my-worker"
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
@@ -31,17 +31,17 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock \
 ### Go Install
 
 ```bash
-go install github.com/warpdotdev/warp-agent-worker@latest
-warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
+go install github.com/warpdotdev/oz-agent-worker@latest
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/warpdotdev/warp-agent-worker.git
-cd warp-agent-worker
-go build -o warp-agent-worker
-./warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
+git clone https://github.com/warpdotdev/oz-agent-worker.git
+cd oz-agent-worker
+go build -o oz-agent-worker
+./oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
 ## Docker Connectivity
@@ -64,7 +64,7 @@ Additional supported environment variables:
 export DOCKER_HOST="tcp://remote-host:2376"
 export DOCKER_TLS_VERIFY=1
 export DOCKER_CERT_PATH="/path/to/certs"
-warp-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
 ## License

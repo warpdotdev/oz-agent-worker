@@ -20,9 +20,9 @@ import (
 	"github.com/docker/docker/registry"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
-	"github.com/warpdotdev/warp-agent-worker/internal/common"
-	"github.com/warpdotdev/warp-agent-worker/internal/log"
-	"github.com/warpdotdev/warp-agent-worker/internal/types"
+	"github.com/warpdotdev/oz-agent-worker/internal/common"
+	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 const (

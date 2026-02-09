@@ -54,4 +54,4 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: warpdotdev/warp-agent-worker:latest
+          tags: warpdotdev/oz-agent-worker:latest

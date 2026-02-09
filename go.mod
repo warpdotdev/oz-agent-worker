@@ -1,4 +1,4 @@
-module github.com/warpdotdev/warp-agent-worker
+module github.com/warpdotdev/oz-agent-worker
 
 go 1.25.0
 
