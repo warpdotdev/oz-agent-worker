@@ -57,6 +57,7 @@ type Worker struct {
 	activeTasks    map[string]context.CancelFunc
 	tasksMutex     sync.Mutex
 	dockerClient   *client.Client
+	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -80,7 +81,28 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		return nil, fmt.Errorf("failed to reach Docker daemon: %w", err)
 	}
 
-	log.Debugf(ctx, "Docker daemon is reachable")
+	// Get the Docker daemon version to determine its platform.
+	versionInfo, err := dockerClient.ServerVersion(ctx)
+	if err != nil {
+		if closeErr := dockerClient.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
+		}
+		cancel()
+		return nil, fmt.Errorf("failed to get Docker version: %w", err)
+	}
+
+	// Determine the platform. The sidecar only supports linux/amd64 and linux/arm64,
+	// so we enforce that all images are pulled for one of these platforms.
+	platform := fmt.Sprintf("%s/%s", versionInfo.Os, versionInfo.Arch)
+	if platform != "linux/amd64" && platform != "linux/arm64" {
+		if closeErr := dockerClient.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
+		}
+		cancel()
+		return nil, fmt.Errorf("unsupported Docker platform %s (only linux/amd64 and linux/arm64 are supported)", platform)
+	}
+
+	log.Debugf(ctx, "Docker daemon is reachable, platform: %s", platform)
 
 	return &Worker{
 		config:         config,
@@ -90,6 +112,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		sendChan:       make(chan []byte, 256),
 		activeTasks:    make(map[string]context.CancelFunc),
 		dockerClient:   dockerClient,
+		platform:       platform,
 	}, nil
 }
 
@@ -339,9 +362,9 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 // pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
 // Docker only downloads changed layers, so this is efficient even if the image exists locally.
 func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string) error {
-	log.Infof(ctx, "Pulling image: %s", imageName)
+	log.Infof(ctx, "Pulling image: %s for platform %s", imageName, w.platform)
 	pullOptions := image.PullOptions{
-		Platform:     "linux/amd64",
+		Platform:     w.platform,
 		RegistryAuth: authStr,
 	}
 	reader, err := w.dockerClient.ImagePull(ctx, imageName, pullOptions)
