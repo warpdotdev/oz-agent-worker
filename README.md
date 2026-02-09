@@ -1,10 +1,10 @@
 # warp-agent-worker
 
-Self-hosted worker for Warp ambient agents.
+Self-hosted worker for Oz cloud agents.
 
 ## Overview
 
-`warp-agent-worker` is a daemon that connects to warp-server via WebSocket to receive and execute ambient agent tasks on self-hosted infrastructure.
+`warp-agent-worker` is a daemon that connects to Oz via WebSocket to receive and execute cloud agent tasks on self-hosted infrastructure.
 
 ## Requirements
 
