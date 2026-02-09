@@ -16,7 +16,7 @@ go.work
 go.work.sum
 
 # Binary
-warp-agent-worker
+oz-agent-worker
 
 # Dependency directories
 vendor/

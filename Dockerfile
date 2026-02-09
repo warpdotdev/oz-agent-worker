@@ -8,7 +8,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o warp-agent-worker .
+RUN CGO_ENABLED=0 GOOS=linux go build -o oz-agent-worker .
 
 # Runtime stage
 FROM alpine:latest
@@ -19,6 +19,6 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /app
 
 # Copy the binary from builder
-COPY --from=builder /app/warp-agent-worker .
+COPY --from=builder /app/oz-agent-worker .
 
-ENTRYPOINT ["./warp-agent-worker"]
+ENTRYPOINT ["./oz-agent-worker"]

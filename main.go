@@ -8,8 +8,8 @@ import (
 	"syscall"
 
 	"github.com/alecthomas/kong"
-	"github.com/warpdotdev/warp-agent-worker/internal/log"
-	"github.com/warpdotdev/warp-agent-worker/internal/worker"
+	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 )
 
 var CLI struct {
@@ -26,7 +26,7 @@ func main() {
 	ctx := context.Background()
 
 	kong.Parse(&CLI,
-		kong.Name("warp-agent-worker"),
+		kong.Name("oz-agent-worker"),
 		kong.Description("Self-hosted worker for Warp ambient agents."),
 		kong.UsageOnError(),
 		kong.Vars{},
