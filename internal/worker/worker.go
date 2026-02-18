@@ -377,9 +377,24 @@ func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string
 		}
 	}()
 
-	// The image pull doesn't actually happen until you read from this stream, but we don't need the output.
-	if _, err = io.Copy(io.Discard, reader); err != nil {
-		return fmt.Errorf("failed to read image pull output: %w", err)
+	// Docker reports many pull failures (rate limits, auth errors, image-not-found for
+	// specific platforms) as JSON messages within the progress stream rather than as the
+	// initial error return. We must decode and inspect each message to detect these.
+	type pullMessage struct {
+		Error string `json:"error"`
+	}
+	decoder := json.NewDecoder(reader)
+	for {
+		var msg pullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read image pull output for %s: %w", imageName, err)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("failed to pull image %s: %s", imageName, msg.Error)
+		}
 	}
 	log.Infof(ctx, "Successfully pulled image: %s", imageName)
 	return nil
