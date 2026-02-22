@@ -337,6 +337,11 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
 
 	if err := w.executeTaskInDocker(ctx, assignment); err != nil {
+		// Don't report cancellation as a failure — it's an intentional action.
+		if ctx.Err() != nil {
+			log.Infof(w.ctx, "Task was cancelled: taskID=%s", taskID)
+			return
+		}
 		log.Errorf(ctx, "Task launch failed: taskID=%s, error=%v", taskID, err)
 		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to launch task: %v", err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
@@ -523,8 +528,11 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 
 	defer func() {
 		if containerID != "" {
-			if removeErr := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); removeErr != nil {
-				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
+			// Use a background context for cleanup so it succeeds even if the task context was cancelled.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			if removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true}); removeErr != nil {
+				log.Debugf(w.ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			}
 		}
 	}()
@@ -537,6 +545,14 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 
 	statusCh, errCh := dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
+	case <-ctx.Done():
+		log.Infof(w.ctx, "Task context cancelled, stopping container %s", containerID)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if stopErr := dockerClient.ContainerStop(stopCtx, containerID, container.StopOptions{}); stopErr != nil {
+			log.Warnf(w.ctx, "Failed to stop container %s: %v", containerID, stopErr)
+		}
+		return ctx.Err()
 	case err := <-errCh:
 		if err != nil {
 			return fmt.Errorf("error waiting for container: %w", err)
