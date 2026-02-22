@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +21,7 @@ var CLI struct {
 	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
 	NoCleanup     bool     `help:"Do not remove containers after execution (for debugging)"`
 	Volumes       []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
+	Env           []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 }
 
 func main() {
@@ -38,6 +40,11 @@ func main() {
 
 	log.SetLevel(CLI.LogLevel)
 
+	envMap, err := parseEnvFlags(CLI.Env)
+	if err != nil {
+		log.Fatalf(ctx, "%v", err)
+	}
+
 	config := worker.Config{
 		APIKey:        CLI.APIKey,
 		WorkerID:      CLI.WorkerID,
@@ -46,6 +53,7 @@ func main() {
 		LogLevel:      CLI.LogLevel,
 		NoCleanup:     CLI.NoCleanup,
 		Volumes:       CLI.Volumes,
+		Env:           envMap,
 	}
 
 	w, err := worker.New(ctx, config)
@@ -71,4 +79,31 @@ func main() {
 	w.Shutdown()
 
 	log.Infof(ctx, "Worker shutdown complete")
+}
+
+// parseEnvFlags parses -e/--env flag values into a map.
+// "KEY=VALUE" is used as-is; bare "KEY" inherits from the host environment.
+// Empty keys and keys containing whitespace are rejected.
+func parseEnvFlags(raw []string) (map[string]string, error) {
+	result := make(map[string]string, len(raw))
+	for _, entry := range raw {
+		if entry == "" {
+			return nil, fmt.Errorf("invalid --env flag: empty value")
+		}
+
+		key, value, hasEquals := strings.Cut(entry, "=")
+		if key == "" {
+			return nil, fmt.Errorf("invalid --env flag: missing key in %q", entry)
+		}
+		if strings.ContainsAny(key, " \t") {
+			return nil, fmt.Errorf("invalid --env flag: key contains whitespace in %q", entry)
+		}
+
+		if hasEquals {
+			result[key] = value
+		} else {
+			result[key] = os.Getenv(key)
+		}
+	}
+	return result, nil
 }

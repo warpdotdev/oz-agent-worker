@@ -43,6 +43,7 @@ type Config struct {
 	LogLevel      string
 	NoCleanup     bool
 	Volumes       []string
+	Env           map[string]string
 }
 
 type Worker struct {
@@ -499,6 +500,11 @@ func (w *Worker) executeTaskInDocker(ctx context.Context, assignment *types.Task
 	}
 
 	for key, value := range assignment.EnvVars {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	// Append user-specified CLI env vars last so they take precedence.
+	for key, value := range w.config.Env {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
 
