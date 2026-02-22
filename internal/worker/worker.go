@@ -381,6 +381,22 @@ func (w *Worker) pullImage(ctx context.Context, imageName string, authStr string
 	if _, err = io.Copy(io.Discard, reader); err != nil {
 		return fmt.Errorf("failed to read image pull output: %w", err)
 	}
+
+	// Verify the pulled image matches the host platform. Docker may pull an image for a different
+	// architecture then what is specified in image.PullOptions.Platform
+	// See: https://github.com/moby/moby/pull/42325
+	inspect, err := w.dockerClient.ImageInspect(ctx, imageName)
+	if err != nil {
+		return fmt.Errorf("failed to inspect pulled image %s: %w", imageName, err)
+	}
+	imagePlatform := fmt.Sprintf("%s/%s", inspect.Os, inspect.Architecture)
+	if imagePlatform != w.platform {
+		return fmt.Errorf(
+			"image %s is for platform %s, but this worker requires %s",
+			imageName, imagePlatform, w.platform,
+		)
+	}
+
 	log.Infof(ctx, "Successfully pulled image: %s", imageName)
 	return nil
 }
