@@ -44,6 +44,30 @@ go build -o oz-agent-worker
 ./oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
+## Environment Variables for Task Containers
+
+Use `-e` / `--env` to pass environment variables into task containers:
+
+```bash
+# Explicit key=value
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker" -e MY_SECRET=hunter2
+
+# Pass through from host environment
+export MY_SECRET=hunter2
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker" -e MY_SECRET
+
+# Multiple variables
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker" -e FOO=bar -e BAZ=qux
+```
+
+When using Docker to run the worker, note that `-e` flags for the worker itself (task containers) are passed as arguments, while `-e` flags for the worker container use Docker's syntax:
+
+```bash
+docker run -v /var/run/docker.sock:/var/run/docker.sock \
+  -e WARP_API_KEY="wk-abc123" \
+  warpdotdev/oz-agent-worker --worker-id "my-worker" -e MY_SECRET=hunter2
+```
+
 ## Docker Connectivity
 
 The worker automatically discovers the Docker daemon using standard Docker client mechanisms, in this order:
