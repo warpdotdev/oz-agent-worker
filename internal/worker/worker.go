@@ -13,6 +13,7 @@ import (
 
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
+	"golang.org/x/sync/semaphore"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
@@ -58,7 +59,7 @@ type Worker struct {
 	sendChan       chan []byte
 	activeTasks    map[string]context.CancelFunc
 	tasksMutex     sync.Mutex
-	taskSemaphore  chan struct{} // nil when unlimited; buffered channel used as counting semaphore
+	taskSemaphore  *semaphore.Weighted // nil when unlimited
 	dockerClient   *client.Client
 	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
 }
@@ -107,9 +108,9 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 
 	log.Debugf(ctx, "Docker daemon is reachable, platform: %s", platform)
 
-	var taskSemaphore chan struct{}
+	var taskSemaphore *semaphore.Weighted
 	if config.MaxConcurrentTasks > 0 {
-		taskSemaphore = make(chan struct{}, config.MaxConcurrentTasks)
+		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
 		log.Infof(ctx, "Concurrency limit set to %d", config.MaxConcurrentTasks)
 	}
 
@@ -334,6 +335,18 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 
+	// If a concurrency limit is configured, try to acquire a slot without blocking.
+	// Failing fast lets the server reroute the task to another worker.
+	if w.taskSemaphore != nil {
+		if !w.taskSemaphore.TryAcquire(1) {
+			log.Warnf(w.ctx, "At max concurrency (%d), rejecting task: taskID=%s", w.config.MaxConcurrentTasks, assignment.TaskID)
+			if err := w.sendTaskFailed(assignment.TaskID, "worker at maximum concurrency"); err != nil {
+				log.Errorf(w.ctx, "Failed to send task failed message: %v", err)
+			}
+			return
+		}
+	}
+
 	// It's important to update the task state to claimed as the task lifecycle treats this as a dependency to advance to further states.
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
@@ -349,28 +362,16 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 }
 
 func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
-	acquiredSlot := false
 	defer func() {
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
 		w.tasksMutex.Unlock()
 
-		// Release the semaphore slot if we acquired one.
-		if w.taskSemaphore != nil && acquiredSlot {
-			<-w.taskSemaphore
+		// Release the semaphore slot if concurrency is limited.
+		if w.taskSemaphore != nil {
+			w.taskSemaphore.Release(1)
 		}
 	}()
-
-	// If a concurrency limit is configured, wait for an available slot.
-	if w.taskSemaphore != nil {
-		log.Infof(ctx, "Waiting for concurrency slot: taskID=%s", assignment.TaskID)
-		select {
-		case w.taskSemaphore <- struct{}{}:
-			acquiredSlot = true
-		case <-ctx.Done():
-			return
-		}
-	}
 
 	taskID := assignment.TaskID
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
