@@ -52,7 +52,7 @@ By default, the worker runs tasks without a concurrency limit. Use `--max-concur
 oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker" --max-concurrent-tasks 4
 ```
 
-When the limit is reached, incoming tasks are rejected so the server can reassign them to other workers. A value of `0` (the default) means unlimited.
+When the limit is reached, incoming tasks are queued and will execute once a slot becomes available. A value of `0` (the default) means unlimited.
 
 ## Environment Variables for Task Containers
 
