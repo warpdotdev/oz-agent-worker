@@ -13,7 +13,6 @@ import (
 
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
-	"golang.org/x/sync/semaphore"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
@@ -24,6 +23,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
