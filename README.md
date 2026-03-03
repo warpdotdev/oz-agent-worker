@@ -44,6 +44,16 @@ go build -o oz-agent-worker
 ./oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
+## Concurrency Limit
+
+By default, the worker runs tasks without a concurrency limit. Use `--max-concurrent-tasks` to cap the number of tasks running simultaneously:
+
+```bash
+oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker" --max-concurrent-tasks 4
+```
+
+When the limit is reached, incoming tasks are rejected so the server can reassign them to other workers. A value of `0` (the default) means unlimited.
+
 ## Environment Variables for Task Containers
 
 Use `-e` / `--env` to pass environment variables into task containers:
