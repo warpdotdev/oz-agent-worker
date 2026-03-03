@@ -14,11 +14,11 @@ import (
 )
 
 var CLI struct {
-	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
-	WorkerID      string   `help:"Worker host identifier" required:""`
-	WebSocketURL  string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
-	ServerRootURL string   `default:"https://app.warp.dev" hidden:""`
-	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
+	APIKey             string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
+	WorkerID           string   `help:"Worker host identifier" required:""`
+	WebSocketURL       string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
+	ServerRootURL      string   `default:"https://app.warp.dev" hidden:""`
+	LogLevel           string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
 	MaxConcurrentTasks int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
 	NoCleanup          bool     `help:"Do not remove containers after execution (for debugging)"`
 	Volumes            []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
