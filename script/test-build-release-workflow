@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Dry-run the build_release workflow locally using nektos/act.
+# Usage: script/test-build-release-workflow
+
+set -euo pipefail
+
+act workflow_dispatch -W .github/workflows/build_release.yml --container-architecture linux/amd64 -P namespace-profile-ubuntu-small=catthehacker/ubuntu:act-latest "$@"

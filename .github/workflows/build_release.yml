@@ -1,0 +1,71 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    name: "Build ${{ matrix.goos }} ${{ matrix.goarch }}"
+    runs-on: namespace-profile-ubuntu-small
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          # Use the Namespace Go cache
+          cache: false
+    
+      - name: Set up build cache
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: go
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          binary="oz-agent-worker"
+          if [ "$GOOS" = "windows" ]; then
+            binary="oz-agent-worker.exe"
+          fi
+          go build -o "$binary" .
+
+      - name: Archive
+        run: |
+          prefix="oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${prefix}.zip" oz-agent-worker.exe
+          else
+            tar czf "${prefix}.tar.gz" oz-agent-worker
+            tar cJf "${prefix}.tar.xz" oz-agent-worker
+          fi
+
+      - name: Upload artifact
+        uses: namespace-actions/upload-artifact@v1
+        with:
+          name: oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.tar.xz
+            oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.zip
