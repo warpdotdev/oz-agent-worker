@@ -23,6 +23,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -36,14 +37,15 @@ const (
 )
 
 type Config struct {
-	APIKey        string
-	WorkerID      string
-	WebSocketURL  string
-	ServerRootURL string
-	LogLevel      string
-	NoCleanup     bool
-	Volumes       []string
-	Env           map[string]string
+	APIKey             string
+	WorkerID           string
+	WebSocketURL       string
+	ServerRootURL      string
+	LogLevel           string
+	MaxConcurrentTasks int
+	NoCleanup          bool
+	Volumes            []string
+	Env                map[string]string
 }
 
 type Worker struct {
@@ -57,6 +59,7 @@ type Worker struct {
 	sendChan       chan []byte
 	activeTasks    map[string]context.CancelFunc
 	tasksMutex     sync.Mutex
+	taskSemaphore  *semaphore.Weighted // nil when unlimited
 	dockerClient   *client.Client
 	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
 }
@@ -105,6 +108,12 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 
 	log.Debugf(ctx, "Docker daemon is reachable, platform: %s", platform)
 
+	var taskSemaphore *semaphore.Weighted
+	if config.MaxConcurrentTasks > 0 {
+		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
+		log.Infof(ctx, "Concurrency limit set to %d", config.MaxConcurrentTasks)
+	}
+
 	return &Worker{
 		config:         config,
 		ctx:            workerCtx,
@@ -112,6 +121,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		reconnectDelay: InitialReconnectDelay,
 		sendChan:       make(chan []byte, 256),
 		activeTasks:    make(map[string]context.CancelFunc),
+		taskSemaphore:  taskSemaphore,
 		dockerClient:   dockerClient,
 		platform:       platform,
 	}, nil
@@ -325,6 +335,18 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 
+	// If a concurrency limit is configured, try to acquire a slot without blocking.
+	// Failing fast lets the server reroute the task to another worker.
+	if w.taskSemaphore != nil {
+		if !w.taskSemaphore.TryAcquire(1) {
+			log.Warnf(w.ctx, "At max concurrency (%d), rejecting task: taskID=%s", w.config.MaxConcurrentTasks, assignment.TaskID)
+			if err := w.sendTaskFailed(assignment.TaskID, "worker at maximum concurrency"); err != nil {
+				log.Errorf(w.ctx, "Failed to send task failed message: %v", err)
+			}
+			return
+		}
+	}
+
 	// It's important to update the task state to claimed as the task lifecycle treats this as a dependency to advance to further states.
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
@@ -344,6 +366,11 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
 		w.tasksMutex.Unlock()
+
+		// Release the semaphore slot if concurrency is limited.
+		if w.taskSemaphore != nil {
+			w.taskSemaphore.Release(1)
+		}
 	}()
 
 	taskID := assignment.TaskID
