@@ -144,9 +144,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// Build Docker-specific command: entrypoint prefix + base args + --sandboxed.
+	// Build Docker-specific command: entrypoint prefix + base args.
 	cmd := append([]string{"/bin/sh", "/agent/entrypoint.sh"}, params.BaseArgs...)
-	cmd = append(cmd, "--sandboxed")
 
 	log.Debugf(ctx, "Creating Docker container with image=%s", imageName)
 

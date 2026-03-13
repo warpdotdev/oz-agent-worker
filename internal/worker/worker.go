@@ -330,6 +330,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		"team:edit",
 		"--task-id",
 		task.ID,
+		"--sandboxed",
 		"--server-root-url",
 		w.config.ServerRootURL,
 	}
