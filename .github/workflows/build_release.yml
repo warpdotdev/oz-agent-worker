@@ -2,7 +2,28 @@ name: Build Release
 
 on:
   workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: 'Docker image tag (leave empty to skip Docker push)'
+        required: false
+        default: ''
+        type: string
   workflow_call:
+    inputs:
+      docker_tag:
+        description: 'Docker image tag (leave empty to skip Docker push)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+    outputs:
+      image:
+        description: 'Full Docker image reference'
+        value: ${{ jobs.docker.outputs.image }}
 
 jobs:
   build:
@@ -69,3 +90,35 @@ jobs:
             oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
             oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.tar.xz
             oz-agent-worker-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+
+  docker:
+    name: Build and push Docker image
+    runs-on: namespace-profile-ubuntu-small
+    outputs:
+      image: "warpdotdev/oz-agent-worker@${{ steps.push.outputs.digest }}"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          provenance: mode=max
+          sbom: true
+          # Only push tagged images. When not pushing, we need to provide a fallback output
+          # as multi-platform images can't be loaded into the local Docker store by default.
+          # See https://docs.docker.com/reference/cli/docker/buildx/build/#docker
+          outputs: ${{ inputs.docker_tag != '' && 'type=registry' || 'type=local,dest=built-images' }}
+          platforms: linux/amd64,linux/arm64
+          tags: warpdotdev/oz-agent-worker:${{ inputs.docker_tag || github.sha }}
+          labels:
+            dev.warp.worker-commit=${{ github.sha }}
