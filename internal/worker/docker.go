@@ -17,17 +17,15 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/registry"
 	"github.com/rs/zerolog"
-	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
-	ServerRootURL string
-	NoCleanup     bool
-	Volumes       []string
-	Env           map[string]string
+	NoCleanup bool
+	Volumes   []string
+	Env       map[string]string
 }
 
 // DockerBackend executes tasks in Docker containers.
@@ -84,45 +82,33 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 }
 
 // ExecuteTask runs the agent in a Docker container.
-func (b *DockerBackend) ExecuteTask(ctx context.Context, assignment *types.TaskAssignmentMessage) error {
-	task := assignment.Task
+func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
 	dockerClient := b.dockerClient
+	imageName := params.DockerImage
 
-	var imageName string
-	if assignment.DockerImage != "" {
-		imageName = assignment.DockerImage
-		log.Debugf(ctx, "Using Docker image from assignment: %s", imageName)
-	} else {
-		imageName = "ubuntu:22.04"
-		if task.AgentConfigSnapshot.EnvironmentID != nil {
-			log.Warnf(ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
-				*task.AgentConfigSnapshot.EnvironmentID, imageName)
-		} else {
-			log.Infof(ctx, "No environment specified, using default image: %s", imageName)
-		}
-	}
+	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
 	if err := b.pullImage(ctx, imageName, authStr); err != nil {
 		return err
 	}
 
-	if assignment.SidecarImage == "" {
+	if params.SidecarImage == "" {
 		return fmt.Errorf("no sidecar image specified in assignment")
 	}
 
 	// Sidecar images are public, so no auth is needed
-	if err := b.pullImage(ctx, assignment.SidecarImage, ""); err != nil {
+	if err := b.pullImage(ctx, params.SidecarImage, ""); err != nil {
 		return err
 	}
 
 	// Get the concrete image digest to ensure volume is rebuilt when the image changes
-	sidecarDigest, err := b.getImageDigest(ctx, assignment.SidecarImage)
+	sidecarDigest, err := b.getImageDigest(ctx, params.SidecarImage)
 	if err != nil {
 		return fmt.Errorf("failed to get sidecar image digest: %w", err)
 	}
 
-	volumeName := sanitizeVolumeName(assignment.SidecarImage, sidecarDigest)
+	volumeName := sanitizeVolumeName(params.SidecarImage, sidecarDigest)
 	log.Debugf(ctx, "Using shared volume: %s", volumeName)
 
 	_, err = dockerClient.VolumeInspect(ctx, volumeName)
@@ -140,47 +126,27 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, assignment *types.TaskA
 
 		log.Debugf(ctx, "Copying warp agent from sidecar to volume (first time)")
 
-		if err := b.copySidecarFilesystemToVolume(ctx, dockerClient, assignment.SidecarImage, volumeName); err != nil {
+		if err := b.copySidecarFilesystemToVolume(ctx, dockerClient, params.SidecarImage, volumeName); err != nil {
 			return fmt.Errorf("failed to copy sidecar to volume: %w", err)
 		}
 	}
 
 	// Prepare additional sidecar volumes (e.g., xvfb for computer use).
-	additionalSidecarBinds, err := b.prepareAdditionalSidecars(ctx, dockerClient, assignment.AdditionalSidecars)
+	additionalSidecarBinds, err := b.prepareAdditionalSidecars(ctx, dockerClient, params.AdditionalSidecars)
 	if err != nil {
 		return err
 	}
 
-	envVars := []string{
-		fmt.Sprintf("TASK_ID=%s", task.ID),
-		"GIT_TERMINAL_PROMPT=0",
-		"GH_PROMPT_DISABLED=1",
-	}
-
-	for key, value := range assignment.EnvVars {
-		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	// Append user-specified CLI env vars last so they take precedence.
+	// Start with common env vars, then append backend-specific config env vars.
+	envVars := make([]string, len(params.EnvVars))
+	copy(envVars, params.EnvVars)
 	for key, value := range b.config.Env {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	cmd := []string{
-		"/bin/sh",
-		"/agent/entrypoint.sh",
-		"agent",
-		"run",
-		"--share",
-		"team:edit",
-		"--task-id",
-		task.ID,
-		"--sandboxed",
-		"--server-root-url",
-		b.config.ServerRootURL,
-	}
-
-	cmd = common.AugmentArgsForTask(task, cmd)
+	// Build Docker-specific command: entrypoint prefix + base args + --sandboxed.
+	cmd := append([]string{"/bin/sh", "/agent/entrypoint.sh"}, params.BaseArgs...)
+	cmd = append(cmd, "--sandboxed")
 
 	log.Debugf(ctx, "Creating Docker container with image=%s", imageName)
 
@@ -252,7 +218,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, assignment *types.TaskA
 		}
 	}
 
-	log.Infof(ctx, "Task %s execution completed successfully", task.ID)
+	log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
 	return nil
 }
 

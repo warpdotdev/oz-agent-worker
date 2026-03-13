@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
@@ -52,10 +53,9 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	workerCtx, cancel := context.WithCancel(ctx)
 
 	backend, err := NewDockerBackend(ctx, DockerBackendConfig{
-		ServerRootURL: config.ServerRootURL,
-		NoCleanup:     config.NoCleanup,
-		Volumes:       config.Volumes,
-		Env:           config.Env,
+		NoCleanup: config.NoCleanup,
+		Volumes:   config.Volumes,
+		Env:       config.Env,
 	})
 	if err != nil {
 		cancel()
@@ -295,6 +295,57 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	go w.executeTask(taskCtx, assignment)
 }
 
+// prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
+// resolving common environment variables, default images, and base CLI arguments.
+func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *TaskParams {
+	task := assignment.Task
+
+	// Resolve Docker image with default fallback.
+	dockerImage := assignment.DockerImage
+	if dockerImage == "" {
+		dockerImage = "ubuntu:22.04"
+		if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
+			log.Warnf(w.ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
+				*task.AgentConfigSnapshot.EnvironmentID, dockerImage)
+		} else {
+			log.Infof(w.ctx, "No environment specified, using default image: %s", dockerImage)
+		}
+	}
+
+	// Build common environment variables.
+	envVars := []string{
+		fmt.Sprintf("TASK_ID=%s", task.ID),
+		"GIT_TERMINAL_PROMPT=0",
+		"GH_PROMPT_DISABLED=1",
+	}
+	for key, value := range assignment.EnvVars {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	// Build base CLI arguments shared across all backends.
+	baseArgs := []string{
+		"agent",
+		"run",
+		"--share",
+		"team:edit",
+		"--task-id",
+		task.ID,
+		"--server-root-url",
+		w.config.ServerRootURL,
+	}
+	baseArgs = common.AugmentArgsForTask(task, baseArgs)
+
+	return &TaskParams{
+		TaskID:             assignment.TaskID,
+		Task:               task,
+		EnvVars:            envVars,
+		BaseArgs:           baseArgs,
+		DockerImage:        dockerImage,
+		SidecarImage:       assignment.SidecarImage,
+		AdditionalSidecars: assignment.AdditionalSidecars,
+	}
+}
+
 func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
 	defer func() {
 		w.tasksMutex.Lock()
@@ -305,7 +356,8 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 	taskID := assignment.TaskID
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
 
-	if err := w.backend.ExecuteTask(ctx, assignment); err != nil {
+	params := w.prepareTaskParams(assignment)
+	if err := w.backend.ExecuteTask(ctx, params); err != nil {
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
 		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to execute task: %v", err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
