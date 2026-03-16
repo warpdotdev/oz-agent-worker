@@ -16,6 +16,7 @@ import (
 
 var CLI struct {
 	ConfigFile    string   `help:"Path to YAML config file" type:"path"`
+	Backend       string   `help:"Backend type (docker or direct)" enum:"docker,direct," default:""`
 	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID      string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL  string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -93,6 +94,16 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		return worker.Config{}, fmt.Errorf("invalid worker-id: values starting with 'warp' are reserved and cannot be used")
 	}
 
+	// Resolve backend type: CLI --backend > config file backend key > default "docker".
+	backendType := CLI.Backend
+	if backendType == "" && fileConfig != nil {
+		if fileConfig.Backend.Direct != nil {
+			backendType = "direct"
+		} else if fileConfig.Backend.Docker != nil {
+			backendType = "docker"
+		}
+	}
+
 	// Merge cleanup: --no-cleanup flag > config file cleanup > default (cleanup=true).
 	noCleanup := CLI.NoCleanup
 	if !noCleanup && fileConfig != nil && fileConfig.Cleanup != nil {
@@ -105,32 +116,68 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		return worker.Config{}, err
 	}
 
-	// Merge env: config file first, then CLI entries overlay (CLI wins on key conflict).
-	mergedEnv := make(map[string]string)
-	if fileConfig != nil && fileConfig.Backend.Docker != nil {
-		mergedEnv = config.ResolveEnv(fileConfig.Backend.Docker.Environment)
-	}
-	for k, v := range cliEnv {
-		mergedEnv[k] = v
-	}
-
-	// Merge volumes: config file + CLI (concatenated).
-	var volumes []string
-	if fileConfig != nil && fileConfig.Backend.Docker != nil {
-		volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
-	}
-	volumes = append(volumes, CLI.Volumes...)
-
-	return worker.Config{
+	wc := worker.Config{
 		APIKey:        CLI.APIKey,
 		WorkerID:      workerID,
 		WebSocketURL:  CLI.WebSocketURL,
 		ServerRootURL: CLI.ServerRootURL,
 		LogLevel:      CLI.LogLevel,
-		NoCleanup:     noCleanup,
-		Volumes:       volumes,
-		Env:           mergedEnv,
-	}, nil
+		BackendType:   backendType,
+	}
+
+	switch backendType {
+	case "direct":
+		// Merge env: config file first, then CLI overlay.
+		mergedEnv := make(map[string]string)
+		if fileConfig != nil && fileConfig.Backend.Direct != nil {
+			mergedEnv = config.ResolveEnv(fileConfig.Backend.Direct.Environment)
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+
+		var workspaceRoot, ozPath, setupCmd, teardownCmd string
+		if fileConfig != nil && fileConfig.Backend.Direct != nil {
+			workspaceRoot = fileConfig.Backend.Direct.WorkspaceRoot
+			ozPath = fileConfig.Backend.Direct.OzPath
+			setupCmd = fileConfig.Backend.Direct.SetupCommand
+			teardownCmd = fileConfig.Backend.Direct.TeardownCommand
+		}
+
+		wc.Direct = &worker.DirectBackendConfig{
+			WorkspaceRoot:   workspaceRoot,
+			OzPath:          ozPath,
+			SetupCommand:    setupCmd,
+			TeardownCommand: teardownCmd,
+			NoCleanup:       noCleanup,
+			Env:             mergedEnv,
+		}
+
+	default: // docker
+		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
+		mergedEnv := make(map[string]string)
+		if fileConfig != nil && fileConfig.Backend.Docker != nil {
+			mergedEnv = config.ResolveEnv(fileConfig.Backend.Docker.Environment)
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+
+		// Merge volumes: config file + CLI (concatenated).
+		var volumes []string
+		if fileConfig != nil && fileConfig.Backend.Docker != nil {
+			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
+		}
+		volumes = append(volumes, CLI.Volumes...)
+
+		wc.Docker = &worker.DockerBackendConfig{
+			NoCleanup: noCleanup,
+			Volumes:   volumes,
+			Env:       mergedEnv,
+		}
+	}
+
+	return wc, nil
 }
 
 // parseEnvFlags parses -e/--env flag values into a map.

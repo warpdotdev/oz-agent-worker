@@ -197,6 +197,59 @@ func TestResolveEnvMissingHostVar(t *testing.T) {
 	}
 }
 
+func TestLoadValidDirectConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "direct-worker"
+backend:
+  direct:
+    workspace_root: "/tmp/oz-workspaces"
+    setup_command: "/opt/setup.sh"
+    teardown_command: "/opt/teardown.sh"
+    environment:
+      - name: MY_VAR
+        value: "hello"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Direct == nil {
+		t.Fatal("expected direct backend to be set")
+	}
+	if cfg.Backend.Docker != nil {
+		t.Error("docker backend should be nil")
+	}
+	if cfg.Backend.Direct.WorkspaceRoot != "/tmp/oz-workspaces" {
+		t.Errorf("workspace_root = %q, want %q", cfg.Backend.Direct.WorkspaceRoot, "/tmp/oz-workspaces")
+	}
+	if cfg.Backend.Direct.SetupCommand != "/opt/setup.sh" {
+		t.Errorf("setup_command = %q, want %q", cfg.Backend.Direct.SetupCommand, "/opt/setup.sh")
+	}
+	if cfg.Backend.Direct.TeardownCommand != "/opt/teardown.sh" {
+		t.Errorf("teardown_command = %q, want %q", cfg.Backend.Direct.TeardownCommand, "/opt/teardown.sh")
+	}
+	if len(cfg.Backend.Direct.Environment) != 1 {
+		t.Errorf("environment count = %d, want 1", len(cfg.Backend.Direct.Environment))
+	}
+}
+
+func TestLoadBothBackendsError(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  docker:
+    volumes: []
+  direct:
+    workspace_root: "/tmp"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error when both backends are set")
+	}
+}
+
 func TestLoadFileNotFound(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	if err == nil {

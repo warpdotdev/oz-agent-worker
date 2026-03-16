@@ -30,9 +30,11 @@ type Config struct {
 	WebSocketURL  string
 	ServerRootURL string
 	LogLevel      string
-	NoCleanup     bool
-	Volumes       []string
-	Env           map[string]string
+	BackendType   string // "docker" or "direct"
+
+	// Backend-specific configs. Only the one matching BackendType should be set.
+	Docker *DockerBackendConfig
+	Direct *DirectBackendConfig
 }
 
 type Worker struct {
@@ -52,11 +54,26 @@ type Worker struct {
 func New(ctx context.Context, config Config) (*Worker, error) {
 	workerCtx, cancel := context.WithCancel(ctx)
 
-	backend, err := NewDockerBackend(ctx, DockerBackendConfig{
-		NoCleanup: config.NoCleanup,
-		Volumes:   config.Volumes,
-		Env:       config.Env,
-	})
+	var backend Backend
+	var err error
+
+	switch config.BackendType {
+	case "direct":
+		if config.Direct == nil {
+			cancel()
+			return nil, fmt.Errorf("direct backend selected but no direct config provided")
+		}
+		backend, err = NewDirectBackend(ctx, *config.Direct)
+	case "docker", "":
+		if config.Docker == nil {
+			config.Docker = &DockerBackendConfig{}
+		}
+		backend, err = NewDockerBackend(ctx, *config.Docker)
+	default:
+		cancel()
+		return nil, fmt.Errorf("unknown backend type: %q", config.BackendType)
+	}
+
 	if err != nil {
 		cancel()
 		return nil, err
