@@ -9,13 +9,15 @@ import (
 	"syscall"
 
 	"github.com/alecthomas/kong"
+	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 )
 
 var CLI struct {
+	ConfigFile    string   `help:"Path to YAML config file" type:"path"`
 	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
-	WorkerID      string   `help:"Worker host identifier" required:""`
+	WorkerID      string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL  string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
 	ServerRootURL string   `default:"https://app.warp.dev" hidden:""`
 	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
@@ -34,29 +36,24 @@ func main() {
 		kong.Vars{},
 	)
 
-	if strings.HasPrefix(CLI.WorkerID, "warp") {
-		log.Fatalf(ctx, "Invalid worker-id: values starting with 'warp' are reserved and cannot be used")
-	}
-
 	log.SetLevel(CLI.LogLevel)
 
-	envMap, err := parseEnvFlags(CLI.Env)
+	// Parse config file if provided.
+	var fileConfig *config.FileConfig
+	if CLI.ConfigFile != "" {
+		var err error
+		fileConfig, err = config.Load(CLI.ConfigFile)
+		if err != nil {
+			log.Fatalf(ctx, "%v", err)
+		}
+	}
+
+	workerConfig, err := mergeConfig(fileConfig)
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
 
-	config := worker.Config{
-		APIKey:        CLI.APIKey,
-		WorkerID:      CLI.WorkerID,
-		WebSocketURL:  CLI.WebSocketURL,
-		ServerRootURL: CLI.ServerRootURL,
-		LogLevel:      CLI.LogLevel,
-		NoCleanup:     CLI.NoCleanup,
-		Volumes:       CLI.Volumes,
-		Env:           envMap,
-	}
-
-	w, err := worker.New(ctx, config)
+	w, err := worker.New(ctx, workerConfig)
 	if err != nil {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
 	}
@@ -79,6 +76,61 @@ func main() {
 	w.Shutdown()
 
 	log.Infof(ctx, "Worker shutdown complete")
+}
+
+// mergeConfig merges CLI flags with an optional config file.
+// Priority: CLI flags > config file > defaults.
+func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
+	// Merge worker_id: CLI > config file.
+	workerID := CLI.WorkerID
+	if workerID == "" && fileConfig != nil {
+		workerID = fileConfig.WorkerID
+	}
+	if workerID == "" {
+		return worker.Config{}, fmt.Errorf("worker-id is required (via --worker-id flag or config file)")
+	}
+	if strings.HasPrefix(workerID, "warp") {
+		return worker.Config{}, fmt.Errorf("invalid worker-id: values starting with 'warp' are reserved and cannot be used")
+	}
+
+	// Merge cleanup: --no-cleanup flag > config file cleanup > default (cleanup=true).
+	noCleanup := CLI.NoCleanup
+	if !noCleanup && fileConfig != nil && fileConfig.Cleanup != nil {
+		noCleanup = !*fileConfig.Cleanup
+	}
+
+	// Parse CLI env flags.
+	cliEnv, err := parseEnvFlags(CLI.Env)
+	if err != nil {
+		return worker.Config{}, err
+	}
+
+	// Merge env: config file first, then CLI entries overlay (CLI wins on key conflict).
+	mergedEnv := make(map[string]string)
+	if fileConfig != nil && fileConfig.Backend.Docker != nil {
+		mergedEnv = config.ResolveEnv(fileConfig.Backend.Docker.Environment)
+	}
+	for k, v := range cliEnv {
+		mergedEnv[k] = v
+	}
+
+	// Merge volumes: config file + CLI (concatenated).
+	var volumes []string
+	if fileConfig != nil && fileConfig.Backend.Docker != nil {
+		volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
+	}
+	volumes = append(volumes, CLI.Volumes...)
+
+	return worker.Config{
+		APIKey:        CLI.APIKey,
+		WorkerID:      workerID,
+		WebSocketURL:  CLI.WebSocketURL,
+		ServerRootURL: CLI.ServerRootURL,
+		LogLevel:      CLI.LogLevel,
+		NoCleanup:     noCleanup,
+		Volumes:       volumes,
+		Env:           mergedEnv,
+	}, nil
 }
 
 // parseEnvFlags parses -e/--env flag values into a map.
