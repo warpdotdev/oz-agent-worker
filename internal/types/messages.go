@@ -12,6 +12,7 @@ const (
 	MessageTypeTaskAssignment MessageType = "task_assignment"
 	MessageTypeTaskClaimed    MessageType = "task_claimed"
 	MessageTypeTaskFailed     MessageType = "task_failed"
+	MessageTypeTaskRejected   MessageType = "task_rejected"
 	MessageTypeHeartbeat      MessageType = "heartbeat"
 )
 
@@ -51,6 +52,13 @@ type TaskClaimedMessage struct {
 type TaskFailedMessage struct {
 	TaskID  string `json:"task_id"`
 	Message string `json:"message"`
+}
+
+// TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
+// (e.g. at maximum concurrency). The server should keep the task queued rather than marking it failed.
+type TaskRejectedMessage struct {
+	TaskID string `json:"task_id"`
+	Reason string `json:"reason"`
 }
 
 type TaskDefinition struct {

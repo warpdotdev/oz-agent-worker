@@ -256,3 +256,35 @@ func TestLoadFileNotFound(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+func TestLoadMaxConcurrentTasks(t *testing.T) {
+	t.Run("parses max_concurrent_tasks when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+max_concurrent_tasks: 5
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MaxConcurrentTasks == nil {
+			t.Fatal("expected max_concurrent_tasks to be set")
+		}
+		if *cfg.MaxConcurrentTasks != 5 {
+			t.Errorf("max_concurrent_tasks = %d, want 5", *cfg.MaxConcurrentTasks)
+		}
+	})
+
+	t.Run("max_concurrent_tasks is nil when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MaxConcurrentTasks != nil {
+			t.Errorf("expected max_concurrent_tasks to be nil, got %d", *cfg.MaxConcurrentTasks)
+		}
+	})
+}
