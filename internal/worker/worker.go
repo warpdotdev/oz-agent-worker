@@ -374,7 +374,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		"--server-root-url",
 		w.config.ServerRootURL,
 	}
-	baseArgs = common.AugmentArgsForTask(task, baseArgs, w.config.IdleOnComplete)
+	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
+		IdleOnComplete: w.config.IdleOnComplete,
+	})
 
 	// Build a unified sidecar list: the Warp agent sidecar (mounted at /agent, where
 	// entrypoint.sh lives) comes first, followed by any additional sidecars.
