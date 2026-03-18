@@ -27,11 +27,11 @@ type TaskParams struct {
 	// Backends that don't use Docker can ignore this.
 	DockerImage string
 
-	// SidecarImage is the Warp agent sidecar image from the assignment.
-	SidecarImage string
-
-	// AdditionalSidecars is the list of extra sidecar images from the assignment.
-	AdditionalSidecars []types.SidecarMount
+	// Sidecars is the unified list of sidecar mounts for this task. The Warp agent
+	// sidecar (mounted at /agent) is included as the first entry when present, followed
+	// by any additional sidecars from the assignment. Backends that don't use sidecars
+	// can ignore this.
+	Sidecars []types.SidecarMount
 }
 
 // Backend defines the interface for task execution backends.

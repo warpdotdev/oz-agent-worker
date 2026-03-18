@@ -93,46 +93,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		return err
 	}
 
-	if params.SidecarImage == "" {
-		return fmt.Errorf("no sidecar image specified in assignment")
-	}
-
-	// Sidecar images are public, so no auth is needed
-	if err := b.pullImage(ctx, params.SidecarImage, ""); err != nil {
-		return err
-	}
-
-	// Get the concrete image digest to ensure volume is rebuilt when the image changes
-	sidecarDigest, err := b.getImageDigest(ctx, params.SidecarImage)
-	if err != nil {
-		return fmt.Errorf("failed to get sidecar image digest: %w", err)
-	}
-
-	volumeName := sanitizeVolumeName(params.SidecarImage, sidecarDigest)
-	log.Debugf(ctx, "Using shared volume: %s", volumeName)
-
-	_, err = dockerClient.VolumeInspect(ctx, volumeName)
-	if err == nil {
-		log.Debugf(ctx, "Reusing existing volume %s (already populated from sidecar)", volumeName)
-	} else {
-		log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
-		volumeResp, err := dockerClient.VolumeCreate(ctx, volume.CreateOptions{
-			Name: volumeName,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create volume: %w", err)
-		}
-		log.Debugf(ctx, "Created volume: %s at %s", volumeName, volumeResp.Mountpoint)
-
-		log.Debugf(ctx, "Copying warp agent from sidecar to volume (first time)")
-
-		if err := b.copySidecarFilesystemToVolume(ctx, dockerClient, params.SidecarImage, volumeName); err != nil {
-			return fmt.Errorf("failed to copy sidecar to volume: %w", err)
-		}
-	}
-
-	// Prepare additional sidecar volumes (e.g., xvfb for computer use).
-	additionalSidecarBinds, err := b.prepareAdditionalSidecars(ctx, dockerClient, params.AdditionalSidecars)
+	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
+	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
 	if err != nil {
 		return err
 	}
@@ -156,12 +118,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		WorkingDir: "/workspace",
 	}
 
-	binds := []string{
-		fmt.Sprintf("%s:/agent:ro", volumeName),
-	}
-	// Add additional sidecar volumes.
-	binds = append(binds, additionalSidecarBinds...)
-	// Add user-configured volumes.
+	// Sidecar binds come first, then user-configured volumes.
+	binds := sidecarBinds
 	binds = append(binds, b.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
@@ -444,9 +402,9 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	return nil
 }
 
-// prepareAdditionalSidecars pulls each additional sidecar image, creates a Docker volume
-// from its filesystem, and returns the list of bind mount strings to add to the container.
-func (b *DockerBackend) prepareAdditionalSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
+// prepareSidecars pulls each sidecar image, creates a Docker volume from its filesystem,
+// and returns the list of bind mount strings to add to the container.
+func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
 	var binds []string
 	seenMountPaths := make(map[string]bool)
 

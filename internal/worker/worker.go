@@ -336,14 +336,24 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 	baseArgs = common.AugmentArgsForTask(task, baseArgs)
 
+	// Build a unified sidecar list: the Warp agent sidecar (mounted at /agent, where
+	// entrypoint.sh lives) comes first, followed by any additional sidecars.
+	var sidecars []types.SidecarMount
+	if assignment.SidecarImage != "" {
+		sidecars = append(sidecars, types.SidecarMount{
+			Image:     assignment.SidecarImage,
+			MountPath: "/agent",
+		})
+	}
+	sidecars = append(sidecars, assignment.AdditionalSidecars...)
+
 	return &TaskParams{
-		TaskID:             assignment.TaskID,
-		Task:               task,
-		EnvVars:            envVars,
-		BaseArgs:           baseArgs,
-		DockerImage:        dockerImage,
-		SidecarImage:       assignment.SidecarImage,
-		AdditionalSidecars: assignment.AdditionalSidecars,
+		TaskID:      assignment.TaskID,
+		Task:        task,
+		EnvVars:     envVars,
+		BaseArgs:    baseArgs,
+		DockerImage: dockerImage,
+		Sidecars:    sidecars,
 	}
 }
 
