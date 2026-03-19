@@ -198,11 +198,12 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir string
 }
 
 // runCommand executes a shell command with the given working directory and environment.
-// The command inherits only standard host vars (HOME, TMPDIR, PATH) plus env.
+// Setup/teardown commands inherit the full worker environment so they can access
+// tools and credentials (e.g. aws, docker) needed for workspace provisioning.
 func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env []string) error {
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	cmd.Dir = dir
-	cmd.Env = mergeEnvVars(hostBaseEnv(), env)
+	cmd.Env = mergeEnvVars(os.Environ(), env)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

@@ -15,16 +15,17 @@ import (
 )
 
 var CLI struct {
-	ConfigFile    string   `help:"Path to YAML config file" type:"path"`
-	Backend       string   `help:"Backend type (docker or direct)" enum:"docker,direct," default:""`
-	APIKey        string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
-	WorkerID      string   `help:"Worker host identifier (required via flag or config file)"`
-	WebSocketURL  string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
-	ServerRootURL string   `default:"https://app.warp.dev" hidden:""`
-	LogLevel      string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
-	NoCleanup     bool     `help:"Do not remove containers after execution (for debugging)"`
-	Volumes       []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
-	Env           []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
+	ConfigFile         string   `help:"Path to YAML config file" type:"path"`
+	Backend            string   `help:"Backend type (docker or direct)" enum:"docker,direct," default:""`
+	APIKey             string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
+	WorkerID           string   `help:"Worker host identifier (required via flag or config file)"`
+	WebSocketURL       string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
+	ServerRootURL      string   `default:"https://app.warp.dev" hidden:""`
+	LogLevel           string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
+	NoCleanup          bool     `help:"Do not remove containers after execution (for debugging)"`
+	Volumes            []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
+	Env                []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
+	MaxConcurrentTasks int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
 }
 
 func main() {
@@ -116,13 +117,20 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		return worker.Config{}, err
 	}
 
+	// Resolve max_concurrent_tasks: CLI (non-zero) > config file > 0 (unlimited).
+	maxConcurrentTasks := CLI.MaxConcurrentTasks
+	if maxConcurrentTasks == 0 && fileConfig != nil && fileConfig.MaxConcurrentTasks != nil {
+		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
+	}
+
 	wc := worker.Config{
-		APIKey:        CLI.APIKey,
-		WorkerID:      workerID,
-		WebSocketURL:  CLI.WebSocketURL,
-		ServerRootURL: CLI.ServerRootURL,
-		LogLevel:      CLI.LogLevel,
-		BackendType:   backendType,
+		APIKey:             CLI.APIKey,
+		WorkerID:           workerID,
+		WebSocketURL:       CLI.WebSocketURL,
+		ServerRootURL:      CLI.ServerRootURL,
+		LogLevel:           CLI.LogLevel,
+		BackendType:        backendType,
+		MaxConcurrentTasks: maxConcurrentTasks,
 	}
 
 	switch backendType {

@@ -14,9 +14,10 @@ import (
 
 // FileConfig represents the top-level YAML configuration file.
 type FileConfig struct {
-	WorkerID string        `yaml:"worker_id"`
-	Cleanup  *bool         `yaml:"cleanup"`
-	Backend  BackendConfig `yaml:"backend"`
+	WorkerID           string        `yaml:"worker_id"`
+	Cleanup            *bool         `yaml:"cleanup"`
+	MaxConcurrentTasks *int          `yaml:"max_concurrent_tasks"`
+	Backend            BackendConfig `yaml:"backend"`
 }
 
 // BackendConfig contains the backend selection.

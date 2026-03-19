@@ -12,6 +12,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -25,12 +26,13 @@ const (
 )
 
 type Config struct {
-	APIKey        string
-	WorkerID      string
-	WebSocketURL  string
-	ServerRootURL string
-	LogLevel      string
-	BackendType   string // "docker" or "direct"
+	APIKey             string
+	WorkerID           string
+	WebSocketURL       string
+	ServerRootURL      string
+	LogLevel           string
+	BackendType        string // "docker" or "direct"
+	MaxConcurrentTasks int    // 0 means unlimited
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker *DockerBackendConfig
@@ -49,6 +51,7 @@ type Worker struct {
 	activeTasks    map[string]context.CancelFunc
 	tasksMutex     sync.Mutex
 	backend        Backend
+	taskSemaphore  *semaphore.Weighted // nil when unlimited
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -79,6 +82,11 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		return nil, err
 	}
 
+	var taskSemaphore *semaphore.Weighted
+	if config.MaxConcurrentTasks > 0 {
+		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
+	}
+
 	return &Worker{
 		config:         config,
 		ctx:            workerCtx,
@@ -87,6 +95,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		sendChan:       make(chan []byte, 256),
 		activeTasks:    make(map[string]context.CancelFunc),
 		backend:        backend,
+		taskSemaphore:  taskSemaphore,
 	}, nil
 }
 
@@ -298,6 +307,17 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 
+	// Check concurrency limit before claiming the task.
+	if w.taskSemaphore != nil {
+		if !w.taskSemaphore.TryAcquire(1) {
+			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
+			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
+				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
+			}
+			return
+		}
+	}
+
 	// It's important to update the task state to claimed as the task lifecycle treats this as a dependency to advance to further states.
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
@@ -379,6 +399,10 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
 		w.tasksMutex.Unlock()
+
+		if w.taskSemaphore != nil {
+			w.taskSemaphore.Release(1)
+		}
 	}()
 
 	taskID := assignment.TaskID
@@ -409,6 +433,30 @@ func (w *Worker) sendTaskClaimed(taskID string) error {
 
 	msg := types.WebSocketMessage{
 		Type: types.MessageTypeTaskClaimed,
+		Data: data,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+
+	return w.sendMessage(msgBytes)
+}
+
+func (w *Worker) sendTaskRejected(taskID, reason string) error {
+	rejectedMsg := types.TaskRejectedMessage{
+		TaskID: taskID,
+		Reason: reason,
+	}
+
+	data, err := json.Marshal(rejectedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task rejected message: %w", err)
+	}
+
+	msg := types.WebSocketMessage{
+		Type: types.MessageTypeTaskRejected,
 		Data: data,
 	}
 
