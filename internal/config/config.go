@@ -23,12 +23,22 @@ type FileConfig struct {
 // At most one backend field may be non-nil; configuring multiple backends simultaneously is an error.
 type BackendConfig struct {
 	Docker *DockerConfig `yaml:"docker"`
+	Direct *DirectConfig `yaml:"direct"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
 	Volumes     []string   `yaml:"volumes"`
 	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+}
+
+// DirectConfig holds direct-backend-specific configuration.
+type DirectConfig struct {
+	WorkspaceRoot   string     `yaml:"workspace_root"`
+	OzPath          string     `yaml:"oz_path"`
+	SetupCommand    string     `yaml:"setup_command"`
+	TeardownCommand string     `yaml:"teardown_command"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // EnvEntry represents a single environment variable in the config file.
