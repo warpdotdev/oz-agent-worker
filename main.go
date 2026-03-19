@@ -26,7 +26,7 @@ var CLI struct {
 	Volumes            []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
-	IdleOnComplete     string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (humantime format, e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
+	IdleOnComplete     string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 }
 
 func main() {
