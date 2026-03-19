@@ -257,6 +257,38 @@ func TestLoadFileNotFound(t *testing.T) {
 	}
 }
 
+func TestLoadIdleOnComplete(t *testing.T) {
+	t.Run("parses idle_on_complete when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+idle_on_complete: "10m"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.IdleOnComplete == nil {
+			t.Fatal("expected idle_on_complete to be set")
+		}
+		if *cfg.IdleOnComplete != "10m" {
+			t.Errorf("idle_on_complete = %q, want %q", *cfg.IdleOnComplete, "10m")
+		}
+	})
+
+	t.Run("idle_on_complete is nil when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.IdleOnComplete != nil {
+			t.Errorf("expected idle_on_complete to be nil, got %q", *cfg.IdleOnComplete)
+		}
+	})
+}
+
 func TestLoadMaxConcurrentTasks(t *testing.T) {
 	t.Run("parses max_concurrent_tasks when set", func(t *testing.T) {
 		path := writeTestConfig(t, `

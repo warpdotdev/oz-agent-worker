@@ -33,6 +33,9 @@ type Config struct {
 	LogLevel           string
 	BackendType        string // "docker" or "direct"
 	MaxConcurrentTasks int    // 0 means unlimited
+	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
+	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
+	IdleOnComplete string
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker *DockerBackendConfig
@@ -371,7 +374,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		"--server-root-url",
 		w.config.ServerRootURL,
 	}
-	baseArgs = common.AugmentArgsForTask(task, baseArgs)
+	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
+		IdleOnComplete: w.config.IdleOnComplete,
+	})
 
 	// Build a unified sidecar list: the Warp agent sidecar (mounted at /agent, where
 	// entrypoint.sh lives) comes first, followed by any additional sidecars.

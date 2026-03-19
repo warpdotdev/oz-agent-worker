@@ -26,6 +26,7 @@ var CLI struct {
 	Volumes            []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
+	IdleOnComplete     string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 }
 
 func main() {
@@ -123,6 +124,12 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
 
+	// Resolve idle_on_complete: CLI (non-empty) > config file > "" (oz CLI default = 45m).
+	idleOnComplete := CLI.IdleOnComplete
+	if idleOnComplete == "" && fileConfig != nil && fileConfig.IdleOnComplete != nil {
+		idleOnComplete = *fileConfig.IdleOnComplete
+	}
+
 	wc := worker.Config{
 		APIKey:             CLI.APIKey,
 		WorkerID:           workerID,
@@ -131,6 +138,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		LogLevel:           CLI.LogLevel,
 		BackendType:        backendType,
 		MaxConcurrentTasks: maxConcurrentTasks,
+		IdleOnComplete:     idleOnComplete,
 	}
 
 	switch backendType {
