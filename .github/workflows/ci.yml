@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.0'
+          go-version-file: 'go.mod'
       - name: Check code formatting
         run: |
           if [ -n "$(gofmt -s -l .)" ]; then
@@ -27,16 +27,37 @@ jobs:
         run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
       - name: Run golangci-lint
         run: golangci-lint run
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Run tests
+        run: go test ./...
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.0'
+          go-version-file: 'go.mod'
       - name: Build
         run: go build -v ./...
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.1.3
+      - name: Lint Helm chart
+        run: helm lint ./charts/oz-agent-worker --set worker.workerId=ci-worker --set image.tag=ci
+      - name: Render Helm chart
+        run: helm template oz-agent-worker ./charts/oz-agent-worker --namespace agents --set worker.workerId=ci-worker --set image.tag=ci >/tmp/oz-agent-worker-chart.yaml
 
   docker:
     runs-on: ubuntu-latest

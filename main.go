@@ -7,16 +7,19 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 var CLI struct {
 	ConfigFile         string   `help:"Path to YAML config file" type:"path"`
-	Backend            string   `help:"Backend type (docker or direct)" enum:"docker,direct," default:""`
+	Backend            string   `help:"Backend type (docker, direct, or kubernetes)" enum:"docker,direct,kubernetes," default:""`
 	APIKey             string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID           string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL       string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -102,6 +105,8 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if backendType == "" && fileConfig != nil {
 		if fileConfig.Backend.Direct != nil {
 			backendType = "direct"
+		} else if fileConfig.Backend.Kubernetes != nil {
+			backendType = "kubernetes"
 		} else if fileConfig.Backend.Docker != nil {
 			backendType = "docker"
 		}
@@ -143,6 +148,97 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	}
 
 	switch backendType {
+	case "kubernetes":
+		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
+		mergedEnv := make(map[string]string)
+		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
+			mergedEnv = config.ResolveEnv(fileConfig.Backend.Kubernetes.Environment)
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+		var (
+			namespace                     string
+			kubeconfig                    string
+			imagePullSecret               string
+			imagePullPolicy               string
+			preflightImage                string
+			serviceAccount                string
+			setupCmd                      string
+			teardownCmd                   string
+			nodeSelector                  map[string]string
+			tolerations                   []corev1.Toleration
+			resources                     corev1.ResourceRequirements
+			extraLabels                   map[string]string
+			extraAnnotations              map[string]string
+			activeDeadlineSeconds         *int64
+			terminationGracePeriodSeconds *int64
+			workspaceSizeLimit            *resource.Quantity
+			unschedulableTimeout          *time.Duration
+		)
+
+		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
+			kc := fileConfig.Backend.Kubernetes
+			namespace = kc.Namespace
+			kubeconfig = kc.Kubeconfig
+			imagePullSecret = kc.ImagePullSecret
+			imagePullPolicy = kc.ImagePullPolicy
+			preflightImage = kc.PreflightImage
+			serviceAccount = kc.ServiceAccount
+			setupCmd = kc.SetupCommand
+			teardownCmd = kc.TeardownCommand
+			nodeSelector = copyStringMap(kc.NodeSelector)
+			var err error
+			tolerations, err = convertKubernetesTolerations(kc.Tolerations)
+			if err != nil {
+				return worker.Config{}, err
+			}
+			resources, err = convertKubernetesResources(kc.Resources)
+			if err != nil {
+				return worker.Config{}, err
+			}
+			extraLabels = copyStringMap(kc.ExtraLabels)
+			extraAnnotations = copyStringMap(kc.ExtraAnnotations)
+			activeDeadlineSeconds = kc.ActiveDeadlineSeconds
+			terminationGracePeriodSeconds = kc.TerminationGracePeriodSeconds
+			if kc.WorkspaceSizeLimit != "" {
+				quantity, err := resource.ParseQuantity(kc.WorkspaceSizeLimit)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.workspace_size_limit %q: %w", kc.WorkspaceSizeLimit, err)
+				}
+				workspaceSizeLimit = &quantity
+			}
+			if kc.UnschedulableTimeout != nil {
+				duration, err := time.ParseDuration(*kc.UnschedulableTimeout)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.unschedulable_timeout %q: %w", *kc.UnschedulableTimeout, err)
+				}
+				unschedulableTimeout = &duration
+			}
+		}
+
+		wc.Kubernetes = &worker.KubernetesBackendConfig{
+			WorkerID:                      workerID,
+			Namespace:                     namespace,
+			Kubeconfig:                    kubeconfig,
+			ImagePullSecret:               imagePullSecret,
+			ImagePullPolicy:               imagePullPolicy,
+			PreflightImage:                preflightImage,
+			ServiceAccount:                serviceAccount,
+			SetupCommand:                  setupCmd,
+			TeardownCommand:               teardownCmd,
+			NoCleanup:                     noCleanup,
+			NodeSelector:                  nodeSelector,
+			Tolerations:                   tolerations,
+			Resources:                     resources,
+			ExtraLabels:                   extraLabels,
+			ExtraAnnotations:              extraAnnotations,
+			ActiveDeadlineSeconds:         activeDeadlineSeconds,
+			TerminationGracePeriodSeconds: terminationGracePeriodSeconds,
+			WorkspaceSizeLimit:            workspaceSizeLimit,
+			UnschedulableTimeout:          unschedulableTimeout,
+			Env:                           mergedEnv,
+		}
 	case "direct":
 		// Merge env: config file first, then CLI overlay.
 		mergedEnv := make(map[string]string)
@@ -229,4 +325,74 @@ func parseEnvFlags(raw []string) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func copyStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func convertKubernetesTolerations(raw []config.KubernetesTolerationConfig) ([]corev1.Toleration, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	tolerations := make([]corev1.Toleration, 0, len(raw))
+	for i, toleration := range raw {
+		converted := corev1.Toleration{
+			Key:               toleration.Key,
+			Operator:          corev1.TolerationOperator(toleration.Operator),
+			Value:             toleration.Value,
+			Effect:            corev1.TaintEffect(toleration.Effect),
+			TolerationSeconds: toleration.TolerationSeconds,
+		}
+		if converted.Operator == "" {
+			converted.Operator = corev1.TolerationOpEqual
+		}
+		switch converted.Operator {
+		case corev1.TolerationOpExists, corev1.TolerationOpEqual:
+		default:
+			return nil, fmt.Errorf("invalid backend.kubernetes.tolerations[%d].operator %q", i, toleration.Operator)
+		}
+		switch converted.Effect {
+		case "", corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:
+		default:
+			return nil, fmt.Errorf("invalid backend.kubernetes.tolerations[%d].effect %q", i, toleration.Effect)
+		}
+		tolerations = append(tolerations, converted)
+	}
+	return tolerations, nil
+}
+
+func convertKubernetesResources(raw config.KubernetesResourcesConfig) (corev1.ResourceRequirements, error) {
+	resources := corev1.ResourceRequirements{}
+
+	if len(raw.Requests) > 0 {
+		resources.Requests = make(corev1.ResourceList, len(raw.Requests))
+		for name, value := range raw.Requests {
+			quantity, err := resource.ParseQuantity(value)
+			if err != nil {
+				return corev1.ResourceRequirements{}, fmt.Errorf("invalid backend.kubernetes.resources.requests[%q] quantity %q: %w", name, value, err)
+			}
+			resources.Requests[corev1.ResourceName(name)] = quantity
+		}
+	}
+
+	if len(raw.Limits) > 0 {
+		resources.Limits = make(corev1.ResourceList, len(raw.Limits))
+		for name, value := range raw.Limits {
+			quantity, err := resource.ParseQuantity(value)
+			if err != nil {
+				return corev1.ResourceRequirements{}, fmt.Errorf("invalid backend.kubernetes.resources.limits[%q] quantity %q: %w", name, value, err)
+			}
+			resources.Limits[corev1.ResourceName(name)] = quantity
+		}
+	}
+
+	return resources, nil
 }

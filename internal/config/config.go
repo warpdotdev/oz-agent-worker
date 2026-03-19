@@ -25,11 +25,25 @@ type FileConfig struct {
 	Backend        BackendConfig `yaml:"backend"`
 }
 
+type KubernetesTolerationConfig struct {
+	Key               string `yaml:"key"`
+	Operator          string `yaml:"operator" validate:"omitempty,oneof=Exists Equal"`
+	Value             string `yaml:"value"`
+	Effect            string `yaml:"effect" validate:"omitempty,oneof=NoSchedule PreferNoSchedule NoExecute"`
+	TolerationSeconds *int64 `yaml:"toleration_seconds"`
+}
+
+type KubernetesResourcesConfig struct {
+	Requests map[string]string `yaml:"requests"`
+	Limits   map[string]string `yaml:"limits"`
+}
+
 // BackendConfig contains the backend selection.
 // At most one backend field may be non-nil; configuring multiple backends simultaneously is an error.
 type BackendConfig struct {
-	Docker *DockerConfig `yaml:"docker"`
-	Direct *DirectConfig `yaml:"direct"`
+	Docker     *DockerConfig     `yaml:"docker"`
+	Direct     *DirectConfig     `yaml:"direct"`
+	Kubernetes *KubernetesConfig `yaml:"kubernetes"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
@@ -46,6 +60,28 @@ type DirectConfig struct {
 	SetupCommand    string     `yaml:"setup_command"`
 	TeardownCommand string     `yaml:"teardown_command"`
 	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+}
+
+// KubernetesConfig holds Kubernetes-backend-specific configuration.
+type KubernetesConfig struct {
+	Namespace                     string                       `yaml:"namespace"`
+	Kubeconfig                    string                       `yaml:"kubeconfig"`
+	ImagePullSecret               string                       `yaml:"image_pull_secret" validate:"omitempty,no_whitespace"`
+	ImagePullPolicy               string                       `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	PreflightImage                string                       `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
+	ServiceAccount                string                       `yaml:"service_account" validate:"omitempty,no_whitespace"`
+	SetupCommand                  string                       `yaml:"setup_command"`
+	TeardownCommand               string                       `yaml:"teardown_command"`
+	NodeSelector                  map[string]string            `yaml:"node_selector"`
+	Tolerations                   []KubernetesTolerationConfig `yaml:"tolerations" validate:"dive"`
+	Resources                     KubernetesResourcesConfig    `yaml:"resources"`
+	ExtraLabels                   map[string]string            `yaml:"extra_labels"`
+	ExtraAnnotations              map[string]string            `yaml:"extra_annotations"`
+	ActiveDeadlineSeconds         *int64                       `yaml:"active_deadline_seconds"`
+	TerminationGracePeriodSeconds *int64                       `yaml:"termination_grace_period_seconds"`
+	WorkspaceSizeLimit            string                       `yaml:"workspace_size_limit"`
+	UnschedulableTimeout          *string                      `yaml:"unschedulable_timeout"`
+	Environment                   []EnvEntry                   `yaml:"environment" validate:"dive"`
 }
 
 // EnvEntry represents a single environment variable in the config file.

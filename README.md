@@ -10,9 +10,11 @@ Self-hosted worker for Oz cloud agents.
 
 ## Requirements
 
-- Docker daemon (accessible via socket or TCP)
 - Service account API key with team scope
 - Network egress to warp-server
+- One supported execution backend:
+  - Docker daemon access for the Docker backend
+  - Kubernetes API access plus cluster credentials for the Kubernetes backend
 
 ## Usage
 
@@ -27,6 +29,77 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock \
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+### Kubernetes
+
+The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
+
+- `backend.kubernetes.kubeconfig` points to an explicit kubeconfig file
+- if `kubeconfig` is omitted, the worker uses in-cluster config when running inside Kubernetes
+- otherwise it falls back to the default kubeconfig loading rules and uses the current context
+
+Example config:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  kubernetes:
+    kubeconfig: "/path/to/kubeconfig"
+    namespace: "agents"
+    service_account: "oz-agent-worker"
+    unschedulable_timeout: "2m"
+```
+
+Notes:
+
+- `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself
+- `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; set it to `0s` to disable that fail-fast behavior
+- the Kubernetes backend requires creating Pods with a root init container to materialize sidecars into `emptyDir` volumes
+- the worker performs a dry-run Job preflight at startup so incompatible Pod Security or admission policy failures surface immediately
+- set `preflight_image` if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
+
+### Helm Chart
+
+This repo includes a namespace-scoped Helm chart at `charts/oz-agent-worker`.
+
+The chart deploys:
+
+- a long-lived `Deployment` for `oz-agent-worker`
+- a namespaced `ServiceAccount`
+- a namespaced `Role` / `RoleBinding`
+- a `ConfigMap` containing the worker config
+- an optional `Secret` for `WARP_API_KEY` (or a reference to an existing `Secret`)
+
+At runtime, the deployed worker connects outbound to Warp and creates one Kubernetes `Job` per task. The built-in Kubernetes Job controller then manages the task Pod lifecycle.
+
+Recommended install flow:
+
+```bash
+kubectl create secret generic oz-agent-worker \
+  --from-literal=WARP_API_KEY="wk-abc123" \
+  --namespace agents
+
+helm install oz-agent-worker ./charts/oz-agent-worker \
+  --namespace agents \
+  --create-namespace \
+  --set worker.workerId=my-worker \
+  --set image.tag=v1.2.3
+```
+
+The chart assumes the worker runs inside the target cluster and uses in-cluster Kubernetes auth by default. It does not create CRDs or cluster-scoped RBAC. Set `image.tag` explicitly for each install so the worker image is pinned instead of defaulting to `latest`.
+
+Keep `replicaCount=1` for a given `worker.workerId`. If you want multiple workers, deploy multiple releases with distinct worker IDs rather than scaling one release horizontally.
+
+The chart defaults the long-lived worker `Deployment` to a non-root security context and conservative starting resource requests of `100m` CPU and `128Mi` memory. Tune `worker.resources` for your workload and cluster policy.
+
+Recommended namespace-scoped permissions for the worker are:
+
+- create, get, list, delete `jobs`
+- get, list `pods`
+- get `pods/log`
+- list `events`
+
+The worker Deployment's `ServiceAccount` is separate from the optional `backend.kubernetes.service_account` used by task Jobs. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup dry-run Job.
 
 ### Go Install
 

@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "oz-agent-worker.fullname" . }}
+  labels:
+    {{- include "oz-agent-worker.labels" . | nindent 4 }}
+  {{- with .Values.worker.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "oz-agent-worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "oz-agent-worker.selectorLabels" . | nindent 8 }}
+        {{- with .Values.worker.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.warp.apiKeySecret.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.worker.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "oz-agent-worker.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: oz-agent-worker
+          image: "{{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config-file
+            - /etc/oz-agent-worker/config.yaml
+            - --backend
+            - kubernetes
+            - --log-level
+            - {{ .Values.worker.logLevel | quote }}
+            - --web-socket-url
+            - {{ .Values.warp.webSocketURL | quote }}
+            - --server-root-url
+            - {{ .Values.warp.serverRootURL | quote }}
+            {{- range .Values.worker.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: WARP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "oz-agent-worker.apiKeySecretName" . }}
+                  key: {{ .Values.warp.apiKeySecret.key }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/oz-agent-worker
+              readOnly: true
+          {{- with .Values.worker.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "oz-agent-worker.fullname" . }}-config
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
