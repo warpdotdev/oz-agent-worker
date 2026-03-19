@@ -66,6 +66,10 @@ spec:
             - name: config
               mountPath: /etc/oz-agent-worker
               readOnly: true
+          {{- with .Values.worker.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.worker.securityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}

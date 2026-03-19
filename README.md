@@ -92,10 +92,12 @@ Keep `replicaCount=1` for a given `worker.workerId`. If you want multiple worker
 
 The chart defaults the long-lived worker `Deployment` to a non-root security context and conservative starting resource requests of `100m` CPU and `128Mi` memory. Tune `worker.resources` for your workload and cluster policy.
 
+The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
+
 Recommended namespace-scoped permissions for the worker are:
 
-- create, get, list, delete `jobs`
-- get, list `pods`
+- create, get, list, watch, delete `jobs`
+- get, list, watch `pods`
 - get `pods/log`
 - list `events`
 

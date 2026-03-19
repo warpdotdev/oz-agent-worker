@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -139,6 +140,171 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			t.Fatalf("expected no error when timeout is disabled, got %v", err)
 		}
 	})
+}
+
+func TestHandleJobStateDetectsCompletion(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+			WorkerID:  "worker-123",
+		},
+		clientset: fakeClient,
+	}
+	ctx := context.Background()
+
+	t.Run("returns nil for in-progress job", func(t *testing.T) {
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "agents"},
+			Status:     batchv1.JobStatus{},
+		}
+		if result := backend.handleJobState(ctx, job, "task-1"); result != nil {
+			t.Fatalf("expected nil for in-progress job, got %v", result.err)
+		}
+	})
+
+	t.Run("returns nil error for completed job", func(t *testing.T) {
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "agents"},
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		result := backend.handleJobState(ctx, job, "task-1")
+		if result == nil {
+			t.Fatal("expected non-nil result for completed job")
+		}
+		if result.err != nil {
+			t.Fatalf("expected nil error for completed job, got %v", result.err)
+		}
+	})
+
+	t.Run("returns error for failed job", func(t *testing.T) {
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "agents"},
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobFailed, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		result := backend.handleJobState(ctx, job, "task-1")
+		if result == nil {
+			t.Fatal("expected non-nil result for failed job")
+		}
+		if result.err == nil || !strings.Contains(result.err.Error(), "failed") {
+			t.Fatalf("expected failure error, got %v", result.err)
+		}
+	})
+}
+
+func TestWatchJobReturnsWatchInterface(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	watcher, err := backend.watchJob(context.Background(), "my-job")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer watcher.Stop()
+
+	// The fake client's watch should be open (channel not closed).
+	select {
+	case _, ok := <-watcher.ResultChan():
+		if ok {
+			// Got an event — fine for the fake client.
+		}
+	case <-time.After(50 * time.Millisecond):
+		// No events yet — expected for an empty cluster.
+	}
+}
+
+func TestWatchReconnectsOnChannelClose(t *testing.T) {
+	// Verify that closing a watch channel and reopening works with the fake client.
+	fakeClient := fake.NewSimpleClientset()
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	watcher1, err := backend.watchJob(context.Background(), "my-job")
+	if err != nil {
+		t.Fatalf("unexpected error on first watch: %v", err)
+	}
+	watcher1.Stop()
+
+	// After stopping, ResultChan should be closed.
+	_, ok := <-watcher1.ResultChan()
+	if ok {
+		t.Fatal("expected channel to be closed after Stop")
+	}
+
+	// Reopening should succeed.
+	watcher2, err := backend.watchJob(context.Background(), "my-job")
+	if err != nil {
+		t.Fatalf("unexpected error on re-watch: %v", err)
+	}
+	defer watcher2.Stop()
+}
+
+func TestWatchTaskPodsReceivesEvents(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	taskID := "task-abc"
+	watcher, err := backend.watchTaskPods(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer watcher.Stop()
+
+	// Create a pod that matches the label selector.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task-pod",
+			Namespace: "agents",
+			Labels: map[string]string{
+				kubernetesTaskHashLabel: kubernetesLabelHash(taskID),
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "task", Image: "ubuntu:22.04"}},
+		},
+	}
+	if _, err := fakeClient.CoreV1().Pods("agents").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+
+	// The watch should receive the ADDED event.
+	select {
+	case event := <-watcher.ResultChan():
+		if event.Type != watch.Added {
+			t.Fatalf("expected Added event, got %v", event.Type)
+		}
+		gotPod, ok := event.Object.(*corev1.Pod)
+		if !ok {
+			t.Fatalf("expected Pod object, got %T", event.Object)
+		}
+		if gotPod.Name != "task-pod" {
+			t.Fatalf("pod name = %q, want %q", gotPod.Name, "task-pod")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pod watch event")
+	}
 }
 
 func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {

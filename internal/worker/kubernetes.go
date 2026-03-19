@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -25,7 +27,7 @@ const (
 	defaultKubernetesNamespace       = "default"
 	defaultWorkspaceMountPath        = "/workspace"
 	defaultSetupEnvironmentFile      = "/workspace/.oz-env"
-	podPollInterval                  = 2 * time.Second
+	watchSafetyInterval              = 30 * time.Second
 	defaultUnschedulableFailureDelay = 30 * time.Second
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
@@ -34,6 +36,10 @@ const (
 	kubernetesWorkerHashLabel        = "oz-worker-hash"
 	kubernetesTaskIDLabel            = "oz-task-id"
 	kubernetesTaskHashLabel          = "oz-task-hash"
+
+	// maxLogBytes caps the amount of container log data read into memory per
+	// container to avoid OOM when a task produces excessive output.
+	maxLogBytes = 1 << 20 // 1 MiB
 )
 
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
@@ -277,8 +283,20 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}()
 
-	ticker := time.NewTicker(podPollInterval)
-	defer ticker.Stop()
+	jobWatcher, err := b.watchJob(ctx, jobName)
+	if err != nil {
+		return fmt.Errorf("failed to watch Job %s: %w", jobName, err)
+	}
+	defer jobWatcher.Stop()
+
+	podWatcher, err := b.watchTaskPods(ctx, params.TaskID)
+	if err != nil {
+		return fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err)
+	}
+	defer podWatcher.Stop()
+
+	safetyTicker := time.NewTicker(watchSafetyInterval)
+	defer safetyTicker.Stop()
 
 	for {
 		select {
@@ -288,7 +306,67 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 			deleted = true
 			return ctx.Err()
-		case <-ticker.C:
+
+		case event, ok := <-jobWatcher.ResultChan():
+			if !ok {
+				// Watch closed; reopen.
+				jobWatcher.Stop()
+				jobWatcher, err = b.watchJob(ctx, jobName)
+				if err != nil {
+					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+				}
+				continue
+			}
+			if event.Type == watch.Error {
+				log.Warnf(ctx, "Job watch error for %s, reopening", jobName)
+				jobWatcher.Stop()
+				jobWatcher, err = b.watchJob(ctx, jobName)
+				if err != nil {
+					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+				}
+				continue
+			}
+			jobState, ok := event.Object.(*batchv1.Job)
+			if !ok {
+				continue
+			}
+			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
+				return result.err
+			}
+
+		case event, ok := <-podWatcher.ResultChan():
+			if !ok {
+				// Watch closed; reopen.
+				podWatcher.Stop()
+				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				if err != nil {
+					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+				}
+				continue
+			}
+			if event.Type == watch.Error {
+				log.Warnf(ctx, "Pod watch error for Job %s, reopening", jobName)
+				podWatcher.Stop()
+				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				if err != nil {
+					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+				}
+				continue
+			}
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			if failure := b.inspectPodFailure(ctx, pod); failure != nil {
+				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
+				if logs != "" {
+					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
+				}
+				return failure
+			}
+
+		case <-safetyTicker.C:
+			// Safety-net poll: catch anything the watches may have missed.
 			jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
 				if apierrors.IsNotFound(err) && ctx.Err() != nil {
@@ -296,33 +374,16 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				}
 				return fmt.Errorf("failed to get Job %s: %w", jobName, err)
 			}
+			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
+				return result.err
+			}
 
 			pods, err := b.listTaskPods(ctx, params.TaskID)
 			if err != nil {
 				return fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)
 			}
-
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
 				return failure
-			}
-
-			if jobComplete(jobState) {
-				if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-					logs := b.collectPodLogs(ctx, pods)
-					if logs != "" {
-						log.Debugf(ctx, "Job %s output:\n%s", jobName, logs)
-					}
-				}
-				log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
-				return nil
-			}
-
-			if jobFailed(jobState) {
-				logs := b.collectPodLogs(ctx, pods)
-				if logs != "" {
-					log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
-				}
-				return fmt.Errorf("job %s failed", jobName)
 			}
 		}
 	}
@@ -343,6 +404,50 @@ func (b *KubernetesBackend) Shutdown(ctx context.Context) {
 			log.Warnf(ctx, "Failed to delete lingering Job %s: %v", job.Name, err)
 		}
 	}
+}
+
+// jobResult wraps a terminal job outcome so handleJobState can signal the
+// select loop with a nil error (success) or a non-nil error (failure).
+type jobResult struct {
+	err error
+}
+
+// handleJobState checks whether a Job has reached a terminal state and, if so,
+// returns a *jobResult. A nil return means the Job is still in progress.
+func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID string) *jobResult {
+	jobName := jobState.Name
+	if jobComplete(jobState) {
+		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
+			pods, _ := b.listTaskPods(ctx, taskID)
+			logs := b.collectPodLogs(ctx, pods)
+			if logs != "" {
+				log.Debugf(ctx, "Job %s output:\n%s", jobName, logs)
+			}
+		}
+		log.Infof(ctx, "Task %s execution completed successfully", taskID)
+		return &jobResult{err: nil}
+	}
+	if jobFailed(jobState) {
+		pods, _ := b.listTaskPods(ctx, taskID)
+		logs := b.collectPodLogs(ctx, pods)
+		if logs != "" {
+			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
+		}
+		return &jobResult{err: fmt.Errorf("job %s failed", jobName)}
+	}
+	return nil
+}
+
+func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch.Interface, error) {
+	return b.clientset.BatchV1().Jobs(b.config.Namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("metadata.name=%s", jobName),
+	})
+}
+
+func (b *KubernetesBackend) watchTaskPods(ctx context.Context, taskID string) (watch.Interface, error) {
+	return b.clientset.CoreV1().Pods(b.config.Namespace).Watch(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+	})
 }
 
 func loadKubernetesClientConfig(kubeconfigPath string) (*rest.Config, error) {
@@ -509,16 +614,20 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		}
 	}
 
-	events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("involvedObject.uid=%s", pod.UID),
-	})
-	if err != nil {
-		log.Warnf(ctx, "Failed to list events for pod %s: %v", pod.Name, err)
-		return nil
-	}
-	for _, event := range events.Items {
-		if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
-			return fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message)
+	// Only query Events when the Pod shows signs of trouble to avoid
+	// expensive API calls on every healthy poll/watch cycle.
+	if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodFailed {
+		events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("involvedObject.uid=%s", pod.UID),
+		})
+		if err != nil {
+			log.Warnf(ctx, "Failed to list events for pod %s: %v", pod.Name, err)
+			return nil
+		}
+		for _, event := range events.Items {
+			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
+				return fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message)
+			}
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
@@ -552,8 +661,10 @@ func (b *KubernetesBackend) collectPodLogs(ctx context.Context, pods []corev1.Po
 }
 
 func (b *KubernetesBackend) readContainerLogs(ctx context.Context, podName, containerName string) (string, error) {
+	limitBytes := int64(maxLogBytes)
 	req := b.clientset.CoreV1().Pods(b.config.Namespace).GetLogs(podName, &corev1.PodLogOptions{
-		Container: containerName,
+		Container:  containerName,
+		LimitBytes: &limitBytes,
 	})
 	stream, err := req.Stream(ctx)
 	if err != nil {
@@ -565,7 +676,7 @@ func (b *KubernetesBackend) readContainerLogs(ctx context.Context, podName, cont
 		}
 	}()
 
-	data, err := io.ReadAll(stream)
+	data, err := io.ReadAll(io.LimitReader(stream, maxLogBytes))
 	if err != nil {
 		return "", err
 	}
@@ -593,9 +704,14 @@ func normalizePullPolicy(policy string) corev1.PullPolicy {
 }
 
 func envSliceFromMap(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	result := make([]string, 0, len(values))
-	for key, value := range values {
-		result = append(result, fmt.Sprintf("%s=%s", key, value))
+	for _, key := range keys {
+		result = append(result, fmt.Sprintf("%s=%s", key, values[key]))
 	}
 	return result
 }

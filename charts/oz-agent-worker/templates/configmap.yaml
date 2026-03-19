@@ -9,61 +9,61 @@ data:
     worker_id: {{ required "worker.workerId is required" .Values.worker.workerId | quote }}
     cleanup: {{ .Values.worker.cleanup }}
     max_concurrent_tasks: {{ .Values.worker.maxConcurrentTasks }}
-{{ if .Values.worker.idleOnComplete -}}
+    {{- if .Values.worker.idleOnComplete }}
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
-{{ end -}}
+    {{- end }}
     backend:
       kubernetes:
         namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace | quote }}
         image_pull_policy: {{ .Values.kubernetesBackend.imagePullPolicy | quote }}
-{{ if .Values.kubernetesBackend.preflightImage -}}
-        preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}
-{{ end -}}
         unschedulable_timeout: {{ .Values.kubernetesBackend.unschedulableTimeout | quote }}
-{{ if .Values.kubernetesBackend.imagePullSecret -}}
+        {{- if .Values.kubernetesBackend.preflightImage }}
+        preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.imagePullSecret }}
         image_pull_secret: {{ .Values.kubernetesBackend.imagePullSecret | quote }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.serviceAccountName -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.serviceAccountName }}
         service_account: {{ .Values.kubernetesBackend.serviceAccountName | quote }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.setupCommand -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.setupCommand }}
         setup_command: |-
 {{ .Values.kubernetesBackend.setupCommand | indent 10 }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.teardownCommand -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.teardownCommand }}
         teardown_command: |-
 {{ .Values.kubernetesBackend.teardownCommand | indent 10 }}
-{{ end -}}
-{{ with .Values.kubernetesBackend.nodeSelector -}}
+        {{- end }}
+        {{- with .Values.kubernetesBackend.nodeSelector }}
         node_selector:
 {{ toYaml . | indent 10 }}
-{{ end -}}
-{{ with .Values.kubernetesBackend.tolerations -}}
+        {{- end }}
+        {{- with .Values.kubernetesBackend.tolerations }}
         tolerations:
 {{ toYaml . | indent 10 }}
-{{ end -}}
-{{ if or .Values.kubernetesBackend.resources.requests .Values.kubernetesBackend.resources.limits -}}
+        {{- end }}
+        {{- if or .Values.kubernetesBackend.resources.requests .Values.kubernetesBackend.resources.limits }}
         resources:
 {{ toYaml .Values.kubernetesBackend.resources | indent 10 }}
-{{ end -}}
-{{ with .Values.kubernetesBackend.extraLabels -}}
+        {{- end }}
+        {{- with .Values.kubernetesBackend.extraLabels }}
         extra_labels:
 {{ toYaml . | indent 10 }}
-{{ end -}}
-{{ with .Values.kubernetesBackend.extraAnnotations -}}
+        {{- end }}
+        {{- with .Values.kubernetesBackend.extraAnnotations }}
         extra_annotations:
 {{ toYaml . | indent 10 }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.activeDeadlineSeconds -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.activeDeadlineSeconds }}
         active_deadline_seconds: {{ .Values.kubernetesBackend.activeDeadlineSeconds }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.terminationGracePeriodSeconds -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.terminationGracePeriodSeconds }}
         termination_grace_period_seconds: {{ .Values.kubernetesBackend.terminationGracePeriodSeconds }}
-{{ end -}}
-{{ if .Values.kubernetesBackend.workspaceSizeLimit -}}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.workspaceSizeLimit }}
         workspace_size_limit: {{ .Values.kubernetesBackend.workspaceSizeLimit | quote }}
-{{ end -}}
-{{ with .Values.kubernetesBackend.environment -}}
+        {{- end }}
+        {{- with .Values.kubernetesBackend.environment }}
         environment:
 {{ toYaml . | indent 10 }}
-{{ end -}}
+        {{- end }}

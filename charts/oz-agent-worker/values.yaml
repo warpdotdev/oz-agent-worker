@@ -50,6 +50,15 @@ worker:
     capabilities:
       drop:
         - ALL
+  # Liveness probe for the long-lived worker process. The default checks that
+  # PID 1 is still running. Override with an httpGet probe if you add a health
+  # endpoint to the worker.
+  livenessProbe:
+    exec:
+      command: ["/bin/sh", "-c", "kill -0 1"]
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    failureThreshold: 3
   # Conservative starting requests for the long-lived worker Deployment.
   resources:
     requests:
