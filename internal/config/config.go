@@ -82,6 +82,25 @@ type KubernetesConfig struct {
 	WorkspaceSizeLimit            string                       `yaml:"workspace_size_limit"`
 	UnschedulableTimeout          *string                      `yaml:"unschedulable_timeout"`
 	Environment                   []EnvEntry                   `yaml:"environment" validate:"dive"`
+	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
+	// required fields at runtime. When set, the legacy scheduling fields
+	// (node_selector, tolerations, resources, service_account, image_pull_secret,
+	// termination_grace_period_seconds) must not be set simultaneously.
+	PodTemplate *RawYAMLNode `yaml:"pod_template"`
+}
+
+// RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation
+// to its content. This is necessary because gopkg.in/yaml.v3's strict KnownFields
+// mode would otherwise try to match Kubernetes field names against yaml.Node's own
+// struct fields rather than treating the sub-tree as opaque YAML.
+type RawYAMLNode struct {
+	Node *yaml.Node
+}
+
+// UnmarshalYAML captures the raw YAML node, bypassing KnownFields strict validation.
+func (r *RawYAMLNode) UnmarshalYAML(value *yaml.Node) error {
+	r.Node = value
+	return nil
 }
 
 // EnvEntry represents a single environment variable in the config file.
@@ -116,6 +135,25 @@ func newConfigValidator() *validator.Validate {
 			sl.ReportError(sl.Current().Interface(), "Backend", "Backend", "only_one_backend", "")
 		}
 	}, BackendConfig{})
+
+	// Struct-level validator for KubernetesConfig: pod_template cannot be combined
+	// with legacy scheduling fields.
+	v.RegisterStructValidation(func(sl validator.StructLevel) {
+		kc := sl.Current().Interface().(KubernetesConfig)
+		if kc.PodTemplate == nil {
+			return
+		}
+		hasLegacy := len(kc.NodeSelector) > 0 ||
+			len(kc.Tolerations) > 0 ||
+			len(kc.Resources.Requests) > 0 ||
+			len(kc.Resources.Limits) > 0 ||
+			kc.ServiceAccount != "" ||
+			kc.ImagePullSecret != "" ||
+			kc.TerminationGracePeriodSeconds != nil
+		if hasLegacy {
+			sl.ReportError(kc.PodTemplate, "PodTemplate", "PodTemplate", "pod_template_conflict", "")
+		}
+	}, KubernetesConfig{})
 
 	return v
 }
@@ -157,6 +195,8 @@ func formatValidationErrors(err error) error {
 			msgs = append(msgs, fmt.Sprintf("%s must not contain whitespace", e.Namespace()))
 		case "only_one_backend":
 			msgs = append(msgs, "at most one backend may be configured")
+		case "pod_template_conflict":
+			msgs = append(msgs, "pod_template cannot be combined with legacy scheduling fields (node_selector, tolerations, resources, service_account, image_pull_secret, termination_grace_period_seconds); migrate all fields into pod_template")
 		default:
 			msgs = append(msgs, fmt.Sprintf("%s failed validation %q", e.Namespace(), e.Tag()))
 		}

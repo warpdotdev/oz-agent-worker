@@ -67,3 +67,7 @@ data:
         environment:
 {{ toYaml . | indent 10 }}
         {{- end }}
+        {{- if .Values.kubernetesBackend.podTemplate }}
+        pod_template:
+{{ toYaml .Values.kubernetesBackend.podTemplate | indent 10 }}
+        {{- end }}

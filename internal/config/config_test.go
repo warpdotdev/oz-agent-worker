@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -400,6 +401,59 @@ worker_id: "test"
 			t.Errorf("expected idle_on_complete to be nil, got %q", *cfg.IdleOnComplete)
 		}
 	})
+}
+
+func TestLoadValidKubernetesPodTemplateConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+    pod_template:
+      nodeSelector:
+        workload: agents
+      containers:
+        - name: task
+          env:
+            - name: SECRET_VALUE
+              valueFrom:
+                secretKeyRef:
+                  name: my-secret
+                  key: value
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend to be set")
+	}
+	if cfg.Backend.Kubernetes.PodTemplate == nil {
+		t.Fatal("expected pod_template to be non-nil")
+	}
+}
+
+func TestLoadPodTemplateWithLegacyFieldsErrors(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+    node_selector:
+      workload: agents
+    pod_template:
+      serviceAccountName: my-sa
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error when pod_template and node_selector are both set")
+	}
+	if !strings.Contains(err.Error(), "pod_template cannot be combined with legacy scheduling fields") {
+		t.Errorf("unexpected error message: %v", err)
+	}
 }
 
 func TestLoadMaxConcurrentTasks(t *testing.T) {

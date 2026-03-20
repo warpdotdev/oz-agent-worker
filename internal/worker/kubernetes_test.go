@@ -307,6 +307,59 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 	}
 }
 
+func TestMergeKubernetesEnvVars(t *testing.T) {
+	t.Run("override wins on key conflict", func(t *testing.T) {
+		base := []corev1.EnvVar{
+			{Name: "FOO", Value: "base-foo"},
+			{Name: "BAR", Value: "base-bar"},
+		}
+		override := []corev1.EnvVar{
+			{Name: "FOO", Value: "override-foo"},
+			{Name: "BAZ", Value: "override-baz"},
+		}
+		result := mergeKubernetesEnvVars(base, override)
+		resultMap := make(map[string]string, len(result))
+		for _, e := range result {
+			resultMap[e.Name] = e.Value
+		}
+		if resultMap["FOO"] != "override-foo" {
+			t.Errorf("FOO = %q, want %q", resultMap["FOO"], "override-foo")
+		}
+		if resultMap["BAR"] != "base-bar" {
+			t.Errorf("BAR = %q, want %q", resultMap["BAR"], "base-bar")
+		}
+		if resultMap["BAZ"] != "override-baz" {
+			t.Errorf("BAZ = %q, want %q", resultMap["BAZ"], "override-baz")
+		}
+		if len(result) != 3 {
+			t.Errorf("result length = %d, want 3", len(result))
+		}
+	})
+
+	t.Run("empty slices", func(t *testing.T) {
+		result := mergeKubernetesEnvVars(nil, nil)
+		if len(result) != 0 {
+			t.Errorf("expected empty result, got %v", result)
+		}
+	})
+
+	t.Run("only base", func(t *testing.T) {
+		base := []corev1.EnvVar{{Name: "A", Value: "1"}}
+		result := mergeKubernetesEnvVars(base, nil)
+		if len(result) != 1 || result[0].Value != "1" {
+			t.Errorf("unexpected result: %v", result)
+		}
+	})
+
+	t.Run("only override", func(t *testing.T) {
+		override := []corev1.EnvVar{{Name: "B", Value: "2"}}
+		result := mergeKubernetesEnvVars(nil, override)
+		if len(result) != 1 || result[0].Value != "2" {
+			t.Errorf("unexpected result: %v", result)
+		}
+	})
+}
+
 func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"

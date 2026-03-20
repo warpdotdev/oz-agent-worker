@@ -1,7 +1,3 @@
-# Keep this at 1 for a given worker.workerId. To run multiple workers, use distinct releases
-# (or otherwise distinct worker IDs) instead of scaling one release horizontally.
-replicaCount: 1
-
 nameOverride: ""
 fullnameOverride: ""
 
@@ -88,3 +84,7 @@ kubernetesBackend:
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
   environment: []
+  # Optional: raw Kubernetes PodSpec YAML for task Jobs. Uses standard K8s syntax
+  # (e.g. nodeSelector, tolerations, containers[].env with valueFrom.secretKeyRef).
+  # When set, this replaces the legacy scheduling/resource fields above.
+  podTemplate: {}

@@ -64,6 +64,10 @@ type KubernetesBackendConfig struct {
 	WorkspaceSizeLimit            *resource.Quantity
 	UnschedulableTimeout          *time.Duration
 	Env                           map[string]string
+	// PodTemplate, when non-nil, is merged with the worker's required Pod fields
+	// at task execution time. It takes precedence over the individual scheduling
+	// fields above (which must not be set simultaneously; enforced at config load).
+	PodTemplate *corev1.PodSpec
 }
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
@@ -151,6 +155,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	var initContainers []corev1.Container
 
+	// TODO(k8s-image-volumes): When Kubernetes image volumes (KEP-4639) reach GA,
+	// replace the tar-based init container materialization below with native image
+	// volume mounts, which would be faster and remove the root init container requirement.
 	for i, sidecar := range params.Sidecars {
 		dataVolumeName := fmt.Sprintf("sidecar-%d-data", i)
 		volumes = append(volumes, corev1.Volume{
@@ -202,9 +209,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		})
 	}
 
-	mainEnvVars := envStringsToKubernetesEnv(append(mainEnv,
-		fmt.Sprintf("OZ_TEARDOWN_COMMAND=%s", b.config.TeardownCommand),
-	))
+	mainEnvVars := envStringsToKubernetesEnv(mainEnv)
 	mainContainer := corev1.Container{
 		Name:            "task",
 		Image:           params.DockerImage,
@@ -231,6 +236,60 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}
 
+	var podSpec corev1.PodSpec
+	if b.config.PodTemplate != nil {
+		podSpec = *b.config.PodTemplate.DeepCopy()
+		// Force required fields.
+		podSpec.RestartPolicy = corev1.RestartPolicyNever
+		// Prepend worker init containers before any user-provided ones.
+		podSpec.InitContainers = append(initContainers, podSpec.InitContainers...)
+		// Append worker volumes.
+		podSpec.Volumes = append(podSpec.Volumes, volumes...)
+		// Find or create the "task" container.
+		taskIdx := -1
+		for i, c := range podSpec.Containers {
+			if c.Name == "task" {
+				taskIdx = i
+				break
+			}
+		}
+		if taskIdx >= 0 {
+			// Merge into existing user-provided task container.
+			tc := &podSpec.Containers[taskIdx]
+			tc.Image = mainContainer.Image
+			tc.ImagePullPolicy = mainContainer.ImagePullPolicy
+			tc.Command = mainContainer.Command
+			tc.Args = mainContainer.Args
+			tc.WorkingDir = mainContainer.WorkingDir
+			tc.VolumeMounts = append(tc.VolumeMounts, mainContainer.VolumeMounts...)
+			// Merge env: worker vars take precedence on key conflict.
+			tc.Env = mergeKubernetesEnvVars(tc.Env, mainContainer.Env)
+			if mainContainer.Lifecycle != nil {
+				tc.Lifecycle = mainContainer.Lifecycle
+			}
+		} else {
+			// No user-provided task container; use the worker's.
+			podSpec.Containers = append(podSpec.Containers, mainContainer)
+		}
+	} else {
+		// Legacy: build PodSpec from individual config fields.
+		podSpec = corev1.PodSpec{
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			ServiceAccountName:            b.config.ServiceAccount,
+			NodeSelector:                  copyStringMap(b.config.NodeSelector),
+			Tolerations:                   append([]corev1.Toleration(nil), b.config.Tolerations...),
+			InitContainers:                initContainers,
+			Containers:                    []corev1.Container{mainContainer},
+			Volumes:                       volumes,
+			TerminationGracePeriodSeconds: b.config.TerminationGracePeriodSeconds,
+		}
+		if b.config.ImagePullSecret != "" {
+			podSpec.ImagePullSecrets = []corev1.LocalObjectReference{
+				{Name: b.config.ImagePullSecret},
+			}
+		}
+	}
+
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -247,23 +306,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 					Labels:      jobLabels,
 					Annotations: jobAnnotations,
 				},
-				Spec: corev1.PodSpec{
-					RestartPolicy:                 corev1.RestartPolicyNever,
-					ServiceAccountName:            b.config.ServiceAccount,
-					NodeSelector:                  copyStringMap(b.config.NodeSelector),
-					Tolerations:                   append([]corev1.Toleration(nil), b.config.Tolerations...),
-					InitContainers:                initContainers,
-					Containers:                    []corev1.Container{mainContainer},
-					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: b.config.TerminationGracePeriodSeconds,
-				},
+				Spec: podSpec,
 			},
 		},
-	}
-	if b.config.ImagePullSecret != "" {
-		job.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-			{Name: b.config.ImagePullSecret},
-		}
 	}
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
@@ -816,11 +861,6 @@ func kubernetesTaskWrapperScript() string {
 		"  set +a",
 		"fi",
 		"/bin/sh /agent/entrypoint.sh \"$@\"",
-		"status=$?",
-		"if [ -n \"$OZ_TEARDOWN_COMMAND\" ]; then",
-		"  /bin/sh -c \"$OZ_TEARDOWN_COMMAND\"",
-		"fi",
-		"exit $status",
 	}, "\n")
 }
 
@@ -836,6 +876,25 @@ func kubernetesSidecarMaterializationScript() string {
 		"  --exclude=./run/secrets \\",
 		"  -C / -cf - . | tar --no-same-owner --no-same-permissions -C /target -xf -",
 	}, "\n")
+}
+
+// mergeKubernetesEnvVars merges base and override env var slices.
+// Override entries take precedence on name conflict.
+func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
+	seen := make(map[string]int, len(base)+len(override))
+	result := make([]corev1.EnvVar, 0, len(base)+len(override))
+	for _, e := range base {
+		seen[e.Name] = len(result)
+		result = append(result, e)
+	}
+	for _, e := range override {
+		if idx, ok := seen[e.Name]; ok {
+			result[idx] = e
+		} else {
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 func rootSecurityContext() *corev1.SecurityContext {

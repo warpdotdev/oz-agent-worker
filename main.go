@@ -15,6 +15,8 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"gopkg.in/yaml.v3"
+	sigsk8syaml "sigs.k8s.io/yaml"
 )
 
 var CLI struct {
@@ -175,6 +177,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			terminationGracePeriodSeconds *int64
 			workspaceSizeLimit            *resource.Quantity
 			unschedulableTimeout          *time.Duration
+			podTemplate                   *corev1.PodSpec
 		)
 
 		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
@@ -215,6 +218,17 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 				}
 				unschedulableTimeout = &duration
 			}
+			if kc.PodTemplate != nil {
+				yamlBytes, err := yaml.Marshal(kc.PodTemplate.Node)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("failed to marshal backend.kubernetes.pod_template: %w", err)
+				}
+				var ps corev1.PodSpec
+				if err := sigsk8syaml.Unmarshal(yamlBytes, &ps); err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.pod_template: %w", err)
+				}
+				podTemplate = &ps
+			}
 		}
 
 		wc.Kubernetes = &worker.KubernetesBackendConfig{
@@ -238,6 +252,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			WorkspaceSizeLimit:            workspaceSizeLimit,
 			UnschedulableTimeout:          unschedulableTimeout,
 			Env:                           mergedEnv,
+			PodTemplate:                   podTemplate,
 		}
 	case "direct":
 		// Merge env: config file first, then CLI overlay.

@@ -46,8 +46,16 @@ backend:
   kubernetes:
     kubeconfig: "/path/to/kubeconfig"
     namespace: "agents"
-    service_account: "oz-agent-worker"
     unschedulable_timeout: "2m"
+    pod_template:
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: task
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
 ```
 
 Notes:
@@ -57,6 +65,22 @@ Notes:
 - the Kubernetes backend requires creating Pods with a root init container to materialize sidecars into `emptyDir` volumes
 - the worker performs a dry-run Job preflight at startup so incompatible Pod Security or admission policy failures surface immediately
 - set `preflight_image` if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
+- `pod_template` accepts standard Kubernetes PodSpec YAML and is the recommended way to configure task pod scheduling, resources, and environment; when set, it replaces the legacy scheduling/resource fields
+- use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
+
+```yaml
+pod_template:
+  containers:
+    - name: task
+      env:
+        - name: MY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: my-k8s-secret
+              key: secret-key
+```
+
+- legacy fields (`node_selector`, `tolerations`, `resources`, `service_account`, `image_pull_secret`, `termination_grace_period_seconds`) still work but cannot be combined with `pod_template`
 
 ### Helm Chart
 
@@ -88,7 +112,7 @@ helm install oz-agent-worker ./charts/oz-agent-worker \
 
 The chart assumes the worker runs inside the target cluster and uses in-cluster Kubernetes auth by default. It does not create CRDs or cluster-scoped RBAC. Set `image.tag` explicitly for each install so the worker image is pinned instead of defaulting to `latest`.
 
-Keep `replicaCount=1` for a given `worker.workerId`. If you want multiple workers, deploy multiple releases with distinct worker IDs rather than scaling one release horizontally.
+The chart always deploys a single replica for a given `worker.workerId`. If you want multiple workers, deploy multiple releases with distinct worker IDs rather than scaling one release horizontally.
 
 The chart defaults the long-lived worker `Deployment` to a non-root security context and conservative starting resource requests of `100m` CPU and `128Mi` memory. Tune `worker.resources` for your workload and cluster policy.
 
