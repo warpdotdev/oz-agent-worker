@@ -29,6 +29,8 @@ const (
 	defaultSetupEnvironmentFile      = "/workspace/.oz-env"
 	watchSafetyInterval              = 30 * time.Second
 	defaultUnschedulableFailureDelay = 30 * time.Second
+	startupPreflightPollInterval     = 500 * time.Millisecond
+	startupPreflightTimeout          = 15 * time.Second
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
@@ -548,11 +550,36 @@ func validateTaskSidecars(sidecars []types.SidecarMount) error {
 }
 
 func (b *KubernetesBackend) runStartupPreflight(ctx context.Context) error {
+	job := b.startupPreflightJob()
+	createdJob, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		return b.startupPreflightError(err)
+	}
+	defer func() {
+		if err := b.deleteJob(context.Background(), createdJob.Name); err != nil {
+			log.Warnf(ctx, "Failed to delete startup preflight Job %s: %v", createdJob.Name, err)
+		}
+	}()
+
+	preflightCtx, cancel := context.WithTimeout(ctx, startupPreflightTimeout)
+	defer cancel()
+
+	if err := b.waitForStartupPreflight(ctx, preflightCtx, createdJob); err != nil {
+		if err == context.Canceled && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return b.startupPreflightError(err)
+	}
+
+	return nil
+}
+
+func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	backoffLimit := int32(0)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "oz-preflight-" + kubernetesLabelHash(b.config.WorkerID),
+			Name:      fmt.Sprintf("oz-preflight-%s-%d", kubernetesLabelHash(b.config.WorkerID), time.Now().UnixNano()),
 			Namespace: b.config.Namespace,
 		},
 		Spec: batchv1.JobSpec{
@@ -587,13 +614,69 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context) error {
 			{Name: b.config.ImagePullSecret},
 		}
 	}
+	return job
+}
 
-	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{
-		DryRun: []string{metav1.DryRunAll},
-	}); err != nil {
-		return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
+func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+	podSelector := fmt.Sprintf("job-name=%s", job.Name)
+	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
+	ticker := time.NewTicker(startupPreflightPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("timed out waiting for startup preflight Job %q to create a Pod or surface a controller failure", job.Name)
+			}
+			return ctx.Err()
+		default:
+		}
+
+		pods, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: podSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight Pods: %w", err)
+		}
+		if len(pods.Items) > 0 {
+			return nil
+		}
+
+		events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: eventSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight events: %w", err)
+		}
+		if err := startupPreflightFailureFromEvents(job.Name, events.Items); err != nil {
+			log.Warnf(logCtx, "Startup preflight Job %s failed before creating a Pod: %v", job.Name, err)
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) error {
+	for _, event := range events {
+		if event.Type != corev1.EventTypeWarning || event.Reason != "FailedCreate" {
+			continue
+		}
+		message := strings.TrimSpace(event.Message)
+		if message == "" {
+			message = event.Reason
+		}
+		return fmt.Errorf("preflight Job %q could not create a Pod: %s", jobName, message)
 	}
 	return nil
+}
+
+func (b *KubernetesBackend) startupPreflightError(err error) error {
+	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 
 func (b *KubernetesBackend) baseLabels(taskID string) map[string]string {

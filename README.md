@@ -63,7 +63,7 @@ Notes:
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; set it to `0s` to disable that fail-fast behavior
 - the Kubernetes backend requires creating Pods with a root init container to materialize sidecars into `emptyDir` volumes
-- the worker performs a dry-run Job preflight at startup so incompatible Pod Security or admission policy failures surface immediately
+- the worker runs a short-lived startup preflight Job and waits for either preflight Pod creation or an early controller failure, so incompatible Pod Security or admission policy failures surface before the worker starts accepting tasks
 - set `preflight_image` if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the recommended way to configure task pod scheduling, resources, and environment; when set, it replaces the legacy scheduling/resource fields
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
@@ -125,7 +125,7 @@ Recommended namespace-scoped permissions for the worker are:
 - get `pods/log`
 - list `events`
 
-The worker Deployment's `ServiceAccount` is separate from the optional `backend.kubernetes.service_account` used by task Jobs. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup dry-run Job.
+The worker Deployment's `ServiceAccount` is separate from the optional `backend.kubernetes.service_account` used by task Jobs. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job.
 
 ### Go Install
 

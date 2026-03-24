@@ -360,9 +360,10 @@ func TestMergeKubernetesEnvVars(t *testing.T) {
 	})
 }
 
-func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {
+func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"
+	var createdJob *batchv1.Job
 	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		createAction, ok := action.(k8stesting.CreateActionImpl)
 		if !ok {
@@ -373,8 +374,8 @@ func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected Job object, got %T", createAction.GetObject())
 		}
-		if got := createAction.GetCreateOptions().DryRun; len(got) != 1 || got[0] != metav1.DryRunAll {
-			t.Fatalf("unexpected dry-run options: %v", got)
+		if got := createAction.GetCreateOptions().DryRun; len(got) != 0 {
+			t.Fatalf("expected real create without dry-run options, got %v", got)
 		}
 		if len(job.Spec.Template.Spec.InitContainers) != 1 {
 			t.Fatalf("expected one init container, got %d", len(job.Spec.Template.Spec.InitContainers))
@@ -391,8 +392,31 @@ func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {
 		if job.Spec.Template.Spec.Containers[0].Image != preflightImage {
 			t.Fatalf("main container image = %q, want %q", job.Spec.Template.Spec.Containers[0].Image, preflightImage)
 		}
+		createdJob = job.DeepCopy()
+		createdJob.UID = "preflight-job-uid"
 
-		return true, job, nil
+		return true, createdJob, nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			t.Fatal("expected preflight job to be created before listing pods")
+		}
+		return true, &corev1.PodList{
+			Items: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "preflight-pod",
+						Namespace: "agents",
+						Labels: map[string]string{
+							"job-name": createdJob.Name,
+						},
+					},
+				},
+			},
+		}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{}, nil
 	})
 
 	backend := &KubernetesBackend{
@@ -408,5 +432,56 @@ func TestRunStartupPreflightUsesDryRunAndRootInitContainer(t *testing.T) {
 
 	if err := backend.runStartupPreflight(context.Background()); err != nil {
 		t.Fatalf("unexpected preflight error: %v", err)
+	}
+}
+
+func TestRunStartupPreflightFailsOnFailedCreateEvent(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		job = job.DeepCopy()
+		job.UID = "preflight-job-uid"
+		return true, job, nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.PodList{}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{
+			Items: []corev1.Event{
+				{
+					Type:    corev1.EventTypeWarning,
+					Reason:  "FailedCreate",
+					Message: "pods \"oz-preflight-abc\" is forbidden: violates PodSecurity \"restricted:latest\"",
+				},
+			},
+		}, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: "registry.internal/platform/preflight:1.0",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.runStartupPreflight(context.Background())
+	if err == nil {
+		t.Fatal("expected preflight failure")
+	}
+	if !strings.Contains(err.Error(), "startup preflight failed") {
+		t.Fatalf("expected wrapped startup preflight error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "could not create a Pod") {
+		t.Fatalf("expected pod creation failure detail, got %v", err)
 	}
 }
