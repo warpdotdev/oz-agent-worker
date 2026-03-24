@@ -34,6 +34,7 @@ func hostBaseEnv() []string {
 // DirectBackendConfig holds configuration specific to the direct (non-containerized) backend.
 type DirectBackendConfig struct {
 	WorkspaceRoot   string
+	TargetDir       string // If set, run all tasks in this directory instead of creating per-task workspaces.
 	OzPath          string // Path to the oz CLI binary. If empty, looks up "oz" in PATH.
 	SetupCommand    string
 	TeardownCommand string
@@ -59,13 +60,25 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 	}
 	log.Infof(ctx, "Using oz CLI at: %s", ozPath)
 
-	if config.WorkspaceRoot == "" {
-		config.WorkspaceRoot = defaultWorkspaceRoot
-	}
+	if config.TargetDir != "" {
+		// Validate that the target directory exists.
+		info, err := os.Stat(config.TargetDir)
+		if err != nil {
+			return nil, fmt.Errorf("target directory %s does not exist: %w", config.TargetDir, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("target directory %s is not a directory", config.TargetDir)
+		}
+		log.Infof(ctx, "Using shared target directory: %s (per-task workspace isolation disabled)", config.TargetDir)
+	} else {
+		if config.WorkspaceRoot == "" {
+			config.WorkspaceRoot = defaultWorkspaceRoot
+		}
 
-	// Ensure workspace root exists.
-	if err := os.MkdirAll(config.WorkspaceRoot, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create workspace root %s: %w", config.WorkspaceRoot, err)
+		// Ensure workspace root exists.
+		if err := os.MkdirAll(config.WorkspaceRoot, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create workspace root %s: %w", config.WorkspaceRoot, err)
+		}
 	}
 
 	return &DirectBackend{
@@ -78,14 +91,27 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
 	taskID := params.TaskID
 
-	// 1. Create per-task workspace directory.
-	workspaceDir := filepath.Join(b.config.WorkspaceRoot, taskID)
-	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
-		return fmt.Errorf("failed to create workspace directory: %w", err)
+	// Determine working directory: shared target dir or per-task workspace.
+	var workspaceDir string
+	usingTargetDir := b.config.TargetDir != ""
+
+	if usingTargetDir {
+		workspaceDir = b.config.TargetDir
+	} else {
+		// Create per-task workspace directory.
+		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
+		if err := os.MkdirAll(workspaceDir, 0755); err != nil {
+			return fmt.Errorf("failed to create workspace directory: %w", err)
+		}
+		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
-	log.Infof(ctx, "Created workspace: %s", workspaceDir)
 
 	defer func() {
+		if usingTargetDir {
+			// Don't clean up the shared target directory.
+			b.runTeardownIfConfigured(ctx, taskID, workspaceDir)
+			return
+		}
 		if b.config.NoCleanup {
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
@@ -102,6 +128,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	if err := envFile.Close(); err != nil {
 		return fmt.Errorf("failed to close environment file: %w", err)
 	}
+	defer os.Remove(envFilePath)
 
 	// 3. Build environment variables: common + config-level.
 	envVars := make([]string, len(params.EnvVars))
@@ -159,6 +186,9 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 // Shutdown cleans up any workspace directories left behind under the workspace root.
 func (b *DirectBackend) Shutdown(ctx context.Context) {
+	if b.config.WorkspaceRoot == "" {
+		return
+	}
 	entries, err := os.ReadDir(b.config.WorkspaceRoot)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -176,20 +206,25 @@ func (b *DirectBackend) Shutdown(ctx context.Context) {
 	}
 }
 
+// runTeardownIfConfigured runs the teardown command if one is configured.
+func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir string) {
+	if b.config.TeardownCommand == "" {
+		return
+	}
+	teardownEnv := []string{
+		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
+		"OZ_WORKER_BACKEND=direct",
+		fmt.Sprintf("OZ_RUN_ID=%s", taskID),
+	}
+	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
+	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
+		log.Warnf(ctx, "Teardown command failed: %v", err)
+	}
+}
+
 // cleanup runs the teardown command (if configured) and removes the workspace directory.
 func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir string) {
-	if b.config.TeardownCommand != "" {
-		teardownEnv := []string{
-			fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
-			"OZ_WORKER_BACKEND=direct",
-			fmt.Sprintf("OZ_RUN_ID=%s", taskID),
-		}
-
-		log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
-		if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
-			log.Warnf(ctx, "Teardown command failed: %v", err)
-		}
-	}
+	b.runTeardownIfConfigured(ctx, taskID, workspaceDir)
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {

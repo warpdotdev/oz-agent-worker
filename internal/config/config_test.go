@@ -235,6 +235,31 @@ backend:
 	}
 }
 
+func TestLoadDirectConfigWithTargetDir(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "direct-worker"
+backend:
+  direct:
+    target_dir: "/home/user/myrepo"
+    setup_command: "/opt/setup.sh"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Direct == nil {
+		t.Fatal("expected direct backend to be set")
+	}
+	if cfg.Backend.Direct.TargetDir != "/home/user/myrepo" {
+		t.Errorf("target_dir = %q, want %q", cfg.Backend.Direct.TargetDir, "/home/user/myrepo")
+	}
+	if cfg.Backend.Direct.WorkspaceRoot != "" {
+		t.Errorf("workspace_root should be empty, got %q", cfg.Backend.Direct.WorkspaceRoot)
+	}
+}
+
 func TestLoadBothBackendsError(t *testing.T) {
 	path := writeTestConfig(t, `
 backend:
