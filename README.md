@@ -14,6 +14,7 @@ Self-hosted worker for Oz cloud agents.
 - Network egress to warp-server
 - One supported execution backend:
   - Docker daemon access for the Docker backend
+  - Local `oz` CLI access plus a writable workspace root for the Direct backend
   - Kubernetes API access plus cluster credentials for the Kubernetes backend
 
 ## Usage
@@ -29,6 +30,20 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock \
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+### Direct
+
+The direct backend executes tasks directly on the host instead of inside Docker or Kubernetes. It requires the `oz` CLI to be available on `PATH` (or configured explicitly with `backend.direct.oz_path`) and stores per-task workspaces under `backend.direct.workspace_root` (default: `/var/lib/oz/workspaces`).
+
+Example config:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  direct:
+    workspace_root: "/var/lib/oz/workspaces"
+    oz_path: "/usr/local/bin/oz"
+```
 
 ### Kubernetes
 
@@ -60,12 +75,14 @@ backend:
 
 Notes:
 
-- `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself
-- `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; set it to `0s` to disable that fail-fast behavior
+- `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
+- `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
+- `image_pull_policy` defaults to `IfNotPresent`
 - the Kubernetes backend requires creating Pods with a root init container to materialize sidecars into `emptyDir` volumes
 - the worker runs a short-lived startup preflight Job and waits for either preflight Pod creation or an early controller failure, so incompatible Pod Security or admission policy failures surface before the worker starts accepting tasks
-- set `preflight_image` if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
+- `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the recommended way to configure task pod scheduling, resources, and environment; when set, it replaces the legacy scheduling/resource fields
+- when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
 
 ```yaml
@@ -80,7 +97,7 @@ pod_template:
               key: secret-key
 ```
 
-- legacy fields (`node_selector`, `tolerations`, `resources`, `service_account`, `image_pull_secret`, `termination_grace_period_seconds`) still work but cannot be combined with `pod_template`
+- legacy fields (`node_selector`, `tolerations`, `resources`, `service_account`, `image_pull_secret`, `termination_grace_period_seconds`) still work but cannot be combined with `pod_template`; when migrating, use the equivalent standard PodSpec fields inside `pod_template`
 
 ### Helm Chart
 
@@ -125,7 +142,7 @@ Recommended namespace-scoped permissions for the worker are:
 - get `pods/log`
 - list `events`
 
-The worker Deployment's `ServiceAccount` is separate from the optional `backend.kubernetes.service_account` used by task Jobs. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job.
+The worker Deployment's `ServiceAccount` is separate from the optional `backend.kubernetes.service_account` used by task Jobs and the startup preflight Job. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job.
 
 ### Go Install
 
