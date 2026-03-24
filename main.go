@@ -22,6 +22,7 @@ var CLI struct {
 	WebSocketURL       string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
 	ServerRootURL      string   `default:"https://app.warp.dev" hidden:""`
 	LogLevel           string   `help:"Log level (debug, info, warn, error)" default:"info" enum:"debug,info,warn,error"`
+	TargetDir          string   `help:"Run all tasks in this directory instead of creating per-task workspaces (direct backend only)"`
 	NoCleanup          bool     `help:"Do not remove containers after execution (for debugging)"`
 	Volumes            []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
@@ -152,16 +153,23 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			mergedEnv[k] = v
 		}
 
-		var workspaceRoot, ozPath, setupCmd, teardownCmd string
+		var workspaceRoot, targetDir, ozPath, setupCmd, teardownCmd string
 		if fileConfig != nil && fileConfig.Backend.Direct != nil {
 			workspaceRoot = fileConfig.Backend.Direct.WorkspaceRoot
+			targetDir = fileConfig.Backend.Direct.TargetDir
 			ozPath = fileConfig.Backend.Direct.OzPath
 			setupCmd = fileConfig.Backend.Direct.SetupCommand
 			teardownCmd = fileConfig.Backend.Direct.TeardownCommand
 		}
 
+		// CLI --target-dir overrides config file.
+		if CLI.TargetDir != "" {
+			targetDir = CLI.TargetDir
+		}
+
 		wc.Direct = &worker.DirectBackendConfig{
 			WorkspaceRoot:   workspaceRoot,
+			TargetDir:       targetDir,
 			OzPath:          ozPath,
 			SetupCommand:    setupCmd,
 			TeardownCommand: teardownCmd,
