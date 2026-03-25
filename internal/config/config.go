@@ -25,19 +25,6 @@ type FileConfig struct {
 	Backend        BackendConfig `yaml:"backend"`
 }
 
-type KubernetesTolerationConfig struct {
-	Key               string `yaml:"key"`
-	Operator          string `yaml:"operator" validate:"omitempty,oneof=Exists Equal"`
-	Value             string `yaml:"value"`
-	Effect            string `yaml:"effect" validate:"omitempty,oneof=NoSchedule PreferNoSchedule NoExecute"`
-	TolerationSeconds *int64 `yaml:"toleration_seconds"`
-}
-
-type KubernetesResourcesConfig struct {
-	Requests map[string]string `yaml:"requests"`
-	Limits   map[string]string `yaml:"limits"`
-}
-
 // BackendConfig contains the backend selection.
 // At most one backend field may be non-nil; configuring multiple backends simultaneously is an error.
 type BackendConfig struct {
@@ -64,28 +51,21 @@ type DirectConfig struct {
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.
 type KubernetesConfig struct {
-	Namespace                     string                       `yaml:"namespace"`
-	Kubeconfig                    string                       `yaml:"kubeconfig"`
-	ImagePullSecret               string                       `yaml:"image_pull_secret" validate:"omitempty,no_whitespace"`
-	ImagePullPolicy               string                       `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
-	PreflightImage                string                       `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
-	ServiceAccount                string                       `yaml:"service_account" validate:"omitempty,no_whitespace"`
-	SetupCommand                  string                       `yaml:"setup_command"`
-	TeardownCommand               string                       `yaml:"teardown_command"`
-	NodeSelector                  map[string]string            `yaml:"node_selector"`
-	Tolerations                   []KubernetesTolerationConfig `yaml:"tolerations" validate:"dive"`
-	Resources                     KubernetesResourcesConfig    `yaml:"resources"`
-	ExtraLabels                   map[string]string            `yaml:"extra_labels"`
-	ExtraAnnotations              map[string]string            `yaml:"extra_annotations"`
-	ActiveDeadlineSeconds         *int64                       `yaml:"active_deadline_seconds"`
-	TerminationGracePeriodSeconds *int64                       `yaml:"termination_grace_period_seconds"`
-	WorkspaceSizeLimit            string                       `yaml:"workspace_size_limit"`
-	UnschedulableTimeout          *string                      `yaml:"unschedulable_timeout"`
-	Environment                   []EnvEntry                   `yaml:"environment" validate:"dive"`
+	Namespace             string            `yaml:"namespace"`
+	Kubeconfig            string            `yaml:"kubeconfig"`
+	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
+	SetupCommand          string            `yaml:"setup_command"`
+	TeardownCommand       string            `yaml:"teardown_command"`
+	ExtraLabels           map[string]string `yaml:"extra_labels"`
+	ExtraAnnotations      map[string]string `yaml:"extra_annotations"`
+	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
+	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
+	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
-	// required fields at runtime. When set, the legacy scheduling fields
-	// (node_selector, tolerations, resources, service_account, image_pull_secret,
-	// termination_grace_period_seconds) must not be set simultaneously.
+	// required fields at runtime. Declarative task Job configuration such as
+	// serviceAccountName, imagePullSecrets, node selectors, tolerations,
+	// resources, and env must be configured here.
 	PodTemplate *RawYAMLNode `yaml:"pod_template"`
 }
 
@@ -136,25 +116,6 @@ func newConfigValidator() *validator.Validate {
 		}
 	}, BackendConfig{})
 
-	// Struct-level validator for KubernetesConfig: pod_template cannot be combined
-	// with legacy scheduling fields.
-	v.RegisterStructValidation(func(sl validator.StructLevel) {
-		kc := sl.Current().Interface().(KubernetesConfig)
-		if kc.PodTemplate == nil {
-			return
-		}
-		hasLegacy := len(kc.NodeSelector) > 0 ||
-			len(kc.Tolerations) > 0 ||
-			len(kc.Resources.Requests) > 0 ||
-			len(kc.Resources.Limits) > 0 ||
-			kc.ServiceAccount != "" ||
-			kc.ImagePullSecret != "" ||
-			kc.TerminationGracePeriodSeconds != nil
-		if hasLegacy {
-			sl.ReportError(kc.PodTemplate, "PodTemplate", "PodTemplate", "pod_template_conflict", "")
-		}
-	}, KubernetesConfig{})
-
 	return v
 }
 
@@ -195,8 +156,6 @@ func formatValidationErrors(err error) error {
 			msgs = append(msgs, fmt.Sprintf("%s must not contain whitespace", e.Namespace()))
 		case "only_one_backend":
 			msgs = append(msgs, "at most one backend may be configured")
-		case "pod_template_conflict":
-			msgs = append(msgs, "pod_template cannot be combined with legacy scheduling fields (node_selector, tolerations, resources, service_account, image_pull_secret, termination_grace_period_seconds); migrate all fields into pod_template")
 		default:
 			msgs = append(msgs, fmt.Sprintf("%s failed validation %q", e.Namespace(), e.Tag()))
 		}

@@ -8,6 +8,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -360,6 +361,100 @@ func TestMergeKubernetesEnvVars(t *testing.T) {
 	})
 }
 
+func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			PodTemplate: &corev1.PodSpec{
+				ServiceAccountName: "task-runner",
+				ImagePullSecrets: []corev1.LocalObjectReference{
+					{Name: "registry-creds"},
+				},
+				NodeSelector: map[string]string{
+					"pool": "agents",
+				},
+				Containers: []corev1.Container{
+					{
+						Name:            "task",
+						ImagePullPolicy: corev1.PullAlways,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("500m"),
+							},
+						},
+						Env: []corev1.EnvVar{
+							{Name: "FROM_TEMPLATE", Value: "1"},
+						},
+					},
+				},
+			},
+			TaskEnv: map[string]string{
+				"FROM_CLI": "1",
+			},
+		},
+	}
+
+	mainContainer := corev1.Container{
+		Name:            "task",
+		Image:           "ubuntu:22.04",
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/bin/sh", "-c", "run-task"},
+		Args:            []string{"arg1"},
+		Env: []corev1.EnvVar{
+			{Name: "FROM_CLI", Value: "1"},
+		},
+		WorkingDir: "/workspace",
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "workspace", MountPath: "/workspace"},
+		},
+	}
+
+	podSpec := backend.buildTaskPodSpec(nil, []corev1.Volume{{Name: "workspace"}}, mainContainer)
+
+	if podSpec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("RestartPolicy = %q, want %q", podSpec.RestartPolicy, corev1.RestartPolicyNever)
+	}
+	if podSpec.ServiceAccountName != "task-runner" {
+		t.Fatalf("ServiceAccountName = %q, want %q", podSpec.ServiceAccountName, "task-runner")
+	}
+	if len(podSpec.ImagePullSecrets) != 1 || podSpec.ImagePullSecrets[0].Name != "registry-creds" {
+		t.Fatalf("ImagePullSecrets = %+v, want registry-creds", podSpec.ImagePullSecrets)
+	}
+	if podSpec.NodeSelector["pool"] != "agents" {
+		t.Fatalf("NodeSelector[pool] = %q, want %q", podSpec.NodeSelector["pool"], "agents")
+	}
+
+	var taskContainer *corev1.Container
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == "task" {
+			taskContainer = &podSpec.Containers[i]
+			break
+		}
+	}
+	if taskContainer == nil {
+		t.Fatal("expected task container to be present")
+	}
+	if taskContainer.Image != "ubuntu:22.04" {
+		t.Fatalf("task image = %q, want %q", taskContainer.Image, "ubuntu:22.04")
+	}
+	if taskContainer.ImagePullPolicy != corev1.PullAlways {
+		t.Fatalf("task imagePullPolicy = %q, want %q", taskContainer.ImagePullPolicy, corev1.PullAlways)
+	}
+	cpuRequest := taskContainer.Resources.Requests[corev1.ResourceCPU]
+	if got := cpuRequest.String(); got != "500m" {
+		t.Fatalf("task cpu request = %q, want %q", got, "500m")
+	}
+
+	envMap := make(map[string]string, len(taskContainer.Env))
+	for _, env := range taskContainer.Env {
+		envMap[env.Name] = env.Value
+	}
+	if envMap["FROM_TEMPLATE"] != "1" {
+		t.Fatalf("FROM_TEMPLATE = %q, want %q", envMap["FROM_TEMPLATE"], "1")
+	}
+	if envMap["FROM_CLI"] != "1" {
+		t.Fatalf("FROM_CLI = %q, want %q", envMap["FROM_CLI"], "1")
+	}
+}
 func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"
@@ -392,6 +487,12 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 		if job.Spec.Template.Spec.Containers[0].Image != preflightImage {
 			t.Fatalf("main container image = %q, want %q", job.Spec.Template.Spec.Containers[0].Image, preflightImage)
 		}
+		if job.Spec.Template.Spec.ServiceAccountName != "oz-agent-worker" {
+			t.Fatalf("serviceAccountName = %q, want %q", job.Spec.Template.Spec.ServiceAccountName, "oz-agent-worker")
+		}
+		if len(job.Spec.Template.Spec.ImagePullSecrets) != 1 || job.Spec.Template.Spec.ImagePullSecrets[0].Name != "registry-creds" {
+			t.Fatalf("imagePullSecrets = %+v, want registry-creds", job.Spec.Template.Spec.ImagePullSecrets)
+		}
 		createdJob = job.DeepCopy()
 		createdJob.UID = "preflight-job-uid"
 
@@ -421,11 +522,15 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:        "worker-123",
-			Namespace:       "agents",
-			PreflightImage:  preflightImage,
-			ServiceAccount:  "oz-agent-worker",
-			ImagePullSecret: "registry-creds",
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: preflightImage,
+			PodTemplate: &corev1.PodSpec{
+				ServiceAccountName: "oz-agent-worker",
+				ImagePullSecrets: []corev1.LocalObjectReference{
+					{Name: "registry-creds"},
+				},
+			},
 		},
 		clientset: fakeClient,
 	}

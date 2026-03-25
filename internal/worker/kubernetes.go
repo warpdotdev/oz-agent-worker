@@ -46,29 +46,24 @@ const (
 
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
-	WorkerID                      string
-	Namespace                     string
-	Kubeconfig                    string
-	ImagePullSecret               string
-	ImagePullPolicy               string
-	PreflightImage                string
-	ServiceAccount                string
-	SetupCommand                  string
-	TeardownCommand               string
-	NoCleanup                     bool
-	NodeSelector                  map[string]string
-	Tolerations                   []corev1.Toleration
-	Resources                     corev1.ResourceRequirements
-	ExtraLabels                   map[string]string
-	ExtraAnnotations              map[string]string
-	ActiveDeadlineSeconds         *int64
-	TerminationGracePeriodSeconds *int64
-	WorkspaceSizeLimit            *resource.Quantity
-	UnschedulableTimeout          *time.Duration
-	Env                           map[string]string
-	// PodTemplate, when non-nil, is merged with the worker's required Pod fields
-	// at task execution time. It takes precedence over the individual scheduling
-	// fields above (which must not be set simultaneously; enforced at config load).
+	WorkerID              string
+	Namespace             string
+	Kubeconfig            string
+	ImagePullPolicy       string
+	PreflightImage        string
+	SetupCommand          string
+	TeardownCommand       string
+	NoCleanup             bool
+	ExtraLabels           map[string]string
+	ExtraAnnotations      map[string]string
+	ActiveDeadlineSeconds *int64
+	WorkspaceSizeLimit    *resource.Quantity
+	UnschedulableTimeout  *time.Duration
+	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
+	// task container env in file or Helm config should be set in PodTemplate.
+	TaskEnv map[string]string
+	// PodTemplate, when non-nil, is the declarative PodSpec template for task
+	// Jobs. Worker-required fields are overlaid at execution time.
 	PodTemplate *corev1.PodSpec
 }
 
@@ -131,7 +126,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
-	baseEnv := envSliceFromMap(b.config.Env)
+	baseEnv := envSliceFromMap(b.config.TaskEnv)
 	mainEnv := mergeEnvVars(params.EnvVars, append(baseEnv,
 		fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", defaultSetupEnvironmentFile),
 		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
@@ -226,7 +221,6 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		Env:          mainEnvVars,
 		WorkingDir:   defaultWorkspaceMountPath,
 		VolumeMounts: mainVolumeMounts,
-		Resources:    b.config.Resources,
 	}
 	if b.config.TeardownCommand != "" {
 		mainContainer.Lifecycle = &corev1.Lifecycle{
@@ -238,59 +232,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}
 
-	var podSpec corev1.PodSpec
-	if b.config.PodTemplate != nil {
-		podSpec = *b.config.PodTemplate.DeepCopy()
-		// Force required fields.
-		podSpec.RestartPolicy = corev1.RestartPolicyNever
-		// Prepend worker init containers before any user-provided ones.
-		podSpec.InitContainers = append(initContainers, podSpec.InitContainers...)
-		// Append worker volumes.
-		podSpec.Volumes = append(podSpec.Volumes, volumes...)
-		// Find or create the "task" container.
-		taskIdx := -1
-		for i, c := range podSpec.Containers {
-			if c.Name == "task" {
-				taskIdx = i
-				break
-			}
-		}
-		if taskIdx >= 0 {
-			// Merge into existing user-provided task container.
-			tc := &podSpec.Containers[taskIdx]
-			tc.Image = mainContainer.Image
-			tc.ImagePullPolicy = mainContainer.ImagePullPolicy
-			tc.Command = mainContainer.Command
-			tc.Args = mainContainer.Args
-			tc.WorkingDir = mainContainer.WorkingDir
-			tc.VolumeMounts = append(tc.VolumeMounts, mainContainer.VolumeMounts...)
-			// Merge env: worker vars take precedence on key conflict.
-			tc.Env = mergeKubernetesEnvVars(tc.Env, mainContainer.Env)
-			if mainContainer.Lifecycle != nil {
-				tc.Lifecycle = mainContainer.Lifecycle
-			}
-		} else {
-			// No user-provided task container; use the worker's.
-			podSpec.Containers = append(podSpec.Containers, mainContainer)
-		}
-	} else {
-		// Legacy: build PodSpec from individual config fields.
-		podSpec = corev1.PodSpec{
-			RestartPolicy:                 corev1.RestartPolicyNever,
-			ServiceAccountName:            b.config.ServiceAccount,
-			NodeSelector:                  copyStringMap(b.config.NodeSelector),
-			Tolerations:                   append([]corev1.Toleration(nil), b.config.Tolerations...),
-			InitContainers:                initContainers,
-			Containers:                    []corev1.Container{mainContainer},
-			Volumes:                       volumes,
-			TerminationGracePeriodSeconds: b.config.TerminationGracePeriodSeconds,
-		}
-		if b.config.ImagePullSecret != "" {
-			podSpec.ImagePullSecrets = []corev1.LocalObjectReference{
-				{Name: b.config.ImagePullSecret},
-			}
-		}
-	}
+	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -511,6 +453,47 @@ func loadKubernetesClientConfig(kubeconfigPath string) (*rest.Config, error) {
 	return loader.ClientConfig()
 }
 
+func (b *KubernetesBackend) basePodSpec() corev1.PodSpec {
+	if b.config.PodTemplate != nil {
+		return *b.config.PodTemplate.DeepCopy()
+	}
+	return corev1.PodSpec{}
+}
+
+func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, volumes []corev1.Volume, mainContainer corev1.Container) corev1.PodSpec {
+	podSpec := b.basePodSpec()
+	podSpec.RestartPolicy = corev1.RestartPolicyNever
+	podSpec.InitContainers = append(initContainers, podSpec.InitContainers...)
+	podSpec.Volumes = append(podSpec.Volumes, volumes...)
+
+	taskIdx := -1
+	for i, c := range podSpec.Containers {
+		if c.Name == "task" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx >= 0 {
+		tc := &podSpec.Containers[taskIdx]
+		tc.Image = mainContainer.Image
+		if tc.ImagePullPolicy == "" {
+			tc.ImagePullPolicy = mainContainer.ImagePullPolicy
+		}
+		tc.Command = mainContainer.Command
+		tc.Args = mainContainer.Args
+		tc.WorkingDir = mainContainer.WorkingDir
+		tc.VolumeMounts = append(tc.VolumeMounts, mainContainer.VolumeMounts...)
+		tc.Env = mergeKubernetesEnvVars(tc.Env, mainContainer.Env)
+		if mainContainer.Lifecycle != nil {
+			tc.Lifecycle = mainContainer.Lifecycle
+		}
+	} else {
+		podSpec.Containers = append(podSpec.Containers, mainContainer)
+	}
+
+	return podSpec
+}
+
 func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
 	volume := corev1.Volume{
 		Name: workspaceVolumeName(),
@@ -577,6 +560,25 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context) error {
 func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	backoffLimit := int32(0)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
+	podSpec := b.basePodSpec()
+	podSpec.RestartPolicy = corev1.RestartPolicyNever
+	podSpec.InitContainers = []corev1.Container{
+		{
+			Name:            "root-init-preflight",
+			Image:           b.config.PreflightImage,
+			ImagePullPolicy: pullPolicy,
+			Command:         []string{"/bin/sh", "-c", "true"},
+			SecurityContext: rootSecurityContext(),
+		},
+	}
+	podSpec.Containers = []corev1.Container{
+		{
+			Name:            "main",
+			Image:           b.config.PreflightImage,
+			ImagePullPolicy: pullPolicy,
+			Command:         []string{"/bin/sh", "-c", "true"},
+		},
+	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("oz-preflight-%s-%d", kubernetesLabelHash(b.config.WorkerID), time.Now().UnixNano()),
@@ -585,34 +587,9 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyNever,
-					ServiceAccountName: b.config.ServiceAccount,
-					InitContainers: []corev1.Container{
-						{
-							Name:            "root-init-preflight",
-							Image:           b.config.PreflightImage,
-							ImagePullPolicy: pullPolicy,
-							Command:         []string{"/bin/sh", "-c", "true"},
-							SecurityContext: rootSecurityContext(),
-						},
-					},
-					Containers: []corev1.Container{
-						{
-							Name:            "main",
-							Image:           b.config.PreflightImage,
-							ImagePullPolicy: pullPolicy,
-							Command:         []string{"/bin/sh", "-c", "true"},
-						},
-					},
-				},
+				Spec: podSpec,
 			},
 		},
-	}
-	if b.config.ImagePullSecret != "" {
-		job.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-			{Name: b.config.ImagePullSecret},
-		}
 	}
 	return job
 }

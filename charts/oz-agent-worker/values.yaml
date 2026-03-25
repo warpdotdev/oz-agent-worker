@@ -66,25 +66,16 @@ worker:
 
 kubernetesBackend:
   namespace: ""
-  imagePullSecret: ""
   imagePullPolicy: IfNotPresent
   preflightImage: ""
-  serviceAccountName: ""
   setupCommand: ""
   teardownCommand: ""
-  nodeSelector: {}
-  tolerations: []
-  resources:
-    requests: {}
-    limits: {}
   extraLabels: {}
   extraAnnotations: {}
   activeDeadlineSeconds: null
-  terminationGracePeriodSeconds: null
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
-  environment: []
-  # Optional: raw Kubernetes PodSpec YAML for task Jobs. Uses standard K8s syntax
-  # (e.g. nodeSelector, tolerations, containers[].env with valueFrom.secretKeyRef).
-  # When set, this replaces the legacy scheduling/resource fields above.
+  # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
+  # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
+  # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
   podTemplate: {}

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeTestConfig(t *testing.T, content string) string {
@@ -268,37 +270,35 @@ backend:
   kubernetes:
     namespace: "agents"
     kubeconfig: "/tmp/kubeconfig"
-    image_pull_secret: "registry-creds"
     image_pull_policy: "IfNotPresent"
     preflight_image: "registry.internal/platform/preflight:1.0"
-    service_account: "oz-agent-worker"
     setup_command: "printf 'SETUP=done\n' > \"$OZ_ENVIRONMENT_FILE\""
     teardown_command: "rm -rf \"$OZ_WORKSPACE_ROOT/tmp\""
-    node_selector:
-      workload: agents
-    tolerations:
-      - key: "dedicated"
-        operator: "Equal"
-        value: "agents"
-        effect: "NoSchedule"
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "512Mi"
-      limits:
-        cpu: "1"
-        memory: "1Gi"
     extra_labels:
       team: "platform"
     extra_annotations:
       owner: "oz"
     active_deadline_seconds: 1800
-    termination_grace_period_seconds: 45
     workspace_size_limit: "10Gi"
     unschedulable_timeout: "2m"
-    environment:
-      - name: SHARED_SECRET
-        value: "abc123"
+    pod_template:
+      serviceAccountName: "oz-agent-worker"
+      imagePullSecrets:
+        - name: "registry-creds"
+      nodeSelector:
+        workload: agents
+      containers:
+        - name: task
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          env:
+            - name: SHARED_SECRET
+              value: "abc123"
 `)
 
 	cfg, err := Load(path)
@@ -318,20 +318,21 @@ backend:
 	if cfg.Backend.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("preflight_image = %q, want %q", cfg.Backend.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
 	}
-	if len(cfg.Backend.Kubernetes.Tolerations) != 1 {
-		t.Errorf("tolerations count = %d, want 1", len(cfg.Backend.Kubernetes.Tolerations))
-	}
-	if got := cfg.Backend.Kubernetes.Resources.Requests["memory"]; got != "512Mi" {
-		t.Errorf("resources.requests.memory = %q, want %q", got, "512Mi")
-	}
 	if cfg.Backend.Kubernetes.WorkspaceSizeLimit != "10Gi" {
 		t.Fatalf("workspace_size_limit = %v, want 10Gi", cfg.Backend.Kubernetes.WorkspaceSizeLimit)
 	}
 	if cfg.Backend.Kubernetes.UnschedulableTimeout == nil || *cfg.Backend.Kubernetes.UnschedulableTimeout != "2m" {
 		t.Fatalf("unschedulable_timeout = %v, want 2m", cfg.Backend.Kubernetes.UnschedulableTimeout)
 	}
-	if len(cfg.Backend.Kubernetes.Environment) != 1 {
-		t.Errorf("environment count = %d, want 1", len(cfg.Backend.Kubernetes.Environment))
+	if cfg.Backend.Kubernetes.PodTemplate == nil {
+		t.Fatal("expected pod_template to be non-nil")
+	}
+	podTemplateYAML, err := yaml.Marshal(cfg.Backend.Kubernetes.PodTemplate.Node)
+	if err != nil {
+		t.Fatalf("failed to marshal pod_template: %v", err)
+	}
+	if !strings.Contains(string(podTemplateYAML), "serviceAccountName: \"oz-agent-worker\"") {
+		t.Fatalf("expected pod_template to retain serviceAccountName, got:\n%s", string(podTemplateYAML))
 	}
 }
 
@@ -435,24 +436,34 @@ backend:
 	}
 }
 
-func TestLoadPodTemplateWithLegacyFieldsErrors(t *testing.T) {
-	path := writeTestConfig(t, `
+func TestLoadLegacyKubernetesFieldRejected(t *testing.T) {
+	tests := []string{
+		"image_pull_secret",
+		"service_account",
+		"node_selector",
+		"tolerations",
+		"resources",
+		"termination_grace_period_seconds",
+		"environment",
+	}
+
+	for _, field := range tests {
+		t.Run(field, func(t *testing.T) {
+			path := writeTestConfig(t, `
 worker_id: "k8s-worker"
 backend:
   kubernetes:
-    namespace: "agents"
-    node_selector:
-      workload: agents
-    pod_template:
-      serviceAccountName: my-sa
+    `+field+`: {}
 `)
 
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error when pod_template and node_selector are both set")
-	}
-	if !strings.Contains(err.Error(), "pod_template cannot be combined with legacy scheduling fields") {
-		t.Errorf("unexpected error message: %v", err)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected error for removed kubernetes field %q", field)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Fatalf("expected error to mention %q, got %v", field, err)
+			}
+		})
 	}
 }
 

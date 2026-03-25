@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 func resetCLIForTest() {
@@ -34,6 +35,20 @@ func int64Ptr(v int64) *int64 {
 	return &v
 }
 
+func rawYAMLNodeFromString(t *testing.T, content string) *config.RawYAMLNode {
+	t.Helper()
+
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
+		t.Fatalf("failed to unmarshal raw YAML node: %v", err)
+	}
+	if len(node.Content) == 0 {
+		t.Fatal("expected raw YAML node content")
+	}
+
+	return &config.RawYAMLNode{Node: node.Content[0]}
+}
+
 func TestMergeConfigKubernetesFromFile(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
@@ -51,31 +66,25 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 				PreflightImage:  "registry.internal/platform/preflight:1.0",
 				SetupCommand:    "setup.sh",
 				TeardownCommand: "teardown.sh",
-				NodeSelector: map[string]string{
-					"pool": "agents",
-				},
-				Tolerations: []config.KubernetesTolerationConfig{
-					{Key: "dedicated", Operator: "Equal", Value: "agents", Effect: "NoSchedule"},
-				},
-				Resources: config.KubernetesResourcesConfig{
-					Requests: map[string]string{
-						"cpu": "500m",
-					},
-				},
 				ExtraLabels: map[string]string{
 					"team": "platform",
 				},
 				ExtraAnnotations: map[string]string{
 					"owner": "oz",
 				},
-				ActiveDeadlineSeconds:         int64Ptr(900),
-				TerminationGracePeriodSeconds: int64Ptr(30),
-				WorkspaceSizeLimit:            "8Gi",
-				UnschedulableTimeout:          stringPtr("2m"),
-				Environment: []config.EnvEntry{
-					{Name: "FILE_ONLY", Value: stringPtr("1")},
-					{Name: "OVERRIDE", Value: stringPtr("file")},
-				},
+				ActiveDeadlineSeconds: int64Ptr(900),
+				WorkspaceSizeLimit:    "8Gi",
+				UnschedulableTimeout:  stringPtr("2m"),
+				PodTemplate: rawYAMLNodeFromString(t, `
+serviceAccountName: task-runner
+imagePullSecrets:
+  - name: registry-creds
+containers:
+  - name: task
+    env:
+      - name: FROM_TEMPLATE
+        value: "1"
+`),
 			},
 		},
 	}
@@ -100,20 +109,26 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 	if wc.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("PreflightImage = %q, want %q", wc.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
 	}
-	if wc.Kubernetes.Env["FILE_ONLY"] != "1" {
-		t.Errorf("FILE_ONLY = %q, want %q", wc.Kubernetes.Env["FILE_ONLY"], "1")
+	if wc.Kubernetes.TaskEnv["CLI_ONLY"] != "1" {
+		t.Errorf("CLI_ONLY = %q, want %q", wc.Kubernetes.TaskEnv["CLI_ONLY"], "1")
 	}
-	if wc.Kubernetes.Env["CLI_ONLY"] != "1" {
-		t.Errorf("CLI_ONLY = %q, want %q", wc.Kubernetes.Env["CLI_ONLY"], "1")
-	}
-	if wc.Kubernetes.Env["OVERRIDE"] != "cli" {
-		t.Errorf("OVERRIDE = %q, want %q", wc.Kubernetes.Env["OVERRIDE"], "cli")
+	if wc.Kubernetes.TaskEnv["OVERRIDE"] != "cli" {
+		t.Errorf("OVERRIDE = %q, want %q", wc.Kubernetes.TaskEnv["OVERRIDE"], "cli")
 	}
 	if wc.Kubernetes.WorkspaceSizeLimit == nil || wc.Kubernetes.WorkspaceSizeLimit.String() != "8Gi" {
 		t.Fatalf("WorkspaceSizeLimit = %v, want 8Gi", wc.Kubernetes.WorkspaceSizeLimit)
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 2*time.Minute {
 		t.Fatalf("UnschedulableTimeout = %v, want 2m", wc.Kubernetes.UnschedulableTimeout)
+	}
+	if wc.Kubernetes.PodTemplate == nil {
+		t.Fatal("expected PodTemplate to be set")
+	}
+	if wc.Kubernetes.PodTemplate.ServiceAccountName != "task-runner" {
+		t.Fatalf("ServiceAccountName = %q, want %q", wc.Kubernetes.PodTemplate.ServiceAccountName, "task-runner")
+	}
+	if len(wc.Kubernetes.PodTemplate.ImagePullSecrets) != 1 || wc.Kubernetes.PodTemplate.ImagePullSecrets[0].Name != "registry-creds" {
+		t.Fatalf("ImagePullSecrets = %+v, want registry-creds", wc.Kubernetes.PodTemplate.ImagePullSecrets)
 	}
 }
 
@@ -130,11 +145,7 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 		WorkerID: "file-worker",
 		Cleanup:  boolPtr(true),
 		Backend: config.BackendConfig{
-			Kubernetes: &config.KubernetesConfig{
-				Environment: []config.EnvEntry{
-					{Name: "FROM_FILE", Value: stringPtr("1")},
-				},
-			},
+			Kubernetes: &config.KubernetesConfig{},
 		},
 	}
 
@@ -152,11 +163,8 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	if !wc.Kubernetes.NoCleanup {
 		t.Error("expected CLI --no-cleanup to take precedence")
 	}
-	if wc.Kubernetes.Env["FROM_FILE"] != "1" {
-		t.Errorf("FROM_FILE = %q, want %q", wc.Kubernetes.Env["FROM_FILE"], "1")
-	}
-	if wc.Kubernetes.Env["FROM_CLI"] != "1" {
-		t.Errorf("FROM_CLI = %q, want %q", wc.Kubernetes.Env["FROM_CLI"], "1")
+	if wc.Kubernetes.TaskEnv["FROM_CLI"] != "1" {
+		t.Errorf("FROM_CLI = %q, want %q", wc.Kubernetes.TaskEnv["FROM_CLI"], "1")
 	}
 }
 
