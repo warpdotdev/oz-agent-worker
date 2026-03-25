@@ -7,16 +7,21 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
+	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	sigsk8syaml "sigs.k8s.io/yaml"
 )
 
 var CLI struct {
 	ConfigFile         string   `help:"Path to YAML config file" type:"path"`
-	Backend            string   `help:"Backend type (docker or direct)" enum:"docker,direct," default:""`
+	Backend            string   `help:"Backend type (docker, direct, or kubernetes)" enum:"docker,direct,kubernetes," default:""`
 	APIKey             string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID           string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL       string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -102,6 +107,8 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if backendType == "" && fileConfig != nil {
 		if fileConfig.Backend.Direct != nil {
 			backendType = "direct"
+		} else if fileConfig.Backend.Kubernetes != nil {
+			backendType = "kubernetes"
 		} else if fileConfig.Backend.Docker != nil {
 			backendType = "docker"
 		}
@@ -143,6 +150,77 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	}
 
 	switch backendType {
+	case "kubernetes":
+		var (
+			namespace             string
+			kubeconfig            string
+			imagePullPolicy       string
+			preflightImage        string
+			setupCmd              string
+			teardownCmd           string
+			extraLabels           map[string]string
+			extraAnnotations      map[string]string
+			activeDeadlineSeconds *int64
+			workspaceSizeLimit    *resource.Quantity
+			unschedulableTimeout  *time.Duration
+			podTemplate           *corev1.PodSpec
+		)
+
+		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
+			kc := fileConfig.Backend.Kubernetes
+			namespace = kc.Namespace
+			kubeconfig = kc.Kubeconfig
+			imagePullPolicy = kc.ImagePullPolicy
+			preflightImage = kc.PreflightImage
+			setupCmd = kc.SetupCommand
+			teardownCmd = kc.TeardownCommand
+			extraLabels = copyStringMap(kc.ExtraLabels)
+			extraAnnotations = copyStringMap(kc.ExtraAnnotations)
+			activeDeadlineSeconds = kc.ActiveDeadlineSeconds
+			if kc.WorkspaceSizeLimit != "" {
+				quantity, err := resource.ParseQuantity(kc.WorkspaceSizeLimit)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.workspace_size_limit %q: %w", kc.WorkspaceSizeLimit, err)
+				}
+				workspaceSizeLimit = &quantity
+			}
+			if kc.UnschedulableTimeout != nil {
+				duration, err := time.ParseDuration(*kc.UnschedulableTimeout)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.unschedulable_timeout %q: %w", *kc.UnschedulableTimeout, err)
+				}
+				unschedulableTimeout = &duration
+			}
+			if kc.PodTemplate != nil {
+				yamlBytes, err := yaml.Marshal(kc.PodTemplate.Node)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("failed to marshal backend.kubernetes.pod_template: %w", err)
+				}
+				var ps corev1.PodSpec
+				if err := sigsk8syaml.Unmarshal(yamlBytes, &ps); err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.pod_template: %w", err)
+				}
+				podTemplate = &ps
+			}
+		}
+
+		wc.Kubernetes = &worker.KubernetesBackendConfig{
+			WorkerID:              workerID,
+			Namespace:             namespace,
+			Kubeconfig:            kubeconfig,
+			ImagePullPolicy:       imagePullPolicy,
+			PreflightImage:        preflightImage,
+			SetupCommand:          setupCmd,
+			TeardownCommand:       teardownCmd,
+			NoCleanup:             noCleanup,
+			ExtraLabels:           extraLabels,
+			ExtraAnnotations:      extraAnnotations,
+			ActiveDeadlineSeconds: activeDeadlineSeconds,
+			WorkspaceSizeLimit:    workspaceSizeLimit,
+			UnschedulableTimeout:  unschedulableTimeout,
+			TaskEnv:               copyStringMap(cliEnv),
+			PodTemplate:           podTemplate,
+		}
 	case "direct":
 		// Merge env: config file first, then CLI overlay.
 		mergedEnv := make(map[string]string)
@@ -229,4 +307,15 @@ func parseEnvFlags(raw []string) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func copyStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }

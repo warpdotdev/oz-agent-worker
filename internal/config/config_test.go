@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeTestConfig(t *testing.T, content string) string {
@@ -260,6 +263,93 @@ backend:
 	}
 }
 
+func TestLoadValidKubernetesConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "kubernetes-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+    kubeconfig: "/tmp/kubeconfig"
+    image_pull_policy: "IfNotPresent"
+    preflight_image: "registry.internal/platform/preflight:1.0"
+    setup_command: "printf 'SETUP=done\n' > \"$OZ_ENVIRONMENT_FILE\""
+    teardown_command: "rm -rf \"$OZ_WORKSPACE_ROOT/tmp\""
+    extra_labels:
+      team: "platform"
+    extra_annotations:
+      owner: "oz"
+    active_deadline_seconds: 1800
+    workspace_size_limit: "10Gi"
+    unschedulable_timeout: "2m"
+    pod_template:
+      serviceAccountName: "oz-agent-worker"
+      imagePullSecrets:
+        - name: "registry-creds"
+      nodeSelector:
+        workload: agents
+      containers:
+        - name: task
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          env:
+            - name: SHARED_SECRET
+              value: "abc123"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend to be set")
+	}
+	if cfg.Backend.Kubernetes.Namespace != "agents" {
+		t.Errorf("namespace = %q, want %q", cfg.Backend.Kubernetes.Namespace, "agents")
+	}
+	if cfg.Backend.Kubernetes.ImagePullPolicy != "IfNotPresent" {
+		t.Errorf("image_pull_policy = %q, want %q", cfg.Backend.Kubernetes.ImagePullPolicy, "IfNotPresent")
+	}
+	if cfg.Backend.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
+		t.Errorf("preflight_image = %q, want %q", cfg.Backend.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
+	}
+	if cfg.Backend.Kubernetes.WorkspaceSizeLimit != "10Gi" {
+		t.Fatalf("workspace_size_limit = %v, want 10Gi", cfg.Backend.Kubernetes.WorkspaceSizeLimit)
+	}
+	if cfg.Backend.Kubernetes.UnschedulableTimeout == nil || *cfg.Backend.Kubernetes.UnschedulableTimeout != "2m" {
+		t.Fatalf("unschedulable_timeout = %v, want 2m", cfg.Backend.Kubernetes.UnschedulableTimeout)
+	}
+	if cfg.Backend.Kubernetes.PodTemplate == nil {
+		t.Fatal("expected pod_template to be non-nil")
+	}
+	podTemplateYAML, err := yaml.Marshal(cfg.Backend.Kubernetes.PodTemplate.Node)
+	if err != nil {
+		t.Fatalf("failed to marshal pod_template: %v", err)
+	}
+	if !strings.Contains(string(podTemplateYAML), "serviceAccountName: \"oz-agent-worker\"") {
+		t.Fatalf("expected pod_template to retain serviceAccountName, got:\n%s", string(podTemplateYAML))
+	}
+}
+
+func TestLoadInvalidKubernetesPullPolicy(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "kubernetes-worker"
+backend:
+  kubernetes:
+    image_pull_policy: "Sometimes"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid kubernetes image_pull_policy")
+	}
+}
+
 func TestLoadBothBackendsError(t *testing.T) {
 	path := writeTestConfig(t, `
 backend:
@@ -312,6 +402,69 @@ worker_id: "test"
 			t.Errorf("expected idle_on_complete to be nil, got %q", *cfg.IdleOnComplete)
 		}
 	})
+}
+
+func TestLoadValidKubernetesPodTemplateConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+    pod_template:
+      nodeSelector:
+        workload: agents
+      containers:
+        - name: task
+          env:
+            - name: SECRET_VALUE
+              valueFrom:
+                secretKeyRef:
+                  name: my-secret
+                  key: value
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend to be set")
+	}
+	if cfg.Backend.Kubernetes.PodTemplate == nil {
+		t.Fatal("expected pod_template to be non-nil")
+	}
+}
+
+func TestLoadLegacyKubernetesFieldRejected(t *testing.T) {
+	tests := []string{
+		"image_pull_secret",
+		"service_account",
+		"node_selector",
+		"tolerations",
+		"resources",
+		"termination_grace_period_seconds",
+		"environment",
+	}
+
+	for _, field := range tests {
+		t.Run(field, func(t *testing.T) {
+			path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    `+field+`: {}
+`)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected error for removed kubernetes field %q", field)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Fatalf("expected error to mention %q, got %v", field, err)
+			}
+		})
+	}
 }
 
 func TestLoadMaxConcurrentTasks(t *testing.T) {

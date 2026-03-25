@@ -28,8 +28,9 @@ type FileConfig struct {
 // BackendConfig contains the backend selection.
 // At most one backend field may be non-nil; configuring multiple backends simultaneously is an error.
 type BackendConfig struct {
-	Docker *DockerConfig `yaml:"docker"`
-	Direct *DirectConfig `yaml:"direct"`
+	Docker     *DockerConfig     `yaml:"docker"`
+	Direct     *DirectConfig     `yaml:"direct"`
+	Kubernetes *KubernetesConfig `yaml:"kubernetes"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
@@ -46,6 +47,40 @@ type DirectConfig struct {
 	SetupCommand    string     `yaml:"setup_command"`
 	TeardownCommand string     `yaml:"teardown_command"`
 	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+}
+
+// KubernetesConfig holds Kubernetes-backend-specific configuration.
+type KubernetesConfig struct {
+	Namespace             string            `yaml:"namespace"`
+	Kubeconfig            string            `yaml:"kubeconfig"`
+	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
+	SetupCommand          string            `yaml:"setup_command"`
+	TeardownCommand       string            `yaml:"teardown_command"`
+	ExtraLabels           map[string]string `yaml:"extra_labels"`
+	ExtraAnnotations      map[string]string `yaml:"extra_annotations"`
+	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
+	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
+	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
+	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
+	// required fields at runtime. Declarative task Job configuration such as
+	// serviceAccountName, imagePullSecrets, node selectors, tolerations,
+	// resources, and env must be configured here.
+	PodTemplate *RawYAMLNode `yaml:"pod_template"`
+}
+
+// RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation
+// to its content. This is necessary because gopkg.in/yaml.v3's strict KnownFields
+// mode would otherwise try to match Kubernetes field names against yaml.Node's own
+// struct fields rather than treating the sub-tree as opaque YAML.
+type RawYAMLNode struct {
+	Node *yaml.Node
+}
+
+// UnmarshalYAML captures the raw YAML node, bypassing KnownFields strict validation.
+func (r *RawYAMLNode) UnmarshalYAML(value *yaml.Node) error {
+	r.Node = value
+	return nil
 }
 
 // EnvEntry represents a single environment variable in the config file.

@@ -1,0 +1,81 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: warpdotdev/oz-agent-worker
+  # Set this explicitly to a published worker image tag for each install.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+warp:
+  apiKeySecret:
+    create: false
+    name: oz-agent-worker
+    key: WARP_API_KEY
+    value: ""
+  webSocketURL: wss://oz.warp.dev/api/v1/selfhosted/worker/ws
+  serverRootURL: https://app.warp.dev
+
+worker:
+  workerId: ""
+  logLevel: info
+  cleanup: true
+  maxConcurrentTasks: 0
+  idleOnComplete: ""
+  extraArgs: []
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  # Liveness probe for the long-lived worker process. The default checks that
+  # PID 1 is still running. Override with an httpGet probe if you add a health
+  # endpoint to the worker.
+  livenessProbe:
+    exec:
+      command: ["/bin/sh", "-c", "kill -0 1"]
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    failureThreshold: 3
+  # Conservative starting requests for the long-lived worker Deployment.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+kubernetesBackend:
+  namespace: ""
+  imagePullPolicy: IfNotPresent
+  preflightImage: ""
+  setupCommand: ""
+  teardownCommand: ""
+  extraLabels: {}
+  extraAnnotations: {}
+  activeDeadlineSeconds: null
+  workspaceSizeLimit: ""
+  unschedulableTimeout: "30s"
+  # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
+  # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
+  # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
+  podTemplate: {}

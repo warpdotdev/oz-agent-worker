@@ -20,9 +20,10 @@ const (
 	MaxReconnectDelay     = 60 * time.Second
 	ReconnectBackoffRate  = 2.0
 
-	HeartbeatInterval = 30 * time.Second
-	PongWait          = 60 * time.Second
-	WriteWait         = 10 * time.Second
+	HeartbeatInterval      = 30 * time.Second
+	PongWait               = 60 * time.Second
+	WriteWait              = 10 * time.Second
+	BackendShutdownTimeout = 10 * time.Second
 )
 
 type Config struct {
@@ -31,15 +32,16 @@ type Config struct {
 	WebSocketURL       string
 	ServerRootURL      string
 	LogLevel           string
-	BackendType        string // "docker" or "direct"
+	BackendType        string // "docker", "direct", or "kubernetes"
 	MaxConcurrentTasks int    // 0 means unlimited
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
-	Docker *DockerBackendConfig
-	Direct *DirectBackendConfig
+	Docker     *DockerBackendConfig
+	Direct     *DirectBackendConfig
+	Kubernetes *KubernetesBackendConfig
 }
 
 type Worker struct {
@@ -64,6 +66,11 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	var err error
 
 	switch config.BackendType {
+	case "kubernetes":
+		if config.Kubernetes == nil {
+			config.Kubernetes = &KubernetesBackendConfig{}
+		}
+		backend, err = NewKubernetesBackend(ctx, *config.Kubernetes)
 	case "direct":
 		if config.Direct == nil {
 			cancel()
@@ -527,8 +534,9 @@ func (w *Worker) Shutdown() {
 	}
 
 	w.cancel()
-
-	w.backend.Shutdown(w.ctx)
+	backendShutdownCtx, backendShutdownCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+	defer backendShutdownCancel()
+	w.backend.Shutdown(backendShutdownCtx)
 
 	w.connMutex.Lock()
 	if w.conn != nil {
