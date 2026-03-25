@@ -5,10 +5,11 @@ go 1.26.0
 require (
 	github.com/alecthomas/kong v1.13.0
 	github.com/distribution/reference v0.6.0
-	github.com/docker/cli v29.1.3+incompatible
+	github.com/docker/cli v29.2.0+incompatible
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/go-playground/validator/v10 v10.30.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/joho/godotenv v1.5.1
 	github.com/rs/zerolog v1.31.0
 	golang.org/x/sync v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -35,7 +36,6 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/golang/protobuf v1.5.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
