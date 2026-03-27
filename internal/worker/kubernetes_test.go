@@ -219,8 +219,8 @@ func TestWatchJobReturnsWatchInterface(t *testing.T) {
 	// The fake client's watch should be open (channel not closed).
 	select {
 	case _, ok := <-watcher.ResultChan():
-		if ok {
-			// Got an event — fine for the fake client.
+		if !ok {
+			t.Fatal("watch channel unexpectedly closed")
 		}
 	case <-time.After(50 * time.Millisecond):
 		// No events yet — expected for an empty cluster.

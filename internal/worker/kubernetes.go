@@ -503,7 +503,7 @@ func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
 	}
 	if sizeLimit != nil {
 		copy := sizeLimit.DeepCopy()
-		volume.VolumeSource.EmptyDir.SizeLimit = &copy
+		volume.EmptyDir.SizeLimit = &copy
 	}
 	return volume
 }
