@@ -21,6 +21,9 @@ type FileConfig struct {
 	// conversation finishes, to allow follow-up interactions via the shared session.
 	// Uses humantime format (e.g. "45m", "10m", "0s"). When nil, the oz CLI default
 	// of 45 minutes is used.
+	// TODO: Remove idle_on_complete from worker config/schema after task-level
+	// config.idle_timeout_minutes is fully rolled out and legacy worker-level
+	// overrides are no longer needed.
 	IdleOnComplete *string       `yaml:"idle_on_complete"`
 	Backend        BackendConfig `yaml:"backend"`
 }

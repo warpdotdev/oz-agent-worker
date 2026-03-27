@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
@@ -12,6 +13,7 @@ import (
 type TaskAugmentOptions struct {
 	// IdleOnComplete is passed to --idle-on-complete. Empty string uses the oz CLI default
 	// (45m). Use "0s" to exit immediately after the conversation finishes.
+	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
 }
 
@@ -66,13 +68,28 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	// Keep the agent alive after task completion to allow follow-ups.
-	// If no duration is configured, pass the flag without a value so the oz CLI
-	// uses its default of 45 minutes.
-	if opts.IdleOnComplete == "" {
+	// Priority: task config idle_timeout_minutes > worker IdleOnComplete > oz CLI default (45m).
+	idleOnComplete, hasIdleOnCompleteValue := resolveIdleOnComplete(task, opts)
+	if !hasIdleOnCompleteValue {
 		args = append(args, "--idle-on-complete")
 	} else {
-		args = append(args, "--idle-on-complete", opts.IdleOnComplete)
+		args = append(args, "--idle-on-complete", idleOnComplete)
 	}
 
 	return args
+}
+
+func resolveIdleOnComplete(task *types.Task, opts TaskAugmentOptions) (string, bool) {
+	if task != nil &&
+		task.AgentConfigSnapshot != nil &&
+		task.AgentConfigSnapshot.IdleTimeoutMinutes != nil &&
+		*task.AgentConfigSnapshot.IdleTimeoutMinutes > 0 {
+		return fmt.Sprintf("%dm", *task.AgentConfigSnapshot.IdleTimeoutMinutes), true
+	}
+
+	if opts.IdleOnComplete != "" {
+		return opts.IdleOnComplete, true
+	}
+
+	return "", false
 }
