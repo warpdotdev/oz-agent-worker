@@ -74,6 +74,7 @@ type AmbientAgentConfig struct {
 	SkillSpec          *string                    `json:"skill_spec,omitempty"`
 	MCPServers         map[string]json.RawMessage `json:"mcp_servers,omitempty"`
 	ComputerUseEnabled *bool                      `json:"computer_use_enabled,omitempty"`
+	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
 }
 
 // Task represents an ambient agent job.

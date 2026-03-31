@@ -128,7 +128,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	if err := envFile.Close(); err != nil {
 		return fmt.Errorf("failed to close environment file: %w", err)
 	}
-	defer os.Remove(envFilePath)
+	defer func() {
+		if err := os.Remove(envFilePath); err != nil && !os.IsNotExist(err) {
+			log.Warnf(ctx, "Failed to remove environment file %s: %v", envFilePath, err)
+		}
+	}()
 
 	// 3. Build environment variables: common + config-level.
 	envVars := make([]string, len(params.EnvVars))
