@@ -17,7 +17,15 @@ const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
 // defaultInheritedEnvVars are the host environment variables passed through to
 // tasks and scripts by default. Sensitive worker credentials are intentionally
 // excluded; additional variables can be opted in via the backend config.
-var defaultInheritedEnvVars = []string{"HOME", "TMPDIR", "PATH"}
+//
+// Proxy env vars are included so that the oz CLI inherits the worker's proxy
+// configuration automatically, avoiding manual config duplication when the
+// worker is deployed behind an HTTP egress proxy.
+var defaultInheritedEnvVars = []string{
+	"HOME", "TMPDIR", "PATH",
+	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+	"http_proxy", "https_proxy", "no_proxy",
+}
 
 // hostBaseEnv builds a minimal env slice from the host, containing only the
 // keys listed in defaultInheritedEnvVars.
