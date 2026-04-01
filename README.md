@@ -61,6 +61,7 @@ backend:
   kubernetes:
     kubeconfig: "/path/to/kubeconfig"
     namespace: "agents"
+    default_image: "my-registry.io/dev-image:latest"
     unschedulable_timeout: "2m"
     pod_template:
       nodeSelector:
@@ -75,6 +76,7 @@ backend:
 
 Notes:
 
+- `default_image` sets the Docker image for task Jobs when no Warp environment is configured on the run; this lets you skip creating a Warp environment entirely if all your tasks use the same base image (precedence: Warp environment image > `default_image` > `ubuntu:22.04`)
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
