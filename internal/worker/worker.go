@@ -400,7 +400,6 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 
 // defaultImageForTask returns the Docker image to use for a task, applying the
 // precedence: server-provided > worker config default_image > hardcoded fallback.
-// Exported for testing.
 func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) string {
 	if assignmentImage != "" {
 		return assignmentImage
