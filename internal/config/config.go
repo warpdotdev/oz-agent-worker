@@ -56,6 +56,7 @@ type DirectConfig struct {
 type KubernetesConfig struct {
 	Namespace             string            `yaml:"namespace"`
 	Kubeconfig            string            `yaml:"kubeconfig"`
+	DefaultImage          string            `yaml:"default_image" validate:"omitempty,no_whitespace"`
 	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SetupCommand          string            `yaml:"setup_command"`

@@ -49,6 +49,7 @@ type KubernetesBackendConfig struct {
 	WorkerID              string
 	Namespace             string
 	Kubeconfig            string
+	DefaultImage          string
 	ImagePullPolicy       string
 	PreflightImage        string
 	SetupCommand          string
