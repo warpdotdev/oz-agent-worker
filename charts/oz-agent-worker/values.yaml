@@ -66,6 +66,7 @@ worker:
 
 kubernetesBackend:
   namespace: ""
+  defaultImage: ""
   imagePullPolicy: IfNotPresent
   preflightImage: ""
   setupCommand: ""

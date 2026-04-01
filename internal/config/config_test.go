@@ -436,6 +436,56 @@ backend:
 	}
 }
 
+func TestLoadKubernetesDefaultImage(t *testing.T) {
+	t.Run("parses default_image when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    default_image: "my-registry.io/custom-image:latest"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backend.Kubernetes == nil {
+			t.Fatal("expected kubernetes backend to be set")
+		}
+		if cfg.Backend.Kubernetes.DefaultImage != "my-registry.io/custom-image:latest" {
+			t.Errorf("default_image = %q, want %q", cfg.Backend.Kubernetes.DefaultImage, "my-registry.io/custom-image:latest")
+		}
+	})
+
+	t.Run("default_image is empty when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backend.Kubernetes.DefaultImage != "" {
+			t.Errorf("expected default_image to be empty, got %q", cfg.Backend.Kubernetes.DefaultImage)
+		}
+	})
+
+	t.Run("rejects default_image with whitespace", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    default_image: "my image:latest"
+`)
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for default_image with whitespace")
+		}
+	})
+}
+
 func TestLoadLegacyKubernetesFieldRejected(t *testing.T) {
 	tests := []string{
 		"image_pull_secret",

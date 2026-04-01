@@ -154,6 +154,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		var (
 			namespace             string
 			kubeconfig            string
+			defaultImage          string
 			imagePullPolicy       string
 			preflightImage        string
 			setupCmd              string
@@ -170,6 +171,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			kc := fileConfig.Backend.Kubernetes
 			namespace = kc.Namespace
 			kubeconfig = kc.Kubeconfig
+			defaultImage = kc.DefaultImage
 			imagePullPolicy = kc.ImagePullPolicy
 			preflightImage = kc.PreflightImage
 			setupCmd = kc.SetupCommand
@@ -208,6 +210,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			WorkerID:              workerID,
 			Namespace:             namespace,
 			Kubeconfig:            kubeconfig,
+			DefaultImage:          defaultImage,
 			ImagePullPolicy:       imagePullPolicy,
 			PreflightImage:        preflightImage,
 			SetupCommand:          setupCmd,

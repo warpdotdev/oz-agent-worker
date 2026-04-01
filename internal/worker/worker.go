@@ -347,17 +347,9 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *TaskParams {
 	task := assignment.Task
 
-	// Resolve Docker image with default fallback.
-	dockerImage := assignment.DockerImage
-	if dockerImage == "" {
-		dockerImage = "ubuntu:22.04"
-		if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
-			log.Warnf(w.ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
-				*task.AgentConfigSnapshot.EnvironmentID, dockerImage)
-		} else {
-			log.Infof(w.ctx, "No environment specified, using default image: %s", dockerImage)
-		}
-	}
+	// Resolve Docker image.
+	// Precedence: server-provided image (from environment) > worker config default_image > hardcoded ubuntu:22.04.
+	dockerImage := w.defaultImageForTask(assignment.DockerImage, task)
 
 	// Build common environment variables.
 	envVars := []string{
@@ -404,6 +396,27 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage: dockerImage,
 		Sidecars:    sidecars,
 	}
+}
+
+// defaultImageForTask returns the Docker image to use for a task, applying the
+// precedence: server-provided > worker config default_image > hardcoded fallback.
+// Exported for testing.
+func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) string {
+	if assignmentImage != "" {
+		return assignmentImage
+	}
+	if w.config.Kubernetes != nil && w.config.Kubernetes.DefaultImage != "" {
+		log.Infof(w.ctx, "Using worker-configured default image: %s", w.config.Kubernetes.DefaultImage)
+		return w.config.Kubernetes.DefaultImage
+	}
+	fallback := "ubuntu:22.04"
+	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
+		log.Warnf(w.ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
+			*task.AgentConfigSnapshot.EnvironmentID, fallback)
+	} else {
+		log.Infof(w.ctx, "No environment specified, using default image: %s", fallback)
+	}
+	return fallback
 }
 
 func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
