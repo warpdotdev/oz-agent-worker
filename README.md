@@ -80,8 +80,9 @@ Notes:
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
-- the Kubernetes backend requires creating Pods with a root init container to materialize sidecars into `emptyDir` volumes
-- the worker runs a short-lived startup preflight Job and waits for either preflight Pod creation or an early controller failure, so incompatible Pod Security or admission policy failures surface before the worker starts accepting tasks
+- the Kubernetes backend mounts task sidecars with native image volumes; sidecar mounts are read-only, and Kubernetes/runtime support for the built-in `ImageVolume` Pod volume source is required
+- Kubernetes `1.35+` is the recommended and tested target for this image-volume path; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes
+- the worker runs a short-lived startup preflight Job and waits for either preflight success or an early controller, mount, or admission failure, so incompatible cluster/runtime policy failures surface before the worker starts accepting tasks
 - `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
@@ -143,7 +144,7 @@ Recommended namespace-scoped permissions for the worker are:
 - get `pods/log`
 - list `events`
 
-The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root, but the task namespace must still allow creating Jobs with a root init container, since sidecar materialization currently depends on that pattern. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
+The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root, and task Jobs mount sidecars via native image volumes instead of root init containers. Kubernetes `1.35+` is the recommended and tested target for this path; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
 
 ### Go Install
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -455,7 +456,156 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 		t.Fatalf("FROM_CLI = %q, want %q", envMap["FROM_CLI"], "1")
 	}
 }
-func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
+func TestValidateTaskSidecarsRejectsReadWriteMounts(t *testing.T) {
+	err := validateTaskSidecars([]types.SidecarMount{
+		{
+			Image:     "registry.internal/agent:1.0",
+			MountPath: "/agent",
+			ReadWrite: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected read-write sidecar validation failure")
+	}
+	if !strings.Contains(err.Error(), "read-write mount") {
+		t.Fatalf("expected read-write validation detail, got %v", err)
+	}
+}
+
+func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobComplete,
+					Status: corev1.ConditionTrue,
+				},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			SetupCommand:    "true",
+			ImagePullPolicy: string(corev1.PullAlways),
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+		Sidecars: []types.SidecarMount{
+			{
+				Image:     "registry.internal/agent:1.0",
+				MountPath: "/agent",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task job to be created")
+	}
+
+	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
+		t.Fatalf("expected only setup init container, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
+	}
+	if createdJob.Spec.Template.Spec.InitContainers[0].Name != "setup" {
+		t.Fatalf("expected setup init container, got %q", createdJob.Spec.Template.Spec.InitContainers[0].Name)
+	}
+	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
+		t.Fatalf("expected workspace and sidecar image volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
+	}
+
+	var sidecarVolume *corev1.Volume
+	for i := range createdJob.Spec.Template.Spec.Volumes {
+		if createdJob.Spec.Template.Spec.Volumes[i].Name == "sidecar-0-image" {
+			sidecarVolume = &createdJob.Spec.Template.Spec.Volumes[i]
+			break
+		}
+	}
+	if sidecarVolume == nil {
+		t.Fatal("expected sidecar image volume to be present")
+	}
+	if sidecarVolume.Image == nil {
+		t.Fatalf("expected image volume source, got %+v", sidecarVolume.VolumeSource)
+	}
+	if sidecarVolume.Image.Reference != "registry.internal/agent:1.0" {
+		t.Fatalf("image volume reference = %q, want %q", sidecarVolume.Image.Reference, "registry.internal/agent:1.0")
+	}
+	if sidecarVolume.Image.PullPolicy != corev1.PullAlways {
+		t.Fatalf("image volume pullPolicy = %q, want %q", sidecarVolume.Image.PullPolicy, corev1.PullAlways)
+	}
+
+	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	var taskSidecarMount *corev1.VolumeMount
+	for i := range taskContainer.VolumeMounts {
+		if taskContainer.VolumeMounts[i].Name == "sidecar-0-image" {
+			taskSidecarMount = &taskContainer.VolumeMounts[i]
+			break
+		}
+	}
+	if taskSidecarMount == nil {
+		t.Fatal("expected task container sidecar mount")
+	}
+	if taskSidecarMount.MountPath != "/agent" {
+		t.Fatalf("task sidecar mount path = %q, want %q", taskSidecarMount.MountPath, "/agent")
+	}
+	if !taskSidecarMount.ReadOnly {
+		t.Fatal("expected task sidecar mount to be read-only")
+	}
+
+	setupContainer := createdJob.Spec.Template.Spec.InitContainers[0]
+	var setupSidecarMount *corev1.VolumeMount
+	for i := range setupContainer.VolumeMounts {
+		if setupContainer.VolumeMounts[i].Name == "sidecar-0-image" {
+			setupSidecarMount = &setupContainer.VolumeMounts[i]
+			break
+		}
+	}
+	if setupSidecarMount == nil {
+		t.Fatal("expected setup init container sidecar mount")
+	}
+	if !setupSidecarMount.ReadOnly {
+		t.Fatal("expected setup sidecar mount to be read-only")
+	}
+}
+
+func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"
 	var createdJob *batchv1.Job
@@ -472,20 +622,38 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 		if got := createAction.GetCreateOptions().DryRun; len(got) != 0 {
 			t.Fatalf("expected real create without dry-run options, got %v", got)
 		}
-		if len(job.Spec.Template.Spec.InitContainers) != 1 {
-			t.Fatalf("expected one init container, got %d", len(job.Spec.Template.Spec.InitContainers))
+		if len(job.Spec.Template.Spec.InitContainers) != 0 {
+			t.Fatalf("expected no init containers, got %d", len(job.Spec.Template.Spec.InitContainers))
 		}
-		if job.Spec.Template.Spec.InitContainers[0].Image != preflightImage {
-			t.Fatalf("init container image = %q, want %q", job.Spec.Template.Spec.InitContainers[0].Image, preflightImage)
+		if len(job.Spec.Template.Spec.Volumes) != 1 {
+			t.Fatalf("expected one preflight image volume, got %d", len(job.Spec.Template.Spec.Volumes))
 		}
-		if job.Spec.Template.Spec.InitContainers[0].SecurityContext == nil || job.Spec.Template.Spec.InitContainers[0].SecurityContext.RunAsUser == nil || *job.Spec.Template.Spec.InitContainers[0].SecurityContext.RunAsUser != 0 {
-			t.Fatalf("expected root init container security context, got %+v", job.Spec.Template.Spec.InitContainers[0].SecurityContext)
+		if job.Spec.Template.Spec.Volumes[0].Name != startupPreflightImageVolumeName {
+			t.Fatalf("volume name = %q, want %q", job.Spec.Template.Spec.Volumes[0].Name, startupPreflightImageVolumeName)
+		}
+		if job.Spec.Template.Spec.Volumes[0].Image == nil {
+			t.Fatalf("expected preflight image volume source, got %+v", job.Spec.Template.Spec.Volumes[0].VolumeSource)
+		}
+		if job.Spec.Template.Spec.Volumes[0].Image.Reference != preflightImage {
+			t.Fatalf("image volume reference = %q, want %q", job.Spec.Template.Spec.Volumes[0].Image.Reference, preflightImage)
 		}
 		if len(job.Spec.Template.Spec.Containers) != 1 {
 			t.Fatalf("expected one main container, got %d", len(job.Spec.Template.Spec.Containers))
 		}
 		if job.Spec.Template.Spec.Containers[0].Image != preflightImage {
 			t.Fatalf("main container image = %q, want %q", job.Spec.Template.Spec.Containers[0].Image, preflightImage)
+		}
+		if len(job.Spec.Template.Spec.Containers[0].VolumeMounts) != 1 {
+			t.Fatalf("expected one main container volume mount, got %d", len(job.Spec.Template.Spec.Containers[0].VolumeMounts))
+		}
+		if job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name != startupPreflightImageVolumeName {
+			t.Fatalf("volumeMount name = %q, want %q", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name, startupPreflightImageVolumeName)
+		}
+		if job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath != startupPreflightImageMountPath {
+			t.Fatalf("volumeMount path = %q, want %q", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath, startupPreflightImageMountPath)
+		}
+		if !job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly {
+			t.Fatal("expected preflight volume mount to be read-only")
 		}
 		if job.Spec.Template.Spec.ServiceAccountName != "oz-agent-worker" {
 			t.Fatalf("serviceAccountName = %q, want %q", job.Spec.Template.Spec.ServiceAccountName, "oz-agent-worker")
@@ -497,6 +665,19 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 		createdJob.UID = "preflight-job-uid"
 
 		return true, createdJob, nil
+	})
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			t.Fatal("expected preflight job to be created before getting job state")
+		}
+		completedJob := createdJob.DeepCopy()
+		completedJob.Status.Conditions = []batchv1.JobCondition{
+			{
+				Type:   batchv1.JobComplete,
+				Status: corev1.ConditionTrue,
+			},
+		}
+		return true, completedJob, nil
 	})
 	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if createdJob == nil {
@@ -511,6 +692,9 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 						Labels: map[string]string{
 							"job-name": createdJob.Name,
 						},
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodSucceeded,
 					},
 				},
 			},
@@ -540,6 +724,82 @@ func TestRunStartupPreflightCreatesRealJobAndWaitsForPodCreation(t *testing.T) {
 	}
 }
 
+func TestRunStartupPreflightFailsOnFailedMountEvent(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		createdJob.UID = "preflight-job-uid"
+		return true, createdJob, nil
+	})
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			t.Fatal("expected preflight job to be created before getting job state")
+		}
+		return true, createdJob.DeepCopy(), nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			t.Fatal("expected preflight job to be created before listing pods")
+		}
+		return true, &corev1.PodList{
+			Items: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "preflight-pod",
+						Namespace: "agents",
+						UID:       "preflight-pod-uid",
+						Labels: map[string]string{
+							"job-name": createdJob.Name,
+						},
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodPending,
+					},
+				},
+			},
+		}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{
+			Items: []corev1.Event{
+				{
+					Reason:  "FailedMount",
+					Message: "MountVolume.SetUp failed for volume \"preflight-image\": image volumes are not supported on this node",
+				},
+			},
+		}, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: "registry.internal/platform/preflight:1.0",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.runStartupPreflight(context.Background())
+	if err == nil {
+		t.Fatal("expected preflight failure")
+	}
+	if !strings.Contains(err.Error(), "failed to mount a volume") {
+		t.Fatalf("expected mount failure detail, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "startup preflight failed") {
+		t.Fatalf("expected wrapped startup preflight error, got %v", err)
+	}
+}
+
 func TestRunStartupPreflightFailsOnFailedCreateEvent(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -553,6 +813,16 @@ func TestRunStartupPreflightFailsOnFailedCreateEvent(t *testing.T) {
 		}
 		job = job.DeepCopy()
 		job.UID = "preflight-job-uid"
+		return true, job, nil
+	})
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "preflight-job",
+				Namespace: "agents",
+				UID:       "preflight-job-uid",
+			},
+		}
 		return true, job, nil
 	})
 	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
