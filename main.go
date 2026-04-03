@@ -156,6 +156,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			kubeconfig            string
 			defaultImage          string
 			imagePullPolicy       string
+			useImageVolumes       bool
 			preflightImage        string
 			setupCmd              string
 			teardownCmd           string
@@ -173,6 +174,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			kubeconfig = kc.Kubeconfig
 			defaultImage = kc.DefaultImage
 			imagePullPolicy = kc.ImagePullPolicy
+			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
@@ -212,6 +214,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			Kubeconfig:            kubeconfig,
 			DefaultImage:          defaultImage,
 			ImagePullPolicy:       imagePullPolicy,
+			UseImageVolumes:       useImageVolumes,
 			PreflightImage:        preflightImage,
 			SetupCommand:          setupCmd,
 			TeardownCommand:       teardownCmd,

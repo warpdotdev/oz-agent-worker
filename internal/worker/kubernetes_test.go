@@ -61,6 +61,23 @@ func TestKubernetesBackendBaseLabelsIncludeStableHashes(t *testing.T) {
 	}
 }
 
+func TestKubernetesSidecarMaterializationScriptMatchesExpectedShell(t *testing.T) {
+	expected := strings.Join([]string{
+		"tar \\",
+		"  --exclude=./target \\",
+		"  --exclude=./proc \\",
+		"  --exclude=./sys \\",
+		"  --exclude=./dev \\",
+		"  --exclude=./.dockerenv \\",
+		"  --exclude=./var/run/secrets \\",
+		"  --exclude=./run/secrets \\",
+		"  -C / -cf - . | tar --no-same-owner --no-same-permissions -C /target -xf -",
+	}, "\n")
+	if script := kubernetesSidecarMaterializationScript(); script != expected {
+		t.Fatalf("unexpected materialization script:\n%s", script)
+	}
+}
+
 func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	ctx := context.Background()
@@ -456,14 +473,27 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 		t.Fatalf("FROM_CLI = %q, want %q", envMap["FROM_CLI"], "1")
 	}
 }
-func TestValidateTaskSidecarsRejectsReadWriteMounts(t *testing.T) {
+func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
 	err := validateTaskSidecars([]types.SidecarMount{
 		{
 			Image:     "registry.internal/agent:1.0",
 			MountPath: "/agent",
 			ReadWrite: true,
 		},
-	})
+	}, false)
+	if err != nil {
+		t.Fatalf("expected read-write sidecar to be allowed by default, got %v", err)
+	}
+}
+
+func TestValidateTaskSidecarsRejectsReadWriteMountsWhenImageVolumesEnabled(t *testing.T) {
+	err := validateTaskSidecars([]types.SidecarMount{
+		{
+			Image:     "registry.internal/agent:1.0",
+			MountPath: "/agent",
+			ReadWrite: true,
+		},
+	}, true)
 	if err == nil {
 		t.Fatal("expected read-write sidecar validation failure")
 	}
@@ -517,8 +547,9 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		config: KubernetesBackendConfig{
 			WorkerID:        "worker-123",
 			Namespace:       "agents",
-			SetupCommand:    "true",
 			ImagePullPolicy: string(corev1.PullAlways),
+			SetupCommand:    "true",
+			UseImageVolumes: true,
 		},
 		clientset: fakeClient,
 	}
@@ -602,6 +633,206 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if !setupSidecarMount.ReadOnly {
 		t.Fatal("expected setup sidecar mount to be read-only")
+	}
+}
+
+func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobComplete,
+					Status: corev1.ConditionTrue,
+				},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			ImagePullPolicy: string(corev1.PullAlways),
+			SetupCommand:    "true",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+		Sidecars: []types.SidecarMount{
+			{
+				Image:     "registry.internal/agent:1.0",
+				MountPath: "/agent",
+				ReadWrite: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task job to be created")
+	}
+
+	if len(createdJob.Spec.Template.Spec.InitContainers) != 2 {
+		t.Fatalf("expected copy init container plus setup, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
+	}
+	copyInit := createdJob.Spec.Template.Spec.InitContainers[0]
+	if copyInit.Name != "copy-sidecar-0" {
+		t.Fatalf("expected copy-sidecar init container, got %q", copyInit.Name)
+	}
+	if copyInit.Image != "registry.internal/agent:1.0" {
+		t.Fatalf("copy init image = %q, want %q", copyInit.Image, "registry.internal/agent:1.0")
+	}
+	if copyInit.SecurityContext == nil || copyInit.SecurityContext.RunAsUser == nil || *copyInit.SecurityContext.RunAsUser != 0 {
+		t.Fatalf("expected root copy init security context, got %+v", copyInit.SecurityContext)
+	}
+	if len(copyInit.VolumeMounts) != 1 || copyInit.VolumeMounts[0].MountPath != sidecarCopyTargetMountPath {
+		t.Fatalf("expected copy init to mount %q, got %+v", sidecarCopyTargetMountPath, copyInit.VolumeMounts)
+	}
+
+	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
+		t.Fatalf("expected workspace and copied sidecar data volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
+	}
+	var sidecarVolume *corev1.Volume
+	for i := range createdJob.Spec.Template.Spec.Volumes {
+		if createdJob.Spec.Template.Spec.Volumes[i].Name == "sidecar-0-data" {
+			sidecarVolume = &createdJob.Spec.Template.Spec.Volumes[i]
+			break
+		}
+	}
+	if sidecarVolume == nil {
+		t.Fatal("expected copied sidecar data volume to be present")
+	}
+	if sidecarVolume.EmptyDir == nil {
+		t.Fatalf("expected emptyDir sidecar volume, got %+v", sidecarVolume.VolumeSource)
+	}
+	if sidecarVolume.Image != nil {
+		t.Fatalf("expected no image volume on default path, got %+v", sidecarVolume.Image)
+	}
+
+	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	var taskSidecarMount *corev1.VolumeMount
+	for i := range taskContainer.VolumeMounts {
+		if taskContainer.VolumeMounts[i].Name == "sidecar-0-data" {
+			taskSidecarMount = &taskContainer.VolumeMounts[i]
+			break
+		}
+	}
+	if taskSidecarMount == nil {
+		t.Fatal("expected task container copied sidecar mount")
+	}
+	if taskSidecarMount.MountPath != "/agent" {
+		t.Fatalf("task sidecar mount path = %q, want %q", taskSidecarMount.MountPath, "/agent")
+	}
+	if taskSidecarMount.ReadOnly {
+		t.Fatal("expected task sidecar mount to remain writable on default path")
+	}
+}
+
+func TestRunStartupPreflightCreatesLegacyRootInitJobAndWaitsForPodCreationByDefault(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	const preflightImage = "registry.internal/platform/preflight:1.0"
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		if len(job.Spec.Template.Spec.InitContainers) != 1 {
+			t.Fatalf("expected one legacy init container, got %d", len(job.Spec.Template.Spec.InitContainers))
+		}
+		if job.Spec.Template.Spec.InitContainers[0].Name != "root-init-preflight" {
+			t.Fatalf("init container name = %q, want %q", job.Spec.Template.Spec.InitContainers[0].Name, "root-init-preflight")
+		}
+		if job.Spec.Template.Spec.InitContainers[0].Image != preflightImage {
+			t.Fatalf("init container image = %q, want %q", job.Spec.Template.Spec.InitContainers[0].Image, preflightImage)
+		}
+		if job.Spec.Template.Spec.InitContainers[0].SecurityContext == nil || job.Spec.Template.Spec.InitContainers[0].SecurityContext.RunAsUser == nil || *job.Spec.Template.Spec.InitContainers[0].SecurityContext.RunAsUser != 0 {
+			t.Fatalf("expected root init security context, got %+v", job.Spec.Template.Spec.InitContainers[0].SecurityContext)
+		}
+		if len(job.Spec.Template.Spec.Volumes) != 0 {
+			t.Fatalf("expected no image volumes on legacy path, got %d", len(job.Spec.Template.Spec.Volumes))
+		}
+		createdJob = job.DeepCopy()
+		createdJob.UID = "preflight-job-uid"
+		return true, createdJob, nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			t.Fatal("expected preflight job to be created before listing pods")
+		}
+		return true, &corev1.PodList{
+			Items: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "preflight-pod",
+						Namespace: "agents",
+						Labels: map[string]string{
+							"job-name": createdJob.Name,
+						},
+					},
+				},
+			},
+		}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{}, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: preflightImage,
+			PodTemplate: &corev1.PodSpec{
+				ServiceAccountName: "oz-agent-worker",
+				ImagePullSecrets: []corev1.LocalObjectReference{
+					{Name: "registry-creds"},
+				},
+			},
+		},
+		clientset: fakeClient,
+	}
+
+	if err := backend.runStartupPreflight(context.Background()); err != nil {
+		t.Fatalf("unexpected preflight error: %v", err)
 	}
 }
 
@@ -706,9 +937,10 @@ func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:       "worker-123",
-			Namespace:      "agents",
-			PreflightImage: preflightImage,
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			PreflightImage:  preflightImage,
+			UseImageVolumes: true,
 			PodTemplate: &corev1.PodSpec{
 				ServiceAccountName: "oz-agent-worker",
 				ImagePullSecrets: []corev1.LocalObjectReference{
@@ -781,9 +1013,10 @@ func TestRunStartupPreflightFailsOnFailedMountEvent(t *testing.T) {
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:       "worker-123",
-			Namespace:      "agents",
-			PreflightImage: "registry.internal/platform/preflight:1.0",
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			PreflightImage:  "registry.internal/platform/preflight:1.0",
+			UseImageVolumes: true,
 		},
 		clientset: fakeClient,
 	}

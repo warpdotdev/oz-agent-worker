@@ -58,6 +58,7 @@ type KubernetesConfig struct {
 	Kubeconfig            string            `yaml:"kubeconfig"`
 	DefaultImage          string            `yaml:"default_image" validate:"omitempty,no_whitespace"`
 	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	UseImageVolumes       bool              `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SetupCommand          string            `yaml:"setup_command"`
 	TeardownCommand       string            `yaml:"teardown_command"`

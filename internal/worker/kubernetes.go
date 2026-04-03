@@ -32,6 +32,7 @@ const (
 	startupPreflightPollInterval     = 500 * time.Millisecond
 	startupPreflightTimeout          = 15 * time.Second
 	kubernetesBackendTypeName        = "kubernetes"
+	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
 	startupPreflightImageVolumeName  = "preflight-image"
 	startupPreflightImageMountPath   = "/preflight-image"
@@ -52,6 +53,7 @@ type KubernetesBackendConfig struct {
 	Kubeconfig            string
 	DefaultImage          string
 	ImagePullPolicy       string
+	UseImageVolumes       bool
 	PreflightImage        string
 	SetupCommand          string
 	TeardownCommand       string
@@ -117,7 +119,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
-	if err := validateTaskSidecars(params.Sidecars); err != nil {
+	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return err
 	}
 
@@ -154,16 +156,55 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	var initContainers []corev1.Container
 	for i, sidecar := range params.Sidecars {
-		volumeName := fmt.Sprintf("sidecar-%d-image", i)
-		volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
+		if b.config.UseImageVolumes {
+			volumeName := fmt.Sprintf("sidecar-%d-image", i)
+			volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
 
-		volumeMount := corev1.VolumeMount{
-			Name:      volumeName,
-			MountPath: sidecar.MountPath,
-			ReadOnly:  true,
+			volumeMount := corev1.VolumeMount{
+				Name:      volumeName,
+				MountPath: sidecar.MountPath,
+				ReadOnly:  true,
+			}
+			mainVolumeMounts = append(mainVolumeMounts, volumeMount)
+			setupVolumeMounts = append(setupVolumeMounts, volumeMount)
+			continue
 		}
-		mainVolumeMounts = append(mainVolumeMounts, volumeMount)
-		setupVolumeMounts = append(setupVolumeMounts, volumeMount)
+
+		dataVolumeName := fmt.Sprintf("sidecar-%d-data", i)
+		volumes = append(volumes, corev1.Volume{
+			Name: dataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+		initContainers = append(initContainers, corev1.Container{
+			Name:            fmt.Sprintf("copy-sidecar-%d", i),
+			Image:           sidecar.Image,
+			ImagePullPolicy: pullPolicy,
+			Command: []string{
+				"/bin/sh",
+				"-c",
+				kubernetesSidecarMaterializationScript(),
+			},
+			SecurityContext: rootSecurityContext(),
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      dataVolumeName,
+					MountPath: sidecarCopyTargetMountPath,
+				},
+			},
+		})
+
+		mainVolumeMounts = append(mainVolumeMounts, corev1.VolumeMount{
+			Name:      dataVolumeName,
+			MountPath: sidecar.MountPath,
+			ReadOnly:  !sidecar.ReadWrite,
+		})
+		setupVolumeMounts = append(setupVolumeMounts, corev1.VolumeMount{
+			Name:      dataVolumeName,
+			MountPath: sidecar.MountPath,
+			ReadOnly:  !sidecar.ReadWrite,
+		})
 	}
 
 	if b.config.SetupCommand != "" {
@@ -497,7 +538,7 @@ func workspaceVolumeName() string {
 	return "workspace"
 }
 
-func validateTaskSidecars(sidecars []types.SidecarMount) error {
+func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) error {
 	seenMountPaths := make(map[string]bool)
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
@@ -512,7 +553,7 @@ func validateTaskSidecars(sidecars []types.SidecarMount) error {
 		if seenMountPaths[sidecar.MountPath] {
 			return fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
 		}
-		if sidecar.ReadWrite {
+		if useImageVolumes && sidecar.ReadWrite {
 			return fmt.Errorf("additional sidecar %s cannot request a read-write mount: kubernetes image volumes are read-only", sidecar.Image)
 		}
 		seenMountPaths[sidecar.MountPath] = true
@@ -550,22 +591,42 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
-	podSpec.InitContainers = nil
-	podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
-	podSpec.Containers = []corev1.Container{
-		{
-			Name:            "main",
-			Image:           b.config.PreflightImage,
-			ImagePullPolicy: pullPolicy,
-			Command:         []string{"/bin/sh", "-c", "test -d " + startupPreflightImageMountPath},
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      startupPreflightImageVolumeName,
-					MountPath: startupPreflightImageMountPath,
-					ReadOnly:  true,
+	if b.config.UseImageVolumes {
+		podSpec.InitContainers = nil
+		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
+		podSpec.Containers = []corev1.Container{
+			{
+				Name:            "main",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "test -d " + startupPreflightImageMountPath},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      startupPreflightImageVolumeName,
+						MountPath: startupPreflightImageMountPath,
+						ReadOnly:  true,
+					},
 				},
 			},
-		},
+		}
+	} else {
+		podSpec.InitContainers = []corev1.Container{
+			{
+				Name:            "root-init-preflight",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "true"},
+				SecurityContext: rootSecurityContext(),
+			},
+		}
+		podSpec.Containers = []corev1.Container{
+			{
+				Name:            "main",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "true"},
+			},
+		}
 	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -583,6 +644,57 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 }
 
 func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+	if b.config.UseImageVolumes {
+		return b.waitForImageVolumeStartupPreflight(logCtx, ctx, job)
+	}
+	return b.waitForLegacyStartupPreflight(logCtx, ctx, job)
+}
+
+func (b *KubernetesBackend) waitForLegacyStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+	podSelector := fmt.Sprintf("job-name=%s", job.Name)
+	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
+	ticker := time.NewTicker(startupPreflightPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("timed out waiting for startup preflight Job %q to create a Pod or surface a controller failure", job.Name)
+			}
+			return ctx.Err()
+		default:
+		}
+
+		pods, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: podSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight Pods: %w", err)
+		}
+		if len(pods.Items) > 0 {
+			return nil
+		}
+
+		events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: eventSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight events: %w", err)
+		}
+		if err := startupPreflightFailureFromEvents(job.Name, events.Items); err != nil {
+			log.Warnf(logCtx, "Startup preflight Job %s failed before creating a Pod: %v", job.Name, err)
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *KubernetesBackend) waitForImageVolumeStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
 	podSelector := fmt.Sprintf("job-name=%s", job.Name)
 	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
 	ticker := time.NewTicker(startupPreflightPollInterval)
@@ -660,7 +772,10 @@ func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) er
 }
 
 func (b *KubernetesBackend) startupPreflightError(err error) error {
-	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs that mount sidecars via image volumes; verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
+	if b.config.UseImageVolumes {
+		return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs that mount sidecars via image volumes; verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
+	}
+	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 
 func (b *KubernetesBackend) baseLabels(taskID string) map[string]string {
@@ -931,6 +1046,20 @@ func kubernetesTaskWrapperScript() string {
 	}, "\n")
 }
 
+func kubernetesSidecarMaterializationScript() string {
+	return strings.Join([]string{
+		"tar \\",
+		"  --exclude=./target \\",
+		"  --exclude=./proc \\",
+		"  --exclude=./sys \\",
+		"  --exclude=./dev \\",
+		"  --exclude=./.dockerenv \\",
+		"  --exclude=./var/run/secrets \\",
+		"  --exclude=./run/secrets \\",
+		"  -C / -cf - . | tar --no-same-owner --no-same-permissions -C /target -xf -",
+	}, "\n")
+}
+
 // mergeKubernetesEnvVars merges base and override env var slices.
 // Override entries take precedence on name conflict.
 func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
@@ -948,6 +1077,15 @@ func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return result
+}
+
+func rootSecurityContext() *corev1.SecurityContext {
+	rootUser := int64(0)
+	rootGroup := int64(0)
+	return &corev1.SecurityContext{
+		RunAsUser:  &rootUser,
+		RunAsGroup: &rootGroup,
+	}
 }
 
 func (b *KubernetesBackend) shouldFailUnschedulablePod(pod *corev1.Pod) bool {
