@@ -68,6 +68,7 @@ kubernetesBackend:
   namespace: ""
   defaultImage: ""
   imagePullPolicy: IfNotPresent
+  useImageVolumes: false
   preflightImage: ""
   setupCommand: ""
   teardownCommand: ""

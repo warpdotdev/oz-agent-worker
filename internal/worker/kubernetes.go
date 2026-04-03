@@ -34,6 +34,8 @@ const (
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
+	startupPreflightImageVolumeName  = "preflight-image"
+	startupPreflightImageMountPath   = "/preflight-image"
 	kubernetesWorkerIDLabel          = "oz-worker-id"
 	kubernetesWorkerHashLabel        = "oz-worker-hash"
 	kubernetesTaskIDLabel            = "oz-task-id"
@@ -51,6 +53,7 @@ type KubernetesBackendConfig struct {
 	Kubeconfig            string
 	DefaultImage          string
 	ImagePullPolicy       string
+	UseImageVolumes       bool
 	PreflightImage        string
 	SetupCommand          string
 	TeardownCommand       string
@@ -116,7 +119,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
-	if err := validateTaskSidecars(params.Sidecars); err != nil {
+	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return err
 	}
 
@@ -152,11 +155,21 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	var initContainers []corev1.Container
-
-	// TODO(k8s-image-volumes): When Kubernetes image volumes (KEP-4639) reach GA,
-	// replace the tar-based init container materialization below with native image
-	// volume mounts, which would be faster and remove the root init container requirement.
 	for i, sidecar := range params.Sidecars {
+		if b.config.UseImageVolumes {
+			volumeName := fmt.Sprintf("sidecar-%d-image", i)
+			volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
+
+			volumeMount := corev1.VolumeMount{
+				Name:      volumeName,
+				MountPath: sidecar.MountPath,
+				ReadOnly:  true,
+			}
+			mainVolumeMounts = append(mainVolumeMounts, volumeMount)
+			setupVolumeMounts = append(setupVolumeMounts, volumeMount)
+			continue
+		}
+
 		dataVolumeName := fmt.Sprintf("sidecar-%d-data", i)
 		volumes = append(volumes, corev1.Volume{
 			Name: dataVolumeName,
@@ -509,11 +522,23 @@ func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
 	return volume
 }
 
+func imageVolume(name, reference string, pullPolicy corev1.PullPolicy) corev1.Volume {
+	return corev1.Volume{
+		Name: name,
+		VolumeSource: corev1.VolumeSource{
+			Image: &corev1.ImageVolumeSource{
+				Reference:  reference,
+				PullPolicy: pullPolicy,
+			},
+		},
+	}
+}
+
 func workspaceVolumeName() string {
 	return "workspace"
 }
 
-func validateTaskSidecars(sidecars []types.SidecarMount) error {
+func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) error {
 	seenMountPaths := make(map[string]bool)
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
@@ -527,6 +552,9 @@ func validateTaskSidecars(sidecars []types.SidecarMount) error {
 		}
 		if seenMountPaths[sidecar.MountPath] {
 			return fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
+		}
+		if useImageVolumes && sidecar.ReadWrite {
+			return fmt.Errorf("additional sidecar %s cannot request a read-write mount: kubernetes image volumes are read-only", sidecar.Image)
 		}
 		seenMountPaths[sidecar.MountPath] = true
 	}
@@ -563,22 +591,42 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
-	podSpec.InitContainers = []corev1.Container{
-		{
-			Name:            "root-init-preflight",
-			Image:           b.config.PreflightImage,
-			ImagePullPolicy: pullPolicy,
-			Command:         []string{"/bin/sh", "-c", "true"},
-			SecurityContext: rootSecurityContext(),
-		},
-	}
-	podSpec.Containers = []corev1.Container{
-		{
-			Name:            "main",
-			Image:           b.config.PreflightImage,
-			ImagePullPolicy: pullPolicy,
-			Command:         []string{"/bin/sh", "-c", "true"},
-		},
+	if b.config.UseImageVolumes {
+		podSpec.InitContainers = nil
+		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
+		podSpec.Containers = []corev1.Container{
+			{
+				Name:            "main",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "test -d " + startupPreflightImageMountPath},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      startupPreflightImageVolumeName,
+						MountPath: startupPreflightImageMountPath,
+						ReadOnly:  true,
+					},
+				},
+			},
+		}
+	} else {
+		podSpec.InitContainers = []corev1.Container{
+			{
+				Name:            "root-init-preflight",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "true"},
+				SecurityContext: rootSecurityContext(),
+			},
+		}
+		podSpec.Containers = []corev1.Container{
+			{
+				Name:            "main",
+				Image:           b.config.PreflightImage,
+				ImagePullPolicy: pullPolicy,
+				Command:         []string{"/bin/sh", "-c", "true"},
+			},
+		}
 	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -596,6 +644,13 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 }
 
 func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+	if b.config.UseImageVolumes {
+		return b.waitForImageVolumeStartupPreflight(logCtx, ctx, job)
+	}
+	return b.waitForLegacyStartupPreflight(logCtx, ctx, job)
+}
+
+func (b *KubernetesBackend) waitForLegacyStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
 	podSelector := fmt.Sprintf("job-name=%s", job.Name)
 	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
 	ticker := time.NewTicker(startupPreflightPollInterval)
@@ -639,6 +694,69 @@ func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context,
 	}
 }
 
+func (b *KubernetesBackend) waitForImageVolumeStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+	podSelector := fmt.Sprintf("job-name=%s", job.Name)
+	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
+	ticker := time.NewTicker(startupPreflightPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("timed out waiting for startup preflight Job %q to complete or surface a failure", job.Name)
+			}
+			return ctx.Err()
+		default:
+		}
+
+		jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, job.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get startup preflight Job: %w", err)
+		}
+		if jobComplete(jobState) {
+			return nil
+		}
+
+		pods, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: podSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight Pods: %w", err)
+		}
+		if len(pods.Items) > 0 {
+			for _, pod := range pods.Items {
+				if pod.Status.Phase == corev1.PodSucceeded {
+					return nil
+				}
+			}
+			if failure := b.detectPodFailure(logCtx, pods.Items); failure != nil {
+				log.Warnf(logCtx, "Startup preflight Job %s failed after creating a Pod: %v", job.Name, failure)
+				return failure
+			}
+		}
+		if jobFailed(jobState) {
+			return fmt.Errorf("startup preflight Job %q failed", job.Name)
+		}
+
+		events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: eventSelector,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list startup preflight events: %w", err)
+		}
+		if err := startupPreflightFailureFromEvents(job.Name, events.Items); err != nil {
+			log.Warnf(logCtx, "Startup preflight Job %s failed before creating a Pod: %v", job.Name, err)
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
 func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) error {
 	for _, event := range events {
 		if event.Type != corev1.EventTypeWarning || event.Reason != "FailedCreate" {
@@ -654,6 +772,9 @@ func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) er
 }
 
 func (b *KubernetesBackend) startupPreflightError(err error) error {
+	if b.config.UseImageVolumes {
+		return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs that mount sidecars via image volumes; verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
+	}
 	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 

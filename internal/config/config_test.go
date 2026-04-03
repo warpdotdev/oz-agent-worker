@@ -271,6 +271,7 @@ backend:
     namespace: "agents"
     kubeconfig: "/tmp/kubeconfig"
     image_pull_policy: "IfNotPresent"
+    use_image_volumes: true
     preflight_image: "registry.internal/platform/preflight:1.0"
     setup_command: "printf 'SETUP=done\n' > \"$OZ_ENVIRONMENT_FILE\""
     teardown_command: "rm -rf \"$OZ_WORKSPACE_ROOT/tmp\""
@@ -314,6 +315,9 @@ backend:
 	}
 	if cfg.Backend.Kubernetes.ImagePullPolicy != "IfNotPresent" {
 		t.Errorf("image_pull_policy = %q, want %q", cfg.Backend.Kubernetes.ImagePullPolicy, "IfNotPresent")
+	}
+	if !cfg.Backend.Kubernetes.UseImageVolumes {
+		t.Fatal("expected use_image_volumes to be true")
 	}
 	if cfg.Backend.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("preflight_image = %q, want %q", cfg.Backend.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")

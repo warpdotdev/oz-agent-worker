@@ -63,6 +63,7 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 				Namespace:       "agents",
 				Kubeconfig:      "/tmp/kubeconfig",
 				ImagePullPolicy: "IfNotPresent",
+				UseImageVolumes: true,
 				PreflightImage:  "registry.internal/platform/preflight:1.0",
 				SetupCommand:    "setup.sh",
 				TeardownCommand: "teardown.sh",
@@ -108,6 +109,9 @@ containers:
 	}
 	if wc.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("PreflightImage = %q, want %q", wc.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
+	}
+	if !wc.Kubernetes.UseImageVolumes {
+		t.Fatal("expected UseImageVolumes to be true")
 	}
 	if wc.Kubernetes.TaskEnv["CLI_ONLY"] != "1" {
 		t.Errorf("CLI_ONLY = %q, want %q", wc.Kubernetes.TaskEnv["CLI_ONLY"], "1")
