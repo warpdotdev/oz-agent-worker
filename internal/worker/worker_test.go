@@ -87,6 +87,66 @@ func TestDefaultImageForTask(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
+	newWorker := func(sidecarImage string) *Worker {
+		ctx := context.Background()
+		var k8sConfig *KubernetesBackendConfig
+		if sidecarImage != "" {
+			k8sConfig = &KubernetesBackendConfig{SidecarImage: sidecarImage}
+		} else {
+			k8sConfig = &KubernetesBackendConfig{}
+		}
+		return &Worker{
+			ctx: ctx,
+			config: Config{
+				Kubernetes: k8sConfig,
+			},
+		}
+	}
+
+	t.Run("config sidecar_image overrides server-provided image", func(t *testing.T) {
+		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:       "task-1",
+			Task:         &types.Task{ID: "task-1"},
+			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
+		})
+		if len(params.Sidecars) == 0 {
+			t.Fatal("expected at least one sidecar")
+		}
+		if params.Sidecars[0].Image != "my-registry.io/warpdotdev/warp-agent:latest" {
+			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "my-registry.io/warpdotdev/warp-agent:latest")
+		}
+	})
+
+	t.Run("server-provided image used when config sidecar_image empty", func(t *testing.T) {
+		w := newWorker("")
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:       "task-1",
+			Task:         &types.Task{ID: "task-1"},
+			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
+		})
+		if len(params.Sidecars) == 0 {
+			t.Fatal("expected at least one sidecar")
+		}
+		if params.Sidecars[0].Image != "docker.io/warpdotdev/warp-agent:latest" {
+			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "docker.io/warpdotdev/warp-agent:latest")
+		}
+	})
+
+	t.Run("no sidecar when server provides empty sidecar image", func(t *testing.T) {
+		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:       "task-1",
+			Task:         &types.Task{ID: "task-1"},
+			SidecarImage: "",
+		})
+		if len(params.Sidecars) != 0 {
+			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
+		}
+	})
+}
+
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}

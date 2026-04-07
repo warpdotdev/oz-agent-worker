@@ -158,6 +158,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy       string
 			useImageVolumes       bool
 			preflightImage        string
+			sidecarImage          string
 			setupCmd              string
 			teardownCmd           string
 			extraLabels           map[string]string
@@ -176,6 +177,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy = kc.ImagePullPolicy
 			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
+			sidecarImage = kc.SidecarImage
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
 			extraLabels = copyStringMap(kc.ExtraLabels)
@@ -216,6 +218,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ImagePullPolicy:       imagePullPolicy,
 			UseImageVolumes:       useImageVolumes,
 			PreflightImage:        preflightImage,
+			SidecarImage:          sidecarImage,
 			SetupCommand:          setupCmd,
 			TeardownCommand:       teardownCmd,
 			NoCleanup:             noCleanup,

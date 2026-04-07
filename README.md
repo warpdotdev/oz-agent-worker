@@ -80,6 +80,7 @@ Notes:
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
+- `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
 - by default, the Kubernetes backend materializes sidecars with root init containers into `emptyDir` volumes, matching the existing behavior
 - set `use_image_volumes: true` to opt into native image volumes for sidecars; in that mode, sidecar mounts are read-only and Kubernetes/runtime support for the built-in `ImageVolume` Pod volume source is required
 - Kubernetes `1.35+` is the recommended and tested target for `use_image_volumes: true`; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes

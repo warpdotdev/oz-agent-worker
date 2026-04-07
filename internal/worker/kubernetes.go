@@ -55,6 +55,7 @@ type KubernetesBackendConfig struct {
 	ImagePullPolicy       string
 	UseImageVolumes       bool
 	PreflightImage        string
+	SidecarImage          string
 	SetupCommand          string
 	TeardownCommand       string
 	NoCleanup             bool

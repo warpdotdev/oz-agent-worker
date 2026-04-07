@@ -24,6 +24,9 @@ data:
         {{- if .Values.kubernetesBackend.preflightImage }}
         preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}
         {{- end }}
+        {{- if .Values.kubernetesBackend.sidecarImage }}
+        sidecar_image: {{ .Values.kubernetesBackend.sidecarImage | quote }}
+        {{- end }}
         {{- if .Values.kubernetesBackend.setupCommand }}
         setup_command: |-
 {{ .Values.kubernetesBackend.setupCommand | indent 10 }}

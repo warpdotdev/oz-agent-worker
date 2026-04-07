@@ -70,6 +70,7 @@ kubernetesBackend:
   imagePullPolicy: IfNotPresent
   useImageVolumes: false
   preflightImage: ""
+  sidecarImage: ""
   setupCommand: ""
   teardownCommand: ""
   extraLabels: {}
