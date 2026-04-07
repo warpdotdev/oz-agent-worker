@@ -381,8 +381,13 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	// entrypoint.sh lives) comes first, followed by any additional sidecars.
 	var sidecars []types.SidecarMount
 	if assignment.SidecarImage != "" {
+		sidecarImage := assignment.SidecarImage
+		if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
+			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, w.config.Kubernetes.SidecarImage)
+			sidecarImage = w.config.Kubernetes.SidecarImage
+		}
 		sidecars = append(sidecars, types.SidecarMount{
-			Image:     assignment.SidecarImage,
+			Image:     sidecarImage,
 			MountPath: "/agent",
 		})
 	}
