@@ -37,6 +37,8 @@ type Config struct {
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
+	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
+	SessionSharingServerURL string
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -376,8 +378,11 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
 		IdleOnComplete: w.config.IdleOnComplete,
 	})
+	if w.config.SessionSharingServerURL != "" {
+		baseArgs = append(baseArgs, "--session-sharing-server-url", w.config.SessionSharingServerURL)
+	}
 
-	// Build a unified sidecar list: the Warp agent sidecar (mounted at /agent, where
+	// Build a unified sidecar list:
 	// entrypoint.sh lives) comes first, followed by any additional sidecars.
 	var sidecars []types.SidecarMount
 	if assignment.SidecarImage != "" {
