@@ -56,6 +56,26 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--idle-on-complete", "20m"},
 		},
 		{
+			name: "adds --harness when harness type is set",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: strPtr("claude")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--harness", "claude", "--idle-on-complete"},
+		},
+		{
+			name: "skips --harness when harness type is nil",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
 			name: "still appends other config-derived args before idle timeout",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{

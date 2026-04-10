@@ -58,6 +58,13 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 				args = append(args, "--no-computer-use")
 			}
 		}
+
+		// Pass harness setting if explicitly configured.
+		if task.AgentConfigSnapshot.Harness != nil && task.AgentConfigSnapshot.Harness.Type != nil {
+			if harness := strings.TrimSpace(*task.AgentConfigSnapshot.Harness.Type); harness != "" {
+				args = append(args, "--harness", harness)
+			}
+		}
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
