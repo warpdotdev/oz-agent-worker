@@ -69,6 +69,11 @@ type TaskDefinition struct {
 type Harness struct {
 	// Type is the name of the harness, e.g. "claude".
 	Type *string `json:"type,omitempty"`
+}
+
+// HarnessAuthSecrets holds authentication secrets for third-party harnesses.
+// Only the secret for the harness specified gets injected into the environment.
+type HarnessAuthSecrets struct {
 	// ClaudeAuthSecretName is the name of a managed secret for Claude Code harness authentication.
 	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
 }
@@ -84,6 +89,7 @@ type AmbientAgentConfig struct {
 	ComputerUseEnabled *bool                      `json:"computer_use_enabled,omitempty"`
 	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness            *Harness                   `json:"harness,omitempty"`
+	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
 }
 
 // Task represents an ambient agent job.
