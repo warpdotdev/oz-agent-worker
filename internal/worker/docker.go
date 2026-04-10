@@ -107,7 +107,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	}
 
 	// Build Docker-specific command: entrypoint prefix + base args.
-	cmd := append([]string{"/bin/sh", "/agent/entrypoint.sh"}, params.BaseArgs...)
+	cmd := append([]string{"/agent/entrypoint.sh"}, params.BaseArgs...)
 
 	log.Debugf(ctx, "Creating Docker container with image=%s", imageName)
 
