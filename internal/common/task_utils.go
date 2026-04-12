@@ -58,6 +58,11 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 				args = append(args, "--no-computer-use")
 			}
 		}
+
+		if task.AgentConfigSnapshot.UseAwsBedrockInference != nil &&
+			*task.AgentConfigSnapshot.UseAwsBedrockInference {
+			args = append(args, "--use-aws-bedrock-inference")
+		}
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {

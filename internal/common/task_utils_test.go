@@ -9,6 +9,7 @@ import (
 
 func strPtr(v string) *string { return &v }
 func intPtr(v int) *int       { return &v }
+func boolPtr(v bool) *bool    { return &v }
 
 func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 	baseArgs := []string{"agent", "run"}
@@ -65,6 +66,24 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			},
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--model", "claude-sonnet-4", "--idle-on-complete", "12m"},
+		},
+		{
+			name: "passes the Bedrock inference flag when enabled",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ModelID:                strPtr("claude-sonnet-4"),
+					UseAwsBedrockInference: boolPtr(true),
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent",
+				"run",
+				"--model",
+				"claude-sonnet-4",
+				"--use-aws-bedrock-inference",
+				"--idle-on-complete",
+			},
 		},
 	}
 

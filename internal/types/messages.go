@@ -67,14 +67,15 @@ type TaskDefinition struct {
 
 // AmbientAgentConfig represents the agent configuration
 type AmbientAgentConfig struct {
-	EnvironmentID      *string                    `json:"environment_id,omitempty"`
-	BasePrompt         *string                    `json:"base_prompt,omitempty"`
-	ModelID            *string                    `json:"model_id,omitempty"`
-	ProfileID          *string                    `json:"profile_id,omitempty"`
-	SkillSpec          *string                    `json:"skill_spec,omitempty"`
-	MCPServers         map[string]json.RawMessage `json:"mcp_servers,omitempty"`
-	ComputerUseEnabled *bool                      `json:"computer_use_enabled,omitempty"`
-	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
+	EnvironmentID          *string                    `json:"environment_id,omitempty"`
+	BasePrompt             *string                    `json:"base_prompt,omitempty"`
+	ModelID                *string                    `json:"model_id,omitempty"`
+	ProfileID              *string                    `json:"profile_id,omitempty"`
+	SkillSpec              *string                    `json:"skill_spec,omitempty"`
+	MCPServers             map[string]json.RawMessage `json:"mcp_servers,omitempty"`
+	ComputerUseEnabled     *bool                      `json:"computer_use_enabled,omitempty"`
+	UseAwsBedrockInference *bool                      `json:"use_aws_bedrock_inference,omitempty"`
+	IdleTimeoutMinutes     *int                       `json:"idle_timeout_minutes,omitempty"`
 }
 
 // Task represents an ambient agent job.
