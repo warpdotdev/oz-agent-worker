@@ -65,7 +65,20 @@ type TaskDefinition struct {
 	Prompt string `json:"prompt"`
 }
 
-// AmbientAgentConfig represents the agent configuration
+// Harness defines a third-party harness to run a cloud agent with.
+type Harness struct {
+	// Type is the name of the harness, e.g. "claude".
+	Type *string `json:"type,omitempty"`
+}
+
+// HarnessAuthSecrets holds authentication secrets for third-party harnesses.
+// Only the secret for the harness specified gets injected into the environment.
+type HarnessAuthSecrets struct {
+	// ClaudeAuthSecretName is the name of a managed secret for Claude Code harness authentication.
+	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
+}
+
+// AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
 	EnvironmentID      *string                    `json:"environment_id,omitempty"`
 	BasePrompt         *string                    `json:"base_prompt,omitempty"`
@@ -75,6 +88,8 @@ type AmbientAgentConfig struct {
 	MCPServers         map[string]json.RawMessage `json:"mcp_servers,omitempty"`
 	ComputerUseEnabled *bool                      `json:"computer_use_enabled,omitempty"`
 	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
+	Harness            *Harness                   `json:"harness,omitempty"`
+	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
 }
 
 // Task represents an ambient agent job.
