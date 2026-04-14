@@ -39,6 +39,9 @@ type Config struct {
 	IdleOnComplete string
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
+	// SkillsDirs is a list of local directories to scan for SKILL.md files.
+	// Discovered skills are reported to the server on each WebSocket connect.
+	SkillsDirs []string
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -130,6 +133,7 @@ func (w *Worker) Start() error {
 
 		w.reconnectDelay = InitialReconnectDelay
 
+		w.reportSkills()
 		w.run()
 	}
 }
@@ -534,6 +538,39 @@ func (w *Worker) sendMessage(message []byte) error {
 		return fmt.Errorf("timeout sending message")
 	case <-w.ctx.Done():
 		return fmt.Errorf("worker context cancelled")
+	}
+}
+
+// reportSkills scans the configured skills directories and sends a worker_skills
+// message to the server so they appear in the webapp's agent selector.
+func (w *Worker) reportSkills() {
+	if len(w.config.SkillsDirs) == 0 {
+		return
+	}
+
+	skills := scanSkillsDirs(w.ctx, w.config.SkillsDirs)
+	log.Infof(w.ctx, "Discovered %d skills from %d configured directories", len(skills), len(w.config.SkillsDirs))
+
+	msg := types.WorkerSkillsMessage{Skills: skills}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Errorf(w.ctx, "Failed to marshal worker skills message: %v", err)
+		return
+	}
+
+	wsMsg := types.WebSocketMessage{
+		Type: types.MessageTypeWorkerSkills,
+		Data: data,
+	}
+
+	msgBytes, err := json.Marshal(wsMsg)
+	if err != nil {
+		log.Errorf(w.ctx, "Failed to marshal websocket message: %v", err)
+		return
+	}
+
+	if err := w.sendMessage(msgBytes); err != nil {
+		log.Errorf(w.ctx, "Failed to send worker skills message: %v", err)
 	}
 }
 

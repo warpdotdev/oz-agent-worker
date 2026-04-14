@@ -31,6 +31,10 @@ worker:
   cleanup: true
   maxConcurrentTasks: 0
   idleOnComplete: ""
+  # skillsDirs is a list of local filesystem directories containing skill folders.
+  # Each directory should contain subdirectories with a SKILL.md file.
+  # Skills discovered here appear in the webapp's agent selector.
+  skillsDirs: []
   extraArgs: []
   deploymentAnnotations: {}
   podAnnotations: {}

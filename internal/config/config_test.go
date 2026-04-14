@@ -408,6 +408,43 @@ worker_id: "test"
 	})
 }
 
+func TestLoadSkillsDirs(t *testing.T) {
+	t.Run("parses skills_dirs when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+skills_dirs:
+  - /opt/skills
+  - /home/user/my-skills
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.SkillsDirs) != 2 {
+			t.Fatalf("skills_dirs count = %d, want 2", len(cfg.SkillsDirs))
+		}
+		if cfg.SkillsDirs[0] != "/opt/skills" {
+			t.Errorf("skills_dirs[0] = %q, want %q", cfg.SkillsDirs[0], "/opt/skills")
+		}
+		if cfg.SkillsDirs[1] != "/home/user/my-skills" {
+			t.Errorf("skills_dirs[1] = %q, want %q", cfg.SkillsDirs[1], "/home/user/my-skills")
+		}
+	})
+
+	t.Run("skills_dirs is nil when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.SkillsDirs != nil {
+			t.Errorf("expected skills_dirs to be nil, got %v", cfg.SkillsDirs)
+		}
+	})
+}
+
 func TestLoadValidKubernetesPodTemplateConfig(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "k8s-worker"

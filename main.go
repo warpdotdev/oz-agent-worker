@@ -139,6 +139,12 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		idleOnComplete = *fileConfig.IdleOnComplete
 	}
 
+	// Resolve skills_dirs from config file.
+	var skillsDirs []string
+	if fileConfig != nil {
+		skillsDirs = fileConfig.SkillsDirs
+	}
+
 	wc := worker.Config{
 		APIKey:                  CLI.APIKey,
 		WorkerID:                workerID,
@@ -149,6 +155,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		MaxConcurrentTasks:      maxConcurrentTasks,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
+		SkillsDirs:              skillsDirs,
 	}
 
 	switch backendType {
