@@ -110,7 +110,7 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 			TaskID:       "task-1",
 			Task:         &types.Task{ID: "task-1"},
 			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
+		}, "")
 		if len(params.Sidecars) == 0 {
 			t.Fatal("expected at least one sidecar")
 		}
@@ -125,7 +125,7 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 			TaskID:       "task-1",
 			Task:         &types.Task{ID: "task-1"},
 			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
+		}, "")
 		if len(params.Sidecars) == 0 {
 			t.Fatal("expected at least one sidecar")
 		}
@@ -140,7 +140,7 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 			TaskID:       "task-1",
 			Task:         &types.Task{ID: "task-1"},
 			SidecarImage: "",
-		})
+		}, "")
 		if len(params.Sidecars) != 0 {
 			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
 		}

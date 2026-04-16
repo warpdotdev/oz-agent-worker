@@ -29,6 +29,14 @@ type SidecarMount struct {
 	ReadWrite bool   `json:"read_write"` // If false (default), the mount is read-only.
 }
 
+// AttachmentDownload contains information needed to download a single task attachment.
+type AttachmentDownload struct {
+	AttachmentID string `json:"attachment_id"`
+	Filename     string `json:"filename"`
+	MimeType     string `json:"mime_type"`
+	DownloadURL  string `json:"download_url"`
+}
+
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
 	TaskID      string `json:"task_id"`
@@ -40,6 +48,9 @@ type TaskAssignmentMessage struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
+	// Attachments contains presigned download URLs for task attachments.
+	// The worker should download these files before starting the agent.
+	Attachments []AttachmentDownload `json:"attachments,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
