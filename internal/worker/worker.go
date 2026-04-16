@@ -21,6 +21,7 @@ const (
 	ReconnectBackoffRate  = 2.0
 
 	HeartbeatInterval      = 30 * time.Second
+	SkillsRefreshInterval  = 60 * time.Second
 	PongWait               = 60 * time.Second
 	WriteWait              = 10 * time.Second
 	BackendShutdownTimeout = 10 * time.Second
@@ -184,6 +185,7 @@ func (w *Worker) run() {
 	go w.readLoop(done)
 	go w.writeLoop(done)
 	go w.heartbeatLoop(done)
+	go w.skillsRefreshLoop(done)
 
 	<-done
 
@@ -292,6 +294,28 @@ func (w *Worker) heartbeatLoop(done chan struct{}) {
 				log.Errorf(w.ctx, "Failed to send ping: %v", err)
 				return
 			}
+		}
+	}
+}
+
+// skillsRefreshLoop periodically re-sends the worker_skills message to the server
+// so the Redis TTL is refreshed before expiry.
+func (w *Worker) skillsRefreshLoop(done chan struct{}) {
+	if len(w.config.SkillsDirs) == 0 {
+		return
+	}
+
+	ticker := time.NewTicker(SkillsRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			w.reportSkills()
 		}
 	}
 }
