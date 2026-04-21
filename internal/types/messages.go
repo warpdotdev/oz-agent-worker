@@ -78,6 +78,24 @@ type HarnessAuthSecrets struct {
 	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
 }
 
+// AccessLevel is the serialized access-level string used inside SessionSharingConfig.
+// Values mirror warp-server's model/types/enums.AccessLevel JSON representation.
+type AccessLevel string
+
+const (
+	AccessLevelViewer AccessLevel = "VIEWER"
+	AccessLevelEditor AccessLevel = "EDITOR"
+)
+
+// SessionSharingConfig mirrors warp-server's sources.SessionSharingConfig and
+// carries the session-sharing choices snapshotted onto the run.
+type SessionSharingConfig struct {
+	// PublicAccess, when set, causes the worker to emit --share public:<level>
+	// so the bundled Warp client applies an anyone-with-link ACL after the
+	// shared session bootstraps.
+	PublicAccess *AccessLevel `json:"public_access,omitempty"`
+}
+
 // AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
 	EnvironmentID      *string                    `json:"environment_id,omitempty"`
@@ -90,6 +108,7 @@ type AmbientAgentConfig struct {
 	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness            *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
+	SessionSharing     *SessionSharingConfig      `json:"session_sharing,omitempty"`
 }
 
 // Task represents an ambient agent job.
