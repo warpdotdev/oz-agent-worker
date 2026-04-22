@@ -40,6 +40,8 @@ type TaskAssignmentMessage struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
+	// ConversationID is the UUID of an existing AI conversation to continue.
+	ConversationID string `json:"conversation_id,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
