@@ -59,6 +59,12 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
+		if task.AgentConfigSnapshot.BedrockInferenceRole != nil {
+			if role := strings.TrimSpace(*task.AgentConfigSnapshot.BedrockInferenceRole); role != "" {
+				args = append(args, "--bedrock-inference-role", role)
+			}
+		}
+
 		// Pass harness setting if explicitly configured.
 		if task.AgentConfigSnapshot.Harness != nil && task.AgentConfigSnapshot.Harness.Type != nil {
 			if harness := strings.TrimSpace(*task.AgentConfigSnapshot.Harness.Type); harness != "" {
