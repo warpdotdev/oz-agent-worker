@@ -59,9 +59,10 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		if task.AgentConfigSnapshot.UseAwsBedrockInference != nil &&
-			*task.AgentConfigSnapshot.UseAwsBedrockInference {
-			args = append(args, "--use-aws-bedrock-inference")
+		if task.AgentConfigSnapshot.BedrockInferenceRole != nil {
+			if role := strings.TrimSpace(*task.AgentConfigSnapshot.BedrockInferenceRole); role != "" {
+				args = append(args, "--bedrock-inference-role", role)
+			}
 		}
 
 		// Pass harness setting if explicitly configured.

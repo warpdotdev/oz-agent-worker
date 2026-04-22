@@ -108,7 +108,7 @@ type AmbientAgentConfig struct {
 	IdleTimeoutMinutes     *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness                *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets     *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
-	UseAwsBedrockInference *bool                      `json:"use_aws_bedrock_inference,omitempty"`
+	BedrockInferenceRole   *string                    `json:"bedrock_inference_role,omitempty"`
 	SessionSharing         *SessionSharingConfig      `json:"session_sharing,omitempty"`
 }
 

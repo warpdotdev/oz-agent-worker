@@ -9,7 +9,6 @@ import (
 
 func strPtr(v string) *string                          { return &v }
 func intPtr(v int) *int                                { return &v }
-func boolPtr(v bool) *bool                             { return &v }
 func accessPtr(v types.AccessLevel) *types.AccessLevel { return &v }
 
 func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
@@ -89,11 +88,11 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--model", "claude-sonnet-4", "--idle-on-complete", "12m"},
 		},
 		{
-			name: "passes the Bedrock inference flag when enabled",
+			name: "passes --bedrock-inference-role when set",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
-					ModelID:                strPtr("claude-sonnet-4"),
-					UseAwsBedrockInference: boolPtr(true),
+					ModelID:              strPtr("claude-sonnet-4"),
+					BedrockInferenceRole: strPtr("arn:aws:iam::123456789012:role/BedrockInference"),
 				},
 			},
 			opts: TaskAugmentOptions{},
@@ -102,9 +101,20 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				"run",
 				"--model",
 				"claude-sonnet-4",
-				"--use-aws-bedrock-inference",
+				"--bedrock-inference-role",
+				"arn:aws:iam::123456789012:role/BedrockInference",
 				"--idle-on-complete",
 			},
+		},
+		{
+			name: "skips --bedrock-inference-role when role is empty",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					BedrockInferenceRole: strPtr("   "),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 		{
 			name: "adds --share public:view when session_sharing.public_access is VIEWER",
