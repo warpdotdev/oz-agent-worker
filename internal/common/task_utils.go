@@ -63,6 +63,28 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			*task.AgentConfigSnapshot.UseAwsBedrockInference {
 			args = append(args, "--use-aws-bedrock-inference")
 		}
+
+		// Pass harness setting if explicitly configured.
+		if task.AgentConfigSnapshot.Harness != nil && task.AgentConfigSnapshot.Harness.Type != nil {
+			if harness := strings.TrimSpace(*task.AgentConfigSnapshot.Harness.Type); harness != "" {
+				args = append(args, "--harness", harness)
+			}
+		}
+
+		// Pass public session-sharing if configured. This is additive to the
+		// collaborator-oriented --share args already set by the worker launcher
+		// (team:edit). The bundled Warp client applies an anyone-with-link ACL
+		// after the session bootstraps; the workspace-level
+		// AnyoneWithLinkSharingEnabled setting still gates whether the ACL
+		// write succeeds. FULL is rejected at the public API layer, so we only
+		// expect VIEWER or EDITOR here and silently skip unsupported values
+		// as a defensive fallback.
+		if task.AgentConfigSnapshot.SessionSharing != nil &&
+			task.AgentConfigSnapshot.SessionSharing.PublicAccess != nil {
+			if level := shareAccessLevelForEmission(*task.AgentConfigSnapshot.SessionSharing.PublicAccess); level != "" {
+				args = append(args, "--share", fmt.Sprintf("public:%s", level))
+			}
+		}
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
@@ -82,6 +104,21 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
+}
+
+// shareAccessLevelForEmission maps an internal AccessLevel to the string
+// accepted by the CLI's --share flag. Returns empty string for values that
+// the CLI cannot represent (e.g. FULL), in which case the caller should
+// omit the emission entirely.
+func shareAccessLevelForEmission(access types.AccessLevel) string {
+	switch access {
+	case types.AccessLevelViewer:
+		return "view"
+	case types.AccessLevelEditor:
+		return "edit"
+	default:
+		return ""
+	}
 }
 
 func resolveIdleOnComplete(task *types.Task, opts TaskAugmentOptions) (string, bool) {

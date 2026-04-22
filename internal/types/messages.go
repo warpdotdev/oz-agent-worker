@@ -65,7 +65,38 @@ type TaskDefinition struct {
 	Prompt string `json:"prompt"`
 }
 
-// AmbientAgentConfig represents the agent configuration
+// Harness defines a third-party harness to run a cloud agent with.
+type Harness struct {
+	// Type is the name of the harness, e.g. "claude".
+	Type *string `json:"type,omitempty"`
+}
+
+// HarnessAuthSecrets holds authentication secrets for third-party harnesses.
+// Only the secret for the harness specified gets injected into the environment.
+type HarnessAuthSecrets struct {
+	// ClaudeAuthSecretName is the name of a managed secret for Claude Code harness authentication.
+	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
+}
+
+// AccessLevel is the serialized access-level string used inside SessionSharingConfig.
+// Values mirror warp-server's model/types/enums.AccessLevel JSON representation.
+type AccessLevel string
+
+const (
+	AccessLevelViewer AccessLevel = "VIEWER"
+	AccessLevelEditor AccessLevel = "EDITOR"
+)
+
+// SessionSharingConfig mirrors warp-server's sources.SessionSharingConfig and
+// carries the session-sharing choices snapshotted onto the run.
+type SessionSharingConfig struct {
+	// PublicAccess, when set, causes the worker to emit --share public:<level>
+	// so the bundled Warp client applies an anyone-with-link ACL after the
+	// shared session bootstraps.
+	PublicAccess *AccessLevel `json:"public_access,omitempty"`
+}
+
+// AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
 	EnvironmentID          *string                    `json:"environment_id,omitempty"`
 	BasePrompt             *string                    `json:"base_prompt,omitempty"`
@@ -74,8 +105,11 @@ type AmbientAgentConfig struct {
 	SkillSpec              *string                    `json:"skill_spec,omitempty"`
 	MCPServers             map[string]json.RawMessage `json:"mcp_servers,omitempty"`
 	ComputerUseEnabled     *bool                      `json:"computer_use_enabled,omitempty"`
-	UseAwsBedrockInference *bool                      `json:"use_aws_bedrock_inference,omitempty"`
 	IdleTimeoutMinutes     *int                       `json:"idle_timeout_minutes,omitempty"`
+	Harness                *Harness                   `json:"harness,omitempty"`
+	HarnessAuthSecrets     *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
+	UseAwsBedrockInference *bool                      `json:"use_aws_bedrock_inference,omitempty"`
+	SessionSharing         *SessionSharingConfig      `json:"session_sharing,omitempty"`
 }
 
 // Task represents an ambient agent job.

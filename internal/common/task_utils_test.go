@@ -7,9 +7,10 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
-func strPtr(v string) *string { return &v }
-func intPtr(v int) *int       { return &v }
-func boolPtr(v bool) *bool    { return &v }
+func strPtr(v string) *string                          { return &v }
+func intPtr(v int) *int                                { return &v }
+func boolPtr(v bool) *bool                             { return &v }
+func accessPtr(v types.AccessLevel) *types.AccessLevel { return &v }
 
 func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 	baseArgs := []string{"agent", "run"}
@@ -57,6 +58,26 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--idle-on-complete", "20m"},
 		},
 		{
+			name: "adds --harness when harness type is set",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: strPtr("claude")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--harness", "claude", "--idle-on-complete"},
+		},
+		{
+			name: "skips --harness when harness type is nil",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
 			name: "still appends other config-derived args before idle timeout",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
@@ -84,6 +105,60 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				"--use-aws-bedrock-inference",
 				"--idle-on-complete",
 			},
+		},
+		{
+			name: "adds --share public:view when session_sharing.public_access is VIEWER",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					SessionSharing: &types.SessionSharingConfig{
+						PublicAccess: accessPtr(types.AccessLevelViewer),
+					},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--share", "public:view", "--idle-on-complete"},
+		},
+		{
+			name: "adds --share public:edit when session_sharing.public_access is EDITOR",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					SessionSharing: &types.SessionSharingConfig{
+						PublicAccess: accessPtr(types.AccessLevelEditor),
+					},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--share", "public:edit", "--idle-on-complete"},
+		},
+		{
+			name: "skips --share public when session_sharing is absent",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
+			name: "skips --share public when public_access is nil",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					SessionSharing: &types.SessionSharingConfig{},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
+			name: "silently omits --share public for unsupported access levels (defensive: FULL rejected earlier)",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					SessionSharing: &types.SessionSharingConfig{
+						PublicAccess: accessPtr(types.AccessLevel("FULL")),
+					},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 	}
 
