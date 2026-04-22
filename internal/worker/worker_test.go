@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
@@ -19,6 +21,101 @@ func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) err
 func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
 	b.shutdownCtxErr = ctx.Err()
+}
+
+type recordingBackend struct {
+	err error
+}
+
+func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
+	return b.err
+}
+
+func (b *recordingBackend) Shutdown(context.Context) {}
+
+func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		backend:     &recordingBackend{},
+	}
+
+	w.executeTask(context.Background(), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskCompleted {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
+	}
+
+	var completed types.TaskCompletedMessage
+	if err := json.Unmarshal(msg.Data, &completed); err != nil {
+		t.Fatalf("failed to unmarshal task completed message: %v", err)
+	}
+	if completed.TaskID != "task-1" {
+		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
+	}
+	if completed.Message != "Task completed successfully" {
+		t.Errorf("message = %q, want %q", completed.Message, "Task completed successfully")
+	}
+	if _, ok := w.activeTasks["task-1"]; ok {
+		t.Fatal("task should be removed from active tasks")
+	}
+}
+
+func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		backend:     &recordingBackend{err: errors.New("boom")},
+	}
+
+	w.executeTask(context.Background(), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to unmarshal task failed message: %v", err)
+	}
+	if failed.TaskID != "task-1" {
+		t.Errorf("task ID = %q, want %q", failed.TaskID, "task-1")
+	}
+	if failed.Message != "Failed to execute task: boom" {
+		t.Errorf("message = %q, want %q", failed.Message, "Failed to execute task: boom")
+	}
+	if _, ok := w.activeTasks["task-1"]; ok {
+		t.Fatal("task should be removed from active tasks")
+	}
+}
+
+func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketMessage {
+	t.Helper()
+
+	select {
+	case msgBytes := <-messages:
+		var msg types.WebSocketMessage
+		if err := json.Unmarshal(msgBytes, &msg); err != nil {
+			t.Fatalf("failed to unmarshal websocket message: %v", err)
+		}
+		return msg
+	default:
+		t.Fatal("expected websocket message")
+	}
+
+	return types.WebSocketMessage{}
 }
 
 func TestDefaultImageForTask(t *testing.T) {

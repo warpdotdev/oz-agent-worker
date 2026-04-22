@@ -11,6 +11,7 @@ type MessageType string
 const (
 	MessageTypeTaskAssignment MessageType = "task_assignment"
 	MessageTypeTaskClaimed    MessageType = "task_claimed"
+	MessageTypeTaskCompleted  MessageType = "task_completed"
 	MessageTypeTaskFailed     MessageType = "task_failed"
 	MessageTypeTaskRejected   MessageType = "task_rejected"
 	MessageTypeHeartbeat      MessageType = "heartbeat"
@@ -48,6 +49,12 @@ type TaskAssignmentMessage struct {
 type TaskClaimedMessage struct {
 	TaskID   string `json:"task_id"`
 	WorkerID string `json:"worker_id"`
+}
+
+// TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
+type TaskCompletedMessage struct {
+	TaskID  string `json:"task_id"`
+	Message string `json:"message"`
 }
 
 // TaskFailedMessage is sent from worker to server if task launch fails

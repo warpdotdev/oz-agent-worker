@@ -455,6 +455,9 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 	}
 
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
+	if err := w.sendTaskCompleted(taskID, "Task completed successfully"); err != nil {
+		log.Errorf(ctx, "Failed to send task completed message: %v", err)
+	}
 }
 
 func (w *Worker) sendTaskClaimed(taskID string) error {
@@ -494,6 +497,30 @@ func (w *Worker) sendTaskRejected(taskID, reason string) error {
 
 	msg := types.WebSocketMessage{
 		Type: types.MessageTypeTaskRejected,
+		Data: data,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+
+	return w.sendMessage(msgBytes)
+}
+
+func (w *Worker) sendTaskCompleted(taskID, message string) error {
+	completedMsg := types.TaskCompletedMessage{
+		TaskID:  taskID,
+		Message: message,
+	}
+
+	data, err := json.Marshal(completedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task completed message: %w", err)
+	}
+
+	msg := types.WebSocketMessage{
+		Type: types.MessageTypeTaskCompleted,
 		Data: data,
 	}
 
