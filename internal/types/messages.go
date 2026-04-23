@@ -132,4 +132,8 @@ type Task struct {
 	CreatedAt           time.Time           `json:"created_at"`
 	UpdatedAt           time.Time           `json:"updated_at"`
 	AgentConfigSnapshot *AmbientAgentConfig `json:"agent_config_snapshot,omitempty"`
+	// AgentConversationID is the UUID of an existing AI conversation the server wants the
+	// embedded warp CLI to resume. When set, the worker appends `--conversation <id>` to the
+	// `oz agent run` invocation (see common.AugmentArgsForTask). Nil for fresh runs.
+	AgentConversationID *string `json:"agent_conversation_id,omitempty"`
 }

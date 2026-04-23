@@ -114,6 +114,14 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		args = append(args, "--idle-on-complete", idleOnComplete)
 	}
 
+	// If the server linked this task to an existing AI conversation, forward the id so the
+	// embedded warp CLI can resume that conversation's state (Oz or Claude Code).
+	if task.AgentConversationID != nil {
+		if id := strings.TrimSpace(*task.AgentConversationID); id != "" {
+			args = append(args, "--conversation", id)
+		}
+	}
+
 	return args
 }
 
