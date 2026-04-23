@@ -107,18 +107,21 @@ type SessionSharingConfig struct {
 
 // AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
-	EnvironmentID        *string                    `json:"environment_id,omitempty"`
-	BasePrompt           *string                    `json:"base_prompt,omitempty"`
-	ModelID              *string                    `json:"model_id,omitempty"`
-	ProfileID            *string                    `json:"profile_id,omitempty"`
-	SkillSpec            *string                    `json:"skill_spec,omitempty"`
-	MCPServers           map[string]json.RawMessage `json:"mcp_servers,omitempty"`
-	ComputerUseEnabled   *bool                      `json:"computer_use_enabled,omitempty"`
-	IdleTimeoutMinutes   *int                       `json:"idle_timeout_minutes,omitempty"`
-	Harness              *Harness                   `json:"harness,omitempty"`
-	HarnessAuthSecrets   *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
-	BedrockInferenceRole *string                    `json:"bedrock_inference_role,omitempty"`
-	SessionSharing       *SessionSharingConfig      `json:"session_sharing,omitempty"`
+	EnvironmentID             *string                    `json:"environment_id,omitempty"`
+	BasePrompt                *string                    `json:"base_prompt,omitempty"`
+	ModelID                   *string                    `json:"model_id,omitempty"`
+	ProfileID                 *string                    `json:"profile_id,omitempty"`
+	SkillSpec                 *string                    `json:"skill_spec,omitempty"`
+	MCPServers                map[string]json.RawMessage `json:"mcp_servers,omitempty"`
+	ComputerUseEnabled        *bool                      `json:"computer_use_enabled,omitempty"`
+	IdleTimeoutMinutes        *int                       `json:"idle_timeout_minutes,omitempty"`
+	Harness                   *Harness                   `json:"harness,omitempty"`
+	HarnessAuthSecrets        *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
+	BedrockInferenceRole      *string                    `json:"bedrock_inference_role,omitempty"`
+	SessionSharing            *SessionSharingConfig      `json:"session_sharing,omitempty"`
+	SnapshotDisabled          *bool                      `json:"snapshot_disabled,omitempty"`
+	SnapshotUploadTimeoutSecs *int                       `json:"snapshot_upload_timeout_secs,omitempty"`
+	SnapshotScriptTimeoutSecs *int                       `json:"snapshot_script_timeout_secs,omitempty"`
 }
 
 // Task represents an ambient agent job.

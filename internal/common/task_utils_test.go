@@ -9,6 +9,7 @@ import (
 
 func strPtr(v string) *string                          { return &v }
 func intPtr(v int) *int                                { return &v }
+func boolPtr(v bool) *bool                             { return &v }
 func accessPtr(v types.AccessLevel) *types.AccessLevel { return &v }
 
 func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
@@ -169,6 +170,24 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			},
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
+			name: "adds snapshot controls when configured",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					SnapshotDisabled:          boolPtr(true),
+					SnapshotUploadTimeoutSecs: intPtr(90),
+					SnapshotScriptTimeoutSecs: intPtr(45),
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent", "run",
+				"--no-snapshot",
+				"--snapshot-upload-timeout", "90s",
+				"--snapshot-script-timeout", "45s",
+				"--idle-on-complete",
+			},
 		},
 	}
 
