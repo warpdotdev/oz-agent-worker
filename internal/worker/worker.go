@@ -375,9 +375,6 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		"--server-root-url",
 		w.config.ServerRootURL,
 	}
-	if assignment.ConversationID != "" {
-		baseArgs = append(baseArgs, "--conversation", assignment.ConversationID)
-	}
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
 		IdleOnComplete: w.config.IdleOnComplete,
 	})
