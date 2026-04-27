@@ -150,6 +150,15 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 		{
+			name: "does not forward --conversation even when AgentConversationID is set; the embedded warp CLI reads it off task metadata",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+				AgentConversationID: strPtr("abc-123"),
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
 			name: "skips --share public when public_access is nil",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
