@@ -150,18 +150,10 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 		{
-			name: "appends --conversation when AgentConversationID is set",
+			name: "does not forward --conversation even when AgentConversationID is set; the embedded warp CLI reads it off task metadata",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 				AgentConversationID: strPtr("abc-123"),
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete", "--conversation", "abc-123"},
-		},
-		{
-			name: "omits --conversation when AgentConversationID is nil",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--idle-on-complete"},
@@ -172,15 +164,6 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
 					SessionSharing: &types.SessionSharingConfig{},
 				},
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
-		},
-		{
-			name: "omits --conversation when AgentConversationID is whitespace-only",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
-				AgentConversationID: strPtr("   "),
 			},
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--idle-on-complete"},
