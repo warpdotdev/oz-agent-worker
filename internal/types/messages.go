@@ -15,6 +15,7 @@ const (
 	MessageTypeTaskFailed     MessageType = "task_failed"
 	MessageTypeTaskRejected   MessageType = "task_rejected"
 	MessageTypeHeartbeat      MessageType = "heartbeat"
+	MessageTypeWorkerSkills   MessageType = "worker_skills"
 )
 
 // WebSocketMessage is the base structure for all WebSocket messages
@@ -70,6 +71,22 @@ type TaskRejectedMessage struct {
 
 type TaskDefinition struct {
 	Prompt string `json:"prompt"`
+}
+
+// WorkerSkill represents a single skill discovered from a local skills directory.
+type WorkerSkill struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Path is the absolute filesystem path to the SKILL.md file.
+	Path string `json:"path"`
+	// BasePrompt is the SKILL.md body content (everything after the frontmatter).
+	BasePrompt string `json:"base_prompt,omitempty"`
+}
+
+// WorkerSkillsMessage is sent from worker to server after connecting,
+// reporting the skills available in the worker's configured skills_dirs.
+type WorkerSkillsMessage struct {
+	Skills []WorkerSkill `json:"skills"`
 }
 
 // Harness defines a third-party harness to run a cloud agent with.
