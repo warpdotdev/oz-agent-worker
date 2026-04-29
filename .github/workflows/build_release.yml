@@ -8,10 +8,20 @@ on:
         required: false
         default: ''
         type: string
+      version:
+        description: 'Build version stamped into the binary via -ldflags="-X main.Version=...". Defaults to docker_tag, then to the commit SHA.'
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       docker_tag:
         description: 'Docker image tag (leave empty to skip Docker push)'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: 'Build version stamped into the binary via -ldflags="-X main.Version=...". Defaults to docker_tag, then to the commit SHA.'
         required: false
         default: ''
         type: string
@@ -65,12 +75,15 @@ jobs:
           CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          # Resolve the version stamped into the binary. Precedence:
+          # workflow input `version` > workflow input `docker_tag` > commit SHA.
+          VERSION: ${{ inputs.version != '' && inputs.version || (inputs.docker_tag != '' && inputs.docker_tag || github.sha) }}
         run: |
           binary="oz-agent-worker"
           if [ "$GOOS" = "windows" ]; then
             binary="oz-agent-worker.exe"
           fi
-          go build -o "$binary" .
+          go build -ldflags="-X main.Version=${VERSION}" -o "$binary" .
 
       - name: Archive
         run: |
@@ -120,5 +133,10 @@ jobs:
           outputs: ${{ inputs.docker_tag != '' && 'type=registry' || 'type=local,dest=built-images' }}
           platforms: linux/amd64,linux/arm64
           tags: warpdotdev/oz-agent-worker:${{ inputs.docker_tag || github.sha }}
+          # Forward the resolved version to the Dockerfile so the binary baked
+          # into the image carries the same main.Version as the standalone
+          # release artifacts.
+          build-args: |
+            VERSION=${{ inputs.version != '' && inputs.version || (inputs.docker_tag != '' && inputs.docker_tag || github.sha) }}
           labels:
             dev.warp.worker-commit=${{ github.sha }}
