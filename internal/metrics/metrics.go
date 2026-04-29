@@ -9,8 +9,8 @@
 //     ${OTEL_EXPORTER_PROMETHEUS_HOST}:${OTEL_EXPORTER_PROMETHEUS_PORT}
 //     (defaults to localhost:9464) serving the /metrics endpoint.
 //   - otlp:       pushes metrics over OTLP (http/protobuf by default;
-//                 controlled by OTEL_EXPORTER_OTLP_PROTOCOL and the standard
-//                 OTLP endpoint environment variables).
+//     controlled by OTEL_EXPORTER_OTLP_PROTOCOL and the standard
+//     OTLP endpoint environment variables).
 //   - console:    writes metrics to stdout.
 //   - none:       disables metrics export entirely.
 //
@@ -59,15 +59,15 @@ type Config struct {
 // a single MeterProvider. Helpers read this struct atomically so that Init can
 // hot-swap from the no-op set to the SDK-backed set without locking.
 type instruments struct {
-	connected         metric.Int64Gauge
-	tasksActive       metric.Int64UpDownCounter
+	connected          metric.Int64Gauge
+	tasksActive        metric.Int64UpDownCounter
 	tasksMaxConcurrent metric.Int64Gauge
-	tasksClaimed      metric.Int64Counter
-	tasksRejected     metric.Int64Counter
-	tasksCompleted    metric.Int64Counter
-	taskDuration      metric.Float64Histogram
-	wsReconnects      metric.Int64Counter
-	workerInfo        metric.Int64Gauge
+	tasksClaimed       metric.Int64Counter
+	tasksRejected      metric.Int64Counter
+	tasksCompleted     metric.Int64Counter
+	taskDuration       metric.Float64Histogram
+	wsReconnects       metric.Int64Counter
+	workerInfo         metric.Int64Gauge
 }
 
 // activeInstruments is the current instrument set. It always points to a
