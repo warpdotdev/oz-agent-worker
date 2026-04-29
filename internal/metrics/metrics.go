@@ -74,6 +74,16 @@ type instruments struct {
 // valid (possibly no-op) instruments value so callers never need to nil-check.
 var activeInstruments atomic.Pointer[instruments]
 
+// Bounded label values used both at runtime call sites and during instrument
+// priming. Keeping these as constants ensures the /metrics endpoint exposes
+// every known (instrument, label-set) series from Init onward, so dashboards
+// and alerts can query them by name even before the worker has handled a task.
+const (
+	RejectReasonAtCapacity       = "at_capacity"
+	WSReconnectReasonDialFailed  = "dial_failed"
+	WSReconnectReasonRemoteClose = "remote_close"
+)
+
 func init() {
 	// Seed the package with no-op instruments backed by the OTel no-op
 	// MeterProvider so helpers work even if Init is never called.
@@ -128,8 +138,36 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		return noop, errors.Join(err, provider.Shutdown(ctx))
 	}
 	activeInstruments.Store(set)
+	primeInstruments(ctx, set)
 
 	return provider.Shutdown, nil
+}
+
+// primeInstruments records a zero observation against every known
+// (instrument, label-set) combination so the corresponding series appear in
+// collection output before any real worker activity. The duration histogram
+// is intentionally left unprimed: a synthetic 0-second observation would
+// distort latency quantiles and inflate the count of "completed" tasks.
+// Dashboards that need to query the duration histogram before the first task
+// runs should fall back to `_count`-based rate queries, which behave correctly
+// when no samples have been observed.
+func primeInstruments(ctx context.Context, set *instruments) {
+	set.connected.Record(ctx, 0)
+	set.tasksActive.Add(ctx, 0)
+	set.tasksClaimed.Add(ctx, 0)
+	set.tasksRejected.Add(ctx, 0,
+		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
+	)
+	for _, r := range []TaskResult{TaskResultSucceeded, TaskResultFailed} {
+		set.tasksCompleted.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("result", string(r))),
+		)
+	}
+	for _, r := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
+		set.wsReconnects.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("reason", r)),
+		)
+	}
 }
 
 func newResource(ctx context.Context, cfg Config) (*resource.Resource, error) {

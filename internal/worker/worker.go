@@ -122,7 +122,7 @@ func (w *Worker) Start() error {
 
 		if err := w.connect(); err != nil {
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
-			metrics.RecordWebsocketReconnect("dial_failed")
+			metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonDialFailed)
 			time.Sleep(w.reconnectDelay)
 
 			// Compute exponential back-off.
@@ -138,7 +138,7 @@ func (w *Worker) Start() error {
 		// run() returns when the connection is torn down. The Start loop will
 		// either exit via w.ctx.Done() above or reconnect on the next iteration.
 		metrics.SetConnected(false)
-		metrics.RecordWebsocketReconnect("remote_close")
+		metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonRemoteClose)
 	}
 }
 
@@ -331,7 +331,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
 			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
-			metrics.RecordTaskRejected("at_capacity")
+			metrics.RecordTaskRejected(metrics.RejectReasonAtCapacity)
 			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
 				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 			}

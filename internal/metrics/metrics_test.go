@@ -216,6 +216,85 @@ func TestInitNoneIsDisabled(t *testing.T) {
 	}
 }
 
+func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
+	reader := withTestReader(t, Config{WorkerID: "w1", Backend: "docker"})
+
+	// Mirror what Init does after building instruments.
+	primeInstruments(context.Background(), activeInstruments.Load())
+
+	rm := collect(t, reader)
+
+	want := []string{
+		"oz_worker_connected",
+		"oz_worker_tasks_active",
+		"oz_worker_tasks_claimed_total",
+		"oz_worker_tasks_rejected_total",
+		"oz_worker_tasks_completed_total",
+		"oz_worker_websocket_reconnects_total",
+	}
+	for _, name := range want {
+		findMetric(t, rm, name) // fails the test if missing
+	}
+
+	// Spot-check that label-bearing counters were primed for every known
+	// label value, so dashboards can query them by name immediately.
+	completed := findMetric(t, rm, "oz_worker_tasks_completed_total").Data.(metricdata.Sum[int64])
+	results := map[string]bool{}
+	for _, dp := range completed.DataPoints {
+		v, _ := dp.Attributes.Value("result")
+		results[v.AsString()] = true
+		if dp.Value != 0 {
+			t.Errorf("primed %s{result=%s} = %d, want 0", "oz_worker_tasks_completed_total", v.AsString(), dp.Value)
+		}
+	}
+	for _, want := range []string{"succeeded", "failed"} {
+		if !results[want] {
+			t.Errorf("oz_worker_tasks_completed_total missing primed series for result=%s", want)
+		}
+	}
+
+	wsReconnects := findMetric(t, rm, "oz_worker_websocket_reconnects_total").Data.(metricdata.Sum[int64])
+	reasons := map[string]bool{}
+	for _, dp := range wsReconnects.DataPoints {
+		v, _ := dp.Attributes.Value("reason")
+		reasons[v.AsString()] = true
+		if dp.Value != 0 {
+			t.Errorf("primed %s{reason=%s} = %d, want 0", "oz_worker_websocket_reconnects_total", v.AsString(), dp.Value)
+		}
+	}
+	for _, want := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
+		if !reasons[want] {
+			t.Errorf("oz_worker_websocket_reconnects_total missing primed series for reason=%s", want)
+		}
+	}
+
+	rejected := findMetric(t, rm, "oz_worker_tasks_rejected_total").Data.(metricdata.Sum[int64])
+	var haveAtCapacity bool
+	for _, dp := range rejected.DataPoints {
+		v, _ := dp.Attributes.Value("reason")
+		if v.AsString() == RejectReasonAtCapacity {
+			haveAtCapacity = true
+			if dp.Value != 0 {
+				t.Errorf("primed oz_worker_tasks_rejected_total{reason=at_capacity} = %d, want 0", dp.Value)
+			}
+		}
+	}
+	if !haveAtCapacity {
+		t.Errorf("oz_worker_tasks_rejected_total missing primed series for reason=at_capacity")
+	}
+
+	// The duration histogram is intentionally NOT primed; verify it stays
+	// absent so we don't accidentally pollute latency quantiles with a
+	// synthetic 0-second observation.
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "oz_worker_task_duration_seconds" {
+				t.Errorf("oz_worker_task_duration_seconds was emitted at startup; expected to remain absent until first task")
+			}
+		}
+	}
+}
+
 func TestNewResourceIncludesWorkerAttrs(t *testing.T) {
 	res, err := newResource(context.Background(), Config{
 		WorkerID: "alpha",
