@@ -14,19 +14,23 @@
 //   - console:    writes metrics to stdout.
 //   - none:       disables metrics export entirely.
 //
-// When OTEL_METRICS_EXPORTER is unset, autoexport defaults to OTLP. To make
-// metrics fully opt-in we treat the unset case as "off" and only call into
-// autoexport when the variable is set, so existing deployments are unaffected.
+// When OTEL_METRICS_EXPORTER is unset, we delegate to autoexport's default,
+// which is OTLP push (to OTEL_EXPORTER_OTLP_ENDPOINT, defaulting to
+// http://localhost:4318 for http/protobuf or http://localhost:4317 for grpc).
+// This matches the OpenTelemetry SDK convention so a worker dropped into an
+// environment that already has an OTLP collector picks it up automatically.
+// Operators who want to fully disable export can set OTEL_METRICS_EXPORTER=none.
 //
 // All instruments are package-level singletons. Helpers are safe to call
-// before Init runs or when metrics are disabled: they fall back to no-op
-// instruments backed by the OpenTelemetry global no-op MeterProvider, so
-// worker code can call the helpers unconditionally.
+// before Init runs: they fall back to no-op instruments backed by the
+// OpenTelemetry global no-op MeterProvider, so worker code can call the
+// helpers unconditionally.
 package metrics
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync/atomic"
 	"time"
@@ -90,28 +94,31 @@ func init() {
 	noopMeter := metricnoop.NewMeterProvider().Meter(scopeName)
 	noopSet, err := buildInstruments(noopMeter)
 	if err != nil {
-		// The no-op meter can't fail in practice; fall back to a zero-value
-		// instruments struct rather than panicking from package init.
-		noopSet = &instruments{}
+		// The no-op meter can't fail in practice; if it ever does, fail loud
+		// at startup instead of installing a zero-value instruments struct
+		// that would nil-panic the first time a helper is called.
+		panic(fmt.Sprintf("metrics: failed to build no-op instruments: %v", err))
 	}
 	activeInstruments.Store(noopSet)
 }
 
 // Init wires up the metrics pipeline based on the OTEL_METRICS_EXPORTER
-// environment variable. When the variable is unset or set to "none", Init is
-// a no-op and returns a no-op shutdown function. Otherwise it constructs an
-// SDK MeterProvider with a worker-scoped resource and replaces the package
-// instruments with SDK-backed versions.
+// environment variable. When the variable is set to "none", Init is a no-op
+// and returns a no-op shutdown function. Otherwise (including the unset
+// case) it constructs an SDK MeterProvider with a worker-scoped resource
+// and replaces the package instruments with SDK-backed versions, delegating
+// exporter selection to autoexport. Following autoexport's convention, an
+// unset OTEL_METRICS_EXPORTER produces an OTLP exporter targeting the
+// OTEL_EXPORTER_OTLP_* defaults; operators who do not run an OTLP collector
+// should set OTEL_METRICS_EXPORTER=none to avoid periodic push errors.
 //
 // Init must only be called once. The returned shutdown function flushes and
 // stops the exporter; it is safe to call after Init returns an error.
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error) {
 	noop := func(context.Context) error { return nil }
 
-	exporter := os.Getenv("OTEL_METRICS_EXPORTER")
-	switch exporter {
-	case "", "none":
-		// Metrics disabled: keep the no-op instruments installed by init().
+	if os.Getenv("OTEL_METRICS_EXPORTER") == "none" {
+		// Explicit opt-out: keep the no-op instruments installed by init().
 		return noop, nil
 	}
 

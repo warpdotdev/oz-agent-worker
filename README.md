@@ -220,8 +220,10 @@ driven by the standard
 [OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),
 implemented via
 [`go.opentelemetry.io/contrib/exporters/autoexport`](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/exporters/autoexport).
-When `OTEL_METRICS_EXPORTER` is unset (or set to `none`), the worker emits no
-metrics, matching the pre-existing behavior.
+When `OTEL_METRICS_EXPORTER` is unset, the worker delegates to autoexport's
+default, which is OTLP push to `OTEL_EXPORTER_OTLP_ENDPOINT` (defaulting to
+`http://localhost:4318` for `http/protobuf` or `http://localhost:4317` for
+`grpc`). To fully disable metrics export, set `OTEL_METRICS_EXPORTER=none`.
 
 ### Quick start with Prometheus
 

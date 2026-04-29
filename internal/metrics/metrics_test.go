@@ -191,25 +191,17 @@ func TestRecordTaskRejectedTagsReason(t *testing.T) {
 	}
 }
 
-func TestInitDisabledByDefault(t *testing.T) {
-	t.Setenv("OTEL_METRICS_EXPORTER", "")
+// TestInitNoneIsDisabled covers the explicit opt-out path. With
+// OTEL_METRICS_EXPORTER=none, Init must return a no-op shutdown without
+// installing the SDK MeterProvider.
+func TestInitNoneIsDisabled(t *testing.T) {
+	t.Setenv("OTEL_METRICS_EXPORTER", "none")
 	shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	if shutdown == nil {
 		t.Fatalf("Init returned nil shutdown")
-	}
-	if err := shutdown(context.Background()); err != nil {
-		t.Errorf("shutdown: %v", err)
-	}
-}
-
-func TestInitNoneIsDisabled(t *testing.T) {
-	t.Setenv("OTEL_METRICS_EXPORTER", "none")
-	shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
 	}
 	if err := shutdown(context.Background()); err != nil {
 		t.Errorf("shutdown: %v", err)
