@@ -1,0 +1,21 @@
+{{- if and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") .Values.metrics.service.create -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oz-agent-worker.fullname" . }}-metrics
+  labels:
+    {{- include "oz-agent-worker.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.metrics.service.type }}
+  selector:
+    {{- include "oz-agent-worker.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

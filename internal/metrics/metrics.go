@@ -1,0 +1,358 @@
+// Package metrics owns the OpenTelemetry metrics pipeline for the worker.
+//
+// The exporter is selected at runtime by the operator via the standard
+// OpenTelemetry environment variables (OTEL_METRICS_EXPORTER and friends),
+// using the go.opentelemetry.io/contrib/exporters/autoexport package. The
+// supported values are:
+//
+//   - prometheus: starts an in-process HTTP server on
+//     ${OTEL_EXPORTER_PROMETHEUS_HOST}:${OTEL_EXPORTER_PROMETHEUS_PORT}
+//     (defaults to localhost:9464) serving the /metrics endpoint.
+//   - otlp:       pushes metrics over OTLP (http/protobuf by default;
+//     controlled by OTEL_EXPORTER_OTLP_PROTOCOL and the standard
+//     OTLP endpoint environment variables).
+//   - console:    writes metrics to stdout.
+//   - none:       disables metrics export entirely.
+//
+// When OTEL_METRICS_EXPORTER is unset, we delegate to autoexport's default,
+// which is OTLP push (to OTEL_EXPORTER_OTLP_ENDPOINT, defaulting to
+// http://localhost:4318 for http/protobuf or http://localhost:4317 for grpc).
+// This matches the OpenTelemetry SDK convention so a worker dropped into an
+// environment that already has an OTLP collector picks it up automatically.
+// Operators who want to fully disable export can set OTEL_METRICS_EXPORTER=none.
+//
+// All instruments are package-level singletons. Helpers are safe to call
+// before Init runs: they fall back to no-op instruments backed by the
+// OpenTelemetry global no-op MeterProvider, so worker code can call the
+// helpers unconditionally.
+package metrics
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/contrib/exporters/autoexport"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+)
+
+// scopeName is the instrumentation-scope name used for all worker metrics.
+// Prometheus translates the scope into the otel_scope_name label, so making
+// this stable is part of the public contract for downstream dashboards.
+const scopeName = "github.com/warpdotdev/oz-agent-worker"
+
+// Config is the input for Init.
+type Config struct {
+	// WorkerID is the operator-supplied identifier for this worker.
+	WorkerID string
+	// Backend is the resolved backend type ("docker", "direct", "kubernetes").
+	Backend string
+	// Version is the build version of the worker binary; may be empty.
+	Version string
+}
+
+// instruments holds the full set of synchronous OTel instruments created from
+// a single MeterProvider. Helpers read this struct atomically so that Init can
+// hot-swap from the no-op set to the SDK-backed set without locking.
+type instruments struct {
+	connected          metric.Int64Gauge
+	tasksActive        metric.Int64UpDownCounter
+	tasksMaxConcurrent metric.Int64Gauge
+	tasksClaimed       metric.Int64Counter
+	tasksRejected      metric.Int64Counter
+	tasksCompleted     metric.Int64Counter
+	taskDuration       metric.Float64Histogram
+	wsReconnects       metric.Int64Counter
+	workerInfo         metric.Int64Gauge
+}
+
+// activeInstruments is the current instrument set. It always points to a
+// valid (possibly no-op) instruments value so callers never need to nil-check.
+var activeInstruments atomic.Pointer[instruments]
+
+// Bounded label values used both at runtime call sites and during instrument
+// priming. Keeping these as constants ensures the /metrics endpoint exposes
+// every known (instrument, label-set) series from Init onward, so dashboards
+// and alerts can query them by name even before the worker has handled a task.
+const (
+	RejectReasonAtCapacity       = "at_capacity"
+	WSReconnectReasonDialFailed  = "dial_failed"
+	WSReconnectReasonRemoteClose = "remote_close"
+)
+
+func init() {
+	// Seed the package with no-op instruments backed by the OTel no-op
+	// MeterProvider so helpers work even if Init is never called.
+	noopMeter := metricnoop.NewMeterProvider().Meter(scopeName)
+	noopSet, err := buildInstruments(noopMeter)
+	if err != nil {
+		// The no-op meter can't fail in practice; if it ever does, fail loud
+		// at startup instead of installing a zero-value instruments struct
+		// that would nil-panic the first time a helper is called.
+		panic(fmt.Sprintf("metrics: failed to build no-op instruments: %v", err))
+	}
+	activeInstruments.Store(noopSet)
+}
+
+// Init wires up the metrics pipeline based on the OTEL_METRICS_EXPORTER
+// environment variable. When the variable is set to "none", Init is a no-op
+// and returns a no-op shutdown function. Otherwise (including the unset
+// case) it constructs an SDK MeterProvider with a worker-scoped resource
+// and replaces the package instruments with SDK-backed versions, delegating
+// exporter selection to autoexport. Following autoexport's convention, an
+// unset OTEL_METRICS_EXPORTER produces an OTLP exporter targeting the
+// OTEL_EXPORTER_OTLP_* defaults; operators who do not run an OTLP collector
+// should set OTEL_METRICS_EXPORTER=none to avoid periodic push errors.
+//
+// Init must only be called once. The returned shutdown function flushes and
+// stops the exporter; it is safe to call after Init returns an error.
+func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error) {
+	noop := func(context.Context) error { return nil }
+
+	if os.Getenv("OTEL_METRICS_EXPORTER") == "none" {
+		// Explicit opt-out: keep the no-op instruments installed by init().
+		return noop, nil
+	}
+
+	reader, err := autoexport.NewMetricReader(ctx)
+	if err != nil {
+		return noop, err
+	}
+
+	res, err := newResource(ctx, cfg)
+	if err != nil {
+		// We have a reader but failed to build a resource; close the reader
+		// and surface the error.
+		return noop, errors.Join(err, reader.Shutdown(ctx))
+	}
+
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(res),
+	)
+
+	meter := provider.Meter(scopeName)
+	set, err := buildInstruments(meter)
+	if err != nil {
+		return noop, errors.Join(err, provider.Shutdown(ctx))
+	}
+	activeInstruments.Store(set)
+	primeInstruments(ctx, set)
+
+	return provider.Shutdown, nil
+}
+
+// primeInstruments records a zero observation against every known
+// (instrument, label-set) combination so the corresponding series appear in
+// collection output before any real worker activity. The duration histogram
+// is intentionally left unprimed: a synthetic 0-second observation would
+// distort latency quantiles and inflate the count of "completed" tasks.
+// Dashboards that need to query the duration histogram before the first task
+// runs should fall back to `_count`-based rate queries, which behave correctly
+// when no samples have been observed.
+func primeInstruments(ctx context.Context, set *instruments) {
+	set.connected.Record(ctx, 0)
+	set.tasksActive.Add(ctx, 0)
+	set.tasksClaimed.Add(ctx, 0)
+	set.tasksRejected.Add(ctx, 0,
+		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
+	)
+	for _, r := range []TaskResult{TaskResultSucceeded, TaskResultFailed} {
+		set.tasksCompleted.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("result", string(r))),
+		)
+	}
+	for _, r := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
+		set.wsReconnects.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("reason", r)),
+		)
+	}
+}
+
+func newResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName("oz-agent-worker"),
+	}
+	if cfg.Version != "" {
+		attrs = append(attrs, semconv.ServiceVersion(cfg.Version))
+	}
+	if cfg.WorkerID != "" {
+		attrs = append(attrs, attribute.String("worker.id", cfg.WorkerID))
+	}
+	if cfg.Backend != "" {
+		attrs = append(attrs, attribute.String("worker.backend", cfg.Backend))
+	}
+	return resource.New(ctx,
+		resource.WithFromEnv(),
+		resource.WithTelemetrySDK(),
+		resource.WithAttributes(attrs...),
+	)
+}
+
+func buildInstruments(m metric.Meter) (*instruments, error) {
+	connected, err := m.Int64Gauge(
+		"oz_worker_connected",
+		metric.WithDescription("1 while the worker has an active WebSocket connection to warp-server, 0 otherwise."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tasksActive, err := m.Int64UpDownCounter(
+		"oz_worker_tasks_active",
+		metric.WithDescription("Number of tasks the worker is currently executing."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tasksMaxConcurrent, err := m.Int64Gauge(
+		"oz_worker_tasks_max_concurrent",
+		metric.WithDescription("Configured upper bound on concurrent tasks for this worker. 0 means unlimited."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tasksClaimed, err := m.Int64Counter(
+		"oz_worker_tasks_claimed_total",
+		metric.WithDescription("Total tasks the worker has claimed since process start."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tasksRejected, err := m.Int64Counter(
+		"oz_worker_tasks_rejected_total",
+		metric.WithDescription("Total tasks the worker has rejected since process start."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tasksCompleted, err := m.Int64Counter(
+		"oz_worker_tasks_completed_total",
+		metric.WithDescription("Total tasks the worker has finished, labeled by terminal result."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	taskDuration, err := m.Float64Histogram(
+		"oz_worker_task_duration_seconds",
+		metric.WithDescription("Wall-clock duration of task execution on the worker, labeled by terminal result."),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	wsReconnects, err := m.Int64Counter(
+		"oz_worker_websocket_reconnects_total",
+		metric.WithDescription("Total WebSocket reconnect attempts since process start."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	workerInfo, err := m.Int64Gauge(
+		"oz_worker_info",
+		metric.WithDescription("Constant 1 with build/runtime metadata as labels."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &instruments{
+		connected:          connected,
+		tasksActive:        tasksActive,
+		tasksMaxConcurrent: tasksMaxConcurrent,
+		tasksClaimed:       tasksClaimed,
+		tasksRejected:      tasksRejected,
+		tasksCompleted:     tasksCompleted,
+		taskDuration:       taskDuration,
+		wsReconnects:       wsReconnects,
+		workerInfo:         workerInfo,
+	}, nil
+}
+
+func current() *instruments {
+	return activeInstruments.Load()
+}
+
+// SetConnected records the worker's WebSocket connection state.
+func SetConnected(connected bool) {
+	val := int64(0)
+	if connected {
+		val = 1
+	}
+	current().connected.Record(context.Background(), val)
+}
+
+// IncTasksActive marks that one more task has begun executing on this worker.
+func IncTasksActive() {
+	current().tasksActive.Add(context.Background(), 1)
+}
+
+// DecTasksActive marks that one task has finished executing on this worker.
+func DecTasksActive() {
+	current().tasksActive.Add(context.Background(), -1)
+}
+
+// SetMaxConcurrent records the configured concurrency limit. 0 means
+// unlimited; expose the configured value as-is so dashboards can decide how
+// to render saturation.
+func SetMaxConcurrent(n int) {
+	current().tasksMaxConcurrent.Record(context.Background(), int64(n))
+}
+
+// RecordTaskClaim records a successful claim (worker has accepted a task).
+func RecordTaskClaim() {
+	current().tasksClaimed.Add(context.Background(), 1)
+}
+
+// RecordTaskRejected records a task that the worker rejected, e.g. because
+// it was at the configured concurrency limit. The reason label is intended
+// to be a small bounded enum.
+func RecordTaskRejected(reason string) {
+	current().tasksRejected.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("reason", reason)),
+	)
+}
+
+// TaskResult is the bounded enum of terminal task outcomes the worker
+// reports. Keeping this list small avoids label-cardinality blowups.
+type TaskResult string
+
+const (
+	TaskResultSucceeded TaskResult = "succeeded"
+	TaskResultFailed    TaskResult = "failed"
+)
+
+// RecordTaskCompleted records a completed task, regardless of outcome, along
+// with its wall-clock duration on this worker.
+func RecordTaskCompleted(result TaskResult, duration time.Duration) {
+	attrs := metric.WithAttributes(attribute.String("result", string(result)))
+	current().tasksCompleted.Add(context.Background(), 1, attrs)
+	current().taskDuration.Record(context.Background(), duration.Seconds(), attrs)
+}
+
+// RecordWebsocketReconnect records a reconnect attempt against warp-server.
+// The reason label is intended to be a small bounded enum
+// (e.g. "dial_failed", "remote_close").
+func RecordWebsocketReconnect(reason string) {
+	current().wsReconnects.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("reason", reason)),
+	)
+}
+
+// SetWorkerInfo emits a constant gauge with build metadata. It is intended
+// to be called once, immediately after Init.
+func SetWorkerInfo(version, backend, workerID string) {
+	current().workerInfo.Record(context.Background(), 1,
+		metric.WithAttributes(
+			attribute.String("version", version),
+			attribute.String("backend", backend),
+			attribute.String("worker_id", workerID),
+		),
+	)
+}

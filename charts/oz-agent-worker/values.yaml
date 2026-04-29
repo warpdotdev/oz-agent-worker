@@ -82,3 +82,37 @@ kubernetesBackend:
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
   podTemplate: {}
+
+# Metrics export uses the OpenTelemetry autoexport package, so the operator
+# selects the exporter via standard OpenTelemetry environment variables. When
+# `metrics.enabled` is false the worker emits no metrics, matching the
+# pre-existing behavior.
+metrics:
+  enabled: false
+  # Exporter to enable. Supported: prometheus | otlp | console | none.
+  # When set to prometheus, the worker exposes /metrics on `metrics.port`.
+  # When set to otlp, configure OTEL_EXPORTER_OTLP_ENDPOINT (and friends) via
+  # `metrics.extraEnv` below.
+  exporter: prometheus
+  # Port served by the embedded Prometheus exporter. Ignored for otlp/console.
+  port: 9464
+  # Extra environment variables forwarded to the worker container, e.g. to
+  # configure the OTLP endpoint:
+  #   - name: OTEL_EXPORTER_OTLP_ENDPOINT
+  #     value: http://otel-collector.observability.svc:4318
+  extraEnv: []
+  service:
+    create: true
+    type: ClusterIP
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9464"
+      prometheus.io/path: "/metrics"
+  # Optional Prometheus Operator PodMonitor for clusters that prefer
+  # PodMonitor/ServiceMonitor over scrape annotations. Disabled by default to
+  # avoid requiring monitoring.coreos.com CRDs at install time.
+  podMonitor:
+    create: false
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
