@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"golang.org/x/sync/semaphore"
 )
@@ -121,6 +122,7 @@ func (w *Worker) Start() error {
 
 		if err := w.connect(); err != nil {
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
+			metrics.RecordWebsocketReconnect("dial_failed")
 			time.Sleep(w.reconnectDelay)
 
 			// Compute exponential back-off.
@@ -129,8 +131,14 @@ func (w *Worker) Start() error {
 		}
 
 		w.reconnectDelay = InitialReconnectDelay
+		metrics.SetConnected(true)
 
 		w.run()
+
+		// run() returns when the connection is torn down. The Start loop will
+		// either exit via w.ctx.Done() above or reconnect on the next iteration.
+		metrics.SetConnected(false)
+		metrics.RecordWebsocketReconnect("remote_close")
 	}
 }
 
@@ -323,6 +331,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
 			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
+			metrics.RecordTaskRejected("at_capacity")
 			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
 				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 			}
@@ -334,6 +343,8 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
+	metrics.RecordTaskClaim()
+	metrics.IncTasksActive()
 
 	taskCtx, taskCancel := context.WithCancel(w.ctx)
 
@@ -429,6 +440,9 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 }
 
 func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
+	start := time.Now()
+	result := metrics.TaskResultSucceeded
+
 	defer func() {
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
@@ -437,6 +451,9 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 		if w.taskSemaphore != nil {
 			w.taskSemaphore.Release(1)
 		}
+
+		metrics.DecTasksActive()
+		metrics.RecordTaskCompleted(result, time.Since(start))
 	}()
 
 	taskID := assignment.TaskID
@@ -444,6 +461,7 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 
 	params := w.prepareTaskParams(assignment)
 	if err := w.backend.ExecuteTask(ctx, params); err != nil {
+		result = metrics.TaskResultFailed
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
 		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to execute task: %v", err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)

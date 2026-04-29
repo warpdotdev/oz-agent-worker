@@ -213,6 +213,115 @@ export DOCKER_CERT_PATH="/path/to/certs"
 oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
+## Monitoring
+
+The worker can export metrics over OpenTelemetry. Exporter selection is
+driven by the standard
+[OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),
+implemented via
+[`go.opentelemetry.io/contrib/exporters/autoexport`](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/exporters/autoexport).
+When `OTEL_METRICS_EXPORTER` is unset (or set to `none`), the worker emits no
+metrics, matching the pre-existing behavior.
+
+### Quick start with Prometheus
+
+```bash
+export OTEL_METRICS_EXPORTER=prometheus
+export OTEL_EXPORTER_PROMETHEUS_HOST=0.0.0.0
+export OTEL_EXPORTER_PROMETHEUS_PORT=9464
+oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
+
+# In another shell:
+curl -s localhost:9464/metrics | grep oz_worker_
+```
+
+### Quick start with OTLP
+
+```bash
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc:4318
+oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
+```
+
+### Helm
+
+```bash
+helm install oz-agent-worker ./charts/oz-agent-worker \
+  --namespace agents --create-namespace \
+  --set worker.workerId=my-worker \
+  --set image.tag=v1.2.3 \
+  --set metrics.enabled=true
+```
+
+With `metrics.enabled=true` and the default `metrics.exporter=prometheus`, the
+chart adds:
+
+- a `containerPort: metrics` (default 9464) on the worker Deployment
+- the `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_PROMETHEUS_HOST`, and
+  `OTEL_EXPORTER_PROMETHEUS_PORT` environment variables
+- a namespace-scoped `Service` named `<release>-oz-agent-worker-metrics` with
+  `prometheus.io/scrape` annotations
+- optionally a `PodMonitor` (`metrics.podMonitor.create=true`) for clusters
+  using the Prometheus Operator
+
+For OTLP push instead, set `metrics.exporter=otlp` and forward the relevant
+endpoint variables via `metrics.extraEnv`:
+
+```yaml
+metrics:
+  enabled: true
+  exporter: otlp
+  extraEnv:
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://otel-collector.observability.svc:4318
+```
+
+### Metric catalog
+
+All metrics carry the resource attributes `service.name=oz-agent-worker`,
+`service.version`, `worker.id`, and `worker.backend`, so each worker process
+shows up as a distinct series.
+
+- `oz_worker_connected` (gauge): `1` while the worker has an active WebSocket
+  connection to warp-server, `0` otherwise. Aggregate to count connected
+  workers: `sum(oz_worker_connected)`.
+- `oz_worker_tasks_active` (gauge / UpDownCounter): tasks currently executing
+  on this worker. To count workers running ≥1 task:
+  `count(oz_worker_tasks_active > 0)`.
+- `oz_worker_tasks_max_concurrent` (gauge): configured concurrency limit
+  (`0` means unlimited).
+- `oz_worker_tasks_claimed_total` (counter): total tasks accepted by the
+  worker since process start.
+- `oz_worker_tasks_rejected_total{reason}` (counter): tasks the worker
+  declined, e.g. `reason="at_capacity"`.
+- `oz_worker_tasks_completed_total{result}` (counter): completed tasks
+  labeled `result="succeeded"` or `result="failed"`. Success rate over 5m:
+  `sum(rate(oz_worker_tasks_completed_total{result="succeeded"}[5m])) /
+   sum(rate(oz_worker_tasks_completed_total[5m]))`.
+- `oz_worker_task_duration_seconds{result}` (histogram): wall-clock task
+  duration on the worker. p95: `histogram_quantile(0.95,
+   sum by (le) (rate(oz_worker_task_duration_seconds_bucket[5m])))`.
+- `oz_worker_websocket_reconnects_total{reason}` (counter): reconnect
+  attempts; spikes indicate flapping workers.
+- `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
+  runtime metadata, useful for joining other series by labels.
+
+### Sample dashboards / alerts
+
+Direct mappings for the questions enterprise operators most commonly ask:
+
+- **Workers available:** `sum(oz_worker_connected)`
+- **Workers active (running ≥1 task):**
+  `count(oz_worker_tasks_active > 0)`
+- **Saturation:**
+  `sum(oz_worker_tasks_active) /
+   sum(oz_worker_tasks_max_concurrent > 0)`
+- **Failure rate:**
+  `sum(rate(oz_worker_tasks_completed_total{result="failed"}[5m]))`
+- **Reconnect storms:**
+  `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
+
 ## License
 
 Copyright © 2026 Warp
