@@ -70,7 +70,6 @@ type instruments struct {
 	connected          metric.Int64Gauge
 	tasksActive        metric.Int64UpDownCounter
 	tasksMaxConcurrent metric.Int64Gauge
-	tasksClaimed       metric.Int64Counter
 	tasksRejected      metric.Int64Counter
 	tasksCompleted     metric.Int64Counter
 	taskDuration       metric.Float64Histogram
@@ -120,6 +119,7 @@ const (
 	TaskFailureReasonInvalidImage    = "invalid_image"
 	TaskFailureReasonActiveDeadline  = "active_deadline"
 	TaskFailureReasonCleanup         = "cleanup"
+
 )
 
 var (
@@ -275,7 +275,6 @@ func shouldInitTraces() bool {
 func primeInstruments(ctx context.Context, set *instruments) {
 	set.connected.Record(ctx, 0)
 	set.tasksActive.Add(ctx, 0)
-	set.tasksClaimed.Add(ctx, 0)
 	set.tasksRejected.Add(ctx, 0,
 		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
 	)
@@ -343,13 +342,6 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
-	tasksClaimed, err := m.Int64Counter(
-		"oz_worker_tasks_claimed_total",
-		metric.WithDescription("Total tasks the worker has claimed since process start."),
-	)
-	if err != nil {
-		return nil, err
-	}
 	tasksRejected, err := m.Int64Counter(
 		"oz_worker_tasks_rejected_total",
 		metric.WithDescription("Total tasks the worker has rejected since process start."),
@@ -397,7 +389,6 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 		connected:          connected,
 		tasksActive:        tasksActive,
 		tasksMaxConcurrent: tasksMaxConcurrent,
-		tasksClaimed:       tasksClaimed,
 		tasksRejected:      tasksRejected,
 		tasksCompleted:     tasksCompleted,
 		taskDuration:       taskDuration,
@@ -435,11 +426,6 @@ func DecTasksActive() {
 // to render saturation.
 func SetMaxConcurrent(n int) {
 	current().tasksMaxConcurrent.Record(context.Background(), int64(n))
-}
-
-// RecordTaskClaim records a successful task claim (the worker has accepted a task).
-func RecordTaskClaim() {
-	current().tasksClaimed.Add(context.Background(), 1)
 }
 
 // RecordTaskRejected records a task that the worker rejected, e.g. because

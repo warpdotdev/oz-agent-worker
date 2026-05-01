@@ -359,7 +359,6 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
-	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
 	select {
@@ -412,20 +411,14 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	baseArgs := []string{
 		"agent",
 		"run",
-	}
-	// Only share with the team when the task is team-owned. User-owned tasks
-	// (created with "Team visible" unchecked) use user-scoped API keys that
-	// cannot set up team-level session sharing.
-	if task.Owner.IsTeamOwned() {
-		baseArgs = append(baseArgs, "--share", "team:edit")
-	}
-	baseArgs = append(baseArgs,
+		"--share",
+		"team:edit",
 		"--task-id",
 		task.ID,
 		"--sandboxed",
 		"--server-root-url",
 		w.config.ServerRootURL,
-	)
+	}
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
 		IdleOnComplete:   w.config.IdleOnComplete,
 		AdditionalOzArgs: assignment.AdditionalOzArgs,
