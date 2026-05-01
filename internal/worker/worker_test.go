@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"testing"
+	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type shutdownRecordingBackend struct {
@@ -33,6 +37,53 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
 
 func (b *recordingBackend) Shutdown(context.Context) {}
 
+func TestTaskFailureLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantPhase  string
+		wantReason string
+	}{
+		{
+			name:       "deadline exceeded",
+			err:        context.DeadlineExceeded,
+			wantPhase:  metrics.TaskFailurePhaseBackend,
+			wantReason: metrics.TaskFailureReasonTaskTimeout,
+		},
+		{
+			name:       "canceled",
+			err:        context.Canceled,
+			wantPhase:  metrics.TaskFailurePhaseBackend,
+			wantReason: metrics.TaskFailureReasonTaskCancelled,
+		},
+		{
+			name: "wrapped backend failure",
+			err: fmt.Errorf("wrapped: %w", newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonImagePull,
+				errors.New("pull failed"),
+			)),
+			wantPhase:  metrics.TaskFailurePhaseBackend,
+			wantReason: metrics.TaskFailureReasonImagePull,
+		},
+		{
+			name:       "unknown error",
+			err:        errors.New("boom"),
+			wantPhase:  metrics.TaskFailurePhaseBackend,
+			wantReason: metrics.TaskFailureReasonUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			phase, reason := taskFailureLabels(tt.err)
+			if phase != tt.wantPhase || reason != tt.wantReason {
+				t.Fatalf("taskFailureLabels() = (%q, %q), want (%q, %q)", phase, reason, tt.wantPhase, tt.wantReason)
+			}
+		})
+	}
+}
+
 func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
@@ -42,10 +93,10 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 		backend:     &recordingBackend{},
 	}
 
-	w.executeTask(context.Background(), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
-	})
+	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
 	if msg.Type != types.MessageTypeTaskCompleted {
@@ -76,10 +127,10 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
-	w.executeTask(context.Background(), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
-	})
+	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
 	if msg.Type != types.MessageTypeTaskFailed {

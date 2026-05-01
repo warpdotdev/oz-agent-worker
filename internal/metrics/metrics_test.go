@@ -84,8 +84,18 @@ func TestHelpersSafeBeforeInit(t *testing.T) {
 	RecordTaskRejected("at_capacity")
 	RecordTaskCompleted(TaskResultSucceeded, 250*time.Millisecond)
 	RecordTaskCompleted(TaskResultFailed, 1*time.Second)
+	RecordTaskCompleted(TaskResultCancelled, 500*time.Millisecond)
+	RecordTaskAssignmentAge(5 * time.Second)
+	RecordTaskStartupDuration(250 * time.Millisecond)
+	RecordTaskFailure(TaskFailurePhaseBackend, TaskFailureReasonImagePull)
+	RecordTaskCancellation(CancelSourceServer)
+	RecordBackendOperation("task", BackendOperationResultSucceeded, 100*time.Millisecond)
+	RecordCleanupFailure(BackendDocker)
 	RecordWebsocketReconnect("dial_failed")
 	SetWorkerInfo("v0.0.0", "docker", "test")
+	ctx, span := StartTaskSpan(context.Background(), "task-1", "test task")
+	AddTaskEvent(ctx, "task.test")
+	span.End()
 }
 
 func TestRecordTaskCompletedEmitsCounterAndHistogram(t *testing.T) {
@@ -222,6 +232,10 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 		"oz_worker_tasks_claimed_total",
 		"oz_worker_tasks_rejected_total",
 		"oz_worker_tasks_completed_total",
+		"oz_worker_task_failures_total",
+		"oz_worker_task_cancellations_total",
+		"oz_worker_backend_operations_total",
+		"oz_worker_cleanup_failures_total",
 		"oz_worker_websocket_reconnects_total",
 	}
 	for _, name := range want {
@@ -239,9 +253,80 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 			t.Errorf("primed %s{result=%s} = %d, want 0", "oz_worker_tasks_completed_total", v.AsString(), dp.Value)
 		}
 	}
-	for _, want := range []string{"succeeded", "failed"} {
+	for _, want := range []string{"succeeded", "failed", "cancelled"} {
 		if !results[want] {
 			t.Errorf("oz_worker_tasks_completed_total missing primed series for result=%s", want)
+		}
+	}
+	failures := findMetric(t, rm, "oz_worker_task_failures_total").Data.(metricdata.Sum[int64])
+	failureSeries := map[string]bool{}
+	for _, dp := range failures.DataPoints {
+		phase, _ := dp.Attributes.Value("phase")
+		reason, _ := dp.Attributes.Value("reason")
+		key := phase.AsString() + "/" + reason.AsString()
+		failureSeries[key] = true
+		if dp.Value != 0 {
+			t.Errorf("primed oz_worker_task_failures_total{%s} = %d, want 0", key, dp.Value)
+		}
+	}
+	for _, want := range []string{
+		TaskFailurePhaseBackend + "/" + TaskFailureReasonImagePull,
+		TaskFailurePhaseBackend + "/" + TaskFailureReasonTaskCancelled,
+		TaskFailurePhaseCleanup + "/" + TaskFailureReasonCleanup,
+	} {
+		if !failureSeries[want] {
+			t.Errorf("oz_worker_task_failures_total missing primed series for %s", want)
+		}
+	}
+
+	cancellations := findMetric(t, rm, "oz_worker_task_cancellations_total").Data.(metricdata.Sum[int64])
+	sources := map[string]bool{}
+	for _, dp := range cancellations.DataPoints {
+		source, _ := dp.Attributes.Value("source")
+		sources[source.AsString()] = true
+		if dp.Value != 0 {
+			t.Errorf("primed oz_worker_task_cancellations_total{source=%s} = %d, want 0", source.AsString(), dp.Value)
+		}
+	}
+	for _, want := range []string{CancelSourceServer, CancelSourceSignal} {
+		if !sources[want] {
+			t.Errorf("oz_worker_task_cancellations_total missing primed series for source=%s", want)
+		}
+	}
+
+	backendOps := findMetric(t, rm, "oz_worker_backend_operations_total").Data.(metricdata.Sum[int64])
+	operationResults := map[string]bool{}
+	for _, dp := range backendOps.DataPoints {
+		operation, _ := dp.Attributes.Value("operation")
+		result, _ := dp.Attributes.Value("result")
+		key := operation.AsString() + "/" + result.AsString()
+		operationResults[key] = true
+		if dp.Value != 0 {
+			t.Errorf("primed oz_worker_backend_operations_total{%s} = %d, want 0", key, dp.Value)
+		}
+	}
+	for _, want := range []string{
+		"task/" + BackendOperationResultSucceeded,
+		"task/" + BackendOperationResultFailed,
+		"task/" + BackendOperationResultCancelled,
+	} {
+		if !operationResults[want] {
+			t.Errorf("oz_worker_backend_operations_total missing primed series for %s", want)
+		}
+	}
+
+	cleanupFailures := findMetric(t, rm, "oz_worker_cleanup_failures_total").Data.(metricdata.Sum[int64])
+	cleanupBackends := map[string]bool{}
+	for _, dp := range cleanupFailures.DataPoints {
+		backend, _ := dp.Attributes.Value("backend")
+		cleanupBackends[backend.AsString()] = true
+		if dp.Value != 0 {
+			t.Errorf("primed oz_worker_cleanup_failures_total{backend=%s} = %d, want 0", backend.AsString(), dp.Value)
+		}
+	}
+	for _, want := range []string{BackendDocker, BackendDirect, BackendKubernetes} {
+		if !cleanupBackends[want] {
+			t.Errorf("oz_worker_cleanup_failures_total missing primed series for backend=%s", want)
 		}
 	}
 
@@ -283,7 +368,33 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 			if m.Name == "oz_worker_task_duration_seconds" {
 				t.Errorf("oz_worker_task_duration_seconds was emitted at startup; expected to remain absent until first task")
 			}
+			if m.Name == "oz_worker_task_assignment_age_seconds" {
+				t.Errorf("oz_worker_task_assignment_age_seconds was emitted at startup; expected to remain absent until first task")
+			}
+			if m.Name == "oz_worker_task_startup_duration_seconds" {
+				t.Errorf("oz_worker_task_startup_duration_seconds was emitted at startup; expected to remain absent until first task")
+			}
+			if m.Name == "oz_worker_backend_operation_duration_seconds" {
+				t.Errorf("oz_worker_backend_operation_duration_seconds was emitted at startup; expected to remain absent until first backend operation")
+			}
 		}
+	}
+}
+
+func TestShouldInitTracesRequiresExporter(t *testing.T) {
+	t.Setenv("OTEL_TRACES_EXPORTER", "")
+	if shouldInitTraces() {
+		t.Fatal("expected empty OTEL_TRACES_EXPORTER to disable traces")
+	}
+
+	t.Setenv("OTEL_TRACES_EXPORTER", " none ")
+	if shouldInitTraces() {
+		t.Fatal("expected OTEL_TRACES_EXPORTER=none to disable traces")
+	}
+
+	t.Setenv("OTEL_TRACES_EXPORTER", "otlp")
+	if !shouldInitTraces() {
+		t.Fatal("expected non-none OTEL_TRACES_EXPORTER to enable traces")
 	}
 }
 

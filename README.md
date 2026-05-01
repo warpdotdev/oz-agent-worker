@@ -241,10 +241,15 @@ curl -s localhost:9464/metrics | grep oz_worker_
 
 ```bash
 export OTEL_METRICS_EXPORTER=otlp
+export OTEL_TRACES_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc:4318
 oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
 ```
+
+Tracing is opt-in. Set `OTEL_TRACES_EXPORTER` to a non-`none` exporter such as
+`otlp` to emit per-task spans and lifecycle events; leave it unset to export
+metrics only.
 
 ### Helm
 
@@ -275,6 +280,8 @@ metrics:
   enabled: true
   exporter: otlp
   extraEnv:
+    - name: OTEL_TRACES_EXPORTER
+      value: otlp
     - name: OTEL_EXPORTER_OTLP_ENDPOINT
       value: http://otel-collector.observability.svc:4318
 ```
@@ -298,12 +305,30 @@ shows up as a distinct series.
 - `oz_worker_tasks_rejected_total{reason}` (counter): tasks the worker
   declined, e.g. `reason="at_capacity"`.
 - `oz_worker_tasks_completed_total{result}` (counter): completed tasks
-  labeled `result="succeeded"` or `result="failed"`. Success rate over 5m:
+  labeled `result="succeeded"`, `result="failed"`, or `result="cancelled"`.
+  Success rate over 5m:
   `sum(rate(oz_worker_tasks_completed_total{result="succeeded"}[5m])) /
    sum(rate(oz_worker_tasks_completed_total[5m]))`.
 - `oz_worker_task_duration_seconds{result}` (histogram): wall-clock task
   duration on the worker. p95: `histogram_quantile(0.95,
    sum by (le) (rate(oz_worker_task_duration_seconds_bucket[5m])))`.
+- `oz_worker_task_assignment_age_seconds` (histogram): age of an assignment
+  when the worker receives it, measured from the server task creation time.
+- `oz_worker_task_startup_duration_seconds` (histogram): time from assignment
+  receipt until backend execution begins.
+- `oz_worker_task_failures_total{phase,reason}` (counter): bounded failure
+  classification for task failures, such as `phase="backend"` with
+  `reason="image_pull"`, `reason="unschedulable"`, or
+  `reason="container_oom"`.
+- `oz_worker_task_cancellations_total{source}` (counter): explicit
+  cancellation requests by source. Server-initiated cancellation is introduced
+  by the worker cancellation controls branch.
+- `oz_worker_backend_operations_total{operation,result}` (counter): backend
+  operations by bounded result (`succeeded`, `failed`, `cancelled`).
+- `oz_worker_backend_operation_duration_seconds{operation,result}`
+  (histogram): backend operation duration.
+- `oz_worker_cleanup_failures_total{backend}` (counter): cleanup attempts that
+  failed after task execution or cancellation.
 - `oz_worker_websocket_reconnects_total{reason}` (counter): reconnect
   attempts; spikes indicate flapping workers.
 - `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
@@ -321,6 +346,11 @@ Direct mappings for the questions enterprise operators most commonly ask:
    sum(oz_worker_tasks_max_concurrent > 0)`
 - **Failure rate:**
   `sum(rate(oz_worker_tasks_completed_total{result="failed"}[5m]))`
+- **Failure modes:**
+  `sum by (phase, reason) (rate(oz_worker_task_failures_total[5m]))`
+- **Assignment latency p95:**
+  `histogram_quantile(0.95,
+   sum by (le) (rate(oz_worker_task_assignment_age_seconds_bucket[5m])))`
 - **Reconnect storms:**
   `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
 

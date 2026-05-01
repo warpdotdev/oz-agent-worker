@@ -32,16 +32,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // scopeName is the instrumentation-scope name used for all worker metrics.
@@ -63,15 +67,22 @@ type Config struct {
 // a single MeterProvider. Helpers read this struct atomically so that Init can
 // hot-swap from the no-op set to the SDK-backed set without locking.
 type instruments struct {
-	connected          metric.Int64Gauge
-	tasksActive        metric.Int64UpDownCounter
-	tasksMaxConcurrent metric.Int64Gauge
-	tasksClaimed       metric.Int64Counter
-	tasksRejected      metric.Int64Counter
-	tasksCompleted     metric.Int64Counter
-	taskDuration       metric.Float64Histogram
-	wsReconnects       metric.Int64Counter
-	workerInfo         metric.Int64Gauge
+	connected                metric.Int64Gauge
+	tasksActive              metric.Int64UpDownCounter
+	tasksMaxConcurrent       metric.Int64Gauge
+	tasksClaimed             metric.Int64Counter
+	tasksRejected            metric.Int64Counter
+	tasksCompleted           metric.Int64Counter
+	taskDuration             metric.Float64Histogram
+	taskAssignmentAge        metric.Float64Histogram
+	taskStartupDuration      metric.Float64Histogram
+	taskFailures             metric.Int64Counter
+	taskCancellations        metric.Int64Counter
+	backendOperations        metric.Int64Counter
+	backendOperationDuration metric.Float64Histogram
+	cleanupFailures          metric.Int64Counter
+	wsReconnects             metric.Int64Counter
+	workerInfo               metric.Int64Gauge
 }
 
 // activeInstruments is the current instrument set. It always points to a
@@ -86,6 +97,99 @@ const (
 	RejectReasonAtCapacity       = "at_capacity"
 	WSReconnectReasonDialFailed  = "dial_failed"
 	WSReconnectReasonRemoteClose = "remote_close"
+
+	TaskFailurePhaseAssignment = "assignment"
+	TaskFailurePhaseBackend    = "backend"
+	TaskFailurePhaseCleanup    = "cleanup"
+
+	TaskFailureReasonUnknown         = "unknown"
+	TaskFailureReasonTaskTimeout     = "task_timeout"
+	TaskFailureReasonTaskCancelled   = "task_cancelled"
+	TaskFailureReasonImagePull       = "image_pull"
+	TaskFailureReasonSidecarPrep     = "sidecar_prep"
+	TaskFailureReasonContainerCreate = "container_create"
+	TaskFailureReasonContainerStart  = "container_start"
+	TaskFailureReasonContainerWait   = "container_wait"
+	TaskFailureReasonContainerExit   = "container_exit"
+	TaskFailureReasonContainerOOM    = "container_oom"
+	TaskFailureReasonWorkspaceSetup  = "workspace_setup"
+	TaskFailureReasonSetupCommand    = "setup_command"
+	TaskFailureReasonAgentInvocation = "agent_invocation"
+	TaskFailureReasonTeardownCommand = "teardown_command"
+	TaskFailureReasonJobCreate       = "job_create"
+	TaskFailureReasonJobWatch        = "job_watch"
+	TaskFailureReasonJobFailed       = "job_failed"
+	TaskFailureReasonPodWatch        = "pod_watch"
+	TaskFailureReasonUnschedulable   = "unschedulable"
+	TaskFailureReasonVolumeMount     = "volume_mount"
+	TaskFailureReasonInitContainer   = "init_container"
+	TaskFailureReasonInvalidImage    = "invalid_image"
+	TaskFailureReasonActiveDeadline  = "active_deadline"
+	TaskFailureReasonCleanup         = "cleanup"
+
+	BackendOperationResultSucceeded = "succeeded"
+	BackendOperationResultFailed    = "failed"
+	BackendOperationResultCancelled = "cancelled"
+
+	CancelSourceServer = "server"
+	CancelSourceSignal = "signal"
+
+	BackendDocker     = "docker"
+	BackendDirect     = "direct"
+	BackendKubernetes = "kubernetes"
+)
+
+var (
+	taskResults = []TaskResult{
+		TaskResultSucceeded,
+		TaskResultFailed,
+		TaskResultCancelled,
+	}
+	taskFailurePhases = []string{
+		TaskFailurePhaseAssignment,
+		TaskFailurePhaseBackend,
+		TaskFailurePhaseCleanup,
+	}
+	taskFailureReasons = []string{
+		TaskFailureReasonUnknown,
+		TaskFailureReasonTaskTimeout,
+		TaskFailureReasonTaskCancelled,
+		TaskFailureReasonImagePull,
+		TaskFailureReasonSidecarPrep,
+		TaskFailureReasonContainerCreate,
+		TaskFailureReasonContainerStart,
+		TaskFailureReasonContainerWait,
+		TaskFailureReasonContainerExit,
+		TaskFailureReasonContainerOOM,
+		TaskFailureReasonWorkspaceSetup,
+		TaskFailureReasonSetupCommand,
+		TaskFailureReasonAgentInvocation,
+		TaskFailureReasonTeardownCommand,
+		TaskFailureReasonJobCreate,
+		TaskFailureReasonJobWatch,
+		TaskFailureReasonJobFailed,
+		TaskFailureReasonPodWatch,
+		TaskFailureReasonUnschedulable,
+		TaskFailureReasonVolumeMount,
+		TaskFailureReasonInitContainer,
+		TaskFailureReasonInvalidImage,
+		TaskFailureReasonActiveDeadline,
+		TaskFailureReasonCleanup,
+	}
+	backendOperationResults = []string{
+		BackendOperationResultSucceeded,
+		BackendOperationResultFailed,
+		BackendOperationResultCancelled,
+	}
+	cancellationSources = []string{
+		CancelSourceServer,
+		CancelSourceSignal,
+	}
+	backends = []string{
+		BackendDocker,
+		BackendDirect,
+		BackendKubernetes,
+	}
 )
 
 func init() {
@@ -116,38 +220,79 @@ func init() {
 // stops the exporter; it is safe to call after Init returns an error.
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error) {
 	noop := func(context.Context) error { return nil }
-
-	if os.Getenv("OTEL_METRICS_EXPORTER") == "none" {
-		// Explicit opt-out: keep the no-op instruments installed by init().
-		return noop, nil
+	var shutdowns []func(context.Context) error
+	var initErr error
+	var res *resource.Resource
+	getResource := func() (*resource.Resource, error) {
+		if res != nil {
+			return res, nil
+		}
+		var err error
+		res, err = newResource(ctx, cfg)
+		return res, err
 	}
 
-	reader, err := autoexport.NewMetricReader(ctx)
-	if err != nil {
-		return noop, err
+	if os.Getenv("OTEL_METRICS_EXPORTER") != "none" {
+		reader, err := autoexport.NewMetricReader(ctx)
+		if err != nil {
+			initErr = errors.Join(initErr, err)
+		} else {
+			res, err := getResource()
+			if err != nil {
+				initErr = errors.Join(initErr, errors.Join(err, reader.Shutdown(ctx)))
+			} else {
+				provider := sdkmetric.NewMeterProvider(
+					sdkmetric.WithReader(reader),
+					sdkmetric.WithResource(res),
+				)
+
+				meter := provider.Meter(scopeName)
+				set, err := buildInstruments(meter)
+				if err != nil {
+					initErr = errors.Join(initErr, errors.Join(err, provider.Shutdown(ctx)))
+				} else {
+					activeInstruments.Store(set)
+					primeInstruments(ctx, set)
+					shutdowns = append(shutdowns, provider.Shutdown)
+				}
+			}
+		}
 	}
 
-	res, err := newResource(ctx, cfg)
-	if err != nil {
-		// We have a reader but failed to build a resource; close the reader
-		// and surface the error.
-		return noop, errors.Join(err, reader.Shutdown(ctx))
+	if shouldInitTraces() {
+		exporter, err := autoexport.NewSpanExporter(ctx)
+		if err != nil {
+			initErr = errors.Join(initErr, err)
+		} else {
+			res, err := getResource()
+			if err != nil {
+				initErr = errors.Join(initErr, errors.Join(err, exporter.Shutdown(ctx)))
+			} else {
+				provider := sdktrace.NewTracerProvider(
+					sdktrace.WithBatcher(exporter),
+					sdktrace.WithResource(res),
+				)
+				otel.SetTracerProvider(provider)
+				shutdowns = append(shutdowns, provider.Shutdown)
+			}
+		}
 	}
 
-	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(reader),
-		sdkmetric.WithResource(res),
-	)
-
-	meter := provider.Meter(scopeName)
-	set, err := buildInstruments(meter)
-	if err != nil {
-		return noop, errors.Join(err, provider.Shutdown(ctx))
+	if len(shutdowns) == 0 {
+		return noop, initErr
 	}
-	activeInstruments.Store(set)
-	primeInstruments(ctx, set)
+	return func(ctx context.Context) error {
+		var err error
+		for i := len(shutdowns) - 1; i >= 0; i-- {
+			err = errors.Join(err, shutdowns[i](ctx))
+		}
+		return err
+	}, initErr
+}
 
-	return provider.Shutdown, nil
+func shouldInitTraces() bool {
+	exporter := strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
+	return exporter != "" && !strings.EqualFold(exporter, "none")
 }
 
 // primeInstruments records a zero observation against every known
@@ -165,9 +310,37 @@ func primeInstruments(ctx context.Context, set *instruments) {
 	set.tasksRejected.Add(ctx, 0,
 		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
 	)
-	for _, r := range []TaskResult{TaskResultSucceeded, TaskResultFailed} {
+	for _, r := range taskResults {
 		set.tasksCompleted.Add(ctx, 0,
 			metric.WithAttributes(attribute.String("result", string(r))),
+		)
+	}
+	for _, phase := range taskFailurePhases {
+		for _, reason := range taskFailureReasons {
+			set.taskFailures.Add(ctx, 0,
+				metric.WithAttributes(
+					attribute.String("phase", phase),
+					attribute.String("reason", reason),
+				),
+			)
+		}
+	}
+	for _, source := range cancellationSources {
+		set.taskCancellations.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("source", source)),
+		)
+	}
+	for _, r := range backendOperationResults {
+		set.backendOperations.Add(ctx, 0,
+			metric.WithAttributes(
+				attribute.String("operation", "task"),
+				attribute.String("result", r),
+			),
+		)
+	}
+	for _, backend := range backends {
+		set.cleanupFailures.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("backend", backend)),
 		)
 	}
 	for _, r := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
@@ -248,6 +421,58 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	taskAssignmentAge, err := m.Float64Histogram(
+		"oz_worker_task_assignment_age_seconds",
+		metric.WithDescription("Age of a task assignment when the worker receives it, measured from the task creation timestamp."),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	taskStartupDuration, err := m.Float64Histogram(
+		"oz_worker_task_startup_duration_seconds",
+		metric.WithDescription("Time from task assignment receipt to when backend execution begins."),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	taskFailures, err := m.Int64Counter(
+		"oz_worker_task_failures_total",
+		metric.WithDescription("Task failures labeled by bounded execution phase and reason."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	taskCancellations, err := m.Int64Counter(
+		"oz_worker_task_cancellations_total",
+		metric.WithDescription("Explicit task cancellation requests received by the worker."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	backendOperations, err := m.Int64Counter(
+		"oz_worker_backend_operations_total",
+		metric.WithDescription("Backend operations completed by the worker, labeled by operation and result."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	backendOperationDuration, err := m.Float64Histogram(
+		"oz_worker_backend_operation_duration_seconds",
+		metric.WithDescription("Duration of backend operations, labeled by operation and result."),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	cleanupFailures, err := m.Int64Counter(
+		"oz_worker_cleanup_failures_total",
+		metric.WithDescription("Cleanup operations that failed after task execution or cancellation."),
+	)
+	if err != nil {
+		return nil, err
+	}
 	wsReconnects, err := m.Int64Counter(
 		"oz_worker_websocket_reconnects_total",
 		metric.WithDescription("Total WebSocket reconnect attempts since process start."),
@@ -263,15 +488,22 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 		return nil, err
 	}
 	return &instruments{
-		connected:          connected,
-		tasksActive:        tasksActive,
-		tasksMaxConcurrent: tasksMaxConcurrent,
-		tasksClaimed:       tasksClaimed,
-		tasksRejected:      tasksRejected,
-		tasksCompleted:     tasksCompleted,
-		taskDuration:       taskDuration,
-		wsReconnects:       wsReconnects,
-		workerInfo:         workerInfo,
+		connected:                connected,
+		tasksActive:              tasksActive,
+		tasksMaxConcurrent:       tasksMaxConcurrent,
+		tasksClaimed:             tasksClaimed,
+		tasksRejected:            tasksRejected,
+		tasksCompleted:           tasksCompleted,
+		taskDuration:             taskDuration,
+		taskAssignmentAge:        taskAssignmentAge,
+		taskStartupDuration:      taskStartupDuration,
+		taskFailures:             taskFailures,
+		taskCancellations:        taskCancellations,
+		backendOperations:        backendOperations,
+		backendOperationDuration: backendOperationDuration,
+		cleanupFailures:          cleanupFailures,
+		wsReconnects:             wsReconnects,
+		workerInfo:               workerInfo,
 	}, nil
 }
 
@@ -326,6 +558,7 @@ type TaskResult string
 const (
 	TaskResultSucceeded TaskResult = "succeeded"
 	TaskResultFailed    TaskResult = "failed"
+	TaskResultCancelled TaskResult = "cancelled"
 )
 
 // RecordTaskCompleted records a completed task, regardless of outcome, along
@@ -334,6 +567,60 @@ func RecordTaskCompleted(result TaskResult, duration time.Duration) {
 	attrs := metric.WithAttributes(attribute.String("result", string(result)))
 	current().tasksCompleted.Add(context.Background(), 1, attrs)
 	current().taskDuration.Record(context.Background(), duration.Seconds(), attrs)
+}
+
+// RecordTaskAssignmentAge records how long a task was queued before this
+// worker received the assignment. Negative durations are ignored because clock
+// skew between server and worker would make the value misleading.
+func RecordTaskAssignmentAge(age time.Duration) {
+	if age < 0 {
+		return
+	}
+	current().taskAssignmentAge.Record(context.Background(), age.Seconds())
+}
+
+// RecordTaskStartupDuration records the time from assignment receipt to backend execution.
+func RecordTaskStartupDuration(duration time.Duration) {
+	if duration < 0 {
+		return
+	}
+	current().taskStartupDuration.Record(context.Background(), duration.Seconds())
+}
+
+// RecordTaskFailure records a bounded failure mode for a task.
+func RecordTaskFailure(phase, reason string) {
+	current().taskFailures.Add(context.Background(), 1,
+		metric.WithAttributes(
+			attribute.String("phase", phase),
+			attribute.String("reason", reason),
+		),
+	)
+}
+
+// RecordTaskCancellation records an explicit cancellation request.
+func RecordTaskCancellation(source string) {
+	current().taskCancellations.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("source", source)),
+	)
+}
+
+// RecordBackendOperation records the result and duration of a backend operation.
+func RecordBackendOperation(operation, result string, duration time.Duration) {
+	attrs := metric.WithAttributes(
+		attribute.String("operation", operation),
+		attribute.String("result", result),
+	)
+	current().backendOperations.Add(context.Background(), 1, attrs)
+	if duration >= 0 {
+		current().backendOperationDuration.Record(context.Background(), duration.Seconds(), attrs)
+	}
+}
+
+// RecordCleanupFailure records failed cleanup for the resolved backend.
+func RecordCleanupFailure(backend string) {
+	current().cleanupFailures.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("backend", backend)),
+	)
 }
 
 // RecordWebsocketReconnect records a reconnect attempt against warp-server.
@@ -355,4 +642,21 @@ func SetWorkerInfo(version, backend, workerID string) {
 			attribute.String("worker_id", workerID),
 		),
 	)
+}
+
+// StartTaskSpan starts a trace span for a single task execution. It is a no-op
+// unless OTEL_TRACES_EXPORTER is configured by the operator.
+func StartTaskSpan(ctx context.Context, taskID, title string) (context.Context, trace.Span) {
+	return otel.Tracer(scopeName).Start(ctx, "oz_worker.task",
+		trace.WithAttributes(
+			attribute.String("task.id", taskID),
+			attribute.String("task.title", title),
+		),
+	)
+}
+
+// AddTaskEvent records a task lifecycle event on the active span. High-cardinality
+// identifiers belong here rather than in metric labels.
+func AddTaskEvent(ctx context.Context, name string, attrs ...attribute.KeyValue) {
+	trace.SpanFromContext(ctx).AddEvent(name, trace.WithAttributes(attrs...))
 }
