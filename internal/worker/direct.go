@@ -154,6 +154,9 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
 		if err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv); err != nil {
+			if ctx.Err() != nil {
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+			}
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err))
 		}
 	}
@@ -183,6 +186,9 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+		}
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err))
 	}
 

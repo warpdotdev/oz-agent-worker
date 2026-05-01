@@ -9,12 +9,13 @@ import (
 type MessageType string
 
 const (
-	MessageTypeTaskAssignment MessageType = "task_assignment"
-	MessageTypeTaskClaimed    MessageType = "task_claimed"
-	MessageTypeTaskCompleted  MessageType = "task_completed"
-	MessageTypeTaskFailed     MessageType = "task_failed"
-	MessageTypeTaskRejected   MessageType = "task_rejected"
-	MessageTypeHeartbeat      MessageType = "heartbeat"
+	MessageTypeTaskAssignment   MessageType = "task_assignment"
+	MessageTypeTaskClaimed      MessageType = "task_claimed"
+	MessageTypeTaskCompleted    MessageType = "task_completed"
+	MessageTypeTaskFailed       MessageType = "task_failed"
+	MessageTypeTaskRejected     MessageType = "task_rejected"
+	MessageTypeTaskCancellation MessageType = "task_cancellation"
+	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
 // WebSocketMessage is the base structure for all WebSocket messages
@@ -51,14 +52,16 @@ type TaskClaimedMessage struct {
 
 // TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
 type TaskCompletedMessage struct {
-	TaskID  string `json:"task_id"`
-	Message string `json:"message"`
+	TaskID    string     `json:"task_id"`
+	Message   string     `json:"message"`
+	TaskState *TaskState `json:"task_state,omitempty"`
 }
 
 // TaskFailedMessage is sent from worker to server if task launch fails
 type TaskFailedMessage struct {
-	TaskID  string `json:"task_id"`
-	Message string `json:"message"`
+	TaskID    string     `json:"task_id"`
+	Message   string     `json:"message"`
+	TaskState *TaskState `json:"task_state,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
@@ -67,6 +70,18 @@ type TaskRejectedMessage struct {
 	TaskID string `json:"task_id"`
 	Reason string `json:"reason"`
 }
+
+// TaskCancellationMessage is sent from server to worker to cancel an active task.
+type TaskCancellationMessage struct {
+	TaskID string `json:"task_id"`
+}
+
+// TaskState is the serialized terminal task state accepted by warp-server.
+type TaskState string
+
+const (
+	TaskStateCancelled TaskState = "CANCELLED"
+)
 
 type TaskDefinition struct {
 	Prompt string `json:"prompt"`
