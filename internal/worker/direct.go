@@ -224,9 +224,7 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 	}
 	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
-		metrics.RecordCleanupFailure(metrics.BackendDirect)
 		metrics.AddTaskEvent(ctx, "cleanup.failed",
-			attribute.String("backend", metrics.BackendDirect),
 			attribute.String("operation", "teardown"),
 			attribute.String("error.message", err.Error()),
 		)
@@ -240,9 +238,7 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir string
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {
-		metrics.RecordCleanupFailure(metrics.BackendDirect)
 		metrics.AddTaskEvent(ctx, "cleanup.failed",
-			attribute.String("backend", metrics.BackendDirect),
 			attribute.String("operation", "remove_workspace"),
 			attribute.String("error.message", err.Error()),
 		)

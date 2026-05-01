@@ -80,17 +80,11 @@ func TestHelpersSafeBeforeInit(t *testing.T) {
 	IncTasksActive()
 	DecTasksActive()
 	SetMaxConcurrent(4)
-	RecordTaskClaim()
 	RecordTaskRejected("at_capacity")
 	RecordTaskCompleted(TaskResultSucceeded, 250*time.Millisecond)
 	RecordTaskCompleted(TaskResultFailed, 1*time.Second)
 	RecordTaskCompleted(TaskResultCancelled, 500*time.Millisecond)
-	RecordTaskAssignmentAge(5 * time.Second)
-	RecordTaskStartupDuration(250 * time.Millisecond)
 	RecordTaskFailure(TaskFailurePhaseBackend, TaskFailureReasonImagePull)
-	RecordTaskCancellation(CancelSourceServer)
-	RecordBackendOperation("task", BackendOperationResultSucceeded, 100*time.Millisecond)
-	RecordCleanupFailure(BackendDocker)
 	RecordWebsocketReconnect("dial_failed")
 	SetWorkerInfo("v0.0.0", "docker", "test")
 	ctx, span := StartTaskSpan(context.Background(), "task-1", "test task")
@@ -229,13 +223,9 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 	want := []string{
 		"oz_worker_connected",
 		"oz_worker_tasks_active",
-		"oz_worker_tasks_claimed_total",
 		"oz_worker_tasks_rejected_total",
 		"oz_worker_tasks_completed_total",
 		"oz_worker_task_failures_total",
-		"oz_worker_task_cancellations_total",
-		"oz_worker_backend_operations_total",
-		"oz_worker_cleanup_failures_total",
 		"oz_worker_websocket_reconnects_total",
 	}
 	for _, name := range want {
@@ -279,57 +269,6 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 		}
 	}
 
-	cancellations := findMetric(t, rm, "oz_worker_task_cancellations_total").Data.(metricdata.Sum[int64])
-	sources := map[string]bool{}
-	for _, dp := range cancellations.DataPoints {
-		source, _ := dp.Attributes.Value("source")
-		sources[source.AsString()] = true
-		if dp.Value != 0 {
-			t.Errorf("primed oz_worker_task_cancellations_total{source=%s} = %d, want 0", source.AsString(), dp.Value)
-		}
-	}
-	for _, want := range []string{CancelSourceServer, CancelSourceSignal} {
-		if !sources[want] {
-			t.Errorf("oz_worker_task_cancellations_total missing primed series for source=%s", want)
-		}
-	}
-
-	backendOps := findMetric(t, rm, "oz_worker_backend_operations_total").Data.(metricdata.Sum[int64])
-	operationResults := map[string]bool{}
-	for _, dp := range backendOps.DataPoints {
-		operation, _ := dp.Attributes.Value("operation")
-		result, _ := dp.Attributes.Value("result")
-		key := operation.AsString() + "/" + result.AsString()
-		operationResults[key] = true
-		if dp.Value != 0 {
-			t.Errorf("primed oz_worker_backend_operations_total{%s} = %d, want 0", key, dp.Value)
-		}
-	}
-	for _, want := range []string{
-		"task/" + BackendOperationResultSucceeded,
-		"task/" + BackendOperationResultFailed,
-		"task/" + BackendOperationResultCancelled,
-	} {
-		if !operationResults[want] {
-			t.Errorf("oz_worker_backend_operations_total missing primed series for %s", want)
-		}
-	}
-
-	cleanupFailures := findMetric(t, rm, "oz_worker_cleanup_failures_total").Data.(metricdata.Sum[int64])
-	cleanupBackends := map[string]bool{}
-	for _, dp := range cleanupFailures.DataPoints {
-		backend, _ := dp.Attributes.Value("backend")
-		cleanupBackends[backend.AsString()] = true
-		if dp.Value != 0 {
-			t.Errorf("primed oz_worker_cleanup_failures_total{backend=%s} = %d, want 0", backend.AsString(), dp.Value)
-		}
-	}
-	for _, want := range []string{BackendDocker, BackendDirect, BackendKubernetes} {
-		if !cleanupBackends[want] {
-			t.Errorf("oz_worker_cleanup_failures_total missing primed series for backend=%s", want)
-		}
-	}
-
 	wsReconnects := findMetric(t, rm, "oz_worker_websocket_reconnects_total").Data.(metricdata.Sum[int64])
 	reasons := map[string]bool{}
 	for _, dp := range wsReconnects.DataPoints {
@@ -367,15 +306,6 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 		for _, m := range sm.Metrics {
 			if m.Name == "oz_worker_task_duration_seconds" {
 				t.Errorf("oz_worker_task_duration_seconds was emitted at startup; expected to remain absent until first task")
-			}
-			if m.Name == "oz_worker_task_assignment_age_seconds" {
-				t.Errorf("oz_worker_task_assignment_age_seconds was emitted at startup; expected to remain absent until first task")
-			}
-			if m.Name == "oz_worker_task_startup_duration_seconds" {
-				t.Errorf("oz_worker_task_startup_duration_seconds was emitted at startup; expected to remain absent until first task")
-			}
-			if m.Name == "oz_worker_backend_operation_duration_seconds" {
-				t.Errorf("oz_worker_backend_operation_duration_seconds was emitted at startup; expected to remain absent until first backend operation")
 			}
 		}
 	}

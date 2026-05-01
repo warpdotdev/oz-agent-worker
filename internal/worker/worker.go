@@ -330,9 +330,6 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
-	if !assignment.Task.CreatedAt.IsZero() {
-		metrics.RecordTaskAssignmentAge(receivedAt.Sub(assignment.Task.CreatedAt))
-	}
 
 	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
@@ -361,8 +358,8 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
-	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.RecordTaskClaim()
+	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
 	taskCtx, taskCancel := context.WithCancel(taskCtx)
 
@@ -479,15 +476,12 @@ func (w *Worker) executeTask(ctx context.Context, span trace.Span, assignment *t
 	metrics.AddTaskEvent(ctx, "task.started")
 
 	params := w.prepareTaskParams(assignment)
-	metrics.RecordTaskStartupDuration(time.Since(receivedAt))
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
 		attribute.String("docker.image", params.DockerImage),
 	)
 
-	backendStart := time.Now()
 	err := w.backend.ExecuteTask(ctx, params)
-	recordBackendOperation("task", backendStart, err)
 	if err != nil {
 		result = metrics.TaskResultFailed
 		phase, reason := taskFailureLabels(err)

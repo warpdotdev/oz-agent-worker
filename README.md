@@ -300,8 +300,6 @@ shows up as a distinct series.
   `count(oz_worker_tasks_active > 0)`.
 - `oz_worker_tasks_max_concurrent` (gauge): configured concurrency limit
   (`0` means unlimited).
-- `oz_worker_tasks_claimed_total` (counter): total tasks accepted by the
-  worker since process start.
 - `oz_worker_tasks_rejected_total{reason}` (counter): tasks the worker
   declined, e.g. `reason="at_capacity"`.
 - `oz_worker_tasks_completed_total{result}` (counter): completed tasks
@@ -312,23 +310,10 @@ shows up as a distinct series.
 - `oz_worker_task_duration_seconds{result}` (histogram): wall-clock task
   duration on the worker. p95: `histogram_quantile(0.95,
    sum by (le) (rate(oz_worker_task_duration_seconds_bucket[5m])))`.
-- `oz_worker_task_assignment_age_seconds` (histogram): age of an assignment
-  when the worker receives it, measured from the server task creation time.
-- `oz_worker_task_startup_duration_seconds` (histogram): time from assignment
-  receipt until backend execution begins.
 - `oz_worker_task_failures_total{phase,reason}` (counter): bounded failure
   classification for task failures, such as `phase="backend"` with
   `reason="image_pull"`, `reason="unschedulable"`, or
   `reason="container_oom"`.
-- `oz_worker_task_cancellations_total{source}` (counter): explicit
-  cancellation requests by source. Server-initiated cancellation is introduced
-  by the worker cancellation controls branch.
-- `oz_worker_backend_operations_total{operation,result}` (counter): backend
-  operations by bounded result (`succeeded`, `failed`, `cancelled`).
-- `oz_worker_backend_operation_duration_seconds{operation,result}`
-  (histogram): backend operation duration.
-- `oz_worker_cleanup_failures_total{backend}` (counter): cleanup attempts that
-  failed after task execution or cancellation.
 - `oz_worker_websocket_reconnects_total{reason}` (counter): reconnect
   attempts; spikes indicate flapping workers.
 - `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
@@ -348,9 +333,6 @@ Direct mappings for the questions enterprise operators most commonly ask:
   `sum(rate(oz_worker_tasks_completed_total{result="failed"}[5m]))`
 - **Failure modes:**
   `sum by (phase, reason) (rate(oz_worker_task_failures_total[5m]))`
-- **Assignment latency p95:**
-  `histogram_quantile(0.95,
-   sum by (le) (rate(oz_worker_task_assignment_age_seconds_bucket[5m])))`
 - **Reconnect storms:**
   `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
 
