@@ -62,6 +62,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "oz-agent-worker.apiKeySecretName" . }}
                   key: {{ .Values.warp.apiKeySecret.key }}
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: OTEL_METRICS_EXPORTER
               value: {{ .Values.metrics.exporter | quote }}
