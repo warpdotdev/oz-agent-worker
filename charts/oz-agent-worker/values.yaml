@@ -32,6 +32,7 @@ worker:
   maxConcurrentTasks: 0
   idleOnComplete: ""
   extraArgs: []
+  extraEnv: []
   deploymentAnnotations: {}
   podAnnotations: {}
   podLabels: {}
