@@ -146,7 +146,6 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	defer func() {
 		if containerID != "" && !b.config.NoCleanup {
 			if removeErr := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); removeErr != nil {
-				metrics.RecordCleanupFailure(metrics.BackendDocker)
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			}
 		}

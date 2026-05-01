@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
@@ -41,16 +40,4 @@ func taskFailureLabels(err error) (phase, reason string) {
 		return failure.phase, failure.reason
 	}
 	return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnknown
-}
-
-func recordBackendOperation(operation string, start time.Time, err error) {
-	result := metrics.BackendOperationResultSucceeded
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			result = metrics.BackendOperationResultCancelled
-		} else {
-			result = metrics.BackendOperationResultFailed
-		}
-	}
-	metrics.RecordBackendOperation(operation, result, time.Since(start))
 }

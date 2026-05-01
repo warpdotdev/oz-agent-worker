@@ -67,22 +67,15 @@ type Config struct {
 // a single MeterProvider. Helpers read this struct atomically so that Init can
 // hot-swap from the no-op set to the SDK-backed set without locking.
 type instruments struct {
-	connected                metric.Int64Gauge
-	tasksActive              metric.Int64UpDownCounter
-	tasksMaxConcurrent       metric.Int64Gauge
-	tasksClaimed             metric.Int64Counter
-	tasksRejected            metric.Int64Counter
-	tasksCompleted           metric.Int64Counter
-	taskDuration             metric.Float64Histogram
-	taskAssignmentAge        metric.Float64Histogram
-	taskStartupDuration      metric.Float64Histogram
-	taskFailures             metric.Int64Counter
-	taskCancellations        metric.Int64Counter
-	backendOperations        metric.Int64Counter
-	backendOperationDuration metric.Float64Histogram
-	cleanupFailures          metric.Int64Counter
-	wsReconnects             metric.Int64Counter
-	workerInfo               metric.Int64Gauge
+	connected          metric.Int64Gauge
+	tasksActive        metric.Int64UpDownCounter
+	tasksMaxConcurrent metric.Int64Gauge
+	tasksRejected      metric.Int64Counter
+	tasksCompleted     metric.Int64Counter
+	taskDuration       metric.Float64Histogram
+	taskFailures       metric.Int64Counter
+	wsReconnects       metric.Int64Counter
+	workerInfo         metric.Int64Gauge
 }
 
 // activeInstruments is the current instrument set. It always points to a
@@ -127,16 +120,6 @@ const (
 	TaskFailureReasonActiveDeadline  = "active_deadline"
 	TaskFailureReasonCleanup         = "cleanup"
 
-	BackendOperationResultSucceeded = "succeeded"
-	BackendOperationResultFailed    = "failed"
-	BackendOperationResultCancelled = "cancelled"
-
-	CancelSourceServer = "server"
-	CancelSourceSignal = "signal"
-
-	BackendDocker     = "docker"
-	BackendDirect     = "direct"
-	BackendKubernetes = "kubernetes"
 )
 
 var (
@@ -175,20 +158,6 @@ var (
 		TaskFailureReasonInvalidImage,
 		TaskFailureReasonActiveDeadline,
 		TaskFailureReasonCleanup,
-	}
-	backendOperationResults = []string{
-		BackendOperationResultSucceeded,
-		BackendOperationResultFailed,
-		BackendOperationResultCancelled,
-	}
-	cancellationSources = []string{
-		CancelSourceServer,
-		CancelSourceSignal,
-	}
-	backends = []string{
-		BackendDocker,
-		BackendDirect,
-		BackendKubernetes,
 	}
 )
 
@@ -306,7 +275,6 @@ func shouldInitTraces() bool {
 func primeInstruments(ctx context.Context, set *instruments) {
 	set.connected.Record(ctx, 0)
 	set.tasksActive.Add(ctx, 0)
-	set.tasksClaimed.Add(ctx, 0)
 	set.tasksRejected.Add(ctx, 0,
 		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
 	)
@@ -324,24 +292,6 @@ func primeInstruments(ctx context.Context, set *instruments) {
 				),
 			)
 		}
-	}
-	for _, source := range cancellationSources {
-		set.taskCancellations.Add(ctx, 0,
-			metric.WithAttributes(attribute.String("source", source)),
-		)
-	}
-	for _, r := range backendOperationResults {
-		set.backendOperations.Add(ctx, 0,
-			metric.WithAttributes(
-				attribute.String("operation", "task"),
-				attribute.String("result", r),
-			),
-		)
-	}
-	for _, backend := range backends {
-		set.cleanupFailures.Add(ctx, 0,
-			metric.WithAttributes(attribute.String("backend", backend)),
-		)
 	}
 	for _, r := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
 		set.wsReconnects.Add(ctx, 0,
@@ -392,13 +342,6 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
-	tasksClaimed, err := m.Int64Counter(
-		"oz_worker_tasks_claimed_total",
-		metric.WithDescription("Total tasks the worker has claimed since process start."),
-	)
-	if err != nil {
-		return nil, err
-	}
 	tasksRejected, err := m.Int64Counter(
 		"oz_worker_tasks_rejected_total",
 		metric.WithDescription("Total tasks the worker has rejected since process start."),
@@ -421,54 +364,9 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
-	taskAssignmentAge, err := m.Float64Histogram(
-		"oz_worker_task_assignment_age_seconds",
-		metric.WithDescription("Age of a task assignment when the worker receives it, measured from the task creation timestamp."),
-		metric.WithUnit("s"),
-	)
-	if err != nil {
-		return nil, err
-	}
-	taskStartupDuration, err := m.Float64Histogram(
-		"oz_worker_task_startup_duration_seconds",
-		metric.WithDescription("Time from task assignment receipt to when backend execution begins."),
-		metric.WithUnit("s"),
-	)
-	if err != nil {
-		return nil, err
-	}
 	taskFailures, err := m.Int64Counter(
 		"oz_worker_task_failures_total",
 		metric.WithDescription("Task failures labeled by bounded execution phase and reason."),
-	)
-	if err != nil {
-		return nil, err
-	}
-	taskCancellations, err := m.Int64Counter(
-		"oz_worker_task_cancellations_total",
-		metric.WithDescription("Explicit task cancellation requests received by the worker."),
-	)
-	if err != nil {
-		return nil, err
-	}
-	backendOperations, err := m.Int64Counter(
-		"oz_worker_backend_operations_total",
-		metric.WithDescription("Backend operations completed by the worker, labeled by operation and result."),
-	)
-	if err != nil {
-		return nil, err
-	}
-	backendOperationDuration, err := m.Float64Histogram(
-		"oz_worker_backend_operation_duration_seconds",
-		metric.WithDescription("Duration of backend operations, labeled by operation and result."),
-		metric.WithUnit("s"),
-	)
-	if err != nil {
-		return nil, err
-	}
-	cleanupFailures, err := m.Int64Counter(
-		"oz_worker_cleanup_failures_total",
-		metric.WithDescription("Cleanup operations that failed after task execution or cancellation."),
 	)
 	if err != nil {
 		return nil, err
@@ -488,22 +386,15 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 		return nil, err
 	}
 	return &instruments{
-		connected:                connected,
-		tasksActive:              tasksActive,
-		tasksMaxConcurrent:       tasksMaxConcurrent,
-		tasksClaimed:             tasksClaimed,
-		tasksRejected:            tasksRejected,
-		tasksCompleted:           tasksCompleted,
-		taskDuration:             taskDuration,
-		taskAssignmentAge:        taskAssignmentAge,
-		taskStartupDuration:      taskStartupDuration,
-		taskFailures:             taskFailures,
-		taskCancellations:        taskCancellations,
-		backendOperations:        backendOperations,
-		backendOperationDuration: backendOperationDuration,
-		cleanupFailures:          cleanupFailures,
-		wsReconnects:             wsReconnects,
-		workerInfo:               workerInfo,
+		connected:          connected,
+		tasksActive:        tasksActive,
+		tasksMaxConcurrent: tasksMaxConcurrent,
+		tasksRejected:      tasksRejected,
+		tasksCompleted:     tasksCompleted,
+		taskDuration:       taskDuration,
+		taskFailures:       taskFailures,
+		wsReconnects:       wsReconnects,
+		workerInfo:         workerInfo,
 	}, nil
 }
 
@@ -537,11 +428,6 @@ func SetMaxConcurrent(n int) {
 	current().tasksMaxConcurrent.Record(context.Background(), int64(n))
 }
 
-// RecordTaskClaim records a successful claim (worker has accepted a task).
-func RecordTaskClaim() {
-	current().tasksClaimed.Add(context.Background(), 1)
-}
-
 // RecordTaskRejected records a task that the worker rejected, e.g. because
 // it was at the configured concurrency limit. The reason label is intended
 // to be a small bounded enum.
@@ -569,24 +455,6 @@ func RecordTaskCompleted(result TaskResult, duration time.Duration) {
 	current().taskDuration.Record(context.Background(), duration.Seconds(), attrs)
 }
 
-// RecordTaskAssignmentAge records how long a task was queued before this
-// worker received the assignment. Negative durations are ignored because clock
-// skew between server and worker would make the value misleading.
-func RecordTaskAssignmentAge(age time.Duration) {
-	if age < 0 {
-		return
-	}
-	current().taskAssignmentAge.Record(context.Background(), age.Seconds())
-}
-
-// RecordTaskStartupDuration records the time from assignment receipt to backend execution.
-func RecordTaskStartupDuration(duration time.Duration) {
-	if duration < 0 {
-		return
-	}
-	current().taskStartupDuration.Record(context.Background(), duration.Seconds())
-}
-
 // RecordTaskFailure records a bounded failure mode for a task.
 func RecordTaskFailure(phase, reason string) {
 	current().taskFailures.Add(context.Background(), 1,
@@ -594,32 +462,6 @@ func RecordTaskFailure(phase, reason string) {
 			attribute.String("phase", phase),
 			attribute.String("reason", reason),
 		),
-	)
-}
-
-// RecordTaskCancellation records an explicit cancellation request.
-func RecordTaskCancellation(source string) {
-	current().taskCancellations.Add(context.Background(), 1,
-		metric.WithAttributes(attribute.String("source", source)),
-	)
-}
-
-// RecordBackendOperation records the result and duration of a backend operation.
-func RecordBackendOperation(operation, result string, duration time.Duration) {
-	attrs := metric.WithAttributes(
-		attribute.String("operation", operation),
-		attribute.String("result", result),
-	)
-	current().backendOperations.Add(context.Background(), 1, attrs)
-	if duration >= 0 {
-		current().backendOperationDuration.Record(context.Background(), duration.Seconds(), attrs)
-	}
-}
-
-// RecordCleanupFailure records failed cleanup for the resolved backend.
-func RecordCleanupFailure(backend string) {
-	current().cleanupFailures.Add(context.Background(), 1,
-		metric.WithAttributes(attribute.String("backend", backend)),
 	)
 }
 

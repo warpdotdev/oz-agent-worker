@@ -13,7 +13,6 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
-	"go.opentelemetry.io/otel/attribute"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -284,13 +283,6 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 		if ctx.Err() != nil || !b.config.NoCleanup {
 			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				metrics.RecordCleanupFailure(metrics.BackendKubernetes)
-				metrics.AddTaskEvent(ctx, "cleanup.failed",
-					attribute.String("backend", metrics.BackendKubernetes),
-					attribute.String("operation", "delete_job"),
-					attribute.String("k8s.job.name", jobName),
-					attribute.String("error.message", err.Error()),
-				)
 				log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 			}
 		}
@@ -315,13 +307,6 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		select {
 		case <-ctx.Done():
 			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				metrics.RecordCleanupFailure(metrics.BackendKubernetes)
-				metrics.AddTaskEvent(ctx, "cleanup.failed",
-					attribute.String("backend", metrics.BackendKubernetes),
-					attribute.String("operation", "delete_job"),
-					attribute.String("k8s.job.name", jobName),
-					attribute.String("error.message", err.Error()),
-				)
 				log.Warnf(ctx, "Failed to delete Job %s on cancellation: %v", jobName, err)
 			} else {
 				deleted = true
