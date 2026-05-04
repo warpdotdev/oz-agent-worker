@@ -1043,7 +1043,7 @@ func kubernetesTaskWrapperScript() string {
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
 		"  set +a",
 		"fi",
-		"/bin/sh /agent/entrypoint.sh \"$@\"",
+		"exec /agent/entrypoint.sh \"$@\"",
 	}, "\n")
 }
 
