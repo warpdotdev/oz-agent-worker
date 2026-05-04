@@ -13,6 +13,9 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -325,13 +328,25 @@ func (w *Worker) handleMessage(message []byte) {
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
+	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
+
+	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
+	metrics.AddTaskEvent(taskCtx, "task.assigned",
+		attribute.String("worker.id", w.config.WorkerID),
+		attribute.String("worker.backend", w.config.BackendType),
+		attribute.String("task.id", assignment.TaskID),
+	)
 
 	// Check concurrency limit before claiming the task.
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
 			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
 			metrics.RecordTaskRejected(metrics.RejectReasonAtCapacity)
+			metrics.AddTaskEvent(taskCtx, "task.rejected",
+				attribute.String("reason", metrics.RejectReasonAtCapacity),
+			)
+			span.End()
 			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
 				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 			}
@@ -344,15 +359,14 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
 	metrics.RecordTaskClaim()
+	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
-
-	taskCtx, taskCancel := context.WithCancel(w.ctx)
+	taskCtx, taskCancel := context.WithCancel(taskCtx)
 
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = taskCancel
 	w.tasksMutex.Unlock()
-
-	go w.executeTask(taskCtx, assignment)
+	go w.executeTask(taskCtx, span, assignment, receivedAt)
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -439,11 +453,12 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 	return fallback
 }
 
-func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
+func (w *Worker) executeTask(ctx context.Context, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
 
 	defer func() {
+		span.End()
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
 		w.tasksMutex.Unlock()
@@ -458,10 +473,26 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 
 	taskID := assignment.TaskID
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
+	metrics.AddTaskEvent(ctx, "task.started")
 
 	params := w.prepareTaskParams(assignment)
-	if err := w.backend.ExecuteTask(ctx, params); err != nil {
+	metrics.AddTaskEvent(ctx, "backend.started",
+		attribute.String("backend", w.config.BackendType),
+		attribute.String("docker.image", params.DockerImage),
+	)
+
+	err := w.backend.ExecuteTask(ctx, params)
+	if err != nil {
 		result = metrics.TaskResultFailed
+		phase, reason := taskFailureLabels(err)
+		metrics.RecordTaskFailure(phase, reason)
+		metrics.AddTaskEvent(ctx, "task.failed",
+			attribute.String("failure.phase", phase),
+			attribute.String("failure.reason", reason),
+			attribute.String("error.message", err.Error()),
+		)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
 		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to execute task: %v", err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
@@ -470,6 +501,8 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 	}
 
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
+	metrics.AddTaskEvent(ctx, "task.completed")
+	span.SetStatus(codes.Ok, "task completed")
 	if err := w.sendTaskCompleted(taskID, "Task completed successfully"); err != nil {
 		log.Errorf(ctx, "Failed to send task completed message: %v", err)
 	}
