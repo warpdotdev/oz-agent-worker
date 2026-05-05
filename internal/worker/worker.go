@@ -392,14 +392,20 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	baseArgs := []string{
 		"agent",
 		"run",
-		"--share",
-		"team:edit",
+	}
+	// Only share with the team when the task is team-owned. User-owned tasks
+	// (created with "Team visible" unchecked) use user-scoped API keys that
+	// cannot set up team-level session sharing.
+	if task.Owner.IsTeamOwned() {
+		baseArgs = append(baseArgs, "--share", "team:edit")
+	}
+	baseArgs = append(baseArgs,
 		"--task-id",
 		task.ID,
 		"--sandboxed",
 		"--server-root-url",
 		w.config.ServerRootURL,
-	}
+	)
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
 		IdleOnComplete: w.config.IdleOnComplete,
 	})

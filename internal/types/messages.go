@@ -122,6 +122,18 @@ type AmbientAgentConfig struct {
 	SnapshotScriptTimeoutSecs *int                       `json:"snapshot_script_timeout_secs,omitempty"`
 }
 
+// TaskOwner identifies the ownership scope of a task.
+// Matches the server's PermissionSubjectAndID serialization.
+type TaskOwner struct {
+	Type string `json:"Type"` // "USER" or "TEAM"
+	Id   int    `json:"Id"`
+}
+
+// IsTeamOwned returns true when the task owner is a team.
+func (o *TaskOwner) IsTeamOwned() bool {
+	return o != nil && o.Type == "TEAM"
+}
+
 // Task represents an ambient agent job.
 type Task struct {
 	ID                  string              `json:"id"`
@@ -129,6 +141,7 @@ type Task struct {
 	Definition          TaskDefinition      `json:"task_definition"`
 	CreatedAt           time.Time           `json:"created_at"`
 	UpdatedAt           time.Time           `json:"updated_at"`
+	Owner               *TaskOwner          `json:"owner,omitempty"`
 	AgentConfigSnapshot *AmbientAgentConfig `json:"agent_config_snapshot,omitempty"`
 	AgentConversationID *string             `json:"agent_conversation_id,omitempty"`
 }
