@@ -295,6 +295,68 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
+	newWorker := func() *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				ServerRootURL: "https://app.warp.dev",
+				Kubernetes:    &KubernetesBackendConfig{},
+			},
+		}
+	}
+
+	containsShareTeamEdit := func(args []string) bool {
+		for i, arg := range args {
+			if arg == "--share" && i+1 < len(args) && args[i+1] == "team:edit" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("includes --share team:edit for team-owned task", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task: &types.Task{
+				ID:    "task-1",
+				Owner: &types.TaskOwner{Type: "TEAM", Id: 42},
+			},
+		})
+		if !containsShareTeamEdit(params.BaseArgs) {
+			t.Fatalf("expected --share team:edit in args for team-owned task, got %v", params.BaseArgs)
+		}
+	})
+
+	t.Run("omits --share team:edit for user-owned task", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-2",
+			Task: &types.Task{
+				ID:    "task-2",
+				Owner: &types.TaskOwner{Type: "USER", Id: 99},
+			},
+		})
+		if containsShareTeamEdit(params.BaseArgs) {
+			t.Fatalf("did not expect --share team:edit in args for user-owned task, got %v", params.BaseArgs)
+		}
+	})
+
+	t.Run("omits --share team:edit when owner is nil", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-3",
+			Task: &types.Task{
+				ID: "task-3",
+			},
+		})
+		if containsShareTeamEdit(params.BaseArgs) {
+			t.Fatalf("did not expect --share team:edit in args when owner is nil, got %v", params.BaseArgs)
+		}
+	})
+}
+
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}
