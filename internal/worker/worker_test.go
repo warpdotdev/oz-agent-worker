@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -81,6 +85,86 @@ func TestTaskFailureLabels(t *testing.T) {
 				t.Fatalf("taskFailureLabels() = (%q, %q), want (%q, %q)", phase, reason, tt.wantPhase, tt.wantReason)
 			}
 		})
+	}
+}
+
+func TestFormatWebSocketDialErrorIncludesActionableStatusGuidance(t *testing.T) {
+	endpoint, err := url.Parse("wss://oz.warp.dev/api/v1/selfhosted/worker/ws?worker_id=worker-123")
+	if err != nil {
+		t.Fatalf("failed to parse endpoint: %v", err)
+	}
+
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Header: http.Header{
+			"X-Warp-Error-Code": []string{"RATE_LIMITED"},
+			"Retry-After":       []string{"30"},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":"too many connections"}`)),
+	}
+	w := &Worker{config: Config{WorkerID: "worker-123"}}
+
+	got := w.formatWebSocketDialError(endpoint, resp, errors.New("bad handshake")).Error()
+	for _, want := range []string{
+		`worker-id "worker-123"`,
+		"HTTP status: 429 Too Many Requests",
+		"Warp error code: RATE_LIMITED",
+		"Retry after: 30",
+		`Response body: {"error":"too many connections"}`,
+		"reduce restart loops",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatted error missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "worker_id=worker-123") {
+		t.Fatalf("formatted error should omit query parameters:\n%s", got)
+	}
+}
+
+func TestFormatWebSocketDialErrorGuidesAuthenticationFailures(t *testing.T) {
+	endpoint, err := url.Parse("wss://oz.warp.dev/api/v1/selfhosted/worker/ws?worker_id=worker-123")
+	if err != nil {
+		t.Fatalf("failed to parse endpoint: %v", err)
+	}
+
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Status:     "401 Unauthorized",
+		Body:       io.NopCloser(strings.NewReader("invalid api key")),
+	}
+	w := &Worker{config: Config{WorkerID: "worker-123"}}
+
+	got := w.formatWebSocketDialError(endpoint, resp, errors.New("bad handshake")).Error()
+	for _, want := range []string{
+		"HTTP status: 401 Unauthorized",
+		"API key was missing, expired, or invalid",
+		"WARP_API_KEY",
+		"team-scoped Warp API key",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatted error missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatWebSocketDialErrorGuidesNetworkFailures(t *testing.T) {
+	endpoint, err := url.Parse("wss://oz.warp.dev/api/v1/selfhosted/worker/ws?worker_id=worker-123")
+	if err != nil {
+		t.Fatalf("failed to parse endpoint: %v", err)
+	}
+	w := &Worker{config: Config{WorkerID: "worker-123"}}
+
+	got := w.formatWebSocketDialError(endpoint, nil, errors.New("dial tcp: lookup failed")).Error()
+	for _, want := range []string{
+		"failed to connect to Warp self-hosted worker endpoint wss://oz.warp.dev/api/v1/selfhosted/worker/ws",
+		"outbound WebSocket access",
+		"DNS/TLS/proxy",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatted error missing %q:\n%s", want, got)
+		}
 	}
 }
 

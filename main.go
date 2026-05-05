@@ -121,6 +121,11 @@ func main() {
 // mergeConfig merges CLI flags with an optional config file.
 // Priority: CLI flags > config file > defaults.
 func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
+	apiKey := strings.TrimSpace(CLI.APIKey)
+	if apiKey == "" {
+		return worker.Config{}, fmt.Errorf("api-key is required (set WARP_API_KEY or pass --api-key with a team-scoped Warp API key). See https://docs.warp.dev/agent-platform/cloud-agents/self-hosting")
+	}
+
 	// Merge worker_id: CLI > config file.
 	workerID := CLI.WorkerID
 	if workerID == "" && fileConfig != nil {
@@ -170,7 +175,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	}
 
 	wc := worker.Config{
-		APIKey:                  CLI.APIKey,
+		APIKey:                  apiKey,
 		WorkerID:                workerID,
 		WebSocketURL:            CLI.WebSocketURL,
 		ServerRootURL:           CLI.ServerRootURL,

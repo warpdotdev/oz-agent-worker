@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +31,9 @@ const (
 	PongWait               = 60 * time.Second
 	WriteWait              = 10 * time.Second
 	BackendShutdownTimeout = 10 * time.Second
+	maxErrorBodyBytes      = 8 * 1024
+
+	selfHostingDocsURL = "https://docs.warp.dev/agent-platform/cloud-agents/self-hosting"
 )
 
 type Config struct {
@@ -162,10 +168,7 @@ func (w *Worker) connect() error {
 
 	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
-		if resp != nil {
-			return fmt.Errorf("failed to dial WebSocket: %w\n%s", err, resp.Status)
-		}
-		return fmt.Errorf("failed to dial WebSocket: %w", err)
+		return w.formatWebSocketDialError(u, resp, err)
 	}
 
 	w.connMutex.Lock()
@@ -183,6 +186,88 @@ func (w *Worker) connect() error {
 	})
 
 	return nil
+}
+
+func (w *Worker) formatWebSocketDialError(u *url.URL, resp *http.Response, err error) error {
+	if resp == nil {
+		return fmt.Errorf("failed to connect to Warp self-hosted worker endpoint %s: %w\n%s",
+			webSocketEndpointForLogs(u),
+			err,
+			networkConnectionGuidance(),
+		)
+	}
+
+	details := []string{
+		fmt.Sprintf("failed to connect to Warp self-hosted worker endpoint %s for worker-id %q: %v",
+			webSocketEndpointForLogs(u),
+			w.config.WorkerID,
+			err,
+		),
+		fmt.Sprintf("HTTP status: %s", resp.Status),
+	}
+	if errorCode := strings.TrimSpace(resp.Header.Get("X-Warp-Error-Code")); errorCode != "" {
+		details = append(details, fmt.Sprintf("Warp error code: %s", errorCode))
+	}
+	if retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")); retryAfter != "" {
+		details = append(details, fmt.Sprintf("Retry after: %s", retryAfter))
+	}
+	if body := readErrorBody(resp.Body); body != "" {
+		details = append(details, fmt.Sprintf("Response body: %s", body))
+	}
+	if guidance := webSocketStatusGuidance(resp.StatusCode); guidance != "" {
+		details = append(details, fmt.Sprintf("Guidance: %s", guidance))
+	}
+
+	return fmt.Errorf("%s", strings.Join(details, "\n"))
+}
+
+func webSocketEndpointForLogs(u *url.URL) string {
+	if u == nil {
+		return "(unknown endpoint)"
+	}
+	copy := *u
+	copy.RawQuery = ""
+	return copy.String()
+}
+
+func readErrorBody(body io.ReadCloser) string {
+	if body == nil {
+		return ""
+	}
+	defer body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	if err != nil {
+		return fmt.Sprintf("unable to read response body: %v", err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func webSocketStatusGuidance(statusCode int) string {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return fmt.Sprintf("the API key was missing, expired, or invalid. Set WARP_API_KEY or pass --api-key with a team-scoped Warp API key, then restart the worker. See %s", selfHostingDocsURL)
+	case http.StatusForbidden:
+		return "the API key was accepted but is not authorized for this worker or team. Verify the key belongs to the same team as the worker host, confirm self-hosted agents are enabled for the team, and check any GitHub App/team installation permissions required by the run."
+	case http.StatusNotFound:
+		return "the worker endpoint was not found. Check --web-socket-url if you are targeting a non-production Warp deployment."
+	case http.StatusTooManyRequests:
+		return "Warp is rate limiting worker connection attempts. Leave the worker running so exponential backoff can retry, reduce restart loops, and check whether multiple pods are repeatedly reconnecting with the same worker-id."
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
+		return "Warp's worker endpoint is temporarily unavailable or overloaded. The worker will keep retrying with exponential backoff; if this persists, capture this log line with the worker-id and HTTP status for Warp support."
+	default:
+		if statusCode >= 500 {
+			return "Warp returned a server error during the worker handshake. The worker will keep retrying with exponential backoff; if this persists, capture this log line with the worker-id and HTTP status for Warp support."
+		}
+		if statusCode >= 400 {
+			return fmt.Sprintf("Warp rejected the worker handshake. Check the API key, worker-id, team self-hosted worker settings, and the setup guide at %s", selfHostingDocsURL)
+		}
+		return ""
+	}
+}
+
+func networkConnectionGuidance() string {
+	return fmt.Sprintf("Guidance: verify outbound WebSocket access to Warp is allowed from this host or cluster, check DNS/TLS/proxy configuration, and confirm --web-socket-url is correct. See %s", selfHostingDocsURL)
 }
 
 func (w *Worker) run() {

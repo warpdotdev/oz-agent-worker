@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 func resetCLIForTest() {
 	CLI.ConfigFile = ""
 	CLI.Backend = ""
-	CLI.APIKey = ""
+	CLI.APIKey = "wk-test"
 	CLI.WorkerID = ""
 	CLI.WebSocketURL = ""
 	CLI.ServerRootURL = ""
@@ -21,6 +22,24 @@ func resetCLIForTest() {
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
 	CLI.IdleOnComplete = ""
+}
+
+func TestMergeConfigRequiresAPIKey(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	CLI.APIKey = "  "
+	CLI.WorkerID = "worker-123"
+
+	_, err := mergeConfig(nil)
+	if err == nil {
+		t.Fatal("expected missing API key error")
+	}
+	for _, want := range []string{"api-key is required", "WARP_API_KEY", "--api-key"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error missing %q: %v", want, err)
+		}
+	}
 }
 
 func boolPtr(v bool) *bool {
