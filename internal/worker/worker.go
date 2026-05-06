@@ -38,6 +38,8 @@ type Config struct {
 	LogLevel           string
 	BackendType        string // "docker", "direct", or "kubernetes"
 	MaxConcurrentTasks int    // 0 means unlimited
+	// TaskTimeout is the maximum wall-clock runtime for each task. 0 means unlimited.
+	TaskTimeout time.Duration
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
@@ -361,7 +363,15 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
-	taskCtx, taskCancel := context.WithCancel(taskCtx)
+	var taskCancel context.CancelFunc
+	if w.config.TaskTimeout > 0 {
+		taskCtx, taskCancel = context.WithTimeout(taskCtx, w.config.TaskTimeout)
+		metrics.AddTaskEvent(taskCtx, "task.timeout_configured",
+			attribute.Int64("timeout.ms", w.config.TaskTimeout.Milliseconds()),
+		)
+	} else {
+		taskCtx, taskCancel = context.WithCancel(taskCtx)
+	}
 
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = taskCancel

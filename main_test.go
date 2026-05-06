@@ -20,7 +20,10 @@ func resetCLIForTest() {
 	CLI.Volumes = nil
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
+	CLI.TaskTimeout = ""
 	CLI.IdleOnComplete = ""
+	CLI.TargetDir = ""
+	CLI.SessionSharingServerURL = ""
 }
 
 func boolPtr(v bool) *bool {
@@ -195,4 +198,93 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 0 {
 		t.Fatalf("UnschedulableTimeout = %v, want 0", wc.Kubernetes.UnschedulableTimeout)
 	}
+}
+
+func TestMergeConfigTaskTimeout(t *testing.T) {
+	t.Run("uses file task_timeout", func(t *testing.T) {
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+
+		fileConfig := &config.FileConfig{
+			WorkerID:    "worker-123",
+			TaskTimeout: stringPtr("2h"),
+		}
+
+		wc, err := mergeConfig(fileConfig)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wc.TaskTimeout != 2*time.Hour {
+			t.Fatalf("TaskTimeout = %v, want 2h", wc.TaskTimeout)
+		}
+	})
+
+	t.Run("cli overrides file task_timeout", func(t *testing.T) {
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+
+		CLI.WorkerID = "worker-123"
+		CLI.TaskTimeout = "30m"
+
+		fileConfig := &config.FileConfig{
+			WorkerID:    "file-worker",
+			TaskTimeout: stringPtr("2h"),
+		}
+
+		wc, err := mergeConfig(fileConfig)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wc.TaskTimeout != 30*time.Minute {
+			t.Fatalf("TaskTimeout = %v, want 30m", wc.TaskTimeout)
+		}
+	})
+
+	t.Run("zero disables task_timeout", func(t *testing.T) {
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+
+		fileConfig := &config.FileConfig{
+			WorkerID:    "worker-123",
+			TaskTimeout: stringPtr("0s"),
+		}
+
+		wc, err := mergeConfig(fileConfig)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wc.TaskTimeout != 0 {
+			t.Fatalf("TaskTimeout = %v, want 0", wc.TaskTimeout)
+		}
+	})
+
+	t.Run("rejects invalid task_timeout", func(t *testing.T) {
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+
+		fileConfig := &config.FileConfig{
+			WorkerID:    "worker-123",
+			TaskTimeout: stringPtr("not-a-duration"),
+		}
+
+		_, err := mergeConfig(fileConfig)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("rejects negative task_timeout", func(t *testing.T) {
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+
+		fileConfig := &config.FileConfig{
+			WorkerID:    "worker-123",
+			TaskTimeout: stringPtr("-1s"),
+		}
+
+		_, err := mergeConfig(fileConfig)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }

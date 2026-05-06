@@ -9,6 +9,9 @@ data:
     worker_id: {{ required "worker.workerId is required" .Values.worker.workerId | quote }}
     cleanup: {{ .Values.worker.cleanup }}
     max_concurrent_tasks: {{ .Values.worker.maxConcurrentTasks }}
+    {{- if .Values.worker.taskTimeout }}
+    task_timeout: {{ .Values.worker.taskTimeout | quote }}
+    {{- end }}
     {{- if .Values.worker.idleOnComplete }}
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
     {{- end }}

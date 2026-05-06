@@ -30,6 +30,9 @@ worker:
   logLevel: info
   cleanup: true
   maxConcurrentTasks: 0
+  # Maximum wall-clock runtime for each task. Empty or "0s" means unlimited.
+  # Examples: "2h", "90m", "30m".
+  taskTimeout: ""
   idleOnComplete: ""
   extraArgs: []
   extraEnv: []

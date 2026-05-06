@@ -602,3 +602,35 @@ worker_id: "test"
 		}
 	})
 }
+
+func TestLoadTaskTimeout(t *testing.T) {
+	t.Run("parses task_timeout when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+task_timeout: "2h"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.TaskTimeout == nil {
+			t.Fatal("expected task_timeout to be set")
+		}
+		if *cfg.TaskTimeout != "2h" {
+			t.Errorf("task_timeout = %q, want %q", *cfg.TaskTimeout, "2h")
+		}
+	})
+
+	t.Run("task_timeout is nil when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.TaskTimeout != nil {
+			t.Errorf("expected task_timeout to be nil, got %q", *cfg.TaskTimeout)
+		}
+	})
+}

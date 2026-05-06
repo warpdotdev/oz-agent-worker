@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -36,6 +36,19 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
 }
 
 func (b *recordingBackend) Shutdown(context.Context) {}
+
+type contextRecordingBackend struct {
+	ctx    context.Context
+	called chan struct{}
+}
+
+func (b *contextRecordingBackend) ExecuteTask(ctx context.Context, _ *TaskParams) error {
+	b.ctx = ctx
+	close(b.called)
+	return nil
+}
+
+func (b *contextRecordingBackend) Shutdown(context.Context) {}
 
 func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
@@ -149,6 +162,70 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	}
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
+	}
+}
+
+func TestHandleTaskAssignmentAppliesTaskTimeout(t *testing.T) {
+	backend := &contextRecordingBackend{called: make(chan struct{})}
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{TaskTimeout: time.Hour},
+		sendChan:    make(chan []byte, 4),
+		activeTasks: make(map[string]context.CancelFunc),
+		backend:     backend,
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	waitForBackendCall(t, backend.called)
+
+	if backend.ctx == nil {
+		t.Fatal("expected backend to receive a context")
+	}
+	deadline, ok := backend.ctx.Deadline()
+	if !ok {
+		t.Fatal("expected backend context to have a deadline")
+	}
+	if time.Until(deadline) <= 0 || time.Until(deadline) > time.Hour {
+		t.Fatalf("deadline = %v, expected within the next hour", deadline)
+	}
+}
+
+func TestHandleTaskAssignmentLeavesTaskUnlimitedWhenTimeoutUnset(t *testing.T) {
+	backend := &contextRecordingBackend{called: make(chan struct{})}
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 4),
+		activeTasks: make(map[string]context.CancelFunc),
+		backend:     backend,
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	waitForBackendCall(t, backend.called)
+
+	if backend.ctx == nil {
+		t.Fatal("expected backend to receive a context")
+	}
+	if _, ok := backend.ctx.Deadline(); ok {
+		t.Fatal("expected backend context to have no deadline")
+	}
+}
+
+func waitForBackendCall(t *testing.T, called <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend execution")
 	}
 }
 

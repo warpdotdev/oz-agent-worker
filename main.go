@@ -37,6 +37,7 @@ var CLI struct {
 	Volumes                 []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                     []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks      int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
+	TaskTimeout             string   `help:"Maximum wall-clock runtime for each task (e.g. 2h, 90m, 0s for unlimited)"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 	SessionSharingServerURL string   `help:"Session sharing server WebSocket URL to pass through to the oz CLI (e.g. ws://127.0.0.1:8081)" hidden:""`
 }
@@ -163,6 +164,22 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
 
+	// Resolve task_timeout: CLI (non-empty) > config file > 0 (unlimited).
+	taskTimeoutRaw := CLI.TaskTimeout
+	if taskTimeoutRaw == "" && fileConfig != nil && fileConfig.TaskTimeout != nil {
+		taskTimeoutRaw = *fileConfig.TaskTimeout
+	}
+	var taskTimeout time.Duration
+	if taskTimeoutRaw != "" {
+		taskTimeout, err = time.ParseDuration(taskTimeoutRaw)
+		if err != nil {
+			return worker.Config{}, fmt.Errorf("invalid task_timeout %q: %w", taskTimeoutRaw, err)
+		}
+		if taskTimeout < 0 {
+			return worker.Config{}, fmt.Errorf("invalid task_timeout %q: must be non-negative", taskTimeoutRaw)
+		}
+	}
+
 	// Resolve idle_on_complete: CLI (non-empty) > config file > "" (oz CLI default = 45m).
 	idleOnComplete := CLI.IdleOnComplete
 	if idleOnComplete == "" && fileConfig != nil && fileConfig.IdleOnComplete != nil {
@@ -177,6 +194,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		LogLevel:                CLI.LogLevel,
 		BackendType:             backendType,
 		MaxConcurrentTasks:      maxConcurrentTasks,
+		TaskTimeout:             taskTimeout,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}

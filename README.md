@@ -39,6 +39,7 @@ Example config:
 
 ```yaml
 worker_id: "my-worker"
+task_timeout: "2h"
 backend:
   direct:
     workspace_root: "/var/lib/oz/workspaces"
@@ -57,6 +58,7 @@ Example config:
 
 ```yaml
 worker_id: "my-worker"
+task_timeout: "2h"
 backend:
   kubernetes:
     kubeconfig: "/path/to/kubeconfig"
@@ -76,6 +78,7 @@ backend:
 
 Notes:
 
+- `task_timeout` is a top-level worker setting that limits the wall-clock runtime of each task across Docker, direct, and Kubernetes backends; omit it or set `0s` for unlimited runtime
 - `default_image` sets the Docker image for task Jobs when no Warp environment is configured on the run; this lets you skip creating a Warp environment entirely if all your tasks use the same base image (precedence: Warp environment image > `default_image` > `ubuntu:22.04`)
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
