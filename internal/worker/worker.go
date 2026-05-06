@@ -500,7 +500,7 @@ func (w *Worker) executeTask(ctx context.Context, span trace.Span, assignment *t
 		span.RecordError(err)
 		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to execute task: %v", err)); statusErr != nil {
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
 		return
