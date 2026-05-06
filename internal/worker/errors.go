@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
@@ -40,4 +41,18 @@ func taskFailureLabels(err error) (phase, reason string) {
 		return failure.phase, failure.reason
 	}
 	return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnknown
+}
+
+// userFacingTaskError returns a user-friendly error message for a task execution
+// failure. Well-known infrastructure errors (context cancellation, deadline exceeded)
+// are translated into clear, actionable messages instead of exposing raw Go error strings.
+func userFacingTaskError(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again."
+	case errors.Is(err, context.DeadlineExceeded):
+		return "The task exceeded its maximum allowed execution time and was terminated. Consider breaking the task into smaller steps or increasing the timeout."
+	default:
+		return fmt.Sprintf("Failed to execute task: %v", err)
+	}
 }

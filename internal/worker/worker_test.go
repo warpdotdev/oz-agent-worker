@@ -152,6 +152,101 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	}
 }
 
+func TestExecuteTaskReportsUserFriendlyMessageOnContextCanceled(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		backend:     &recordingBackend{err: context.Canceled},
+	}
+
+	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to unmarshal task failed message: %v", err)
+	}
+	want := "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again."
+	if failed.Message != want {
+		t.Errorf("message = %q, want %q", failed.Message, want)
+	}
+}
+
+func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		backend:     &recordingBackend{err: context.DeadlineExceeded},
+	}
+
+	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to unmarshal task failed message: %v", err)
+	}
+	want := "The task exceeded its maximum allowed execution time and was terminated. Consider breaking the task into smaller steps or increasing the timeout."
+	if failed.Message != want {
+		t.Errorf("message = %q, want %q", failed.Message, want)
+	}
+}
+
+func TestUserFacingTaskError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "context canceled",
+			err:  context.Canceled,
+			want: "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again.",
+		},
+		{
+			name: "wrapped context canceled",
+			err:  fmt.Errorf("exec failed: %w", context.Canceled),
+			want: "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again.",
+		},
+		{
+			name: "deadline exceeded",
+			err:  context.DeadlineExceeded,
+			want: "The task exceeded its maximum allowed execution time and was terminated. Consider breaking the task into smaller steps or increasing the timeout.",
+		},
+		{
+			name: "generic error",
+			err:  errors.New("boom"),
+			want: "Failed to execute task: boom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := userFacingTaskError(tt.err)
+			if got != tt.want {
+				t.Errorf("userFacingTaskError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketMessage {
 	t.Helper()
 
