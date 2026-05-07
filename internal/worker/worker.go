@@ -390,6 +390,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
+	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
 	select {
