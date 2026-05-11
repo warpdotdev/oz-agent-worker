@@ -108,12 +108,8 @@ type AmbientAgentConfig struct {
 	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness            *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
-	// InferenceProviders carries the resolved BYO-LLM provider configuration for
-	// the run. The server flattens any cascade (run -> agent identity -> workspace
-	// defaults) into this block before sending the assignment, so the worker just
-	// reads the snapshot value.
-	InferenceProviders *InferenceProviders   `json:"inference_providers,omitempty"`
-	SessionSharing     *SessionSharingConfig `json:"session_sharing,omitempty"`
+	InferenceProviders *InferenceProviders        `json:"inference_providers,omitempty"`
+	SessionSharing     *SessionSharingConfig      `json:"session_sharing,omitempty"`
 }
 
 // InferenceProviders carries per-provider inference configuration.

@@ -59,9 +59,6 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		// Forward the resolved AWS Bedrock OIDC role ARN, if any. The server has
-		// already applied the run -> agent -> workspace cascade, so we only need
-		// to honor an explicit opt-out (Disabled) and skip empty role ARNs.
 		if aws := task.AgentConfigSnapshot.InferenceProviders; aws != nil && aws.Aws != nil && !aws.Aws.Disabled {
 			if role := strings.TrimSpace(aws.Aws.RoleARN); role != "" {
 				args = append(args, "--bedrock-inference-role", role)
