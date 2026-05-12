@@ -86,6 +86,16 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 				args = append(args, "--share", fmt.Sprintf("public:%s", level))
 			}
 		}
+
+		if task.AgentConfigSnapshot.SnapshotDisabled != nil && *task.AgentConfigSnapshot.SnapshotDisabled {
+			args = append(args, "--no-snapshot")
+		}
+		if task.AgentConfigSnapshot.SnapshotUploadTimeoutSecs != nil && *task.AgentConfigSnapshot.SnapshotUploadTimeoutSecs > 0 {
+			args = append(args, "--snapshot-upload-timeout", fmt.Sprintf("%ds", *task.AgentConfigSnapshot.SnapshotUploadTimeoutSecs))
+		}
+		if task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs != nil && *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs > 0 {
+			args = append(args, "--snapshot-script-timeout", fmt.Sprintf("%ds", *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs))
+		}
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {

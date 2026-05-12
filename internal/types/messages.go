@@ -11,6 +11,7 @@ type MessageType string
 const (
 	MessageTypeTaskAssignment MessageType = "task_assignment"
 	MessageTypeTaskClaimed    MessageType = "task_claimed"
+	MessageTypeTaskCompleted  MessageType = "task_completed"
 	MessageTypeTaskFailed     MessageType = "task_failed"
 	MessageTypeTaskRejected   MessageType = "task_rejected"
 	MessageTypeHeartbeat      MessageType = "heartbeat"
@@ -46,6 +47,12 @@ type TaskAssignmentMessage struct {
 type TaskClaimedMessage struct {
 	TaskID   string `json:"task_id"`
 	WorkerID string `json:"worker_id"`
+}
+
+// TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
+type TaskCompletedMessage struct {
+	TaskID  string `json:"task_id"`
+	Message string `json:"message"`
 }
 
 // TaskFailedMessage is sent from worker to server if task launch fails
@@ -98,18 +105,33 @@ type SessionSharingConfig struct {
 
 // AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
-	EnvironmentID      *string                    `json:"environment_id,omitempty"`
-	BasePrompt         *string                    `json:"base_prompt,omitempty"`
-	ModelID            *string                    `json:"model_id,omitempty"`
-	ProfileID          *string                    `json:"profile_id,omitempty"`
-	SkillSpec          *string                    `json:"skill_spec,omitempty"`
-	MCPServers         map[string]json.RawMessage `json:"mcp_servers,omitempty"`
-	ComputerUseEnabled *bool                      `json:"computer_use_enabled,omitempty"`
-	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
-	Harness            *Harness                   `json:"harness,omitempty"`
-	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
-	InferenceProviders *InferenceProviders        `json:"inference_providers,omitempty"`
-	SessionSharing     *SessionSharingConfig      `json:"session_sharing,omitempty"`
+	EnvironmentID             *string                    `json:"environment_id,omitempty"`
+	BasePrompt                *string                    `json:"base_prompt,omitempty"`
+	ModelID                   *string                    `json:"model_id,omitempty"`
+	ProfileID                 *string                    `json:"profile_id,omitempty"`
+	SkillSpec                 *string                    `json:"skill_spec,omitempty"`
+	MCPServers                map[string]json.RawMessage `json:"mcp_servers,omitempty"`
+	ComputerUseEnabled        *bool                      `json:"computer_use_enabled,omitempty"`
+	IdleTimeoutMinutes        *int                       `json:"idle_timeout_minutes,omitempty"`
+	Harness                   *Harness                   `json:"harness,omitempty"`
+	HarnessAuthSecrets        *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
+	InferenceProviders        *InferenceProviders        `json:"inference_providers,omitempty"`
+	SessionSharing            *SessionSharingConfig      `json:"session_sharing,omitempty"`
+	SnapshotDisabled          *bool                      `json:"snapshot_disabled,omitempty"`
+	SnapshotUploadTimeoutSecs *int                       `json:"snapshot_upload_timeout_secs,omitempty"`
+	SnapshotScriptTimeoutSecs *int                       `json:"snapshot_script_timeout_secs,omitempty"`
+}
+
+// TaskOwner identifies the ownership scope of a task.
+// Matches the server's PermissionSubjectAndID serialization.
+type TaskOwner struct {
+	Type string `json:"Type"` // "USER" or "TEAM"
+	Id   int    `json:"Id"`
+}
+
+// IsTeamOwned returns true when the task owner is a team.
+func (o *TaskOwner) IsTeamOwned() bool {
+	return o != nil && o.Type == "TEAM"
 }
 
 // InferenceProviders carries per-provider inference configuration.
@@ -132,5 +154,7 @@ type Task struct {
 	Definition          TaskDefinition      `json:"task_definition"`
 	CreatedAt           time.Time           `json:"created_at"`
 	UpdatedAt           time.Time           `json:"updated_at"`
+	Owner               *TaskOwner          `json:"owner,omitempty"`
 	AgentConfigSnapshot *AmbientAgentConfig `json:"agent_config_snapshot,omitempty"`
+	AgentConversationID *string             `json:"agent_conversation_id,omitempty"`
 }

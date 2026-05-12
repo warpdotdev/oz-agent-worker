@@ -10,6 +10,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
@@ -101,7 +103,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		// Create per-task workspace directory.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
 		if err := os.MkdirAll(workspaceDir, 0755); err != nil {
-			return fmt.Errorf("failed to create workspace directory: %w", err)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err))
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
@@ -122,11 +124,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	// 2. Create temp environment file for setup script to write to.
 	envFile, err := os.CreateTemp(workspaceDir, "oz-env-*")
 	if err != nil {
-		return fmt.Errorf("failed to create environment file: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create environment file: %w", err))
 	}
 	envFilePath := envFile.Name()
 	if err := envFile.Close(); err != nil {
-		return fmt.Errorf("failed to close environment file: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to close environment file: %w", err))
 	}
 	defer func() {
 		if err := os.Remove(envFilePath); err != nil && !os.IsNotExist(err) {
@@ -152,7 +154,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
 		if err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv); err != nil {
-			return fmt.Errorf("setup command failed: %w", err)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err))
 		}
 	}
 
@@ -181,7 +183,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("oz agent exited with error: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err))
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
@@ -222,6 +224,10 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 	}
 	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
+		metrics.AddTaskEvent(ctx, "cleanup.failed",
+			attribute.String("operation", "teardown"),
+			attribute.String("error.message", err.Error()),
+		)
 		log.Warnf(ctx, "Teardown command failed: %v", err)
 	}
 }
@@ -232,6 +238,10 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir string
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {
+		metrics.AddTaskEvent(ctx, "cleanup.failed",
+			attribute.String("operation", "remove_workspace"),
+			attribute.String("error.message", err.Error()),
+		)
 		log.Warnf(ctx, "Failed to remove workspace %s: %v", workspaceDir, err)
 	}
 }

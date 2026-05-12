@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -121,7 +122,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
-		return err
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
 	}
 
 	jobName := sanitizeKubernetesJobName(params.TaskID)
@@ -272,7 +273,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
 	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("failed to create Kubernetes Job: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
 	}
 
 	deleted := false
@@ -289,13 +290,13 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
 	if err != nil {
-		return fmt.Errorf("failed to watch Job %s: %w", jobName, err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to watch Job %s: %w", jobName, err))
 	}
 	defer jobWatcher.Stop()
 
 	podWatcher, err := b.watchTaskPods(ctx, params.TaskID)
 	if err != nil {
-		return fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err))
 	}
 	defer podWatcher.Stop()
 
@@ -307,9 +308,10 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		case <-ctx.Done():
 			if err := b.deleteJob(context.Background(), jobName); err != nil {
 				log.Warnf(ctx, "Failed to delete Job %s on cancellation: %v", jobName, err)
+			} else {
+				deleted = true
 			}
-			deleted = true
-			return ctx.Err()
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
 
 		case event, ok := <-jobWatcher.ResultChan():
 			if !ok {
@@ -317,7 +319,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
 				}
 				continue
 			}
@@ -326,7 +328,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
 				}
 				continue
 			}
@@ -344,7 +346,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				podWatcher.Stop()
 				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
 				}
 				continue
 			}
@@ -353,7 +355,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				podWatcher.Stop()
 				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
 				}
 				continue
 			}
@@ -374,9 +376,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
 				if apierrors.IsNotFound(err) && ctx.Err() != nil {
-					return ctx.Err()
+					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
 				}
-				return fmt.Errorf("failed to get Job %s: %w", jobName, err)
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err))
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
 				return result.err
@@ -384,7 +386,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 			pods, err := b.listTaskPods(ctx, params.TaskID)
 			if err != nil {
-				return fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err))
 			}
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
 				return failure
@@ -437,7 +439,7 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		if logs != "" {
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
 		}
-		return &jobResult{err: fmt.Errorf("job %s failed", jobName)}
+		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, classifyJobFailure(jobState), fmt.Errorf("job %s failed", jobName))}
 	}
 	return nil
 }
@@ -818,26 +820,26 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 
 	for _, status := range pod.Status.InitContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return fmt.Errorf("init container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, fmt.Errorf("init container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return fmt.Errorf("init container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), fmt.Errorf("init container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting)))
 		}
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return fmt.Errorf("container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), fmt.Errorf("container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return fmt.Errorf("container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), fmt.Errorf("container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting)))
 		}
 	}
 
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable {
 			if b.shouldFailUnschedulablePod(pod) {
-				return fmt.Errorf("pod %s is unschedulable: %s", pod.Name, condition.Message)
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnschedulable, fmt.Errorf("pod %s is unschedulable: %s", pod.Name, condition.Message))
 			}
 		}
 	}
@@ -854,18 +856,22 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		}
 		for _, event := range events.Items {
 			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
-				return fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message)
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message))
 			}
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
+		reason := metrics.TaskFailureReasonJobFailed
+		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
+			reason = metrics.TaskFailureReasonActiveDeadline
+		}
 		if pod.Status.Message != "" {
-			return fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Message)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Message))
 		}
 		if pod.Status.Reason != "" {
-			return fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Reason)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Reason))
 		}
-		return fmt.Errorf("pod %s failed", pod.Name)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed", pod.Name))
 	}
 
 	return nil
@@ -1043,7 +1049,7 @@ func kubernetesTaskWrapperScript() string {
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
 		"  set +a",
 		"fi",
-		"/bin/sh /agent/entrypoint.sh \"$@\"",
+		"exec /agent/entrypoint.sh \"$@\"",
 	}, "\n")
 }
 
@@ -1103,6 +1109,45 @@ func isImmediateContainerFailure(reason string) bool {
 	default:
 		return false
 	}
+}
+
+func classifyJobFailure(job *batchv1.Job) string {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		detail := strings.ToLower(condition.Reason + " " + condition.Message)
+		if strings.Contains(detail, "deadline") {
+			return metrics.TaskFailureReasonActiveDeadline
+		}
+	}
+	return metrics.TaskFailureReasonJobFailed
+}
+
+func classifyWaitingReason(reason string, initContainer bool) string {
+	switch reason {
+	case "ErrImagePull", "ImagePullBackOff":
+		return metrics.TaskFailureReasonImagePull
+	case "InvalidImageName":
+		return metrics.TaskFailureReasonInvalidImage
+	case "CreateContainerConfigError", "CreateContainerError":
+		if initContainer {
+			return metrics.TaskFailureReasonInitContainer
+		}
+		return metrics.TaskFailureReasonContainerCreate
+	default:
+		if initContainer {
+			return metrics.TaskFailureReasonInitContainer
+		}
+		return metrics.TaskFailureReasonContainerWait
+	}
+}
+
+func classifyTerminatedReason(reason string) string {
+	if reason == "OOMKilled" {
+		return metrics.TaskFailureReasonContainerOOM
+	}
+	return metrics.TaskFailureReasonContainerExit
 }
 
 func waitingMessage(waiting *corev1.ContainerStateWaiting) string {

@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/registry"
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -26,6 +27,14 @@ type DockerBackendConfig struct {
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
+}
+
+func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient *client.Client, containerID string) bool {
+	inspect, err := dockerClient.ContainerInspect(ctx, containerID)
+	if err != nil || inspect.State == nil {
+		return false
+	}
+	return inspect.State.OOMKilled
 }
 
 // DockerBackend executes tasks in Docker containers.
@@ -90,13 +99,13 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	authStr := b.getRegistryAuth(ctx, imageName)
 	if err := b.pullImage(ctx, imageName, authStr); err != nil {
-		return err
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err)
 	}
 
 	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
 	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
 	if err != nil {
-		return err
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
 	}
 
 	// Start with common env vars, then append backend-specific config env vars.
@@ -128,7 +137,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	resp, err := dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
 	if err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err))
 	}
 
 	containerID := resp.ID
@@ -143,7 +152,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	}()
 
 	if err := dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err))
 	}
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
@@ -152,7 +161,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return fmt.Errorf("error waiting for container: %w", err)
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerWait, fmt.Errorf("error waiting for container: %w", err))
 		}
 	case status := <-statusCh:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
@@ -171,7 +180,11 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		}
 
 		if status.StatusCode != 0 {
-			return fmt.Errorf("container exited with non-zero status: %d", status.StatusCode)
+			reason := metrics.TaskFailureReasonContainerExit
+			if b.containerWasOOMKilled(ctx, dockerClient, containerID) {
+				reason = metrics.TaskFailureReasonContainerOOM
+			}
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode))
 		}
 	}
 

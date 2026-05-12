@@ -12,12 +12,17 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	sigsk8syaml "sigs.k8s.io/yaml"
 )
+
+// Version is the build-time version string. Override at link time with
+// -ldflags="-X main.Version=...".
+var Version = "dev"
 
 var CLI struct {
 	ConfigFile              string   `help:"Path to YAML config file" type:"path"`
@@ -63,6 +68,20 @@ func main() {
 		log.Fatalf(ctx, "%v", err)
 	}
 
+	// Set up the metrics pipeline before constructing the worker so that early
+	// reconnect attempts on Start() are observed. Failures here are
+	// non-fatal: the worker must continue even if metrics export breaks.
+	metricsShutdown, err := metrics.Init(ctx, metrics.Config{
+		WorkerID: workerConfig.WorkerID,
+		Backend:  workerConfig.BackendType,
+		Version:  Version,
+	})
+	if err != nil {
+		log.Errorf(ctx, "Failed to initialize metrics export: %v (continuing without metrics)", err)
+	}
+	metrics.SetMaxConcurrent(workerConfig.MaxConcurrentTasks)
+	metrics.SetWorkerInfo(Version, workerConfig.BackendType, workerConfig.WorkerID)
+
 	w, err := worker.New(ctx, workerConfig)
 	if err != nil {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
@@ -84,6 +103,17 @@ func main() {
 	log.Infof(ctx, "Received signal %v, shutting down gracefully...", sig)
 
 	w.Shutdown()
+
+	// Flush and stop the metrics exporter after the worker has stopped
+	// recording new data points. We use a fresh context with a short timeout
+	// because ctx may already be cancelled by the time we get here.
+	if metricsShutdown != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := metricsShutdown(shutdownCtx); err != nil {
+			log.Warnf(ctx, "Failed to shut down metrics exporter cleanly: %v", err)
+		}
+		cancel()
+	}
 
 	log.Infof(ctx, "Worker shutdown complete")
 }

@@ -11,7 +11,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -121,6 +125,7 @@ func (w *Worker) Start() error {
 
 		if err := w.connect(); err != nil {
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
+			metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonDialFailed)
 			time.Sleep(w.reconnectDelay)
 
 			// Compute exponential back-off.
@@ -129,8 +134,14 @@ func (w *Worker) Start() error {
 		}
 
 		w.reconnectDelay = InitialReconnectDelay
+		metrics.SetConnected(true)
 
 		w.run()
+
+		// run() returns when the connection is torn down. The Start loop will
+		// either exit via w.ctx.Done() above or reconnect on the next iteration.
+		metrics.SetConnected(false)
+		metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonRemoteClose)
 	}
 }
 
@@ -317,12 +328,25 @@ func (w *Worker) handleMessage(message []byte) {
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
+	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
+
+	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
+	metrics.AddTaskEvent(taskCtx, "task.assigned",
+		attribute.String("worker.id", w.config.WorkerID),
+		attribute.String("worker.backend", w.config.BackendType),
+		attribute.String("task.id", assignment.TaskID),
+	)
 
 	// Check concurrency limit before claiming the task.
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
 			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
+			metrics.RecordTaskRejected(metrics.RejectReasonAtCapacity)
+			metrics.AddTaskEvent(taskCtx, "task.rejected",
+				attribute.String("reason", metrics.RejectReasonAtCapacity),
+			)
+			span.End()
 			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
 				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 			}
@@ -334,14 +358,15 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
 		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
 	}
-
-	taskCtx, taskCancel := context.WithCancel(w.ctx)
+	metrics.RecordTaskClaim()
+	metrics.AddTaskEvent(taskCtx, "task.claimed")
+	metrics.IncTasksActive()
+	taskCtx, taskCancel := context.WithCancel(taskCtx)
 
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = taskCancel
 	w.tasksMutex.Unlock()
-
-	go w.executeTask(taskCtx, assignment)
+	go w.executeTask(taskCtx, span, assignment, receivedAt)
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -367,14 +392,20 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	baseArgs := []string{
 		"agent",
 		"run",
-		"--share",
-		"team:edit",
+	}
+	// Only share with the team when the task is team-owned. User-owned tasks
+	// (created with "Team visible" unchecked) use user-scoped API keys that
+	// cannot set up team-level session sharing.
+	if task.Owner.IsTeamOwned() {
+		baseArgs = append(baseArgs, "--share", "team:edit")
+	}
+	baseArgs = append(baseArgs,
 		"--task-id",
 		task.ID,
 		"--sandboxed",
 		"--server-root-url",
 		w.config.ServerRootURL,
-	}
+	)
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
 		IdleOnComplete: w.config.IdleOnComplete,
 	})
@@ -428,8 +459,12 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 	return fallback
 }
 
-func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignmentMessage) {
+func (w *Worker) executeTask(ctx context.Context, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
+	start := time.Now()
+	result := metrics.TaskResultSucceeded
+
 	defer func() {
+		span.End()
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)
 		w.tasksMutex.Unlock()
@@ -437,21 +472,46 @@ func (w *Worker) executeTask(ctx context.Context, assignment *types.TaskAssignme
 		if w.taskSemaphore != nil {
 			w.taskSemaphore.Release(1)
 		}
+
+		metrics.DecTasksActive()
+		metrics.RecordTaskCompleted(result, time.Since(start))
 	}()
 
 	taskID := assignment.TaskID
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
+	metrics.AddTaskEvent(ctx, "task.started")
 
 	params := w.prepareTaskParams(assignment)
-	if err := w.backend.ExecuteTask(ctx, params); err != nil {
+	metrics.AddTaskEvent(ctx, "backend.started",
+		attribute.String("backend", w.config.BackendType),
+		attribute.String("docker.image", params.DockerImage),
+	)
+
+	err := w.backend.ExecuteTask(ctx, params)
+	if err != nil {
+		result = metrics.TaskResultFailed
+		phase, reason := taskFailureLabels(err)
+		metrics.RecordTaskFailure(phase, reason)
+		metrics.AddTaskEvent(ctx, "task.failed",
+			attribute.String("failure.phase", phase),
+			attribute.String("failure.reason", reason),
+			attribute.String("error.message", err.Error()),
+		)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, fmt.Sprintf("Failed to execute task: %v", err)); statusErr != nil {
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
 		return
 	}
 
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
+	metrics.AddTaskEvent(ctx, "task.completed")
+	span.SetStatus(codes.Ok, "task completed")
+	if err := w.sendTaskCompleted(taskID, "Task completed successfully"); err != nil {
+		log.Errorf(ctx, "Failed to send task completed message: %v", err)
+	}
 }
 
 func (w *Worker) sendTaskClaimed(taskID string) error {
@@ -491,6 +551,30 @@ func (w *Worker) sendTaskRejected(taskID, reason string) error {
 
 	msg := types.WebSocketMessage{
 		Type: types.MessageTypeTaskRejected,
+		Data: data,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+
+	return w.sendMessage(msgBytes)
+}
+
+func (w *Worker) sendTaskCompleted(taskID, message string) error {
+	completedMsg := types.TaskCompletedMessage{
+		TaskID:  taskID,
+		Message: message,
+	}
+
+	data, err := json.Marshal(completedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task completed message: %w", err)
+	}
+
+	msg := types.WebSocketMessage{
+		Type: types.MessageTypeTaskCompleted,
 		Data: data,
 	}
 

@@ -1,0 +1,20 @@
+{{- if and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") .Values.metrics.podMonitor.create -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "oz-agent-worker.fullname" . }}
+  labels:
+    {{- include "oz-agent-worker.labels" . | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "oz-agent-worker.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.podMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.metrics.podMonitor.scrapeTimeout | quote }}
+{{- end }}
