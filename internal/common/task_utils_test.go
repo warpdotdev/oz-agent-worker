@@ -89,11 +89,15 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--model", "claude-sonnet-4", "--idle-on-complete", "12m"},
 		},
 		{
-			name: "passes --bedrock-inference-role when set",
+			name: "passes --bedrock-inference-role when inference_providers.aws.role_arn is set",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
-					ModelID:              strPtr("claude-sonnet-4"),
-					BedrockInferenceRole: strPtr("arn:aws:iam::123456789012:role/BedrockInference"),
+					ModelID: strPtr("claude-sonnet-4"),
+					InferenceProviders: &types.InferenceProviders{
+						Aws: &types.AwsInferenceProvider{
+							RoleARN: "arn:aws:iam::123456789012:role/BedrockInference",
+						},
+					},
 				},
 			},
 			opts: TaskAugmentOptions{},
@@ -108,10 +112,27 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			},
 		},
 		{
-			name: "skips --bedrock-inference-role when role is empty",
+			name: "skips --bedrock-inference-role when role_arn is whitespace",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
-					BedrockInferenceRole: strPtr("   "),
+					InferenceProviders: &types.InferenceProviders{
+						Aws: &types.AwsInferenceProvider{RoleARN: "   "},
+					},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
+		{
+			name: "skips --bedrock-inference-role when aws block is opted out",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					InferenceProviders: &types.InferenceProviders{
+						Aws: &types.AwsInferenceProvider{
+							Disabled: true,
+							RoleARN:  "arn:aws:iam::123456789012:role/BedrockInference",
+						},
+					},
 				},
 			},
 			opts:     TaskAugmentOptions{},

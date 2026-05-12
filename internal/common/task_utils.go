@@ -59,8 +59,8 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		if task.AgentConfigSnapshot.BedrockInferenceRole != nil {
-			if role := strings.TrimSpace(*task.AgentConfigSnapshot.BedrockInferenceRole); role != "" {
+		if aws := task.AgentConfigSnapshot.InferenceProviders; aws != nil && aws.Aws != nil && !aws.Aws.Disabled {
+			if role := strings.TrimSpace(aws.Aws.RoleARN); role != "" {
 				args = append(args, "--bedrock-inference-role", role)
 			}
 		}

@@ -115,7 +115,7 @@ type AmbientAgentConfig struct {
 	IdleTimeoutMinutes        *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness                   *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets        *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
-	BedrockInferenceRole      *string                    `json:"bedrock_inference_role,omitempty"`
+	InferenceProviders        *InferenceProviders        `json:"inference_providers,omitempty"`
 	SessionSharing            *SessionSharingConfig      `json:"session_sharing,omitempty"`
 	SnapshotDisabled          *bool                      `json:"snapshot_disabled,omitempty"`
 	SnapshotUploadTimeoutSecs *int                       `json:"snapshot_upload_timeout_secs,omitempty"`
@@ -132,6 +132,19 @@ type TaskOwner struct {
 // IsTeamOwned returns true when the task owner is a team.
 func (o *TaskOwner) IsTeamOwned() bool {
 	return o != nil && o.Type == "TEAM"
+}
+
+// InferenceProviders carries per-provider inference configuration.
+type InferenceProviders struct {
+	Aws *AwsInferenceProvider `json:"aws,omitempty"`
+}
+
+// AwsInferenceProvider mirrors warp-server's snapshot-local representation of
+// the AWS Bedrock block. When Disabled is false and RoleARN is non-empty, the
+// worker forwards the role to the Warp client as --bedrock-inference-role.
+type AwsInferenceProvider struct {
+	Disabled bool   `json:"disabled,omitempty"`
+	RoleARN  string `json:"role_arn,omitempty"`
 }
 
 // Task represents an ambient agent job.
