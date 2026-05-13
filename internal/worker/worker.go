@@ -366,7 +366,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = taskCancel
 	w.tasksMutex.Unlock()
-	go w.executeTask(taskCtx, span, assignment, receivedAt)
+	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -459,11 +459,12 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 	return fallback
 }
 
-func (w *Worker) executeTask(ctx context.Context, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
+func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
 
 	defer func() {
+		taskCancel()
 		span.End()
 		w.tasksMutex.Lock()
 		delete(w.activeTasks, assignment.TaskID)

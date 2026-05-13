@@ -93,7 +93,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 		backend:     &recordingBackend{},
 	}
 
-	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -127,7 +127,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
-	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -161,7 +161,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnContextCanceled(t *testing.T) {
 		backend:     &recordingBackend{err: context.Canceled},
 	}
 
-	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -190,7 +190,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
 
-	w.executeTask(context.Background(), trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
