@@ -127,7 +127,7 @@ func newConfigValidator() *validator.Validate {
 
 // Load reads and validates a YAML config file.
 func Load(path string) (*FileConfig, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the config path is an explicit operator-supplied CLI/config input.
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}

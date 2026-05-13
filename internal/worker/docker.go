@@ -278,7 +278,7 @@ func (b *DockerBackend) getRegistryAuth(ctx context.Context, imageName string) s
 		return ""
 	}
 
-	authJSON, _ := json.Marshal(authConfig)
+	authJSON, _ := json.Marshal(authConfig) // #nosec G117 -- Docker RegistryAuth requires marshaling credentials before base64 encoding; the value is not logged.
 	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", authKey, authConfig.Username)
 	return base64.URLEncoding.EncodeToString(authJSON)
 }
