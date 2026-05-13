@@ -16,6 +16,20 @@ import (
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
 
+// validateTaskIDForPath ensures task IDs are safe to use as a single path component.
+func validateTaskIDForPath(taskID string) error {
+	if taskID == "" || taskID == "." || taskID == ".." {
+		return fmt.Errorf("invalid task ID")
+	}
+	if strings.Contains(taskID, "/") || strings.Contains(taskID, "\\") {
+		return fmt.Errorf("invalid task ID")
+	}
+	if filepath.Base(taskID) != taskID {
+		return fmt.Errorf("invalid task ID")
+	}
+	return nil
+}
+
 // defaultInheritedEnvVars are the host environment variables passed through to
 // tasks and scripts by default. Sensitive worker credentials are intentionally
 // excluded; additional variables can be opted in via the backend config.
@@ -92,6 +106,9 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 // ExecuteTask runs the agent directly on the host.
 func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
 	taskID := params.TaskID
+	if err := validateTaskIDForPath(taskID); err != nil {
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err))
+	}
 
 	// Determine working directory: shared target dir or per-task workspace.
 	var workspaceDir string
