@@ -140,6 +140,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	for key, value := range b.config.Env {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
+	envVars = mergeEnvVars(envVars, harnessEnvVars(workspaceDir, params))
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
@@ -281,4 +282,39 @@ func mergeEnvVars(base, override []string) []string {
 // It supports quoted values, comments, and other standard dotenv syntax via godotenv.
 func parseEnvFile(path string) (map[string]string, error) {
 	return godotenv.Read(path)
+}
+
+type harnessConfig struct {
+	configEnvVar string
+	configDir    string
+}
+
+// Used for setting configEnvVar to "workspaceDir/configDir"
+var harnessConfigs = map[string]harnessConfig{
+	"claude": {
+		configEnvVar: "CLAUDE_CONFIG_DIR",
+		configDir:    ".claude",
+	},
+	"codex": {
+		configEnvVar: "CODEX_HOME",
+		configDir:    ".codex",
+	},
+}
+
+// When running with a third-party harness, set state environment variables so that the harness
+// state will be written to the workspace dir rather than globally. This helps us keep concurrent tasks
+// from interfering with one another.
+func harnessEnvVars(workspaceDir string, params *TaskParams) []string {
+	if params == nil ||
+		params.Task == nil ||
+		params.Task.AgentConfigSnapshot == nil ||
+		params.Task.AgentConfigSnapshot.Harness == nil ||
+		params.Task.AgentConfigSnapshot.Harness.Type == nil {
+		return nil
+	}
+	config, ok := harnessConfigs[strings.TrimSpace(*params.Task.AgentConfigSnapshot.Harness.Type)]
+	if !ok {
+		return nil
+	}
+	return []string{fmt.Sprintf("%s=%s", config.configEnvVar, filepath.Join(workspaceDir, config.configDir))}
 }
