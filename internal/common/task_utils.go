@@ -59,9 +59,15 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
+		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
+		// configured, pair it with --bedrock-role-region so the Warp client's
+		// STS AssumeRoleWithWebIdentity call targets the right regional endpoint.
 		if aws := task.AgentConfigSnapshot.InferenceProviders; aws != nil && aws.Aws != nil && !aws.Aws.Disabled {
 			if role := strings.TrimSpace(aws.Aws.RoleARN); role != "" {
 				args = append(args, "--bedrock-inference-role", role)
+				if region := strings.TrimSpace(aws.Aws.Region); region != "" {
+					args = append(args, "--bedrock-role-region", region)
+				}
 			}
 		}
 
