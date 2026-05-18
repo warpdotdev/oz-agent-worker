@@ -112,6 +112,50 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			},
 		},
 		{
+			name: "pairs --bedrock-role-region with --bedrock-inference-role when region is set",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					InferenceProviders: &types.InferenceProviders{
+						Aws: &types.AwsInferenceProvider{
+							RoleARN: "arn:aws:iam::123456789012:role/BedrockInference",
+							Region:  "  us-east-1  ",
+						},
+					},
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent",
+				"run",
+				"--bedrock-inference-role",
+				"arn:aws:iam::123456789012:role/BedrockInference",
+				"--bedrock-role-region",
+				"us-east-1",
+				"--idle-on-complete",
+			},
+		},
+		{
+			name: "omits --bedrock-role-region when region is whitespace",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					InferenceProviders: &types.InferenceProviders{
+						Aws: &types.AwsInferenceProvider{
+							RoleARN: "arn:aws:iam::123456789012:role/BedrockInference",
+							Region:  "   ",
+						},
+					},
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent",
+				"run",
+				"--bedrock-inference-role",
+				"arn:aws:iam::123456789012:role/BedrockInference",
+				"--idle-on-complete",
+			},
+		},
+		{
 			name: "skips --bedrock-inference-role when role_arn is whitespace",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{

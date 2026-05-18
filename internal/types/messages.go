@@ -141,10 +141,13 @@ type InferenceProviders struct {
 
 // AwsInferenceProvider mirrors warp-server's snapshot-local representation of
 // the AWS Bedrock block. When Disabled is false and RoleARN is non-empty, the
-// worker forwards the role to the Warp client as --bedrock-inference-role.
+// worker forwards the role to the Warp client as --bedrock-inference-role and,
+// when Region is set, pairs it with --bedrock-role-region so the STS
+// AssumeRoleWithWebIdentity call targets the right regional endpoint.
 type AwsInferenceProvider struct {
 	Disabled bool   `json:"disabled,omitempty"`
 	RoleARN  string `json:"role_arn,omitempty"`
+	Region   string `json:"region,omitempty"`
 }
 
 // Task represents an ambient agent job.
