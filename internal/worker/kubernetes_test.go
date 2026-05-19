@@ -705,6 +705,9 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
 	}
+	if createdJob.Spec.TTLSecondsAfterFinished == nil || *createdJob.Spec.TTLSecondsAfterFinished != defaultJobTTLSecondsAfterFinish {
+		t.Fatalf("expected default ttlSecondsAfterFinished %d, got %v", defaultJobTTLSecondsAfterFinish, createdJob.Spec.TTLSecondsAfterFinished)
+	}
 
 	if len(createdJob.Spec.Template.Spec.InitContainers) != 2 {
 		t.Fatalf("expected copy init container plus setup, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
@@ -855,6 +858,17 @@ func TestKubernetesBackendShutdownPreservesWorkerJobs(t *testing.T) {
 	}
 	if len(jobs.Items) != 1 {
 		t.Fatalf("expected worker Job to be preserved, got %d jobs", len(jobs.Items))
+	}
+}
+
+func TestTaskJobTTLDisabledWhenCleanupDisabled(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			NoCleanup: true,
+		},
+	}
+	if ttl := backend.taskJobTTLSecondsAfterFinished(); ttl != nil {
+		t.Fatalf("expected nil ttlSecondsAfterFinished when cleanup is disabled, got %v", *ttl)
 	}
 }
 

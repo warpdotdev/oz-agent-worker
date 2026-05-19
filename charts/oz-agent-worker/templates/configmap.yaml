@@ -46,6 +46,9 @@ data:
         {{- if .Values.kubernetesBackend.activeDeadlineSeconds }}
         active_deadline_seconds: {{ .Values.kubernetesBackend.activeDeadlineSeconds }}
         {{- end }}
+        {{- if and .Values.worker.cleanup .Values.kubernetesBackend.ttlSecondsAfterFinished }}
+        ttl_seconds_after_finished: {{ .Values.kubernetesBackend.ttlSecondsAfterFinished }}
+        {{- end }}
         {{- if .Values.kubernetesBackend.workspaceSizeLimit }}
         workspace_size_limit: {{ .Values.kubernetesBackend.workspaceSizeLimit | quote }}
         {{- end }}

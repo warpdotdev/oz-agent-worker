@@ -22,10 +22,19 @@ Kubernetes backend changes:
 - Change the `ExecuteTask` cancellation branch so context cancellation stops local watching and returns a cancellation error without deleting the Job when the cancellation is caused by worker shutdown.
 - Change `KubernetesBackend.Shutdown` to avoid deleting all worker-labeled Jobs. Its previous cleanup behavior is unsafe for drainable workers because it destroys unrelated in-flight Jobs on pod termination.
 - Preserve existing cleanup after terminal Job completion when `cleanup=true`; completed/failed Jobs should still be deleted by the worker that observes the terminal state.
+- Set `ttlSecondsAfterFinished` on task Jobs when cleanup is enabled so preserved Jobs that finish while no worker is watching are eventually garbage-collected by Kubernetes.
 Helm/documentation changes:
 - Add a chart value for `worker.terminationGracePeriodSeconds`, defaulting to a short bounded value, so operators can make SIGTERM handling explicit without relying on `do-not-disrupt`.
+- Add a chart value for `kubernetesBackend.ttlSecondsAfterFinished`, defaulting to one day, as the fallback cleanup window for Jobs that outlive their original worker pod.
 - Document that worker pod disruption no longer intentionally deletes active task Jobs, while task pod/node disruption can still interrupt the live run.
 This MVP does not fully reattach a replacement worker to already-running Jobs and send final `task_completed` / `task_failed` messages. It prevents the immediate destructive behavior, which is the highest-leverage first fix. A follow-up should persist/reconcile active Kubernetes Jobs so a new worker can resume monitoring and finalize abandoned Jobs instead of relying on the agent runtime and stale-task timeout.
+# Cleanup behavior
+Changing shutdown to preserve Jobs must not mean Jobs accumulate forever.
+There are three cleanup paths:
+- Normal observed completion: if the worker that created the Job is still watching when the Job completes or fails, the existing `cleanup=true` behavior still deletes the terminal Job immediately.
+- Worker-disrupted completion: if the worker pod terminates first and the Job later completes while no worker is watching, `ttlSecondsAfterFinished` lets the Kubernetes TTL controller garbage-collect the terminal Job. The Helm chart defaults this fallback to one day via `kubernetesBackend.ttlSecondsAfterFinished`, and the worker omits the TTL when `cleanup=false` so debugging behavior remains opt-in.
+- Reattach/reconcile follow-up: the durable fix should let a replacement worker reattach to preserved Jobs, report terminal task state, and delete or TTL-clean reconciled Jobs idempotently.
+The remaining caveat is Jobs that never reach a terminal state. `ttlSecondsAfterFinished` only starts after completion or failure, so truly stuck running Jobs still need either an operator-configured `activeDeadlineSeconds`, a future reconciliation loop that can classify stale Jobs, or explicit cancellation semantics.
 # Zero-loss Karpenter disruption scope
 There are two different disruption cases behind “zero loss,” and they have different implementation costs.
 ## Worker pod relocated, task pod remains running
@@ -37,6 +46,7 @@ To make this fully zero-loss instead of “do not kill the Job,” the next incr
 - Make finalization idempotent so both the old worker (if it exits slowly) and the replacement worker can safely race to report the same terminal outcome.
 - Add cleanup for orphaned terminal Jobs after successful reconciliation.
 Estimated effort: roughly 2-4 engineering days if the control-plane APIs already expose the needed open-task lookup/update hooks; closer to 1 week if we need to add worker-data persistence or a new reattach handshake.
+This PR includes a fallback `ttlSecondsAfterFinished` so completed Jobs do not accumulate indefinitely before reattach/reconcile exists. That TTL only applies after the Job reaches a terminal state; it does not replace reattach/finalization and does not stop truly stuck running Jobs without `activeDeadlineSeconds`.
 ## Task pod or task node evicted
 This is a larger project. If Karpenter evicts the actual task pod, the live process, PTY/session stream, and ephemeral workspace state are gone unless we make the agent runtime resumable.
 Zero loss for task-pod eviction would require:

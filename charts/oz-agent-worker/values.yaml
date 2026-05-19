@@ -81,6 +81,10 @@ kubernetesBackend:
   extraLabels: {}
   extraAnnotations: {}
   activeDeadlineSeconds: null
+  # Fallback cleanup for task Jobs that finish after the worker pod that created
+  # them has been disrupted. When worker.cleanup=false, the worker does not set
+  # a TTL so Jobs remain available for debugging.
+  ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod

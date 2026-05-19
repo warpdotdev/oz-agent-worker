@@ -143,8 +143,10 @@ When the worker pod is terminated by normal Kubernetes disruption (for example
 Karpenter node consolidation), the Kubernetes backend preserves active task
 Jobs instead of deleting them during worker shutdown. The default
 `worker.terminationGracePeriodSeconds` only needs to cover WebSocket close and
-metrics flush. Disruption of the task pod or its node can still interrupt the
-live Oz session.
+metrics flush. Task Jobs also set `ttlSecondsAfterFinished` when cleanup is
+enabled so Jobs that finish after a worker disruption are eventually garbage
+collected even before replacement-worker reconciliation exists. Disruption of
+the task pod or its node can still interrupt the live Oz session.
 
 Recommended namespace-scoped permissions for the worker are:
 

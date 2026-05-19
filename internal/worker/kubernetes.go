@@ -35,6 +35,7 @@ const (
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
+	defaultJobTTLSecondsAfterFinish  = int32(24 * 60 * 60)
 	startupPreflightImageVolumeName  = "preflight-image"
 	startupPreflightImageMountPath   = "/preflight-image"
 	kubernetesWorkerIDLabel          = "oz-worker-id"
@@ -63,6 +64,7 @@ type KubernetesBackendConfig struct {
 	ExtraLabels           map[string]string
 	ExtraAnnotations      map[string]string
 	ActiveDeadlineSeconds *int64
+	TTLSecondsAfterFinish *int32
 	WorkspaceSizeLimit    *resource.Quantity
 	UnschedulableTimeout  *time.Duration
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
@@ -263,8 +265,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			Annotations: jobAnnotations,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          &backoffLimit,
-			ActiveDeadlineSeconds: b.config.ActiveDeadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			ActiveDeadlineSeconds:   b.config.ActiveDeadlineSeconds,
+			TTLSecondsAfterFinished: b.taskJobTTLSecondsAfterFinished(),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      jobLabels,
@@ -406,6 +409,17 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 // here would kill otherwise healthy running sessions.
 func (b *KubernetesBackend) Shutdown(ctx context.Context) {
 	log.Infof(ctx, "Preserving Kubernetes task Jobs during worker shutdown")
+}
+
+func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
+	if b.config.NoCleanup {
+		return nil
+	}
+	if b.config.TTLSecondsAfterFinish != nil {
+		return b.config.TTLSecondsAfterFinish
+	}
+	value := defaultJobTTLSecondsAfterFinish
+	return &value
 }
 
 // jobResult wraps a terminal job outcome so handleJobState can signal the
