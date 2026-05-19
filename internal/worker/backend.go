@@ -41,3 +41,10 @@ type Backend interface {
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
 }
+
+// TaskPreservingBackend is implemented by backends whose task execution units
+// can safely outlive the worker process. Worker shutdown should detach from
+// those tasks instead of cancelling them.
+type TaskPreservingBackend interface {
+	PreservesTasksOnShutdown() bool
+}

@@ -36,6 +36,10 @@ worker:
   deploymentAnnotations: {}
   podAnnotations: {}
   podLabels: {}
+  # Bounded grace period for worker pod termination. The Kubernetes backend
+  # preserves active task Jobs when the worker pod is disrupted, so this only
+  # needs to cover WebSocket close and metrics shutdown.
+  terminationGracePeriodSeconds: 30
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 10001

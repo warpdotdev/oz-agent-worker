@@ -27,6 +27,14 @@ func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCtxErr = ctx.Err()
 }
 
+type preservingShutdownRecordingBackend struct {
+	shutdownRecordingBackend
+}
+
+func (b *preservingShutdownRecordingBackend) PreservesTasksOnShutdown() bool {
+	return true
+}
+
 type recordingBackend struct {
 	err error
 }
@@ -469,5 +477,30 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	}
 	if backend.shutdownCtxErr != nil {
 		t.Fatalf("expected backend shutdown context to be active, got %v", backend.shutdownCtxErr)
+	}
+}
+
+func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	backend := &preservingShutdownRecordingBackend{}
+	cancelledTask := false
+	w := &Worker{
+		ctx:    workerCtx,
+		cancel: cancel,
+		activeTasks: map[string]context.CancelFunc{
+			"task-1": func() {
+				cancelledTask = true
+			},
+		},
+		backend: backend,
+	}
+
+	w.Shutdown()
+
+	if cancelledTask {
+		t.Fatal("expected active task to be preserved, but cancel function was called")
+	}
+	if !backend.shutdownCalled {
+		t.Fatal("expected backend shutdown to be called")
 	}
 }

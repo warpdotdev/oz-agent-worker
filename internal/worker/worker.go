@@ -330,8 +330,7 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
-
-	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
+	taskCtx, span := metrics.StartTaskSpan(w.taskContextParent(), assignment.TaskID, assignment.Task.Title)
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
 		attribute.String("worker.id", w.config.WorkerID),
 		attribute.String("worker.backend", w.config.BackendType),
@@ -367,6 +366,13 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	w.activeTasks[assignment.TaskID] = taskCancel
 	w.tasksMutex.Unlock()
 	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+}
+
+func (w *Worker) taskContextParent() context.Context {
+	if backendPreservesTasksOnShutdown(w.backend) {
+		return context.WithoutCancel(w.ctx)
+	}
+	return w.ctx
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -624,10 +630,13 @@ func (w *Worker) sendMessage(message []byte) error {
 
 func (w *Worker) Shutdown() {
 	log.Infof(w.ctx, "Shutting down worker...")
+	preserveActiveTasks := backendPreservesTasksOnShutdown(w.backend)
 
 	w.tasksMutex.Lock()
 	activeTaskCount := len(w.activeTasks)
-	if activeTaskCount > 0 {
+	if activeTaskCount > 0 && preserveActiveTasks {
+		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
+	} else if activeTaskCount > 0 {
 		log.Infof(w.ctx, "Cancelling %d active tasks", activeTaskCount)
 		for taskID, cancel := range w.activeTasks {
 			log.Debugf(w.ctx, "Cancelling task: %s", taskID)
@@ -636,7 +645,7 @@ func (w *Worker) Shutdown() {
 	}
 	w.tasksMutex.Unlock()
 
-	if activeTaskCount > 0 {
+	if activeTaskCount > 0 && !preserveActiveTasks {
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -658,4 +667,9 @@ func (w *Worker) Shutdown() {
 	w.connMutex.Unlock()
 
 	log.Infof(w.ctx, "Worker shutdown complete")
+}
+
+func backendPreservesTasksOnShutdown(backend Backend) bool {
+	preservingBackend, ok := backend.(TaskPreservingBackend)
+	return ok && preservingBackend.PreservesTasksOnShutdown()
 }

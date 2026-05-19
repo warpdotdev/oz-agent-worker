@@ -139,6 +139,13 @@ The chart defaults the long-lived worker `Deployment` to a non-root security con
 
 The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
 
+When the worker pod is terminated by normal Kubernetes disruption (for example
+Karpenter node consolidation), the Kubernetes backend preserves active task
+Jobs instead of deleting them during worker shutdown. The default
+`worker.terminationGracePeriodSeconds` only needs to cover WebSocket close and
+metrics flush. Disruption of the task pod or its node can still interrupt the
+live Oz session.
+
 Recommended namespace-scoped permissions for the worker are:
 
 - create, get, list, watch, delete `jobs`

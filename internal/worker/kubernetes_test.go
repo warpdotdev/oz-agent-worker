@@ -762,6 +762,102 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 }
 
+func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	created := make(chan string, 1)
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		created <- job.Name
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- backend.ExecuteTask(ctx, &TaskParams{
+			TaskID:      "task-1",
+			DockerImage: "ubuntu:22.04",
+			BaseArgs:    []string{"run"},
+		})
+	}()
+
+	var jobName string
+	select {
+	case jobName = <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task Job creation")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("expected context cancellation error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ExecuteTask to return")
+	}
+
+	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected Job %s to be preserved after context cancellation, got %v", jobName, err)
+	}
+}
+
+func TestKubernetesBackendShutdownPreservesWorkerJobs(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task-job",
+			Namespace: "agents",
+			Labels:    backend.baseLabels("task-1"),
+		},
+	}
+	fakeClient := fake.NewSimpleClientset(job)
+	backend.clientset = fakeClient
+
+	backend.Shutdown(context.Background())
+
+	jobs, err := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected worker Job to be preserved, got %d jobs", len(jobs.Items))
+	}
+}
+
 func TestRunStartupPreflightCreatesLegacyRootInitJobAndWaitsForPodCreationByDefault(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"
