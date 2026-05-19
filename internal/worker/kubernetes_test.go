@@ -78,6 +78,22 @@ func TestKubernetesSidecarMaterializationScriptMatchesExpectedShell(t *testing.T
 	}
 }
 
+func TestKubernetesTaskWrapperScriptReportsShutdown(t *testing.T) {
+	script := kubernetesTaskWrapperScript()
+	requiredSnippets := []string{
+		"report_shutdown()",
+		"/agent/entrypoint.sh \"$@\" &",
+		"wait \"$agent_pid\"",
+		"/agent/entrypoint.sh harness-support --run-id \"$OZ_RUN_ID\" report-shutdown",
+		"--error-category agent_process_failed",
+		"exit \"$status\"",
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(script, snippet) {
+			t.Fatalf("expected wrapper script to contain %q, got:\n%s", snippet, script)
+		}
+	}
+}
 func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	ctx := context.Background()

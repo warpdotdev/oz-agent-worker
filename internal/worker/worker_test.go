@@ -460,6 +460,28 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
+	w := &Worker{
+		ctx: context.Background(),
+		config: Config{
+			ServerRootURL: "https://staging.example.com",
+			Kubernetes:    &KubernetesBackendConfig{},
+		},
+	}
+
+	params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1"},
+	})
+
+	want := warpServerRootURLEnv + "=https://staging.example.com"
+	for _, entry := range params.EnvVars {
+		if entry == want {
+			return
+		}
+	}
+	t.Fatalf("expected %s in env vars, got %v", want, params.EnvVars)
+}
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}

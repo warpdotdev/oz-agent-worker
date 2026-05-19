@@ -28,6 +28,8 @@ const (
 	PongWait               = 60 * time.Second
 	WriteWait              = 10 * time.Second
 	BackendShutdownTimeout = 10 * time.Second
+
+	warpServerRootURLEnv = "WARP_SERVER_ROOT_URL"
 )
 
 type Config struct {
@@ -389,6 +391,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		fmt.Sprintf("TASK_ID=%s", task.ID),
 		"GIT_TERMINAL_PROMPT=0",
 		"GH_PROMPT_DISABLED=1",
+	}
+	if w.config.ServerRootURL != "" {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", warpServerRootURLEnv, w.config.ServerRootURL))
 	}
 	for key, value := range assignment.EnvVars {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))

@@ -145,8 +145,14 @@ Jobs instead of deleting them during worker shutdown. The default
 `worker.terminationGracePeriodSeconds` only needs to cover WebSocket close and
 metrics flush. Task Jobs also set `ttlSecondsAfterFinished` when cleanup is
 enabled so Jobs that finish after a worker disruption are eventually garbage
-collected even before replacement-worker reconciliation exists. Disruption of
-the task pod or its node can still interrupt the live Oz session.
+collected even before replacement-worker reconciliation exists. The task Pod
+also reports agent shutdown directly through the task-scoped workload token when
+the agent process exits, which lets a preserved Job finalize its execution even
+if the original worker WebSocket is gone. Until replacement-worker
+reconciliation exists, a worker disruption can still leave the control-plane
+execution open if that task-side shutdown report cannot run, which may delay
+handoff to a subsequent run until stale-task cleanup or manual intervention.
+Disruption of the task pod or its node can still interrupt the live Oz session.
 
 Recommended namespace-scoped permissions for the worker are:
 
