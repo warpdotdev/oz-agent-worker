@@ -139,20 +139,30 @@ The chart defaults the long-lived worker `Deployment` to a non-root security con
 
 The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
 
-When the worker pod is terminated by normal Kubernetes disruption (for example
-Karpenter node consolidation), the Kubernetes backend preserves active task
-Jobs instead of deleting them during worker shutdown. The default
-`worker.terminationGracePeriodSeconds` only needs to cover WebSocket close and
-metrics flush. Task Jobs also set `ttlSecondsAfterFinished` when cleanup is
-enabled so Jobs that finish after a worker disruption are eventually garbage
-collected even before replacement-worker reconciliation exists. The task Pod
-also reports agent shutdown directly through the task-scoped workload token when
-the agent process exits, which lets a preserved Job finalize its execution even
-if the original worker WebSocket is gone. Until replacement-worker
-reconciliation exists, a worker disruption can still leave the control-plane
-execution open if that task-side shutdown report cannot run, which may delay
-handoff to a subsequent run until stale-task cleanup or manual intervention.
-Disruption of the task pod or its node can still interrupt the live Oz session.
+When the long-lived worker pod is terminated by normal Kubernetes disruption
+(for example Karpenter node consolidation), the Kubernetes backend preserves
+active task Jobs instead of deleting them during worker shutdown. This protects
+running Oz sessions from worker pod rotation as long as the task Job and task Pod
+remain healthy. The default `worker.terminationGracePeriodSeconds` only needs to
+cover WebSocket close and metrics flush.
+
+This does not make task Pods disruption-proof. If Karpenter or another cluster
+operation evicts the node that is actually running the task Pod, the live Oz
+session can still be interrupted because the process and any pod-local workspace
+state are on that task Pod. For stronger protection, schedule worker pods and
+task pods independently (for example with separate node pools, selectors,
+tolerations, or disruption budgets) so worker rotation does not imply task pod
+eviction.
+
+Task Jobs also set `ttlSecondsAfterFinished` when cleanup is enabled so Jobs
+that finish after a worker disruption are eventually garbage collected even
+before replacement-worker reconciliation exists. The task Pod also reports agent
+shutdown directly through the task-scoped workload token when the agent process
+exits, which lets a preserved Job finalize its execution even if the original
+worker WebSocket is gone. Until replacement-worker reconciliation exists, a
+worker disruption can still leave the control-plane execution open if that
+task-side shutdown report cannot run, which may delay handoff to a subsequent
+run until stale-task cleanup or manual intervention.
 
 Recommended namespace-scoped permissions for the worker are:
 
