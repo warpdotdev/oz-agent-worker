@@ -26,6 +26,9 @@ func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
 	b.shutdownCtxErr = ctx.Err()
 }
+func (b *shutdownRecordingBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
 
 type preservingShutdownRecordingBackend struct {
 	shutdownRecordingBackend
@@ -44,6 +47,9 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
 }
 
 func (b *recordingBackend) Shutdown(context.Context) {}
+func (b *recordingBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
 
 func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
@@ -524,5 +530,27 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	}
 	if !backend.shutdownCalled {
 		t.Fatal("expected backend shutdown to be called")
+	}
+}
+
+func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing.T) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := &Worker{
+		ctx:         workerCtx,
+		cancel:      cancel,
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: make(map[string]context.CancelFunc),
+		backend:     &preservingShutdownRecordingBackend{},
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	if len(w.activeTasks) != 0 {
+		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
 	}
 }

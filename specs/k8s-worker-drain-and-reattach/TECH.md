@@ -14,7 +14,7 @@ With this behavior, a normal Kubernetes pod termination caused by Karpenter cons
 Implement the smallest durable fix by making Kubernetes backend tasks survive worker shutdown.
 Add a backend capability that lets the shared worker know whether task execution should be detached during process shutdown. Docker and direct backends keep the current behavior because their child process/container lifetimes are owned by the worker host. The Kubernetes backend opts into preservation because the durable unit is the Kubernetes Job.
 Worker lifecycle changes:
-- Introduce an optional backend interface such as `PreservesTasksOnShutdown() bool`.
+- Add `PreservesTasksOnShutdown() bool` to the shared `Backend` interface so each backend explicitly declares its shutdown behavior.
 - In `Worker.Shutdown`, skip cancelling `activeTasks` when the backend opts into preservation.
 - Still cancel the worker context and close the WebSocket so the process exits cleanly and the control plane stops assigning new work to that connection.
 Kubernetes backend changes:
@@ -23,7 +23,7 @@ Kubernetes backend changes:
 - Change `KubernetesBackend.Shutdown` to avoid deleting all worker-labeled Jobs. Its previous cleanup behavior is unsafe for drainable workers because it destroys unrelated in-flight Jobs on pod termination.
 - Preserve existing cleanup after terminal Job completion when `cleanup=true`; completed/failed Jobs should still be deleted by the worker that observes the terminal state.
 - Set `ttlSecondsAfterFinished` on task Jobs when cleanup is enabled so preserved Jobs that finish while no worker is watching are eventually garbage-collected by Kubernetes.
-- Wrap the Kubernetes task command so the task Pod itself calls `harness-support report-shutdown` after the agent process exits. This lets a preserved Job finalize its active execution through the task-scoped workload token even when the original worker WebSocket is gone.
+- Continue delegating Kubernetes task execution through the standard `/agent/entrypoint.sh`, which reports shutdown after the agent process exits. This lets a preserved Job finalize its active execution through the task-scoped workload token even when the original worker WebSocket is gone.
 Helm/documentation changes:
 - Add a chart value for `worker.terminationGracePeriodSeconds`, defaulting to a short bounded value, so operators can make SIGTERM handling explicit without relying on `do-not-disrupt`.
 - Add a chart value for `kubernetesBackend.ttlSecondsAfterFinished`, defaulting to one day, as the fallback cleanup window for Jobs that outlive their original worker pod.
@@ -70,7 +70,7 @@ Validation commands:
 # Parallelization
 Parallel sub-agents are not proposed. The change is tightly scoped to one repo and a small set of coupled files (`worker.go`, `kubernetes.go`, Kubernetes tests, and Helm chart templates). Splitting this across agents would create merge conflicts and add coordination overhead beyond the implementation cost.
 # Risks and mitigations
-- Risk: preserving Jobs without reattach can leave a task row/execution in an open state if the task-side shutdown report does not run successfully and no worker observes the terminal Job. This can delay handoff to a subsequent run until server-side stale-task cleanup or manual intervention. Mitigation: have the Kubernetes wrapper call `harness-support report-shutdown` from inside the task Pod, rely on the existing stale-task timeout only as a safety net, and prioritize replacement-worker reattach/reconcile before positioning this as seamless handoff.
+- Risk: preserving Jobs without reattach can leave a task row/execution in an open state if the task-side shutdown report does not run successfully and no worker observes the terminal Job. This can delay handoff to a subsequent run until server-side stale-task cleanup or manual intervention. Mitigation: rely on the standard task entrypoint to call `harness-support report-shutdown` from inside the task Pod, use the existing stale-task timeout only as a safety net, and prioritize replacement-worker reattach/reconcile before positioning this as seamless handoff.
 - Risk: shutdown-triggered context cancellation is indistinguishable from explicit task cancellation inside `KubernetesBackend.ExecuteTask`. Mitigation: preserve Jobs only for worker-level shutdown, while explicit task cancellation should remain destructive in a follow-up by threading cancellation reason through the backend.
 - Risk: completed Jobs may accumulate if the worker is repeatedly disrupted. Mitigation: keep terminal cleanup when a worker observes completion and add reattach/reconcile cleanup in the follow-up.
 # Follow-ups

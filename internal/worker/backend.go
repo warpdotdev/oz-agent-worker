@@ -38,13 +38,9 @@ type TaskParams struct {
 type Backend interface {
 	// ExecuteTask runs the agent for the given task parameters.
 	ExecuteTask(ctx context.Context, params *TaskParams) error
+	// PreservesTasksOnShutdown reports whether active task execution units can
+	// safely outlive the worker process during shutdown.
+	PreservesTasksOnShutdown() bool
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
-}
-
-// TaskPreservingBackend is implemented by backends whose task execution units
-// can safely outlive the worker process. Worker shutdown should detach from
-// those tasks instead of cancelling them.
-type TaskPreservingBackend interface {
-	PreservesTasksOnShutdown() bool
 }
