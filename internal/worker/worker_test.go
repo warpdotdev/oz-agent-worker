@@ -26,6 +26,17 @@ func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
 	b.shutdownCtxErr = ctx.Err()
 }
+func (b *shutdownRecordingBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
+
+type preservingShutdownRecordingBackend struct {
+	shutdownRecordingBackend
+}
+
+func (b *preservingShutdownRecordingBackend) PreservesTasksOnShutdown() bool {
+	return true
+}
 
 type recordingBackend struct {
 	err error
@@ -36,6 +47,9 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
 }
 
 func (b *recordingBackend) Shutdown(context.Context) {}
+func (b *recordingBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
 
 func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
@@ -452,6 +466,28 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
+	w := &Worker{
+		ctx: context.Background(),
+		config: Config{
+			ServerRootURL: "https://staging.example.com",
+			Kubernetes:    &KubernetesBackendConfig{},
+		},
+	}
+
+	params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1"},
+	})
+
+	want := warpServerRootURLEnv + "=https://staging.example.com"
+	for _, entry := range params.EnvVars {
+		if entry == want {
+			return
+		}
+	}
+	t.Fatalf("expected %s in env vars, got %v", want, params.EnvVars)
+}
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}
@@ -469,5 +505,52 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	}
 	if backend.shutdownCtxErr != nil {
 		t.Fatalf("expected backend shutdown context to be active, got %v", backend.shutdownCtxErr)
+	}
+}
+
+func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	backend := &preservingShutdownRecordingBackend{}
+	cancelledTask := false
+	w := &Worker{
+		ctx:    workerCtx,
+		cancel: cancel,
+		activeTasks: map[string]context.CancelFunc{
+			"task-1": func() {
+				cancelledTask = true
+			},
+		},
+		backend: backend,
+	}
+
+	w.Shutdown()
+
+	if cancelledTask {
+		t.Fatal("expected active task to be preserved, but cancel function was called")
+	}
+	if !backend.shutdownCalled {
+		t.Fatal("expected backend shutdown to be called")
+	}
+}
+
+func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing.T) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := &Worker{
+		ctx:         workerCtx,
+		cancel:      cancel,
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: make(map[string]context.CancelFunc),
+		backend:     &preservingShutdownRecordingBackend{},
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	if len(w.activeTasks) != 0 {
+		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
 	}
 }

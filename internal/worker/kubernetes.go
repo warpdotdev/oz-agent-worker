@@ -35,6 +35,7 @@ const (
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
+	defaultJobTTLSecondsAfterFinish  = int32(24 * 60 * 60)
 	startupPreflightImageVolumeName  = "preflight-image"
 	startupPreflightImageMountPath   = "/preflight-image"
 	kubernetesWorkerIDLabel          = "oz-worker-id"
@@ -63,6 +64,7 @@ type KubernetesBackendConfig struct {
 	ExtraLabels           map[string]string
 	ExtraAnnotations      map[string]string
 	ActiveDeadlineSeconds *int64
+	TTLSecondsAfterFinish *int32
 	WorkspaceSizeLimit    *resource.Quantity
 	UnschedulableTimeout  *time.Duration
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
@@ -77,6 +79,10 @@ type KubernetesBackendConfig struct {
 type KubernetesBackend struct {
 	config    KubernetesBackendConfig
 	clientset kubernetes.Interface
+}
+
+func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
+	return true
 }
 
 // NewKubernetesBackend creates a new Kubernetes backend and validates startup requirements.
@@ -259,8 +265,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			Annotations: jobAnnotations,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          &backoffLimit,
-			ActiveDeadlineSeconds: b.config.ActiveDeadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			ActiveDeadlineSeconds:   b.config.ActiveDeadlineSeconds,
+			TTLSecondsAfterFinished: b.taskJobTTLSecondsAfterFinished(),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      jobLabels,
@@ -281,7 +288,11 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if deleted {
 			return
 		}
-		if ctx.Err() != nil || !b.config.NoCleanup {
+		if ctx.Err() != nil {
+			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
+			return
+		}
+		if !b.config.NoCleanup {
 			if err := b.deleteJob(context.Background(), jobName); err != nil {
 				log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 			}
@@ -306,11 +317,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	for {
 		select {
 		case <-ctx.Done():
-			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				log.Warnf(ctx, "Failed to delete Job %s on cancellation: %v", jobName, err)
-			} else {
-				deleted = true
-			}
+			log.Infof(ctx, "Stopping local watch for Kubernetes Job %s after task context cancellation", jobName)
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
 
 		case event, ok := <-jobWatcher.ResultChan():
@@ -395,21 +402,24 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 }
 
-// Shutdown deletes all Jobs still labeled for this worker.
+// Shutdown intentionally does not delete task Jobs.
+//
+// Kubernetes Jobs are the durable execution unit for this backend. During
+// worker pod disruption (for example Karpenter node rotation), deleting Jobs
+// here would kill otherwise healthy running sessions.
 func (b *KubernetesBackend) Shutdown(ctx context.Context) {
-	selector := fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
-	jobs, err := b.clientset.BatchV1().Jobs(b.config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
-		log.Warnf(ctx, "Failed to list lingering Jobs during shutdown: %v", err)
-		return
+	log.Infof(ctx, "Preserving Kubernetes task Jobs during worker shutdown")
+}
+
+func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
+	if b.config.NoCleanup {
+		return nil
 	}
-	for _, job := range jobs.Items {
-		if err := b.deleteJob(ctx, job.Name); err != nil {
-			log.Warnf(ctx, "Failed to delete lingering Job %s: %v", job.Name, err)
-		}
+	if b.config.TTLSecondsAfterFinish != nil {
+		return b.config.TTLSecondsAfterFinish
 	}
+	value := defaultJobTTLSecondsAfterFinish
+	return &value
 }
 
 // jobResult wraps a terminal job outcome so handleJobState can signal the
@@ -1049,6 +1059,7 @@ func kubernetesTaskWrapperScript() string {
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
 		"  set +a",
 		"fi",
+		"",
 		"exec /agent/entrypoint.sh \"$@\"",
 	}, "\n")
 }

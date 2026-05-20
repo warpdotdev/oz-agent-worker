@@ -201,6 +201,10 @@ func (b *DockerBackend) Shutdown(ctx context.Context) {
 	}
 }
 
+func (b *DockerBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
+
 // pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
 // Docker only downloads changed layers, so this is efficient even if the image exists locally.
 func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string) error {

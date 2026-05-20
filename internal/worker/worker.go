@@ -28,6 +28,8 @@ const (
 	PongWait               = 60 * time.Second
 	WriteWait              = 10 * time.Second
 	BackendShutdownTimeout = 10 * time.Second
+
+	warpServerRootURLEnv = "WARP_SERVER_ROOT_URL"
 )
 
 type Config struct {
@@ -330,7 +332,6 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
-
 	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
 		attribute.String("worker.id", w.config.WorkerID),
@@ -361,7 +362,23 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
-	taskCtx, taskCancel := context.WithCancel(taskCtx)
+	select {
+	case <-w.ctx.Done():
+		log.Infof(w.ctx, "Skipping task execution after worker shutdown during claim: taskID=%s", assignment.TaskID)
+		if w.taskSemaphore != nil {
+			w.taskSemaphore.Release(1)
+		}
+		metrics.DecTasksActive()
+		span.End()
+		return
+	default:
+	}
+
+	executionCtx := taskCtx
+	if w.backend.PreservesTasksOnShutdown() {
+		executionCtx = context.WithoutCancel(taskCtx)
+	}
+	taskCtx, taskCancel := context.WithCancel(executionCtx)
 
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = taskCancel
@@ -383,6 +400,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		fmt.Sprintf("TASK_ID=%s", task.ID),
 		"GIT_TERMINAL_PROMPT=0",
 		"GH_PROMPT_DISABLED=1",
+	}
+	if w.config.ServerRootURL != "" {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", warpServerRootURLEnv, w.config.ServerRootURL))
 	}
 	for key, value := range assignment.EnvVars {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
@@ -624,10 +644,13 @@ func (w *Worker) sendMessage(message []byte) error {
 
 func (w *Worker) Shutdown() {
 	log.Infof(w.ctx, "Shutting down worker...")
+	preserveActiveTasks := w.backend.PreservesTasksOnShutdown()
 
 	w.tasksMutex.Lock()
 	activeTaskCount := len(w.activeTasks)
-	if activeTaskCount > 0 {
+	if activeTaskCount > 0 && preserveActiveTasks {
+		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
+	} else if activeTaskCount > 0 {
 		log.Infof(w.ctx, "Cancelling %d active tasks", activeTaskCount)
 		for taskID, cancel := range w.activeTasks {
 			log.Debugf(w.ctx, "Cancelling task: %s", taskID)
@@ -636,7 +659,7 @@ func (w *Worker) Shutdown() {
 	}
 	w.tasksMutex.Unlock()
 
-	if activeTaskCount > 0 {
+	if activeTaskCount > 0 && !preserveActiveTasks {
 		time.Sleep(500 * time.Millisecond)
 	}
 
