@@ -20,11 +20,10 @@ type TaskAugmentOptions struct {
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
 // Uses task.AgentConfigSnapshot as the source of truth when available.
 //
-// executionInput carries the per-execution inputs (prompt + initial snapshot token)
-// the worker uses to derive per-execution CLI behavior such as --skip-initial-turn.
-// It is derived fresh per execution so cloud->cloud follow-ups cannot inherit a
-// stale decision from a prior execution on the same task.
-func AugmentArgsForTask(task *types.Task, executionInput *types.WorkerExecutionInput, args []string, opts TaskAugmentOptions) []string {
+// skipInitialTurn is the server-computed decision (warp-server-4's
+// shouldSkipInitialTurn helper is the single authority) that controls whether
+// the worker emits --skip-initial-turn to the CLI. The worker is a passthrough.
+func AugmentArgsForTask(task *types.Task, skipInitialTurn bool, args []string, opts TaskAugmentOptions) []string {
 	if task == nil {
 		return args
 	}
@@ -116,11 +115,11 @@ func AugmentArgsForTask(task *types.Task, executionInput *types.WorkerExecutionI
 		}
 	}
 
-	// Worker-derived: skip the cloud agent's initial LLM turn when this
-	// execution has no prompt and no snapshot to rehydrate against. Derived
-	// fresh per execution so a cloud->cloud follow-up with a real prompt
-	// does not inherit the skip decision from a prior empty-prompt execution.
-	if shouldSkipInitialTurn(executionInput) {
+	// Server-computed: skip the cloud agent's initial LLM turn. The decision
+	// lives in warp-server-4's shouldSkipInitialTurn helper so future content
+	// sources (e.g. orchestration system prompts) can be enumerated server-side
+	// without touching the worker.
+	if skipInitialTurn {
 		args = append(args, "--skip-initial-turn")
 	}
 
@@ -134,23 +133,6 @@ func AugmentArgsForTask(task *types.Task, executionInput *types.WorkerExecutionI
 	}
 
 	return args
-}
-
-// shouldSkipInitialTurn returns true when this execution has nothing for the
-// cloud agent's first LLM turn to act on: an empty prompt AND no initial
-// snapshot to rehydrate. Mirrors warp-server-4's derivation helper so both
-// sides of the worker pipeline make the same decision.
-func shouldSkipInitialTurn(executionInput *types.WorkerExecutionInput) bool {
-	if executionInput == nil {
-		return false
-	}
-	if executionInput.Prompt != "" {
-		return false
-	}
-	if executionInput.InitialSnapshotToken != nil && *executionInput.InitialSnapshotToken != "" {
-		return false
-	}
-	return true
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string

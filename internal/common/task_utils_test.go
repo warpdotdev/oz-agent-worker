@@ -16,11 +16,11 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 	baseArgs := []string{"agent", "run"}
 
 	tests := []struct {
-		name           string
-		task           *types.Task
-		executionInput *types.WorkerExecutionInput
-		opts           TaskAugmentOptions
-		expected       []string
+		name            string
+		task            *types.Task
+		skipInitialTurn bool
+		opts            TaskAugmentOptions
+		expected        []string
 	}{
 		{
 			name: "uses task idle_timeout_minutes when set",
@@ -265,84 +265,31 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			},
 		},
 		{
-			name: "emits --skip-initial-turn when execution prompt is empty and no snapshot token",
+			// Worker is a passthrough: when the server-computed SkipInitialTurn
+			// is true, emit --skip-initial-turn. The derivation logic lives in
+			// warp-server-4's shouldSkipInitialTurn, not here.
+			name: "emits --skip-initial-turn when skipInitialTurn is true",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
-			executionInput: &types.WorkerExecutionInput{
-				Prompt:               "",
-				InitialSnapshotToken: nil,
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
+			skipInitialTurn: true,
+			opts:            TaskAugmentOptions{},
+			expected:        []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
 		},
 		{
-			name: "does not emit --skip-initial-turn when execution prompt is empty but snapshot token is set",
+			name: "does not emit --skip-initial-turn when skipInitialTurn is false",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
-			executionInput: &types.WorkerExecutionInput{
-				Prompt:               "",
-				InitialSnapshotToken: strPtr("snap-token-abc"),
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
-		},
-		{
-			name: "does not emit --skip-initial-turn when execution prompt is non-empty",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
-			},
-			executionInput: &types.WorkerExecutionInput{
-				Prompt:               "do the thing",
-				InitialSnapshotToken: nil,
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
-		},
-		{
-			// Cloud->cloud-follow-up regression: same task, follow-up execution
-			// arrives with a real prompt. The derivation must reflect the live
-			// execution, not any flag the original empty-prompt execution may have
-			// carried. Worker derives fresh per execution, so the follow-up never
-			// emits --skip-initial-turn even though the first execution would have.
-			name: "cloud->cloud follow-up: follow-up execution with prompt does not emit --skip-initial-turn",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
-			},
-			executionInput: &types.WorkerExecutionInput{
-				Prompt:               "follow up question",
-				InitialSnapshotToken: nil,
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
-		},
-		{
-			name: "does not emit --skip-initial-turn when execution input is nil",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
-			},
-			executionInput: nil,
-			opts:           TaskAugmentOptions{},
-			expected:       []string{"agent", "run", "--idle-on-complete"},
-		},
-		{
-			name: "treats empty-string snapshot token the same as nil",
-			task: &types.Task{
-				AgentConfigSnapshot: &types.AmbientAgentConfig{},
-			},
-			executionInput: &types.WorkerExecutionInput{
-				Prompt:               "",
-				InitialSnapshotToken: strPtr(""),
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
+			skipInitialTurn: false,
+			opts:            TaskAugmentOptions{},
+			expected:        []string{"agent", "run", "--idle-on-complete"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := AugmentArgsForTask(tt.task, tt.executionInput, append([]string{}, baseArgs...), tt.opts)
+			got := AugmentArgsForTask(tt.task, tt.skipInitialTurn, append([]string{}, baseArgs...), tt.opts)
 			if !reflect.DeepEqual(got, tt.expected) {
 				t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, tt.expected)
 			}
