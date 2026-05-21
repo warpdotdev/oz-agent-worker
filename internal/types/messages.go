@@ -30,6 +30,16 @@ type SidecarMount struct {
 	ReadWrite bool   `json:"read_write"` // If false (default), the mount is read-only.
 }
 
+// WorkerExecutionInput carries the per-execution inputs the worker needs to derive
+// per-execution CLI behavior (e.g. whether to skip the cloud agent's initial LLM
+// turn). Mirrors the wire shape on warp-server-4's TaskAssignmentMessage so the
+// derivation is computed fresh from the live execution rather than from a stored
+// task-config flag, which would drift on cloud->cloud follow-ups.
+type WorkerExecutionInput struct {
+	Prompt               string  `json:"prompt"`
+	InitialSnapshotToken *string `json:"initial_snapshot_token,omitempty"`
+}
+
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
 	TaskID      string `json:"task_id"`
@@ -41,6 +51,10 @@ type TaskAssignmentMessage struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
+	// ExecutionInput carries the per-execution inputs the worker uses to derive
+	// per-execution CLI behavior. Nil for legacy senders or messages that
+	// haven't been upgraded yet.
+	ExecutionInput *WorkerExecutionInput `json:"execution_input,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task

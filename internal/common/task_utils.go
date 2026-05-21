@@ -19,7 +19,12 @@ type TaskAugmentOptions struct {
 
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
 // Uses task.AgentConfigSnapshot as the source of truth when available.
-func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions) []string {
+//
+// executionInput carries the per-execution inputs (prompt + initial snapshot token)
+// the worker uses to derive per-execution CLI behavior such as --skip-initial-turn.
+// It is derived fresh per execution so cloud->cloud follow-ups cannot inherit a
+// stale decision from a prior execution on the same task.
+func AugmentArgsForTask(task *types.Task, executionInput *types.WorkerExecutionInput, args []string, opts TaskAugmentOptions) []string {
 	if task == nil {
 		return args
 	}
@@ -111,6 +116,14 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		}
 	}
 
+	// Worker-derived: skip the cloud agent's initial LLM turn when this
+	// execution has no prompt and no snapshot to rehydrate against. Derived
+	// fresh per execution so a cloud->cloud follow-up with a real prompt
+	// does not inherit the skip decision from a prior empty-prompt execution.
+	if shouldSkipInitialTurn(executionInput) {
+		args = append(args, "--skip-initial-turn")
+	}
+
 	// Keep the agent alive after task completion to allow follow-ups.
 	// Priority: task config idle_timeout_minutes > worker IdleOnComplete > oz CLI default (45m).
 	idleOnComplete, hasIdleOnCompleteValue := resolveIdleOnComplete(task, opts)
@@ -121,6 +134,23 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
+}
+
+// shouldSkipInitialTurn returns true when this execution has nothing for the
+// cloud agent's first LLM turn to act on: an empty prompt AND no initial
+// snapshot to rehydrate. Mirrors warp-server-4's derivation helper so both
+// sides of the worker pipeline make the same decision.
+func shouldSkipInitialTurn(executionInput *types.WorkerExecutionInput) bool {
+	if executionInput == nil {
+		return false
+	}
+	if executionInput.Prompt != "" {
+		return false
+	}
+	if executionInput.InitialSnapshotToken != nil && *executionInput.InitialSnapshotToken != "" {
+		return false
+	}
+	return true
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string
