@@ -16,11 +16,10 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 	baseArgs := []string{"agent", "run"}
 
 	tests := []struct {
-		name            string
-		task            *types.Task
-		skipInitialTurn bool
-		opts            TaskAugmentOptions
-		expected        []string
+		name     string
+		task     *types.Task
+		opts     TaskAugmentOptions
+		expected []string
 	}{
 		{
 			name: "uses task idle_timeout_minutes when set",
@@ -266,30 +265,28 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 		},
 		{
 			// Worker is a passthrough: when the server-computed SkipInitialTurn
-			// is true, emit --skip-initial-turn. The derivation logic lives in
-			// warp-server-4's shouldSkipInitialTurn, not here.
-			name: "emits --skip-initial-turn when skipInitialTurn is true",
+			// option is true, emit --skip-initial-turn. The derivation logic
+			// lives in warp-server-4's ShouldSkipInitialTurn, not here.
+			name: "emits --skip-initial-turn when opts.SkipInitialTurn is true",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
-			skipInitialTurn: true,
-			opts:            TaskAugmentOptions{},
-			expected:        []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
+			opts:     TaskAugmentOptions{SkipInitialTurn: true},
+			expected: []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
 		},
 		{
-			name: "does not emit --skip-initial-turn when skipInitialTurn is false",
+			name: "does not emit --skip-initial-turn when opts.SkipInitialTurn is false",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
-			skipInitialTurn: false,
-			opts:            TaskAugmentOptions{},
-			expected:        []string{"agent", "run", "--idle-on-complete"},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := AugmentArgsForTask(tt.task, tt.skipInitialTurn, append([]string{}, baseArgs...), tt.opts)
+			got := AugmentArgsForTask(tt.task, append([]string{}, baseArgs...), tt.opts)
 			if !reflect.DeepEqual(got, tt.expected) {
 				t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, tt.expected)
 			}

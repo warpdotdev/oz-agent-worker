@@ -488,6 +488,57 @@ func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
 	}
 	t.Fatalf("expected %s in env vars, got %v", want, params.EnvVars)
 }
+
+// TestPrepareTaskParamsSkipInitialTurn locks in the passthrough wiring from
+// TaskAssignmentMessage.SkipInitialTurn through prepareTaskParams into the
+// CLI args. The bare unit test on AugmentArgsForTask is necessary but not
+// sufficient: this test guards against worker.go regressing the field-to-opts
+// mapping at the call site.
+func TestPrepareTaskParamsSkipInitialTurn(t *testing.T) {
+	newWorker := func() *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				ServerRootURL: "https://app.warp.dev",
+				Kubernetes:    &KubernetesBackendConfig{},
+			},
+		}
+	}
+
+	containsSkipInitialTurn := func(args []string) bool {
+		for _, arg := range args {
+			if arg == "--skip-initial-turn" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("forwards --skip-initial-turn when assignment.SkipInitialTurn is true", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:          "task-skip",
+			Task:            &types.Task{ID: "task-skip"},
+			SkipInitialTurn: true,
+		})
+		if !containsSkipInitialTurn(params.BaseArgs) {
+			t.Fatalf("expected --skip-initial-turn in args, got %v", params.BaseArgs)
+		}
+	})
+
+	t.Run("omits --skip-initial-turn when assignment.SkipInitialTurn is false", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:          "task-no-skip",
+			Task:            &types.Task{ID: "task-no-skip"},
+			SkipInitialTurn: false,
+		})
+		if containsSkipInitialTurn(params.BaseArgs) {
+			t.Fatalf("did not expect --skip-initial-turn in args, got %v", params.BaseArgs)
+		}
+	})
+}
+
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}

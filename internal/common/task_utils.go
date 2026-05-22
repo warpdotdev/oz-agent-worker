@@ -8,22 +8,23 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
-// TaskAugmentOptions contains worker-level settings that are translated into oz CLI flags
-// for every task. Add new per-worker CLI overrides here rather than as extra parameters.
+// TaskAugmentOptions contains settings translated into oz CLI flags for every task.
+// Add new CLI overrides here rather than as extra parameters.
 type TaskAugmentOptions struct {
 	// IdleOnComplete is passed to --idle-on-complete. Empty string uses the oz CLI default
 	// (45m). Use "0s" to exit immediately after the conversation finishes.
 	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
+	// SkipInitialTurn is the server-computed decision (warp-server-4's
+	// ShouldSkipInitialTurn helper is the single authority) that controls
+	// whether the worker emits --skip-initial-turn to the CLI. The worker is a
+	// passthrough; it does not re-derive the decision.
+	SkipInitialTurn bool
 }
 
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
 // Uses task.AgentConfigSnapshot as the source of truth when available.
-//
-// skipInitialTurn is the server-computed decision (warp-server-4's
-// shouldSkipInitialTurn helper is the single authority) that controls whether
-// the worker emits --skip-initial-turn to the CLI. The worker is a passthrough.
-func AugmentArgsForTask(task *types.Task, skipInitialTurn bool, args []string, opts TaskAugmentOptions) []string {
+func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions) []string {
 	if task == nil {
 		return args
 	}
@@ -116,10 +117,10 @@ func AugmentArgsForTask(task *types.Task, skipInitialTurn bool, args []string, o
 	}
 
 	// Server-computed: skip the cloud agent's initial LLM turn. The decision
-	// lives in warp-server-4's shouldSkipInitialTurn helper so future content
+	// lives in warp-server-4's ShouldSkipInitialTurn helper so future content
 	// sources (e.g. orchestration system prompts) can be enumerated server-side
 	// without touching the worker.
-	if skipInitialTurn {
+	if opts.SkipInitialTurn {
 		args = append(args, "--skip-initial-turn")
 	}
 

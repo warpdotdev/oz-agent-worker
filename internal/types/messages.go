@@ -42,10 +42,11 @@ type TaskAssignmentMessage struct {
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
 	// SkipInitialTurn mirrors the warp-server-4 wire shape: the server's
-	// shouldSkipInitialTurn helper is the single authority for the decision,
+	// ShouldSkipInitialTurn helper is the single authority for the decision,
 	// computed fresh per execution. The worker just passes it through to the
-	// CLI via --skip-initial-turn.
-	SkipInitialTurn bool `json:"skip_initial_turn"`
+	// CLI via --skip-initial-turn. The omitempty tag matches the server's
+	// emission so a false value never appears on the wire.
+	SkipInitialTurn bool `json:"skip_initial_turn,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
