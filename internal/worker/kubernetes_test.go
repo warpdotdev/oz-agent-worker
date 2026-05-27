@@ -176,6 +176,57 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 	})
 }
 
+func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+
+	err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task-pod",
+			Namespace: "agents",
+			Labels: map[string]string{
+				"job-name": "task-job",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "task",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 143,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected container termination error")
+	}
+
+	message := err.Error()
+	for _, want := range []string{
+		"container task",
+		"pod task-pod",
+		"namespace agents",
+		"job task-job",
+		"exited with code 143",
+		"SIGTERM",
+		"Pod phase: Failed",
+		"check pod events and node activity",
+		"eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("expected error message to contain %q, got %q", want, message)
+		}
+	}
+}
 func TestHandleJobStateDetectsCompletion(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	backend := &KubernetesBackend{
