@@ -449,7 +449,11 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		if logs != "" {
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
 		}
-		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, classifyJobFailure(jobState), fmt.Errorf("job %s failed", jobName))}
+		if failure := b.detectPodFailure(ctx, pods); failure != nil {
+			return &jobResult{err: failure}
+		}
+		reason := classifyJobFailure(jobState)
+		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.jobFailureError(jobState))}
 	}
 	return nil
 }
@@ -830,26 +834,26 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 
 	for _, status := range pod.Status.InitContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, fmt.Errorf("init container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), fmt.Errorf("init container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting)))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), b.containerWaitingFailureError(pod, "init container", status.Name, status.State.Waiting))
 		}
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), fmt.Errorf("container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), b.containerTerminatedFailureError(pod, "container", status.Name, status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), fmt.Errorf("container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting)))
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), b.containerWaitingFailureError(pod, "container", status.Name, status.State.Waiting))
 		}
 	}
 
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable {
 			if b.shouldFailUnschedulablePod(pod) {
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnschedulable, fmt.Errorf("pod %s is unschedulable: %s", pod.Name, condition.Message))
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnschedulable, b.podConditionFailureError(pod, "is unschedulable", condition.Reason, condition.Message))
 			}
 		}
 	}
@@ -866,7 +870,7 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		}
 		for _, event := range events.Items {
 			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message))
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, b.podEventFailureError(pod, "failed to mount a volume", event))
 			}
 		}
 	}
@@ -875,13 +879,7 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
 			reason = metrics.TaskFailureReasonActiveDeadline
 		}
-		if pod.Status.Message != "" {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Message))
-		}
-		if pod.Status.Reason != "" {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Reason))
-		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("pod %s failed", pod.Name))
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.podFailureError(pod))
 	}
 
 	return nil
@@ -1103,6 +1101,150 @@ func rootSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		RunAsUser:  &rootUser,
 		RunAsGroup: &rootGroup,
+	}
+}
+
+func (b *KubernetesBackend) jobFailureError(job *batchv1.Job) error {
+	details := []string{
+		fmt.Sprintf("kubernetes Job %s in namespace %s failed", job.Name, b.objectNamespace(job.Namespace)),
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		if condition.Reason != "" {
+			details = append(details, "Job reason: "+condition.Reason)
+		}
+		if condition.Message != "" {
+			details = append(details, "Job message: "+condition.Message)
+		}
+		break
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+// TODO: Send these Kubernetes diagnostics to the server as structured failure
+// details so the UI/API can format them without parsing this human-readable
+// message string.
+func (b *KubernetesBackend) containerTerminatedFailureError(pod *corev1.Pod, kind, containerName string, terminated *corev1.ContainerStateTerminated) error {
+	message := fmt.Sprintf("%s %s in %s exited with code %d", kind, containerName, b.podContext(pod), terminated.ExitCode)
+	if signal := exitSignalName(terminated); signal != "" {
+		message = fmt.Sprintf("%s (%s)", message, signal)
+	}
+	details := append([]string{message}, b.podStatusDetails(pod, terminated.Reason, terminated.Message)...)
+	if guidance := b.terminationGuidance(kind, terminated); guidance != "" {
+		details = append(details, guidance)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) containerWaitingFailureError(pod *corev1.Pod, kind, containerName string, waiting *corev1.ContainerStateWaiting) error {
+	message := fmt.Sprintf("%s %s in %s is waiting: %s", kind, containerName, b.podContext(pod), waitingMessage(waiting))
+	return fmt.Errorf("%s", strings.Join(append([]string{message}, b.podStatusDetails(pod, waiting.Reason, waiting.Message)...), ". "))
+}
+
+func (b *KubernetesBackend) podConditionFailureError(pod *corev1.Pod, summary, reason, message string) error {
+	details := []string{fmt.Sprintf("%s %s", b.podContext(pod), summary)}
+	if reason != "" {
+		details = append(details, "Pod reason: "+reason)
+	}
+	if message != "" {
+		details = append(details, "Pod message: "+message)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) podEventFailureError(pod *corev1.Pod, summary string, event corev1.Event) error {
+	details := []string{fmt.Sprintf("%s %s", b.podContext(pod), summary)}
+	if event.Reason != "" {
+		details = append(details, "Kubernetes event reason: "+event.Reason)
+	}
+	if event.Message != "" {
+		details = append(details, "Kubernetes event message: "+event.Message)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) podFailureError(pod *corev1.Pod) error {
+	details := []string{fmt.Sprintf("%s failed", b.podContext(pod))}
+	return fmt.Errorf("%s", strings.Join(append(details, b.podStatusDetails(pod, "", "")...), ". "))
+}
+
+func (b *KubernetesBackend) podContext(pod *corev1.Pod) string {
+	details := []string{"namespace " + b.objectNamespace(pod.Namespace)}
+	if pod.Labels["job-name"] != "" {
+		details = append(details, "job "+pod.Labels["job-name"])
+	}
+	return fmt.Sprintf("pod %s (%s)", pod.Name, strings.Join(details, ", "))
+}
+
+func (b *KubernetesBackend) objectNamespace(namespace string) string {
+	if namespace != "" {
+		return namespace
+	}
+	return b.config.Namespace
+}
+
+func (b *KubernetesBackend) podStatusDetails(pod *corev1.Pod, reason, message string) []string {
+	var details []string
+	if pod.Status.Phase != "" {
+		details = append(details, "Pod phase: "+string(pod.Status.Phase))
+	}
+	if reason == "" {
+		reason = pod.Status.Reason
+	}
+	if reason != "" {
+		details = append(details, "Pod reason: "+reason)
+	}
+	if message == "" {
+		message = pod.Status.Message
+	}
+	if message != "" {
+		details = append(details, "Pod message: "+message)
+	}
+	return details
+}
+
+func (b *KubernetesBackend) terminationGuidance(kind string, terminated *corev1.ContainerStateTerminated) string {
+	if exitSignalName(terminated) != "SIGTERM" {
+		return ""
+	}
+	switch kind {
+	case "container":
+		return "SIGTERM usually means Kubernetes or the container runtime asked the task process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	case "init container":
+		return "SIGTERM usually means Kubernetes or the container runtime asked the setup process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	default:
+		return "SIGTERM usually means Kubernetes or the container runtime asked the process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	}
+}
+
+func exitSignalName(terminated *corev1.ContainerStateTerminated) string {
+	if signal := signalName(terminated.Signal); signal != "" {
+		return signal
+	}
+	return signalName(terminated.ExitCode - 128)
+}
+
+func signalName(signal int32) string {
+	switch signal {
+	case 1:
+		return "SIGHUP"
+	case 2:
+		return "SIGINT"
+	case 3:
+		return "SIGQUIT"
+	case 6:
+		return "SIGABRT"
+	case 9:
+		return "SIGKILL"
+	case 15:
+		return "SIGTERM"
+	default:
+		if signal > 0 {
+			return fmt.Sprintf("signal %d", signal)
+		}
+		return ""
 	}
 }
 
