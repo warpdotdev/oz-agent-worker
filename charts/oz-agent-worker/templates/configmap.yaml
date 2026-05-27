@@ -12,6 +12,10 @@ data:
     {{- if .Values.worker.idleOnComplete }}
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
     {{- end }}
+    {{- with .Values.worker.skillsDirs }}
+    skills_dirs:
+{{ toYaml . | indent 6 }}
+    {{- end }}
     backend:
       kubernetes:
         namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace | quote }}

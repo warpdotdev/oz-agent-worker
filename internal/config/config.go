@@ -26,6 +26,12 @@ type FileConfig struct {
 	// overrides are no longer needed.
 	IdleOnComplete *string       `yaml:"idle_on_complete"`
 	Backend        BackendConfig `yaml:"backend"`
+	// SkillsDirs is a list of local filesystem directories containing skill folders.
+	// Each directory should contain subdirectories with a SKILL.md file:
+	//   <dir>/skill-name/SKILL.md
+	// Skills discovered here are reported to the server on connect so they appear
+	// in the webapp's agent/skill selector for users with access to this worker.
+	SkillsDirs []string `yaml:"skills_dirs"`
 }
 
 // BackendConfig contains the backend selection.
