@@ -1,6 +1,9 @@
 package worker
 
 import (
+	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -73,4 +76,77 @@ func envMap(values []string) map[string]string {
 		result[key] = val
 	}
 	return result
+}
+
+func TestDirectBackendRedirectsGlobalGitConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available on PATH")
+	}
+
+	hostHome := t.TempDir()
+	t.Setenv("HOME", hostHome)
+
+	testDir := t.TempDir()
+	homeCapture := filepath.Join(testDir, "home.txt")
+	cfgCapture := filepath.Join(testDir, "git_config_global.txt")
+	ozPath := filepath.Join(testDir, "oz")
+	script := `#!/bin/sh
+set -eu
+printf '%s' "$HOME" > "$OZ_HOME_CAPTURE"
+printf '%s' "$GIT_CONFIG_GLOBAL" > "$OZ_CFG_CAPTURE"
+git config --global --add url."https://x-access-token:tok@github.com/".insteadOf "ssh://git@github.com/"
+`
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+		Env: map[string]string{
+			"OZ_HOME_CAPTURE": homeCapture,
+			"OZ_CFG_CAPTURE":  cfgCapture,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-1"}); err != nil {
+		t.Fatalf("failed to execute task: %v", err)
+	}
+
+	// HOME is intentionally left untouched: only git's global config is redirected.
+	if got, err := os.ReadFile(homeCapture); err != nil {
+		t.Fatalf("failed to read captured HOME: %v", err)
+	} else if string(got) != hostHome {
+		t.Fatalf("HOME = %q, want host home %q (HOME must not be repointed)", string(got), hostHome)
+	}
+
+	// GIT_CONFIG_GLOBAL must point inside the per-task workspace.
+	wantCfg := filepath.Join(workspaceRoot, "task-1", ".gitconfig")
+	if got, err := os.ReadFile(cfgCapture); err != nil {
+		t.Fatalf("failed to read captured GIT_CONFIG_GLOBAL: %v", err)
+	} else if string(got) != wantCfg {
+		t.Fatalf("GIT_CONFIG_GLOBAL = %q, want %q", string(got), wantCfg)
+	}
+
+	// The insteadOf rewrite must land in the isolated config...
+	data, err := os.ReadFile(wantCfg)
+	if err != nil {
+		t.Fatalf("isolated git config was not written: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(string(data)), "insteadof") {
+		t.Fatalf("isolated git config missing insteadOf rewrite:\n%s", data)
+	}
+
+	// ...and must NOT pollute the developer's real global git config.
+	if _, err := os.Stat(filepath.Join(hostHome, ".gitconfig")); !os.IsNotExist(err) {
+		t.Fatalf("host ~/.gitconfig should not exist; stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hostHome, ".config", "git", "config")); !os.IsNotExist(err) {
+		t.Fatalf("host XDG git config should not exist; stat err = %v", err)
+	}
 }
