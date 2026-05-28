@@ -15,11 +15,8 @@ type TaskAugmentOptions struct {
 	// (45m). Use "0s" to exit immediately after the conversation finishes.
 	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
-	// SkipInitialTurn is the server-computed decision (warp-server-4's
-	// ShouldSkipInitialTurn helper is the single authority) that controls
-	// whether the worker emits --skip-initial-turn to the CLI. The worker is a
-	// passthrough; it does not re-derive the decision.
-	SkipInitialTurn bool
+	// AdditionalOzArgs are server-resolved supplemental oz CLI arguments.
+	AdditionalOzArgs []string
 }
 
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
@@ -116,13 +113,7 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		}
 	}
 
-	// Server-computed: skip the cloud agent's initial LLM turn. The decision
-	// lives in warp-server-4's ShouldSkipInitialTurn helper so future content
-	// sources (e.g. orchestration system prompts) can be enumerated server-side
-	// without touching the worker.
-	if opts.SkipInitialTurn {
-		args = append(args, "--skip-initial-turn")
-	}
+	args = append(args, opts.AdditionalOzArgs...)
 
 	// Keep the agent alive after task completion to allow follow-ups.
 	// Priority: task config idle_timeout_minutes > worker IdleOnComplete > oz CLI default (45m).

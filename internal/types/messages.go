@@ -41,12 +41,9 @@ type TaskAssignmentMessage struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
-	// SkipInitialTurn mirrors the warp-server-4 wire shape: the server's
-	// ShouldSkipInitialTurn helper is the single authority for the decision,
-	// computed fresh per execution. The worker just passes it through to the
-	// CLI via --skip-initial-turn. The omitempty tag matches the server's
-	// emission so a false value never appears on the wire.
-	SkipInitialTurn bool `json:"skip_initial_turn,omitempty"`
+	// AdditionalOzArgs are server-resolved supplemental arguments for the oz
+	// CLI. The worker forwards these tokens without deriving task semantics.
+	AdditionalOzArgs []string `json:"additional_oz_args,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task

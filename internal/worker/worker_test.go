@@ -489,12 +489,7 @@ func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
 	t.Fatalf("expected %s in env vars, got %v", want, params.EnvVars)
 }
 
-// TestPrepareTaskParamsSkipInitialTurn locks in the passthrough wiring from
-// TaskAssignmentMessage.SkipInitialTurn through prepareTaskParams into the
-// CLI args. The bare unit test on AugmentArgsForTask is necessary but not
-// sufficient: this test guards against worker.go regressing the field-to-opts
-// mapping at the call site.
-func TestPrepareTaskParamsSkipInitialTurn(t *testing.T) {
+func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
 	newWorker := func() *Worker {
 		return &Worker{
 			ctx: context.Background(),
@@ -514,24 +509,22 @@ func TestPrepareTaskParamsSkipInitialTurn(t *testing.T) {
 		return false
 	}
 
-	t.Run("forwards --skip-initial-turn when assignment.SkipInitialTurn is true", func(t *testing.T) {
+	t.Run("forwards server supplemental oz args", func(t *testing.T) {
 		w := newWorker()
 		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:          "task-skip",
-			Task:            &types.Task{ID: "task-skip"},
-			SkipInitialTurn: true,
+			TaskID:           "task-skip",
+			Task:             &types.Task{ID: "task-skip"},
+			AdditionalOzArgs: []string{"--skip-initial-turn"},
 		})
 		if !containsSkipInitialTurn(params.BaseArgs) {
 			t.Fatalf("expected --skip-initial-turn in args, got %v", params.BaseArgs)
 		}
 	})
-
-	t.Run("omits --skip-initial-turn when assignment.SkipInitialTurn is false", func(t *testing.T) {
+	t.Run("does not add omitted supplemental oz args", func(t *testing.T) {
 		w := newWorker()
 		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:          "task-no-skip",
-			Task:            &types.Task{ID: "task-no-skip"},
-			SkipInitialTurn: false,
+			TaskID: "task-no-skip",
+			Task:   &types.Task{ID: "task-no-skip"},
 		})
 		if containsSkipInitialTurn(params.BaseArgs) {
 			t.Fatalf("did not expect --skip-initial-turn in args, got %v", params.BaseArgs)
