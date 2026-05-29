@@ -52,16 +52,14 @@ func hostBaseEnv() []string {
 // global config keeps writes like `git config --global url.<x>.insteadOf` out of
 // the developer's real ~/.gitconfig (and $XDG_CONFIG_HOME/git/config) without
 // repointing HOME for every tool the agent runs.
-func prepareTaskGitConfig(workspaceDir, taskID string, usingTargetDir bool) (string, func(), error) {
+func prepareTaskGitConfig(workspaceDir string, usingTargetDir bool) (string, func(), error) {
 	if !usingTargetDir {
-		// The per-task workspace is removed after the task, so the config goes with it.
 		return filepath.Join(workspaceDir, ".gitconfig"), func() {}, nil
 	}
 
 	// In shared target-dir mode the workspace is the user's real checkout, so keep
 	// the throwaway global config in a temporary directory outside of it.
-	sanitizedTaskID := strings.NewReplacer("/", "_", "\\", "_").Replace(taskID)
-	dir, err := os.MkdirTemp("", fmt.Sprintf("oz-gitconfig-%s-", sanitizedTaskID))
+	dir, err := os.MkdirTemp("", "oz-gitconfig-")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temporary git config directory: %w", err)
 	}
@@ -149,7 +147,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
-	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, taskID, usingTargetDir)
+	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir)
 	if err != nil {
 		return err
 	}

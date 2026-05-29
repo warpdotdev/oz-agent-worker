@@ -118,22 +118,18 @@ git config --global --add url."https://x-access-token:tok@github.com/".insteadOf
 		t.Fatalf("failed to execute task: %v", err)
 	}
 
-	// HOME is intentionally left untouched: only git's global config is redirected.
 	if got, err := os.ReadFile(homeCapture); err != nil {
 		t.Fatalf("failed to read captured HOME: %v", err)
 	} else if string(got) != hostHome {
 		t.Fatalf("HOME = %q, want host home %q (HOME must not be repointed)", string(got), hostHome)
 	}
 
-	// GIT_CONFIG_GLOBAL must point inside the per-task workspace.
 	wantCfg := filepath.Join(workspaceRoot, "task-1", ".gitconfig")
 	if got, err := os.ReadFile(cfgCapture); err != nil {
 		t.Fatalf("failed to read captured GIT_CONFIG_GLOBAL: %v", err)
 	} else if string(got) != wantCfg {
 		t.Fatalf("GIT_CONFIG_GLOBAL = %q, want %q", string(got), wantCfg)
 	}
-
-	// The insteadOf rewrite must land in the isolated config...
 	data, err := os.ReadFile(wantCfg)
 	if err != nil {
 		t.Fatalf("isolated git config was not written: %v", err)
@@ -142,11 +138,36 @@ git config --global --add url."https://x-access-token:tok@github.com/".insteadOf
 		t.Fatalf("isolated git config missing insteadOf rewrite:\n%s", data)
 	}
 
-	// ...and must NOT pollute the developer's real global git config.
 	if _, err := os.Stat(filepath.Join(hostHome, ".gitconfig")); !os.IsNotExist(err) {
 		t.Fatalf("host ~/.gitconfig should not exist; stat err = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(hostHome, ".config", "git", "config")); !os.IsNotExist(err) {
 		t.Fatalf("host XDG git config should not exist; stat err = %v", err)
+	}
+}
+
+func TestDirectBackendRejectsUnsafeTaskID(t *testing.T) {
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+
+	for _, badID := range []string{"../escape", "a/../../escape", "/abs/path", "..", ""} {
+		if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: badID}); err == nil {
+			t.Fatalf("expected error for unsafe task ID %q, got nil", badID)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(testDir, "escape")); !os.IsNotExist(err) {
+		t.Fatalf("traversal path should not exist; stat err = %v", err)
 	}
 }
