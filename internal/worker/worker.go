@@ -451,6 +451,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 
 	return &TaskParams{
 		TaskID:      assignment.TaskID,
+		ExecutionID: assignment.ExecutionID,
 		Task:        task,
 		EnvVars:     envVars,
 		BaseArgs:    baseArgs,

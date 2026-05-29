@@ -42,6 +42,8 @@ const (
 	kubernetesWorkerHashLabel        = "oz-worker-hash"
 	kubernetesTaskIDLabel            = "oz-task-id"
 	kubernetesTaskHashLabel          = "oz-task-hash"
+	kubernetesExecutionIDLabel       = "oz-execution-id"
+	kubernetesExecutionHashLabel     = "oz-execution-hash"
 
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
@@ -131,8 +133,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
 	}
 
-	jobName := sanitizeKubernetesJobName(params.TaskID)
-	jobLabels := b.baseLabels(params.TaskID)
+	executionID := taskExecutionID(params)
+	jobName := sanitizeKubernetesJobName(executionID)
+	jobLabels := b.baseLabels(params.TaskID, executionID)
 	jobAnnotations := copyStringMap(b.config.ExtraAnnotations)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 
@@ -144,6 +147,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
 		"OZ_WORKER_BACKEND="+kubernetesBackendTypeName,
 		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
+		fmt.Sprintf("OZ_EXECUTION_ID=%s", executionID),
 	))
 
 	volumes := []corev1.Volume{
@@ -305,7 +309,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 	defer jobWatcher.Stop()
 
-	podWatcher, err := b.watchTaskPods(ctx, params.TaskID)
+	podWatcher, err := b.watchTaskPods(ctx, executionID)
 	if err != nil {
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err))
 	}
@@ -343,7 +347,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				continue
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
+			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
 				return result.err
 			}
 
@@ -351,7 +355,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				// Watch closed; reopen.
 				podWatcher.Stop()
-				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
 					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
 				}
@@ -360,7 +364,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if event.Type == watch.Error {
 				log.Warnf(ctx, "Pod watch error for Job %s, reopening", jobName)
 				podWatcher.Stop()
-				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
 					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
 				}
@@ -387,11 +391,11 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				}
 				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err))
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
+			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
 				return result.err
 			}
 
-			pods, err := b.listTaskPods(ctx, params.TaskID)
+			pods, err := b.listTaskPods(ctx, executionID)
 			if err != nil {
 				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err))
 			}
@@ -430,11 +434,11 @@ type jobResult struct {
 
 // handleJobState checks whether a Job has reached a terminal state and, if so,
 // returns a *jobResult. A nil return means the Job is still in progress.
-func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID string) *jobResult {
+func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID, executionID string) *jobResult {
 	jobName := jobState.Name
 	if jobComplete(jobState) {
 		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-			pods, _ := b.listTaskPods(ctx, taskID)
+			pods, _ := b.listTaskPods(ctx, executionID)
 			logs := b.collectPodLogs(ctx, pods)
 			if logs != "" {
 				log.Debugf(ctx, "Job %s output:\n%s", jobName, logs)
@@ -444,7 +448,7 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		return &jobResult{err: nil}
 	}
 	if jobFailed(jobState) {
-		pods, _ := b.listTaskPods(ctx, taskID)
+		pods, _ := b.listTaskPods(ctx, executionID)
 		logs := b.collectPodLogs(ctx, pods)
 		if logs != "" {
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
@@ -464,9 +468,9 @@ func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch
 	})
 }
 
-func (b *KubernetesBackend) watchTaskPods(ctx context.Context, taskID string) (watch.Interface, error) {
+func (b *KubernetesBackend) watchTaskPods(ctx context.Context, executionID string) (watch.Interface, error) {
 	return b.clientset.CoreV1().Pods(b.config.Namespace).Watch(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesExecutionHashLabel, kubernetesLabelHash(executionID)),
 	})
 }
 
@@ -795,21 +799,26 @@ func (b *KubernetesBackend) startupPreflightError(err error) error {
 	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 
-func (b *KubernetesBackend) baseLabels(taskID string) map[string]string {
+func (b *KubernetesBackend) baseLabels(taskID, executionID string) map[string]string {
+	if strings.TrimSpace(executionID) == "" {
+		executionID = taskID
+	}
 	labels := copyStringMap(b.config.ExtraLabels)
 	if labels == nil {
-		labels = make(map[string]string, 4)
+		labels = make(map[string]string, 6)
 	}
 	labels[kubernetesWorkerIDLabel] = sanitizeKubernetesLabelValue(b.config.WorkerID)
 	labels[kubernetesWorkerHashLabel] = kubernetesLabelHash(b.config.WorkerID)
 	labels[kubernetesTaskIDLabel] = sanitizeKubernetesLabelValue(taskID)
 	labels[kubernetesTaskHashLabel] = kubernetesLabelHash(taskID)
+	labels[kubernetesExecutionIDLabel] = sanitizeKubernetesLabelValue(executionID)
+	labels[kubernetesExecutionHashLabel] = kubernetesLabelHash(executionID)
 	return labels
 }
 
-func (b *KubernetesBackend) listTaskPods(ctx context.Context, taskID string) ([]corev1.Pod, error) {
+func (b *KubernetesBackend) listTaskPods(ctx context.Context, executionID string) ([]corev1.Pod, error) {
 	podList, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesExecutionHashLabel, kubernetesLabelHash(executionID)),
 	})
 	if err != nil {
 		return nil, err
@@ -1048,6 +1057,16 @@ func sanitizeKubernetesNameFragment(value string) string {
 func kubernetesLabelHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", sum[:8])
+}
+
+func taskExecutionID(params *TaskParams) string {
+	if params == nil {
+		return ""
+	}
+	if executionID := strings.TrimSpace(params.ExecutionID); executionID != "" {
+		return executionID
+	}
+	return params.TaskID
 }
 
 func kubernetesTaskWrapperScript() string {

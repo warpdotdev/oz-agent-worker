@@ -32,7 +32,11 @@ type SidecarMount struct {
 
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
-	TaskID      string `json:"task_id"`
+	TaskID string `json:"task_id"`
+	// ExecutionID identifies the concrete run execution being launched. It is
+	// distinct from TaskID/Task.ID, which identify the logical run and can be
+	// reused by follow-up or handoff executions.
+	ExecutionID string `json:"execution_id,omitempty"`
 	Task        *Task  `json:"task"`
 	DockerImage string `json:"docker_image,omitempty"`
 	// The "sidecar image" contains the warp agent binary and a couple other dependencies.

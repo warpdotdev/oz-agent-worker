@@ -11,8 +11,9 @@ import (
 // and the backend interface, so backends don't need to handle common concerns like
 // resolving environment variables, choosing default images, or building base CLI args.
 type TaskParams struct {
-	TaskID string
-	Task   *types.Task
+	TaskID      string
+	ExecutionID string
+	Task        *types.Task
 
 	// EnvVars contains pre-resolved common environment variables (TASK_ID, Git config,
 	// assignment env vars). Backends append their own config-specific env vars.
