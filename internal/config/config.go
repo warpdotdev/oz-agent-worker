@@ -114,7 +114,7 @@ func newConfigValidator() *validator.Validate {
 		cfg := sl.Current()
 		configured := 0
 		for i := 0; i < cfg.NumField(); i++ {
-			if cfg.Field(i).Kind() == reflect.Ptr && !cfg.Field(i).IsNil() {
+			if cfg.Field(i).Kind() == reflect.Pointer && !cfg.Field(i).IsNil() {
 				configured++
 			}
 		}

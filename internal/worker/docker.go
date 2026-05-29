@@ -47,7 +47,7 @@ type DockerBackend struct {
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
 func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerBackend, error) {
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
