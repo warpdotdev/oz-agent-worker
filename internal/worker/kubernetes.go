@@ -147,7 +147,6 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
 		"OZ_WORKER_BACKEND="+kubernetesBackendTypeName,
 		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-		fmt.Sprintf("OZ_EXECUTION_ID=%s", executionID),
 	))
 
 	volumes := []corev1.Volume{

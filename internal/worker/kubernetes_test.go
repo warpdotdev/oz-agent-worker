@@ -710,8 +710,8 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	if envMap["OZ_RUN_ID"] != "task-1" {
 		t.Fatalf("OZ_RUN_ID = %q, want %q", envMap["OZ_RUN_ID"], "task-1")
 	}
-	if envMap["OZ_EXECUTION_ID"] != "execution-1" {
-		t.Fatalf("OZ_EXECUTION_ID = %q, want %q", envMap["OZ_EXECUTION_ID"], "execution-1")
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected OZ_EXECUTION_ID to be omitted from task container env")
 	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
@@ -870,8 +870,8 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	for _, env := range taskContainer.Env {
 		envMap[env.Name] = env.Value
 	}
-	if envMap["OZ_EXECUTION_ID"] != "task-1" {
-		t.Fatalf("fallback OZ_EXECUTION_ID = %q, want %q", envMap["OZ_EXECUTION_ID"], "task-1")
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected fallback OZ_EXECUTION_ID to be omitted from task container env")
 	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
