@@ -46,18 +46,33 @@ func TestKubernetesBackendBaseLabelsIncludeStableHashes(t *testing.T) {
 		},
 	}
 
-	labels := backend.baseLabels("Task A")
+	labels := backend.baseLabels("Task A", "Execution A")
 	if labels[kubernetesWorkerIDLabel] != "worker-a" {
 		t.Fatalf("worker label = %q, want %q", labels[kubernetesWorkerIDLabel], "worker-a")
 	}
 	if labels[kubernetesTaskIDLabel] != "task-a" {
 		t.Fatalf("task label = %q, want %q", labels[kubernetesTaskIDLabel], "task-a")
 	}
+	if labels[kubernetesExecutionIDLabel] != "execution-a" {
+		t.Fatalf("execution label = %q, want %q", labels[kubernetesExecutionIDLabel], "execution-a")
+	}
 	if labels[kubernetesWorkerHashLabel] != kubernetesLabelHash("Worker A") {
 		t.Fatalf("worker hash = %q, want %q", labels[kubernetesWorkerHashLabel], kubernetesLabelHash("Worker A"))
 	}
 	if labels[kubernetesTaskHashLabel] != kubernetesLabelHash("Task A") {
 		t.Fatalf("task hash = %q, want %q", labels[kubernetesTaskHashLabel], kubernetesLabelHash("Task A"))
+	}
+	if labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("Execution A") {
+		t.Fatalf("execution hash = %q, want %q", labels[kubernetesExecutionHashLabel], kubernetesLabelHash("Execution A"))
+	}
+}
+
+func TestTaskExecutionIDFallsBackToTaskID(t *testing.T) {
+	if got := taskExecutionID(&TaskParams{TaskID: "task-1", ExecutionID: " execution-1 "}); got != "execution-1" {
+		t.Fatalf("execution ID = %q, want %q", got, "execution-1")
+	}
+	if got := taskExecutionID(&TaskParams{TaskID: "task-1"}); got != "task-1" {
+		t.Fatalf("fallback execution ID = %q, want %q", got, "task-1")
 	}
 }
 
@@ -243,7 +258,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "agents"},
 			Status:     batchv1.JobStatus{},
 		}
-		if result := backend.handleJobState(ctx, job, "task-1"); result != nil {
+		if result := backend.handleJobState(ctx, job, "task-1", "execution-1"); result != nil {
 			t.Fatalf("expected nil for in-progress job, got %v", result.err)
 		}
 	})
@@ -257,7 +272,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 				},
 			},
 		}
-		result := backend.handleJobState(ctx, job, "task-1")
+		result := backend.handleJobState(ctx, job, "task-1", "execution-1")
 		if result == nil {
 			t.Fatal("expected non-nil result for completed job")
 		}
@@ -275,7 +290,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 				},
 			},
 		}
-		result := backend.handleJobState(ctx, job, "task-1")
+		result := backend.handleJobState(ctx, job, "task-1", "execution-1")
 		if result == nil {
 			t.Fatal("expected non-nil result for failed job")
 		}
@@ -350,8 +365,8 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	taskID := "task-abc"
-	watcher, err := backend.watchTaskPods(context.Background(), taskID)
+	executionID := "execution-abc"
+	watcher, err := backend.watchTaskPods(context.Background(), executionID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -363,7 +378,7 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 			Name:      "task-pod",
 			Namespace: "agents",
 			Labels: map[string]string{
-				kubernetesTaskHashLabel: kubernetesLabelHash(taskID),
+				kubernetesExecutionHashLabel: kubernetesLabelHash(executionID),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -622,6 +637,7 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 
 	err := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
+		ExecutionID: "execution-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
 		Sidecars: []types.SidecarMount{
@@ -636,6 +652,24 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
+	}
+	if createdJob.Name != sanitizeKubernetesJobName("execution-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, sanitizeKubernetesJobName("execution-1"))
+	}
+	if createdJob.Name == sanitizeKubernetesJobName("task-1") {
+		t.Fatalf("job name should be execution-scoped, got task-scoped name %q", createdJob.Name)
+	}
+	if createdJob.Labels[kubernetesTaskIDLabel] != "task-1" {
+		t.Fatalf("task label = %q, want %q", createdJob.Labels[kubernetesTaskIDLabel], "task-1")
+	}
+	if createdJob.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash("task-1") {
+		t.Fatalf("task hash label = %q, want %q", createdJob.Labels[kubernetesTaskHashLabel], kubernetesLabelHash("task-1"))
+	}
+	if createdJob.Labels[kubernetesExecutionIDLabel] != "execution-1" {
+		t.Fatalf("execution label = %q, want %q", createdJob.Labels[kubernetesExecutionIDLabel], "execution-1")
+	}
+	if createdJob.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("execution-1") {
+		t.Fatalf("execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("execution-1"))
 	}
 
 	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
@@ -669,6 +703,16 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]string, len(taskContainer.Env))
+	for _, env := range taskContainer.Env {
+		envMap[env.Name] = env.Value
+	}
+	if envMap["OZ_RUN_ID"] != "task-1" {
+		t.Fatalf("OZ_RUN_ID = %q, want %q", envMap["OZ_RUN_ID"], "task-1")
+	}
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected OZ_EXECUTION_ID to be omitted from task container env")
+	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
 		if taskContainer.VolumeMounts[i].Name == "sidecar-0-image" {
@@ -771,6 +815,15 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
 	}
+	if createdJob.Name != sanitizeKubernetesJobName("task-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, sanitizeKubernetesJobName("task-1"))
+	}
+	if createdJob.Labels[kubernetesExecutionIDLabel] != "task-1" {
+		t.Fatalf("fallback execution label = %q, want %q", createdJob.Labels[kubernetesExecutionIDLabel], "task-1")
+	}
+	if createdJob.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("task-1") {
+		t.Fatalf("fallback execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("task-1"))
+	}
 	if createdJob.Spec.TTLSecondsAfterFinished == nil || *createdJob.Spec.TTLSecondsAfterFinished != defaultJobTTLSecondsAfterFinish {
 		t.Fatalf("expected default ttlSecondsAfterFinished %d, got %v", defaultJobTTLSecondsAfterFinish, createdJob.Spec.TTLSecondsAfterFinished)
 	}
@@ -813,6 +866,13 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]string, len(taskContainer.Env))
+	for _, env := range taskContainer.Env {
+		envMap[env.Name] = env.Value
+	}
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected fallback OZ_EXECUTION_ID to be omitted from task container env")
+	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
 		if taskContainer.VolumeMounts[i].Name == "sidecar-0-data" {
@@ -910,7 +970,7 @@ func TestKubernetesBackendShutdownPreservesWorkerJobs(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "task-job",
 			Namespace: "agents",
-			Labels:    backend.baseLabels("task-1"),
+			Labels:    backend.baseLabels("task-1", "execution-1"),
 		},
 	}
 	fakeClient := fake.NewSimpleClientset(job)
