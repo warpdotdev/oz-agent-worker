@@ -488,6 +488,50 @@ func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
 	}
 	t.Fatalf("expected %s in env vars, got %v", want, params.EnvVars)
 }
+
+func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
+	newWorker := func() *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				ServerRootURL: "https://app.warp.dev",
+				Kubernetes:    &KubernetesBackendConfig{},
+			},
+		}
+	}
+
+	containsSkipInitialTurn := func(args []string) bool {
+		for _, arg := range args {
+			if arg == "--skip-initial-turn" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("forwards server supplemental oz args", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:           "task-skip",
+			Task:             &types.Task{ID: "task-skip"},
+			AdditionalOzArgs: []string{"--skip-initial-turn"},
+		})
+		if !containsSkipInitialTurn(params.BaseArgs) {
+			t.Fatalf("expected --skip-initial-turn in args, got %v", params.BaseArgs)
+		}
+	})
+	t.Run("does not add omitted supplemental oz args", func(t *testing.T) {
+		w := newWorker()
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-no-skip",
+			Task:   &types.Task{ID: "task-no-skip"},
+		})
+		if containsSkipInitialTurn(params.BaseArgs) {
+			t.Fatalf("did not expect --skip-initial-turn in args, got %v", params.BaseArgs)
+		}
+	})
+}
+
 func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}

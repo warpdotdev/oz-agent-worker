@@ -41,6 +41,9 @@ type TaskAssignmentMessage struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
+	// AdditionalOzArgs are server-resolved supplemental arguments for the oz
+	// CLI. The worker forwards these tokens without deriving task semantics.
+	AdditionalOzArgs []string `json:"additional_oz_args,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task

@@ -8,13 +8,15 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
-// TaskAugmentOptions contains worker-level settings that are translated into oz CLI flags
-// for every task. Add new per-worker CLI overrides here rather than as extra parameters.
+// TaskAugmentOptions contains settings translated into oz CLI flags for every task.
+// Add new CLI overrides here rather than as extra parameters.
 type TaskAugmentOptions struct {
 	// IdleOnComplete is passed to --idle-on-complete. Empty string uses the oz CLI default
 	// (45m). Use "0s" to exit immediately after the conversation finishes.
 	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
+	// AdditionalOzArgs are server-resolved supplemental oz CLI arguments.
+	AdditionalOzArgs []string
 }
 
 // AugmentArgsForTask allows different task sources to add CLI args in a centralized place.
@@ -110,6 +112,8 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			args = append(args, "--environment", env)
 		}
 	}
+
+	args = append(args, opts.AdditionalOzArgs...)
 
 	// Keep the agent alive after task completion to allow follow-ups.
 	// Priority: task config idle_timeout_minutes > worker IdleOnComplete > oz CLI default (45m).

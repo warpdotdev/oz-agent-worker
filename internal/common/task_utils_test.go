@@ -263,6 +263,22 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				"--idle-on-complete",
 			},
 		},
+		{
+			name: "appends supplemental oz args before idle timeout",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+			},
+			opts:     TaskAugmentOptions{AdditionalOzArgs: []string{"--skip-initial-turn"}},
+			expected: []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
+		},
+		{
+			name: "does not emit supplemental oz args when none are provided",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--idle-on-complete"},
+		},
 	}
 
 	for _, tt := range tests {

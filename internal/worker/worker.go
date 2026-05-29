@@ -427,7 +427,8 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		w.config.ServerRootURL,
 	)
 	baseArgs = common.AugmentArgsForTask(task, baseArgs, common.TaskAugmentOptions{
-		IdleOnComplete: w.config.IdleOnComplete,
+		IdleOnComplete:   w.config.IdleOnComplete,
+		AdditionalOzArgs: assignment.AdditionalOzArgs,
 	})
 	if w.config.SessionSharingServerURL != "" {
 		baseArgs = append(baseArgs, "--session-sharing-server-url", w.config.SessionSharingServerURL)
