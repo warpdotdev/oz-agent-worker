@@ -78,6 +78,215 @@ func envMap(values []string) map[string]string {
 	return result
 }
 
+func TestDirectBackendSetupCommandDoesNotReadHostGlobalGitConfig(t *testing.T) {
+	requireGit(t)
+
+	hostHome := t.TempDir()
+	t.Setenv("HOME", hostHome)
+
+	testDir := t.TempDir()
+	originPath := filepath.Join(testDir, "origin.git")
+	runGit(t, nil, "init", "--bare", originPath)
+
+	rewriteURL := "rewrite-test://repo"
+	fileURL := gitFileURL(originPath)
+	runGit(t, []string{"HOME=" + hostHome}, "config", "--global", "--add", "url."+fileURL+".insteadOf", rewriteURL)
+
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		SetupCommand:  `git ls-remote "$TEST_REWRITE_URL"`,
+		Env: map[string]string{
+			"TEST_REWRITE_URL": rewriteURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-unseeded"}); err == nil {
+		t.Fatal("expected setup git command to fail because host global git config is hidden")
+	}
+
+	backend, err = NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+		SetupCommand: strings.Join([]string{
+			`git config --global --add url."$TEST_FILE_REPO_URL".insteadOf "$TEST_REWRITE_URL"`,
+			`git ls-remote "$TEST_REWRITE_URL"`,
+		}, "\n"),
+		Env: map[string]string{
+			"TEST_FILE_REPO_URL": fileURL,
+			"TEST_REWRITE_URL":   rewriteURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create seeded direct backend: %v", err)
+	}
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-seeded"}); err != nil {
+		t.Fatalf("expected setup git command to succeed after seeding isolated git config: %v", err)
+	}
+}
+
+func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
+	requireGit(t)
+
+	hostHome := t.TempDir()
+	t.Setenv("HOME", hostHome)
+
+	testDir := t.TempDir()
+	cfgCapture := filepath.Join(testDir, "setup_git_config_global.txt")
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+		SetupCommand: strings.Join([]string{
+			`printf '%s' "$GIT_CONFIG_GLOBAL" > "$SETUP_CFG_CAPTURE"`,
+			`git config --global user.email setup@example.com`,
+		}, "\n"),
+		Env: map[string]string{
+			"SETUP_CFG_CAPTURE": cfgCapture,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-setup"}); err != nil {
+		t.Fatalf("failed to execute task: %v", err)
+	}
+
+	wantCfg := filepath.Join(workspaceRoot, "task-setup", ".gitconfig")
+	if got, err := os.ReadFile(cfgCapture); err != nil {
+		t.Fatalf("failed to read captured setup GIT_CONFIG_GLOBAL: %v", err)
+	} else if string(got) != wantCfg {
+		t.Fatalf("setup GIT_CONFIG_GLOBAL = %q, want %q", string(got), wantCfg)
+	}
+	data, err := os.ReadFile(wantCfg)
+	if err != nil {
+		t.Fatalf("isolated git config was not written by setup: %v", err)
+	}
+	if !strings.Contains(string(data), "setup@example.com") {
+		t.Fatalf("isolated git config missing setup user.email:\\n%s", data)
+	}
+	if _, err := os.Stat(filepath.Join(hostHome, ".gitconfig")); !os.IsNotExist(err) {
+		t.Fatalf("host ~/.gitconfig should not exist; stat err = %v", err)
+	}
+}
+
+func TestDirectBackendSetupEnvFileCannotOverrideGitConfigGlobal(t *testing.T) {
+	testDir := t.TempDir()
+	mainCfgCapture := filepath.Join(testDir, "main_git_config_global.txt")
+	overrideCfg := filepath.Join(testDir, "override.gitconfig")
+	ozPath := filepath.Join(testDir, "oz")
+	script := `#!/bin/sh
+set -eu
+printf '%s' "$GIT_CONFIG_GLOBAL" > "$MAIN_CFG_CAPTURE"
+git config --global user.email main@example.com
+`
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+		SetupCommand:  `printf 'GIT_CONFIG_GLOBAL=%s\n' "$OVERRIDE_CFG" > "$OZ_ENVIRONMENT_FILE"`,
+		Env: map[string]string{
+			"MAIN_CFG_CAPTURE": mainCfgCapture,
+			"OVERRIDE_CFG":     overrideCfg,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-envfile"}); err != nil {
+		t.Fatalf("failed to execute task: %v", err)
+	}
+
+	wantCfg := filepath.Join(workspaceRoot, "task-envfile", ".gitconfig")
+	if got, err := os.ReadFile(mainCfgCapture); err != nil {
+		t.Fatalf("failed to read captured main GIT_CONFIG_GLOBAL: %v", err)
+	} else if string(got) != wantCfg {
+		t.Fatalf("main GIT_CONFIG_GLOBAL = %q, want %q", string(got), wantCfg)
+	}
+	data, err := os.ReadFile(wantCfg)
+	if err != nil {
+		t.Fatalf("isolated git config was not written by main oz process: %v", err)
+	}
+	if !strings.Contains(string(data), "main@example.com") {
+		t.Fatalf("isolated git config missing main user.email:\\n%s", data)
+	}
+	if _, err := os.Stat(overrideCfg); !os.IsNotExist(err) {
+		t.Fatalf("setup-provided GIT_CONFIG_GLOBAL override should not be used; stat err = %v", err)
+	}
+}
+
+func TestDirectBackendGitConfigIsolationSmoke(t *testing.T) {
+	requireGit(t)
+
+	hostHome := t.TempDir()
+	t.Setenv("HOME", hostHome)
+
+	testDir := t.TempDir()
+	originPath := filepath.Join(testDir, "origin.git")
+	runGit(t, nil, "init", "--bare", originPath)
+
+	rewriteURL := "rewrite-smoke://repo"
+	fileURL := gitFileURL(originPath)
+	ozPath := filepath.Join(testDir, "oz")
+	script := `#!/bin/sh
+set -eu
+git ls-remote "$TEST_REWRITE_URL"
+`
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+		SetupCommand:  `git config --global --add url."$TEST_FILE_REPO_URL".insteadOf "$TEST_REWRITE_URL"`,
+		Env: map[string]string{
+			"TEST_FILE_REPO_URL": fileURL,
+			"TEST_REWRITE_URL":   rewriteURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-smoke"}); err != nil {
+		t.Fatalf("expected main oz git command to use setup-seeded isolated git config: %v", err)
+	}
+
+	wantCfg := filepath.Join(workspaceRoot, "task-smoke", ".gitconfig")
+	data, err := os.ReadFile(wantCfg)
+	if err != nil {
+		t.Fatalf("isolated git config was not written: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(string(data)), "insteadof") {
+		t.Fatalf("isolated git config missing rewrite seeded by setup:\\n%s", data)
+	}
+	if _, err := os.Stat(filepath.Join(hostHome, ".gitconfig")); !os.IsNotExist(err) {
+		t.Fatalf("host ~/.gitconfig should not exist; stat err = %v", err)
+	}
+}
 func TestDirectBackendRedirectsGlobalGitConfig(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available on PATH")
@@ -169,5 +378,26 @@ func TestDirectBackendRejectsUnsafeTaskID(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(testDir, "escape")); !os.IsNotExist(err) {
 		t.Fatalf("traversal path should not exist; stat err = %v", err)
+	}
+}
+
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available on PATH")
+	}
+}
+
+func gitFileURL(path string) string {
+	return "file://" + filepath.ToSlash(path)
+}
+
+func runGit(t *testing.T, env []string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), env...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
 }
