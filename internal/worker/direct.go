@@ -47,6 +47,29 @@ func hostBaseEnv() []string {
 	return base
 }
 
+// prepareTaskGitConfig returns the path to use as the task's global git config
+// (GIT_CONFIG_GLOBAL) along with a cleanup function. Redirecting only git's
+// global config keeps writes like `git config --global url.<x>.insteadOf` out of
+// the developer's real ~/.gitconfig (and $XDG_CONFIG_HOME/git/config) without
+// repointing HOME for every tool the agent runs.
+func prepareTaskGitConfig(workspaceDir string, usingTargetDir bool) (string, func(), error) {
+	if !usingTargetDir {
+		return filepath.Join(workspaceDir, ".gitconfig"), func() {}, nil
+	}
+
+	// In shared target-dir mode the workspace is the user's real checkout, so keep
+	// the throwaway global config in a temporary directory outside of it.
+	dir, err := os.MkdirTemp("", "oz-gitconfig-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temporary git config directory: %w", err)
+	}
+	return filepath.Join(dir, ".gitconfig"), func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Warnf(context.Background(), "Failed to remove temporary git config dir %s: %v", dir, err)
+		}
+	}, nil
+}
+
 // DirectBackendConfig holds configuration specific to the direct (non-containerized) backend.
 type DirectBackendConfig struct {
 	WorkspaceRoot   string
@@ -124,18 +147,24 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
+	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir)
+	if err != nil {
+		return err
+	}
+	defer cleanupGitConfig()
+	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
 
 	defer func() {
 		if usingTargetDir {
 			// Don't clean up the shared target directory.
-			b.runTeardownIfConfigured(ctx, taskID, workspaceDir)
+			b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath)
 			return
 		}
 		if b.config.NoCleanup {
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
 		}
-		b.cleanup(ctx, taskID, workspaceDir)
+		b.cleanup(ctx, taskID, workspaceDir, gitConfigPath)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -160,6 +189,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
 	envVars = mergeEnvVars(envVars, harnessEnvVars(workspaceDir, params))
+	envVars = mergeEnvVars(envVars, gitConfigEnv)
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
@@ -187,6 +217,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		setupScriptVars = append(setupScriptVars, fmt.Sprintf("%s=%s", key, value))
 	}
 	envVars = mergeEnvVars(envVars, setupScriptVars)
+	envVars = mergeEnvVars(envVars, gitConfigEnv)
 
 	// 6. Invoke oz CLI with base args.
 	// Start from a minimal host base (HOME, TMPDIR, PATH) and overlay task env vars,
@@ -235,12 +266,13 @@ func (b *DirectBackend) PreservesTasksOnShutdown() bool {
 }
 
 // runTeardownIfConfigured runs the teardown command if one is configured.
-func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir string) {
+func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir, gitConfigPath string) {
 	if b.config.TeardownCommand == "" {
 		return
 	}
 	teardownEnv := []string{
 		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
+		fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath),
 		"OZ_WORKER_BACKEND=direct",
 		fmt.Sprintf("OZ_RUN_ID=%s", taskID),
 	}
@@ -255,8 +287,8 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 }
 
 // cleanup runs the teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir string) {
-	b.runTeardownIfConfigured(ctx, taskID, workspaceDir)
+func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string) {
+	b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath)
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {
