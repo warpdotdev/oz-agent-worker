@@ -2,6 +2,8 @@ name: Create Release
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   generate-tag:
@@ -20,6 +22,7 @@ jobs:
     secrets: inherit
     with:
       docker_tag: ${{ needs.generate-tag.outputs.tag_name }}
+      publish_latest: true
       # Stamp the same tag into main.Version so `oz_worker_info{version=...}`
       # in /metrics matches the published release tag and Docker image tag.
       version: ${{ needs.generate-tag.outputs.tag_name }}
@@ -44,5 +47,9 @@ jobs:
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           append_body: true
-          body: "**Docker image:** `${{ needs.build.outputs.image }}`"
+          body: |
+            **Docker image tag:** `${{ needs.build.outputs.tagged_image }}`
+            **Docker image digest:** `${{ needs.build.outputs.image }}`
+
+            `latest` was updated to this same image as part of this release. For production self-hosted workers, pin the immutable release tag or digest instead of `latest`.
           files: artifacts/**/*

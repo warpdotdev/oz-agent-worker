@@ -58,21 +58,3 @@ jobs:
         run: helm lint ./charts/oz-agent-worker --set worker.workerId=ci-worker --set image.tag=ci
       - name: Render Helm chart
         run: helm template oz-agent-worker ./charts/oz-agent-worker --namespace agents --set worker.workerId=ci-worker --set image.tag=ci >/tmp/oz-agent-worker-chart.yaml
-
-  docker:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: warpdotdev/oz-agent-worker:latest

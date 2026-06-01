@@ -26,10 +26,29 @@ The worker needs access to the Docker daemon to spawn task containers. Mount the
 ```bash
 docker run -v /var/run/docker.sock:/var/run/docker.sock \
   -e WARP_API_KEY="wk-abc123" \
-  warpdotdev/oz-agent-worker --worker-id "my-worker"
+  warpdotdev/oz-agent-worker:<release-tag> --worker-id "my-worker"
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+### Image releases and pinning
+
+Production self-hosted workers should pin an immutable image version instead of relying on `latest`.
+
+Each merge to `main` creates a GitHub release and publishes a multi-architecture Docker image with a UTC timestamp tag:
+
+```text
+warpdotdev/oz-agent-worker:vYYYY-MM-DD-HH-MM-SS
+```
+
+The GitHub release body includes both the Docker tag and digest. Use either the timestamp tag or the digest in production deployments:
+
+```bash
+docker pull warpdotdev/oz-agent-worker:v2026-06-01-10-09-37
+docker pull warpdotdev/oz-agent-worker@sha256:<digest>
+```
+
+`latest` is updated to the same image when a release is published, but it is a moving tag intended for quick testing only.
 
 ### Direct
 
@@ -128,7 +147,7 @@ helm install oz-agent-worker ./charts/oz-agent-worker \
   --namespace agents \
   --create-namespace \
   --set worker.workerId=my-worker \
-  --set image.tag=v1.2.3
+  --set image.tag=v2026-06-01-10-09-37
 ```
 
 The chart assumes the worker runs inside the target cluster and uses in-cluster Kubernetes auth by default. It does not create CRDs or cluster-scoped RBAC. Set `image.tag` explicitly for each install so the worker image is pinned instead of defaulting to `latest`.
@@ -203,7 +222,7 @@ When using Docker to run the worker, note that `-e` flags for the worker itself 
 ```bash
 docker run -v /var/run/docker.sock:/var/run/docker.sock \
   -e WARP_API_KEY="wk-abc123" \
-  warpdotdev/oz-agent-worker --worker-id "my-worker" -e MY_SECRET=hunter2
+  warpdotdev/oz-agent-worker:<release-tag> --worker-id "my-worker" -e MY_SECRET=hunter2
 ```
 
 When configuring the Kubernetes backend via YAML or Helm, declarative task-container env belongs in `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate` rather than a separate top-level Kubernetes env list. The `-e` / `--env` flags remain available as backend-agnostic runtime overrides.
@@ -275,7 +294,7 @@ metrics only.
 helm install oz-agent-worker ./charts/oz-agent-worker \
   --namespace agents --create-namespace \
   --set worker.workerId=my-worker \
-  --set image.tag=v1.2.3 \
+  --set image.tag=v2026-06-01-10-09-37 \
   --set metrics.enabled=true
 ```
 

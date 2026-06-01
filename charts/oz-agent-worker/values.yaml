@@ -3,7 +3,9 @@ fullnameOverride: ""
 
 image:
   repository: warpdotdev/oz-agent-worker
-  # Set this explicitly to a published worker image tag for each install.
+  # Set this explicitly to a published immutable worker image tag for each
+  # install, e.g. v2026-06-01-10-09-37. Avoid using the mutable `latest` tag for
+  # production self-hosted workers.
   tag: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
