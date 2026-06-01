@@ -8,6 +8,11 @@ on:
         required: false
         default: ''
         type: string
+      publish_latest:
+        description: 'Also tag the Docker image as latest when docker_tag is provided'
+        required: false
+        default: false
+        type: boolean
       version:
         description: 'Build version stamped into the binary via -ldflags="-X main.Version=...". Defaults to docker_tag, then to the commit SHA.'
         required: false
@@ -20,6 +25,11 @@ on:
         required: false
         default: ''
         type: string
+      publish_latest:
+        description: 'Also tag the Docker image as latest when docker_tag is provided'
+        required: false
+        default: false
+        type: boolean
       version:
         description: 'Build version stamped into the binary via -ldflags="-X main.Version=...". Defaults to docker_tag, then to the commit SHA.'
         required: false
@@ -34,6 +44,9 @@ on:
       image:
         description: 'Full Docker image reference'
         value: ${{ jobs.docker.outputs.image }}
+      tagged_image:
+        description: 'Primary tagged Docker image reference'
+        value: ${{ jobs.docker.outputs.tagged_image }}
 
 jobs:
   build:
@@ -109,6 +122,7 @@ jobs:
     runs-on: namespace-profile-ubuntu-small
     outputs:
       image: "warpdotdev/oz-agent-worker@${{ steps.push.outputs.digest }}"
+      tagged_image: ${{ steps.image-tags.outputs.primary }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -118,6 +132,28 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Resolve Docker image tags
+        id: image-tags
+        env:
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+        run: |
+          if [ -n "$DOCKER_TAG" ]; then
+            {
+              echo 'tags<<EOF'
+              echo "warpdotdev/oz-agent-worker:${DOCKER_TAG}"
+              if [ "$PUBLISH_LATEST" = "true" ]; then
+                echo "warpdotdev/oz-agent-worker:latest"
+              fi
+              echo 'EOF'
+              echo "primary=warpdotdev/oz-agent-worker:${DOCKER_TAG}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags=warpdotdev/oz-agent-worker:${GITHUB_SHA}"
+              echo "primary=warpdotdev/oz-agent-worker:${GITHUB_SHA}"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push image
         id: push
@@ -132,11 +168,14 @@ jobs:
           # See https://docs.docker.com/reference/cli/docker/buildx/build/#docker
           outputs: ${{ inputs.docker_tag != '' && 'type=registry' || 'type=local,dest=built-images' }}
           platforms: linux/amd64,linux/arm64
-          tags: warpdotdev/oz-agent-worker:${{ inputs.docker_tag || github.sha }}
+          tags: ${{ steps.image-tags.outputs.tags }}
           # Forward the resolved version to the Dockerfile so the binary baked
           # into the image carries the same main.Version as the standalone
           # release artifacts.
           build-args: |
             VERSION=${{ inputs.version != '' && inputs.version || (inputs.docker_tag != '' && inputs.docker_tag || github.sha) }}
-          labels:
+          labels: |
             dev.warp.worker-commit=${{ github.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version != '' && inputs.version || (inputs.docker_tag != '' && inputs.docker_tag || github.sha) }}
