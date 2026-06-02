@@ -81,6 +81,11 @@ spec:
             {{- with .Values.metrics.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            {{- else }}
+            # The worker defaults an unset exporter to OTLP, so disabling
+            # chart-managed metrics must explicitly disable metric export.
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
             {{- end }}
           {{- if and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") }}
           ports:
