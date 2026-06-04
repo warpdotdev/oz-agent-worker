@@ -81,6 +81,7 @@ backend:
     kubeconfig: "/path/to/kubeconfig"
     namespace: "agents"
     default_image: "my-registry.io/dev-image:latest"
+    preserve_failed_jobs: true
     unschedulable_timeout: "2m"
     pod_template:
       nodeSelector:
@@ -98,6 +99,7 @@ Notes:
 - `default_image` sets the Docker image for task Jobs when no Warp environment is configured on the run; this lets you skip creating a Warp environment entirely if all your tasks use the same base image (precedence: Warp environment image > `default_image` > `ubuntu:22.04`)
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
+- `preserve_failed_jobs` controls whether failed task Jobs and Pods are left in place for debugging; it defaults to true. When cleanup is enabled, `ttl_seconds_after_finished` still bounds how long failed Jobs remain after they reach a terminal state
 - `image_pull_policy` defaults to `IfNotPresent`
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
 - by default, the Kubernetes backend materializes sidecars with root init containers into `emptyDir` volumes, matching the existing behavior
@@ -121,6 +123,11 @@ pod_template:
               key: secret-key
 ```
 
+To support different Kubernetes pod sizes without making every run expensive,
+deploy multiple Helm releases with distinct `worker.workerId` values and
+different `kubernetesBackend.podTemplate` resource settings. Select the
+corresponding self-hosted worker/host for runs that need the larger profile,
+while keeping the default worker on smaller requests and limits.
 
 ### Helm Chart
 
@@ -174,7 +181,10 @@ tolerations, or disruption budgets) so worker rotation does not imply task pod
 eviction.
 
 When cleanup is enabled, completed task Jobs are still cleaned up by normal
-worker cleanup when observed, with Kubernetes Job TTL as a fallback.
+worker cleanup when observed, with Kubernetes Job TTL as a fallback. Failed task
+Jobs are preserved by default so operators can inspect the Pod, Events, and
+container logs after startup or runtime failures; disable this with
+`kubernetesBackend.preserveFailedJobs=false` if immediate cleanup is preferred.
 
 Recommended namespace-scoped permissions for the worker are:
 

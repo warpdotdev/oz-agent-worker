@@ -197,6 +197,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			extraAnnotations      map[string]string
 			activeDeadlineSeconds *int64
 			ttlSecondsAfterFinish *int32
+			preserveFailedJobs    *bool
 			workspaceSizeLimit    *resource.Quantity
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
@@ -217,6 +218,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			extraAnnotations = copyStringMap(kc.ExtraAnnotations)
 			activeDeadlineSeconds = kc.ActiveDeadlineSeconds
 			ttlSecondsAfterFinish = kc.TTLSecondsAfterFinish
+			preserveFailedJobs = kc.PreserveFailedJobs
 			if kc.WorkspaceSizeLimit != "" {
 				quantity, err := resource.ParseQuantity(kc.WorkspaceSizeLimit)
 				if err != nil {
@@ -260,6 +262,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ExtraAnnotations:      extraAnnotations,
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
 			TTLSecondsAfterFinish: ttlSecondsAfterFinish,
+			PreserveFailedJobs:    preserveFailedJobs,
 			WorkspaceSizeLimit:    workspaceSizeLimit,
 			UnschedulableTimeout:  unschedulableTimeout,
 			TaskEnv:               copyStringMap(cliEnv),

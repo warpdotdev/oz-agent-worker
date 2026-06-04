@@ -87,6 +87,10 @@ kubernetesBackend:
   # them has been disrupted. When worker.cleanup=false, the worker does not set
   # a TTL so Jobs remain available for debugging.
   ttlSecondsAfterFinished: 86400
+  # Keep failed task Jobs and Pods around for debugging startup and runtime
+  # failures. With cleanup enabled, ttlSecondsAfterFinished still bounds how
+  # long failed Jobs remain after they reach a terminal state.
+  preserveFailedJobs: true
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod

@@ -49,6 +49,7 @@ data:
         {{- if and .Values.worker.cleanup .Values.kubernetesBackend.ttlSecondsAfterFinished }}
         ttl_seconds_after_finished: {{ .Values.kubernetesBackend.ttlSecondsAfterFinished }}
         {{- end }}
+        preserve_failed_jobs: {{ .Values.kubernetesBackend.preserveFailedJobs }}
         {{- if .Values.kubernetesBackend.workspaceSizeLimit }}
         workspace_size_limit: {{ .Values.kubernetesBackend.workspaceSizeLimit | quote }}
         {{- end }}
