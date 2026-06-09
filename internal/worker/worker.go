@@ -61,10 +61,22 @@ type Worker struct {
 	reconnectDelay time.Duration
 	lastHeartbeat  time.Time
 	sendChan       chan []byte
-	activeTasks    map[string]context.CancelFunc
+	activeTasks    map[string]activeTask
 	tasksMutex     sync.Mutex
 	backend        Backend
 	taskSemaphore  *semaphore.Weighted // nil when unlimited
+}
+type taskCancellationSource string
+
+const (
+	taskCancellationSourceUser     taskCancellationSource = "user"
+	taskCancellationSourceShutdown taskCancellationSource = "shutdown"
+)
+
+type activeTask struct {
+	ctx                context.Context
+	cancel             context.CancelFunc
+	cancellationSource taskCancellationSource
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -111,7 +123,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		cancel:         cancel,
 		reconnectDelay: InitialReconnectDelay,
 		sendChan:       make(chan []byte, 256),
-		activeTasks:    make(map[string]context.CancelFunc),
+		activeTasks:    make(map[string]activeTask),
 		backend:        backend,
 		taskSemaphore:  taskSemaphore,
 	}, nil
@@ -324,9 +336,38 @@ func (w *Worker) handleMessage(message []byte) {
 		}
 		w.handleTaskAssignment(&assignment)
 
+	case types.MessageTypeTaskCancellation:
+		var cancellation types.TaskCancellationMessage
+		if err := json.Unmarshal(msg.Data, &cancellation); err != nil {
+			log.Errorf(w.ctx, "Failed to unmarshal task cancellation: %v", err)
+			return
+		}
+		w.handleTaskCancellation(&cancellation)
+
 	default:
 		log.Warnf(w.ctx, "Unknown message type: %s", msg.Type)
 	}
+}
+
+func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
+	w.tasksMutex.Lock()
+	task, ok := w.activeTasks[cancellation.TaskID]
+	if ok && task.cancellationSource == "" {
+		task.cancellationSource = taskCancellationSourceUser
+		w.activeTasks[cancellation.TaskID] = task
+	}
+	w.tasksMutex.Unlock()
+	if !ok {
+		log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
+		return
+	}
+
+	log.Infof(w.ctx, "Cancelling task from server request: taskID=%s", cancellation.TaskID)
+	metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
+		attribute.String("source", "server"),
+		attribute.String("task.id", cancellation.TaskID),
+	)
+	task.cancel()
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
@@ -381,7 +422,10 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	taskCtx, taskCancel := context.WithCancel(executionCtx)
 
 	w.tasksMutex.Lock()
-	w.activeTasks[assignment.TaskID] = taskCancel
+	w.activeTasks[assignment.TaskID] = activeTask{
+		ctx:    taskCtx,
+		cancel: taskCancel,
+	}
 	w.tasksMutex.Unlock()
 	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
 }
@@ -512,6 +556,19 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 	err := w.backend.ExecuteTask(ctx, params)
 	if err != nil {
+		if ctx.Err() == context.Canceled && w.cancellationSource(taskID) == taskCancellationSourceUser {
+			result = metrics.TaskResultCancelled
+			metrics.AddTaskEvent(ctx, "task.cancelled",
+				attribute.String("source", string(taskCancellationSourceUser)),
+			)
+			span.SetStatus(codes.Ok, "task cancelled by user request")
+			log.Infof(ctx, "Task execution cancelled by user request: taskID=%s", taskID)
+			if statusErr := w.sendTaskCancelled(taskID, "Task cancelled by user request."); statusErr != nil {
+				log.Errorf(ctx, "Failed to send task cancelled message: %v", statusErr)
+			}
+			return
+		}
+
 		result = metrics.TaskResultFailed
 		phase, reason := taskFailureLabels(err)
 		metrics.RecordTaskFailure(phase, reason)
@@ -537,6 +594,16 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	}
 }
 
+func (w *Worker) cancellationSource(taskID string) taskCancellationSource {
+	w.tasksMutex.Lock()
+	defer w.tasksMutex.Unlock()
+
+	task, ok := w.activeTasks[taskID]
+	if !ok {
+		return ""
+	}
+	return task.cancellationSource
+}
 func (w *Worker) sendTaskClaimed(taskID string) error {
 	claimed := types.TaskClaimedMessage{
 		TaskID:   taskID,
@@ -550,6 +617,32 @@ func (w *Worker) sendTaskClaimed(taskID string) error {
 
 	msg := types.WebSocketMessage{
 		Type: types.MessageTypeTaskClaimed,
+		Data: data,
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+
+	return w.sendMessage(msgBytes)
+}
+
+func (w *Worker) sendTaskCancelled(taskID, message string) error {
+	taskState := types.TaskStateCancelled
+	completedMsg := types.TaskCompletedMessage{
+		TaskID:    taskID,
+		Message:   message,
+		TaskState: &taskState,
+	}
+
+	data, err := json.Marshal(completedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task cancelled message: %w", err)
+	}
+
+	msg := types.WebSocketMessage{
+		Type: types.MessageTypeTaskCompleted,
 		Data: data,
 	}
 
@@ -654,9 +747,17 @@ func (w *Worker) Shutdown() {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
 		log.Infof(w.ctx, "Cancelling %d active tasks", activeTaskCount)
-		for taskID, cancel := range w.activeTasks {
+		for taskID, task := range w.activeTasks {
+			if task.cancellationSource == "" {
+				task.cancellationSource = taskCancellationSourceShutdown
+				w.activeTasks[taskID] = task
+			}
 			log.Debugf(w.ctx, "Cancelling task: %s", taskID)
-			cancel()
+			metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
+				attribute.String("source", "signal"),
+				attribute.String("task.id", taskID),
+			)
+			task.cancel()
 		}
 	}
 	w.tasksMutex.Unlock()

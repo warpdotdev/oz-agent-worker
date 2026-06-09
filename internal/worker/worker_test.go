@@ -98,12 +98,110 @@ func TestTaskFailureLabels(t *testing.T) {
 	}
 }
 
+func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
+	taskCtx, taskCancel := context.WithCancel(context.Background())
+	taskCancel()
+	w := &Worker{
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {
+			cancel:             func() {},
+			cancellationSource: taskCancellationSourceUser,
+		}},
+		backend: &recordingBackend{err: context.Canceled},
+	}
+	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskCompleted {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
+	}
+
+	var completed types.TaskCompletedMessage
+	if err := json.Unmarshal(msg.Data, &completed); err != nil {
+		t.Fatalf("failed to unmarshal task completed message: %v", err)
+	}
+	if completed.TaskID != "task-1" {
+		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
+	}
+	if completed.TaskState == nil || *completed.TaskState != types.TaskStateCancelled {
+		t.Fatalf("task state = %v, want %q", completed.TaskState, types.TaskStateCancelled)
+	}
+	if completed.Message != "Task cancelled by user request." {
+		t.Errorf("message = %q, want %q", completed.Message, "Task cancelled by user request.")
+	}
+	if _, ok := w.activeTasks["task-1"]; ok {
+		t.Fatal("task should be removed from active tasks")
+	}
+}
+
+func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
+	}
+
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+}
+
+func TestHandleMessageCancelsActiveTask(t *testing.T) {
+	taskCtx, taskCancel := context.WithCancel(context.Background())
+	defer taskCancel()
+
+	w := &Worker{
+		ctx:      context.Background(),
+		sendChan: make(chan []byte, 1),
+		activeTasks: map[string]activeTask{
+			"task-1": {
+				ctx:    taskCtx,
+				cancel: taskCancel,
+			},
+		},
+	}
+
+	data, err := json.Marshal(types.TaskCancellationMessage{TaskID: "task-1"})
+	if err != nil {
+		t.Fatalf("failed to marshal cancellation message: %v", err)
+	}
+	message, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeTaskCancellation,
+		Data: data,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal websocket message: %v", err)
+	}
+
+	w.handleMessage(message)
+
+	if taskCtx.Err() != context.Canceled {
+		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
+	}
+	if task := w.activeTasks["task-1"]; task.cancellationSource != taskCancellationSourceUser {
+		t.Fatalf("task cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
+	}
+}
+
 func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
 		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{},
 	}
 
@@ -137,7 +235,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		ctx:         context.Background(),
 		config:      Config{},
 		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
@@ -166,41 +264,12 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	}
 }
 
-func TestExecuteTaskReportsUserFriendlyMessageOnContextCanceled(t *testing.T) {
-	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
-		backend:     &recordingBackend{err: context.Canceled},
-	}
-
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
-	}, time.Now())
-
-	msg := readWebSocketMessage(t, w.sendChan)
-	if msg.Type != types.MessageTypeTaskFailed {
-		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
-	}
-
-	var failed types.TaskFailedMessage
-	if err := json.Unmarshal(msg.Data, &failed); err != nil {
-		t.Fatalf("failed to unmarshal task failed message: %v", err)
-	}
-	want := "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again."
-	if failed.Message != want {
-		t.Errorf("message = %q, want %q", failed.Message, want)
-	}
-}
-
 func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
 		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]context.CancelFunc{"task-1": func() {}},
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
 
@@ -538,7 +607,7 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	w := &Worker{
 		ctx:         workerCtx,
 		cancel:      cancel,
-		activeTasks: make(map[string]context.CancelFunc),
+		activeTasks: make(map[string]activeTask),
 		backend:     backend,
 	}
 
@@ -559,10 +628,10 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	w := &Worker{
 		ctx:    workerCtx,
 		cancel: cancel,
-		activeTasks: map[string]context.CancelFunc{
-			"task-1": func() {
+		activeTasks: map[string]activeTask{
+			"task-1": {cancel: func() {
 				cancelledTask = true
-			},
+			}},
 		},
 		backend: backend,
 	}
@@ -585,7 +654,7 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 		cancel:      cancel,
 		config:      Config{},
 		sendChan:    make(chan []byte, 1),
-		activeTasks: make(map[string]context.CancelFunc),
+		activeTasks: make(map[string]activeTask),
 		backend:     &preservingShutdownRecordingBackend{},
 	}
 
