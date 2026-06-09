@@ -98,16 +98,20 @@ func TestTaskFailureLabels(t *testing.T) {
 	}
 }
 
-func TestExecuteTaskReportsTaskCancelledOnContextCancellation(t *testing.T) {
+func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
+	taskCtx, taskCancel := context.WithCancel(context.Background())
+	taskCancel()
 	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
-		backend:     &recordingBackend{err: context.Canceled},
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {
+			cancel:             func() {},
+			cancellationSource: taskCancellationSourceUser,
+		}},
+		backend: &recordingBackend{err: context.Canceled},
 	}
-
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -127,8 +131,31 @@ func TestExecuteTaskReportsTaskCancelledOnContextCancellation(t *testing.T) {
 	if completed.TaskState == nil || *completed.TaskState != types.TaskStateCancelled {
 		t.Fatalf("task state = %v, want %q", completed.TaskState, types.TaskStateCancelled)
 	}
+	if completed.Message != "Task cancelled by user request." {
+		t.Errorf("message = %q, want %q", completed.Message, "Task cancelled by user request.")
+	}
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
+	}
+}
+
+func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
+	}
+
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
 }
 
@@ -163,6 +190,9 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 
 	if taskCtx.Err() != context.Canceled {
 		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
+	}
+	if task := w.activeTasks["task-1"]; task.cancellationSource != taskCancellationSourceUser {
+		t.Fatalf("task cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
 	}
 }
 
