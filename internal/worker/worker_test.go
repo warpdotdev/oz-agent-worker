@@ -5,10 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -345,6 +350,101 @@ func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketM
 	}
 
 	return types.WebSocketMessage{}
+}
+
+// TestRunHeartbeatAndWritesAreConcurrencySafe is a regression test for the
+// "concurrent write to websocket connection" panic: the heartbeat loop used
+// to send pings via WriteMessage, racing writeLoop's data writes on the same
+// connection and crashing the whole worker process (taking the metrics
+// exporter down with it). It floods the send channel while heartbeats fire
+// every millisecond; before the fix this panicked within the test window.
+func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var messagesReceived, pingsReceived atomic.Int64
+
+	serverConnClosed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			t.Errorf("failed to upgrade connection: %v", err)
+			return
+		}
+		defer close(serverConnClosed)
+		defer conn.Close()
+		conn.SetPingHandler(func(string) error {
+			pingsReceived.Add(1)
+			return nil
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			messagesReceived.Add(1)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial test server: %v", err)
+	}
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &Worker{
+		config:            Config{},
+		conn:              conn,
+		ctx:               ctx,
+		cancel:            cancel,
+		sendChan:          make(chan []byte, 256),
+		activeTasks:       make(map[string]activeTask),
+		heartbeatInterval: time.Millisecond,
+	}
+
+	runDone := make(chan struct{})
+	go func() {
+		w.run()
+		close(runDone)
+	}()
+
+	// Flood data writes while heartbeats fire so the two write paths overlap
+	// constantly for the duration of the test window.
+	message := []byte(`{"type":"task_claimed","data":{"task_id":"task-1"}}`)
+	deadline := time.After(500 * time.Millisecond)
+flood:
+	for {
+		select {
+		case <-deadline:
+			break flood
+		case w.sendChan <- message:
+		}
+	}
+
+	// Tear down: cancelling the context stops writeLoop/heartbeatLoop, and
+	// closing the connection unblocks readLoop so run() returns.
+	cancel()
+	conn.Close()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not return after context cancellation and connection close")
+	}
+	select {
+	case <-serverConnClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server connection was not closed")
+	}
+
+	if messagesReceived.Load() == 0 {
+		t.Error("expected the server to receive data messages")
+	}
+	if pingsReceived.Load() == 0 {
+		t.Error("expected the server to receive heartbeat pings")
+	}
 }
 
 func TestDefaultImageForTask(t *testing.T) {
