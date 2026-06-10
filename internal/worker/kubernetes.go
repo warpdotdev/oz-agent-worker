@@ -45,6 +45,12 @@ const (
 	kubernetesExecutionIDLabel       = "oz-execution-id"
 	kubernetesExecutionHashLabel     = "oz-execution-hash"
 
+	// Annotations carry the un-sanitized task and execution identity so a
+	// replacement worker can reconstruct the logical IDs needed to report
+	// terminal task state. Labels are DNS-sanitized and therefore lossy.
+	kubernetesTaskIDAnnotation      = "oz.warp.dev/task-id"
+	kubernetesExecutionIDAnnotation = "oz.warp.dev/execution-id"
+
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
 	maxLogBytes = 1 << 20 // 1 MiB
@@ -136,7 +142,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	executionID := taskExecutionID(params)
 	jobName := sanitizeKubernetesJobName(executionID)
 	jobLabels := b.baseLabels(params.TaskID, executionID)
-	jobAnnotations := copyStringMap(b.config.ExtraAnnotations)
+	jobAnnotations := b.baseAnnotations(params.TaskID, executionID)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
@@ -286,6 +292,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
 	}
 
+	return b.monitorJob(ctx, jobName, params.TaskID, executionID)
+}
+
+// monitorJob watches an existing task Job until it reaches a terminal state,
+// applying the configured cleanup policy. It is shared by ExecuteTask (after
+// creating the Job) and MonitorTask (reattaching to a Job created by a previous
+// worker lifetime). The Job is left in place when the context is cancelled so
+// worker disruption does not destroy a still-running session.
+func (b *KubernetesBackend) monitorJob(ctx context.Context, jobName, taskID, executionID string) error {
 	deleted := false
 	defer func() {
 		if deleted {
@@ -346,7 +361,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				continue
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
+			if result := b.handleJobState(ctx, jobState, taskID, executionID); result != nil {
 				return result.err
 			}
 
@@ -390,7 +405,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				}
 				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err))
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
+			if result := b.handleJobState(ctx, jobState, taskID, executionID); result != nil {
 				return result.err
 			}
 
@@ -403,6 +418,60 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 		}
 	}
+}
+
+// ListReattachableTasks lists this worker's still-running task Jobs so a freshly
+// started worker can resume monitoring them after a restart or relocation. Only
+// non-terminal Jobs are returned: terminal Jobs are handled by the existing
+// cleanup path and Job TTL, and re-reporting their terminal state on every
+// restart would be redundant.
+func (b *KubernetesBackend) ListReattachableTasks(ctx context.Context) ([]ReattachableTask, error) {
+	jobs, err := b.clientset.BatchV1().Jobs(b.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list reattachable Jobs for worker %s: %w", b.config.WorkerID, err)
+	}
+
+	var tasks []ReattachableTask
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if jobComplete(job) || jobFailed(job) {
+			continue
+		}
+		taskID := job.Annotations[kubernetesTaskIDAnnotation]
+		if taskID == "" {
+			// Without the un-sanitized task ID we cannot report terminal state
+			// to the control plane, so skip rather than guess from labels.
+			log.Warnf(ctx, "Skipping reattach for Job %s: missing %s annotation", job.Name, kubernetesTaskIDAnnotation)
+			continue
+		}
+		executionID := job.Annotations[kubernetesExecutionIDAnnotation]
+		if executionID == "" {
+			executionID = taskID
+		}
+		tasks = append(tasks, ReattachableTask{
+			TaskID:      taskID,
+			ExecutionID: executionID,
+			BackendRef:  job.Name,
+		})
+	}
+	return tasks, nil
+}
+
+// MonitorTask reattaches to an already-created task Job and blocks until it
+// reaches a terminal state.
+func (b *KubernetesBackend) MonitorTask(ctx context.Context, task ReattachableTask) error {
+	executionID := strings.TrimSpace(task.ExecutionID)
+	if executionID == "" {
+		executionID = task.TaskID
+	}
+	jobName := task.BackendRef
+	if jobName == "" {
+		jobName = sanitizeKubernetesJobName(executionID)
+	}
+	log.Infof(ctx, "Reattaching to Kubernetes Job %s for task %s in namespace %s", jobName, task.TaskID, b.config.Namespace)
+	return b.monitorJob(ctx, jobName, task.TaskID, executionID)
 }
 
 // Shutdown intentionally does not delete task Jobs.
@@ -813,6 +882,22 @@ func (b *KubernetesBackend) baseLabels(taskID, executionID string) map[string]st
 	labels[kubernetesExecutionIDLabel] = sanitizeKubernetesLabelValue(executionID)
 	labels[kubernetesExecutionHashLabel] = kubernetesLabelHash(executionID)
 	return labels
+}
+
+// baseAnnotations returns the Job annotations, including the un-sanitized task
+// and execution identity that lets a replacement worker reconstruct the logical
+// IDs needed to report terminal task state when reattaching.
+func (b *KubernetesBackend) baseAnnotations(taskID, executionID string) map[string]string {
+	if strings.TrimSpace(executionID) == "" {
+		executionID = taskID
+	}
+	annotations := copyStringMap(b.config.ExtraAnnotations)
+	if annotations == nil {
+		annotations = make(map[string]string, 2)
+	}
+	annotations[kubernetesTaskIDAnnotation] = taskID
+	annotations[kubernetesExecutionIDAnnotation] = executionID
+	return annotations
 }
 
 func (b *KubernetesBackend) listTaskPods(ctx context.Context, executionID string) ([]corev1.Pod, error) {

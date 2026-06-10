@@ -65,6 +65,9 @@ type Worker struct {
 	tasksMutex     sync.Mutex
 	backend        Backend
 	taskSemaphore  *semaphore.Weighted // nil when unlimited
+	// reattachOnce guards the one-time reattach pass that re-adopts task
+	// execution units a previous worker lifetime left running.
+	reattachOnce sync.Once
 }
 type taskCancellationSource string
 
@@ -205,6 +208,15 @@ func (w *Worker) run() {
 	go w.readLoop(done)
 	go w.writeLoop(done)
 	go w.heartbeatLoop(done)
+
+	// After the first successful connection, re-adopt any task execution units
+	// a previous worker lifetime left running (e.g. after the worker pod was
+	// relocated by Karpenter or a spot-instance reclaim). This runs once for the
+	// life of the process; the writeLoop above drains the resulting status
+	// messages over the now-established connection.
+	w.reattachOnce.Do(func() {
+		go w.reattachPreservedTasks()
+	})
 
 	<-done
 
@@ -428,6 +440,102 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	}
 	w.tasksMutex.Unlock()
 	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+}
+
+// reattachPreservedTasks re-adopts task execution units that a previous worker
+// lifetime left running, so a replacement worker pod finalizes them instead of
+// leaving the run open until server-side stale-task cleanup fires. It is a no-op
+// for backends that do not preserve tasks across worker restarts.
+func (w *Worker) reattachPreservedTasks() {
+	rb, ok := w.backend.(ReattachingBackend)
+	if !ok {
+		return
+	}
+
+	tasks, err := rb.ListReattachableTasks(w.ctx)
+	if err != nil {
+		log.Errorf(w.ctx, "Failed to list reattachable tasks: %v", err)
+		return
+	}
+	if len(tasks) == 0 {
+		return
+	}
+
+	log.Infof(w.ctx, "Reattaching to %d preserved task(s) from a previous worker lifetime", len(tasks))
+	for _, task := range tasks {
+		w.reattachTask(rb, task)
+	}
+}
+
+// reattachTask registers a preserved task as active and starts monitoring it to
+// completion. Tasks already tracked by this worker (for example because a fresh
+// assignment arrived first) are skipped.
+func (w *Worker) reattachTask(rb ReattachingBackend, task ReattachableTask) {
+	w.tasksMutex.Lock()
+	if _, exists := w.activeTasks[task.TaskID]; exists {
+		w.tasksMutex.Unlock()
+		log.Debugf(w.ctx, "Skipping reattach for already-active task %s", task.TaskID)
+		return
+	}
+	// Reattach only applies to preserving backends, so detach the task context
+	// from the worker context the same way fresh assignments do: a subsequent
+	// worker shutdown must not cancel monitoring of a still-running execution.
+	executionCtx := context.WithoutCancel(w.ctx)
+	taskCtx, taskCancel := context.WithCancel(executionCtx)
+	w.activeTasks[task.TaskID] = activeTask{
+		ctx:    taskCtx,
+		cancel: taskCancel,
+	}
+	w.tasksMutex.Unlock()
+
+	// Reattached tasks represent pre-existing work rather than a fresh claim, so
+	// they are not counted against the configured concurrency semaphore.
+	metrics.IncTasksActive()
+	go w.monitorReattachedTask(taskCtx, taskCancel, rb, task)
+}
+
+// monitorReattachedTask blocks until a reattached task execution reaches a
+// terminal state and reports the outcome to the control plane, mirroring the
+// finalization logic in executeTask.
+func (w *Worker) monitorReattachedTask(ctx context.Context, taskCancel context.CancelFunc, rb ReattachingBackend, task ReattachableTask) {
+	start := time.Now()
+	result := metrics.TaskResultSucceeded
+
+	defer func() {
+		taskCancel()
+		w.tasksMutex.Lock()
+		delete(w.activeTasks, task.TaskID)
+		w.tasksMutex.Unlock()
+		metrics.DecTasksActive()
+		metrics.RecordTaskCompleted(result, time.Since(start))
+	}()
+
+	log.Infof(w.ctx, "Monitoring reattached task to completion: taskID=%s", task.TaskID)
+	err := rb.MonitorTask(ctx, task)
+	if err != nil {
+		if ctx.Err() == context.Canceled && w.cancellationSource(task.TaskID) == taskCancellationSourceUser {
+			result = metrics.TaskResultCancelled
+			log.Infof(w.ctx, "Reattached task cancelled by user request: taskID=%s", task.TaskID)
+			if statusErr := w.sendTaskCancelled(task.TaskID, "Task cancelled by user request."); statusErr != nil {
+				log.Errorf(w.ctx, "Failed to send task cancelled message: %v", statusErr)
+			}
+			return
+		}
+
+		result = metrics.TaskResultFailed
+		phase, reason := taskFailureLabels(err)
+		metrics.RecordTaskFailure(phase, reason)
+		log.Errorf(w.ctx, "Reattached task execution failed: taskID=%s, error=%v", task.TaskID, err)
+		if statusErr := w.sendTaskFailed(task.TaskID, userFacingTaskError(err)); statusErr != nil {
+			log.Errorf(w.ctx, "Failed to send task failed message: %v", statusErr)
+		}
+		return
+	}
+
+	log.Infof(w.ctx, "Reattached task execution completed successfully: taskID=%s", task.TaskID)
+	if statusErr := w.sendTaskCompleted(task.TaskID, "Task completed successfully"); statusErr != nil {
+		log.Errorf(w.ctx, "Failed to send task completed message: %v", statusErr)
+	}
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,

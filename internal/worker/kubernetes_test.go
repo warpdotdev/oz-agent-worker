@@ -21,6 +21,141 @@ func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
 
+func workerLabeledJob(name, workerID, taskID, executionID string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "agents",
+			Labels: map[string]string{
+				kubernetesWorkerHashLabel: kubernetesLabelHash(workerID),
+			},
+			Annotations: map[string]string{
+				kubernetesTaskIDAnnotation:      taskID,
+				kubernetesExecutionIDAnnotation: executionID,
+			},
+		},
+	}
+}
+
+func TestBaseAnnotationsIncludeTaskIdentity(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			ExtraAnnotations: map[string]string{"team": "platform"},
+		},
+	}
+
+	annotations := backend.baseAnnotations("task-1", "execution-1")
+	if annotations[kubernetesTaskIDAnnotation] != "task-1" {
+		t.Fatalf("task annotation = %q, want %q", annotations[kubernetesTaskIDAnnotation], "task-1")
+	}
+	if annotations[kubernetesExecutionIDAnnotation] != "execution-1" {
+		t.Fatalf("execution annotation = %q, want %q", annotations[kubernetesExecutionIDAnnotation], "execution-1")
+	}
+	if annotations["team"] != "platform" {
+		t.Fatalf("extra annotation = %q, want %q", annotations["team"], "platform")
+	}
+
+	// Execution ID falls back to task ID when empty.
+	fallback := backend.baseAnnotations("task-2", "")
+	if fallback[kubernetesExecutionIDAnnotation] != "task-2" {
+		t.Fatalf("execution annotation fallback = %q, want %q", fallback[kubernetesExecutionIDAnnotation], "task-2")
+	}
+}
+
+func TestListReattachableTasksReturnsNonTerminalAnnotatedJobs(t *testing.T) {
+	const workerID = "worker-123"
+
+	running := workerLabeledJob("oz-task-running", workerID, "task-running", "exec-running")
+
+	completed := workerLabeledJob("oz-task-completed", workerID, "task-completed", "exec-completed")
+	completed.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+
+	failed := workerLabeledJob("oz-task-failed", workerID, "task-failed", "exec-failed")
+	failed.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}
+
+	otherWorker := workerLabeledJob("oz-task-other", "worker-999", "task-other", "exec-other")
+
+	noAnnotation := workerLabeledJob("oz-task-noannotation", workerID, "", "")
+	delete(noAnnotation.Annotations, kubernetesTaskIDAnnotation)
+
+	fakeClient := fake.NewSimpleClientset(running, completed, failed, otherWorker, noAnnotation)
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+			WorkerID:  workerID,
+		},
+		clientset: fakeClient,
+	}
+
+	tasks, err := backend.ListReattachableTasks(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected exactly one reattachable task, got %d: %+v", len(tasks), tasks)
+	}
+	got := tasks[0]
+	if got.TaskID != "task-running" {
+		t.Fatalf("task ID = %q, want %q", got.TaskID, "task-running")
+	}
+	if got.ExecutionID != "exec-running" {
+		t.Fatalf("execution ID = %q, want %q", got.ExecutionID, "exec-running")
+	}
+	if got.BackendRef != "oz-task-running" {
+		t.Fatalf("backend ref = %q, want %q", got.BackendRef, "oz-task-running")
+	}
+}
+
+func TestMonitorTaskWatchesExistingJobToCompletion(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	existingJob := workerLabeledJob("oz-task-existing", "worker-123", "task-1", "execution-1")
+	if _, err := fakeClient.BatchV1().Jobs("agents").Create(context.Background(), existingJob, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to seed existing job: %v", err)
+	}
+
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			completed := existingJob.DeepCopy()
+			completed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completed)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+			WorkerID:  "worker-123",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.MonitorTask(context.Background(), ReattachableTask{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		BackendRef:  "oz-task-existing",
+	})
+	if err != nil {
+		t.Fatalf("unexpected MonitorTask error: %v", err)
+	}
+
+	// With cleanup enabled (NoCleanup=false), the observed terminal Job is deleted.
+	if _, getErr := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), "oz-task-existing", metav1.GetOptions{}); getErr == nil {
+		t.Fatal("expected reattached Job to be deleted after completion")
+	}
+}
+
 func TestSanitizeKubernetesJobNameUsesHashSuffix(t *testing.T) {
 	first := sanitizeKubernetesJobName("Task A")
 	second := sanitizeKubernetesJobName("Task-A")

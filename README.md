@@ -159,11 +159,21 @@ The chart defaults the long-lived worker `Deployment` to a non-root security con
 The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
 
 When the long-lived worker pod is terminated by normal Kubernetes disruption
-(for example Karpenter node consolidation), the Kubernetes backend preserves
-active task Jobs instead of deleting them during worker shutdown. This protects
-running Oz sessions from worker pod rotation as long as the task Job and task Pod
-remain healthy. The default `worker.terminationGracePeriodSeconds` only needs to
-cover WebSocket close and metrics flush.
+(for example Karpenter node consolidation or a spot-instance reclaim of the
+worker node), the Kubernetes backend preserves active task Jobs instead of
+deleting them during worker shutdown. This protects running Oz sessions from
+worker pod rotation as long as the task Job and task Pod remain healthy. The
+default `worker.terminationGracePeriodSeconds` only needs to cover WebSocket
+close and metrics flush.
+
+When the replacement worker pod starts (it keeps the same `worker.workerId`), it
+reattaches to any of its still-running task Jobs, resumes watching them, and
+reports `task_completed` / `task_failed` to Warp when they finish. This means a
+worker pod that is evicted and rescheduled — for example on a spot node pool —
+resumes preserved runs to completion instead of leaving them open until
+server-side stale-task cleanup. Reattachment relies on Job labels/annotations,
+so keep `worker.workerId` stable across restarts. Terminal Jobs are not
+re-reported on restart; they are handled by normal cleanup and Job TTL.
 
 This does not make task Pods disruption-proof. If Karpenter or another cluster
 operation evicts the node that is actually running the task Pod, the live Oz

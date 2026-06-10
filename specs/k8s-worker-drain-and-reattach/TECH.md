@@ -40,13 +40,14 @@ The remaining caveat is Jobs that never reach a terminal state. `ttlSecondsAfter
 There are two different disruption cases behind “zero loss,” and they have different implementation costs.
 ## Worker pod relocated, task pod remains running
 This is the customer’s immediate scenario when Karpenter moves the long-lived worker pod but leaves the task Job/Pod alone. The MVP in this PR is the destructive-behavior fix: worker termination no longer cancels the active task context or deletes the task Job.
-To make this fully zero-loss instead of “do not kill the Job,” the next increment is reattach/reconcile:
-- Persist the Kubernetes Job name, namespace, worker ID, task ID, and current backend state in worker/task execution data when creating a Job.
-- On worker startup, list Jobs labeled with the worker ID/task hash labels and match them to open tasks in the control plane.
-- Recreate local watches for matched Jobs and Pods, then send `task_completed` or `task_failed` when a preserved Job reaches a terminal state.
-- Make finalization idempotent so both the old worker (if it exits slowly) and the replacement worker can safely race to report the same terminal outcome.
-- Add cleanup for orphaned terminal Jobs after successful reconciliation.
-Estimated effort: roughly 2-4 engineering days if the control-plane APIs already expose the needed open-task lookup/update hooks; closer to 1 week if we need to add worker-data persistence or a new reattach handshake.
+To make this fully zero-loss instead of “do not kill the Job,” the next increment is reattach/reconcile. This increment is now implemented for still-running Jobs:
+- Task Jobs are annotated with the un-sanitized task ID (`oz.warp.dev/task-id`) and execution ID (`oz.warp.dev/execution-id`) so a replacement worker can reconstruct the logical identity needed to report terminal state (labels are DNS-sanitized and lossy).
+- On the first successful WebSocket connection after startup, the worker runs a one-time reattach pass (`Worker.reattachPreservedTasks`). The Kubernetes backend exposes `ListReattachableTasks` (lists non-terminal Jobs carrying this worker's `oz-worker-hash` label) and `MonitorTask` (re-establishes Job/Pod watches for an existing Job) via an optional `ReattachingBackend` interface.
+- Reattached tasks are registered in `activeTasks` (deduped against fresh assignments), monitored to completion through the shared `monitorJob` watch loop, and finalized with `task_completed` / `task_failed` / `task_cancelled` exactly like fresh executions. Terminal Jobs are deliberately excluded from reattach to avoid re-reporting; they are handled by the existing cleanup path and `ttlSecondsAfterFinished`.
+Finalization is intended to be idempotent so the old worker (if it exits slowly) and the replacement worker can both report the same terminal outcome; `deleteJob` already tolerates `NotFound`. Server-side idempotency for duplicate terminal reports is assumed.
+Remaining work for this increment:
+- Make the duplicate-terminal-report race explicitly idempotent end-to-end (server-side dedupe contract).
+- Add an explicit reconcile/cleanup sweep for orphaned terminal Jobs that no worker observed (beyond TTL).
 This PR includes a fallback `ttlSecondsAfterFinished` so completed Jobs do not accumulate indefinitely before reattach/reconcile exists. That TTL only applies after the Job reaches a terminal state; it does not replace reattach/finalization and does not stop truly stuck running Jobs without `activeDeadlineSeconds`.
 ## Task pod or task node evicted
 This is a larger project. If Karpenter evicts the actual task pod, the live process, PTY/session stream, and ephemeral workspace state are gone unless we make the agent runtime resumable.
@@ -74,8 +75,9 @@ Parallel sub-agents are not proposed. The change is tightly scoped to one repo a
 - Risk: shutdown-triggered context cancellation is indistinguishable from explicit task cancellation inside `KubernetesBackend.ExecuteTask`. Mitigation: preserve Jobs only for worker-level shutdown, while explicit task cancellation should remain destructive in a follow-up by threading cancellation reason through the backend.
 - Risk: completed Jobs may accumulate if the worker is repeatedly disrupted. Mitigation: keep terminal cleanup when a worker observes completion and add reattach/reconcile cleanup in the follow-up.
 # Follow-ups
-- Persist Kubernetes Job identity in worker data / execution data.
-- On worker startup, list open Jobs for the worker ID and reattach watches for tasks still open in the control plane.
+- [done] Persist Kubernetes Job identity (task/execution ID) in Job annotations.
+- [done] On worker startup, list this worker's still-running Jobs and reattach watches to finalize them when they reach a terminal state.
+- [done] Add customer-facing Karpenter/spot guidance for worker Deployment disruption vs task pod disruption (README).
 - Add an explicit draining state/message in the worker WebSocket protocol so the control plane can distinguish a healthy idle worker from one that is terminating.
-- Add customer-facing Karpenter guidance for worker Deployment disruption vs task pod disruption.
+- Reconcile/clean up orphaned terminal Jobs that finished while no worker was watching, beyond the `ttlSecondsAfterFinished` fallback.
 - Design durable task-pod resume semantics before promising zero loss when Karpenter evicts the task pod itself.
