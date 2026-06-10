@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -49,6 +50,167 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
 	return false
+}
+
+// reattachingRecordingBackend is a Backend that also implements
+// ReattachingBackend, recording which tasks it was asked to monitor.
+type reattachingRecordingBackend struct {
+	recordingBackend
+	tasks      []ReattachableTask
+	monitorErr error
+
+	mu        sync.Mutex
+	monitored []ReattachableTask
+}
+
+func (b *reattachingRecordingBackend) PreservesTasksOnShutdown() bool {
+	return true
+}
+
+func (b *reattachingRecordingBackend) ListReattachableTasks(context.Context) ([]ReattachableTask, error) {
+	return b.tasks, nil
+}
+
+func (b *reattachingRecordingBackend) MonitorTask(_ context.Context, task ReattachableTask) error {
+	b.mu.Lock()
+	b.monitored = append(b.monitored, task)
+	b.mu.Unlock()
+	return b.monitorErr
+}
+
+func (b *reattachingRecordingBackend) monitoredTasks() []ReattachableTask {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]ReattachableTask(nil), b.monitored...)
+}
+
+func waitForWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketMessage {
+	t.Helper()
+	select {
+	case msgBytes := <-messages:
+		var msg types.WebSocketMessage
+		if err := json.Unmarshal(msgBytes, &msg); err != nil {
+			t.Fatalf("failed to unmarshal websocket message: %v", err)
+		}
+		return msg
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for websocket message")
+	}
+	return types.WebSocketMessage{}
+}
+
+func waitForActiveTasksEmpty(t *testing.T, w *Worker) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		w.tasksMutex.Lock()
+		n := len(w.activeTasks)
+		w.tasksMutex.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for active tasks to drain")
+}
+
+func TestReattachPreservedTasksReportsCompletion(t *testing.T) {
+	backend := &reattachingRecordingBackend{
+		tasks: []ReattachableTask{{TaskID: "task-1", ExecutionID: "exec-1", BackendRef: "job-1"}},
+	}
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 4),
+		activeTasks: make(map[string]activeTask),
+		backend:     backend,
+	}
+
+	w.reattachPreservedTasks()
+
+	msg := waitForWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskCompleted {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
+	}
+	var completed types.TaskCompletedMessage
+	if err := json.Unmarshal(msg.Data, &completed); err != nil {
+		t.Fatalf("failed to unmarshal task completed message: %v", err)
+	}
+	if completed.TaskID != "task-1" {
+		t.Fatalf("task ID = %q, want %q", completed.TaskID, "task-1")
+	}
+	if monitored := backend.monitoredTasks(); len(monitored) != 1 || monitored[0].BackendRef != "job-1" {
+		t.Fatalf("expected backend to monitor job-1, got %+v", monitored)
+	}
+	waitForActiveTasksEmpty(t, w)
+}
+
+func TestReattachPreservedTasksReportsFailure(t *testing.T) {
+	backend := &reattachingRecordingBackend{
+		tasks:      []ReattachableTask{{TaskID: "task-1", ExecutionID: "exec-1", BackendRef: "job-1"}},
+		monitorErr: errors.New("boom"),
+	}
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 4),
+		activeTasks: make(map[string]activeTask),
+		backend:     backend,
+	}
+
+	w.reattachPreservedTasks()
+
+	msg := waitForWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+	waitForActiveTasksEmpty(t, w)
+}
+
+func TestReattachPreservedTasksSkipsAlreadyActiveTask(t *testing.T) {
+	backend := &reattachingRecordingBackend{
+		tasks: []ReattachableTask{{TaskID: "task-1", ExecutionID: "exec-1", BackendRef: "job-1"}},
+	}
+	w := &Worker{
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 4),
+		activeTasks: map[string]activeTask{
+			"task-1": {cancel: func() {}},
+		},
+		backend: backend,
+	}
+
+	w.reattachPreservedTasks()
+
+	// Give any erroneously spawned monitor goroutine a chance to run.
+	time.Sleep(50 * time.Millisecond)
+	if monitored := backend.monitoredTasks(); len(monitored) != 0 {
+		t.Fatalf("expected no monitoring for already-active task, got %+v", monitored)
+	}
+	select {
+	case <-w.sendChan:
+		t.Fatal("did not expect a status message for an already-active task")
+	default:
+	}
+}
+
+func TestReattachPreservedTasksNoOpForNonReattachingBackend(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 1),
+		activeTasks: make(map[string]activeTask),
+		backend:     &recordingBackend{},
+	}
+
+	// Should simply return without panicking or sending messages.
+	w.reattachPreservedTasks()
+	select {
+	case <-w.sendChan:
+		t.Fatal("did not expect a status message for a non-reattaching backend")
+	default:
+	}
 }
 
 func TestTaskFailureLabels(t *testing.T) {

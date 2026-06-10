@@ -45,3 +45,34 @@ type Backend interface {
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
 }
+
+// ReattachableTask identifies an in-flight task execution unit that a
+// replacement worker can resume monitoring after a restart or relocation.
+type ReattachableTask struct {
+	// TaskID is the logical run ID, used to report terminal task state back to
+	// the control plane.
+	TaskID string
+	// ExecutionID identifies the concrete run execution. It falls back to
+	// TaskID when the execution unit predates execution-scoped identity.
+	ExecutionID string
+	// BackendRef is an opaque backend-specific handle (e.g. a Kubernetes Job
+	// name) used to re-establish monitoring for the existing execution unit.
+	BackendRef string
+}
+
+// ReattachingBackend is an optional capability implemented by backends whose
+// task execution units (for example Kubernetes Jobs) outlive the worker
+// process. It lets a freshly started worker re-adopt and finalize executions
+// that a previous worker pod left running when it was disrupted (for example by
+// Karpenter consolidation or spot-instance reclamation of the worker node).
+type ReattachingBackend interface {
+	Backend
+	// ListReattachableTasks returns the in-flight, non-terminal task execution
+	// units this worker created in a previous lifetime that still need a worker
+	// to monitor them to completion.
+	ListReattachableTasks(ctx context.Context) ([]ReattachableTask, error)
+	// MonitorTask re-establishes monitoring for an already-created execution
+	// unit and blocks until it reaches a terminal state, returning the terminal
+	// outcome the same way ExecuteTask does.
+	MonitorTask(ctx context.Context, task ReattachableTask) error
+}
