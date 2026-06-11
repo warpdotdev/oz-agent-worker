@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -888,6 +889,126 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 	if taskSidecarMount.ReadOnly {
 		t.Fatal("expected task sidecar mount to remain writable on default path")
+	}
+}
+
+func TestExecuteTaskRecreatesStaleJobOnAlreadyExists(t *testing.T) {
+	jobName := sanitizeKubernetesJobName("task-1")
+	staleJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: "agents",
+		},
+	}
+	fakeClient := fake.NewSimpleClientset(staleJob)
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createCount int
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createCount++
+		createdJob = job.DeepCopy()
+		// Fall through to the tracker: the first create collides with the seeded
+		// stale Job (AlreadyExists), the second succeeds after deletion.
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobComplete,
+					Status: corev1.ConditionTrue,
+				},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if err != nil {
+		t.Fatalf("expected ExecuteTask to recover from AlreadyExists, got %v", err)
+	}
+	if createCount != 2 {
+		t.Fatalf("expected exactly 2 create attempts (collide + recreate), got %d", createCount)
+	}
+}
+
+func TestExecuteTaskFailsWhenStaleJobDeletionStuck(t *testing.T) {
+	prevPoll, prevTimeout := jobDeletionPollInterval, jobDeletionTimeout
+	jobDeletionPollInterval = time.Millisecond
+	jobDeletionTimeout = 5 * time.Millisecond
+	defer func() {
+		jobDeletionPollInterval = prevPoll
+		jobDeletionTimeout = prevTimeout
+	}()
+
+	jobName := sanitizeKubernetesJobName("task-1")
+	staleJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: "agents",
+		},
+	}
+	fakeClient := fake.NewSimpleClientset(staleJob)
+
+	// The Job stays present forever, simulating a deletion that never completes.
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, staleJob.DeepCopy(), nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if err == nil {
+		t.Fatal("expected ExecuteTask to fail when stale Job deletion is stuck")
+	}
+	if _, reason := taskFailureLabels(err); reason != metrics.TaskFailureReasonJobCreate {
+		t.Fatalf("failure reason = %q, want %q", reason, metrics.TaskFailureReasonJobCreate)
+	}
+	if !strings.Contains(err.Error(), "deletion appears stuck") {
+		t.Fatalf("expected stuck-deletion detail, got %v", err)
 	}
 }
 
