@@ -65,6 +65,9 @@ type Worker struct {
 	tasksMutex     sync.Mutex
 	backend        Backend
 	taskSemaphore  *semaphore.Weighted // nil when unlimited
+	// heartbeatInterval is how often the worker pings the server. It defaults
+	// to HeartbeatInterval and is overridable in tests.
+	heartbeatInterval time.Duration
 }
 type taskCancellationSource string
 
@@ -118,14 +121,15 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	}
 
 	return &Worker{
-		config:         config,
-		ctx:            workerCtx,
-		cancel:         cancel,
-		reconnectDelay: InitialReconnectDelay,
-		sendChan:       make(chan []byte, 256),
-		activeTasks:    make(map[string]activeTask),
-		backend:        backend,
-		taskSemaphore:  taskSemaphore,
+		config:            config,
+		ctx:               workerCtx,
+		cancel:            cancel,
+		reconnectDelay:    InitialReconnectDelay,
+		sendChan:          make(chan []byte, 256),
+		activeTasks:       make(map[string]activeTask),
+		backend:           backend,
+		taskSemaphore:     taskSemaphore,
+		heartbeatInterval: HeartbeatInterval,
 	}, nil
 }
 
@@ -200,11 +204,23 @@ func (w *Worker) connect() error {
 }
 
 func (w *Worker) run() {
+	w.connMutex.Lock()
+	conn := w.conn
+	w.connMutex.Unlock()
+	if conn == nil {
+		return
+	}
+
 	done := make(chan struct{})
 
-	go w.readLoop(done)
-	go w.writeLoop(done)
-	go w.heartbeatLoop(done)
+	// Each loop is bound to this connection. A loop from a previous
+	// connection must never write to a newer connection: gorilla/websocket
+	// supports at most one concurrent writer per connection, and a stale
+	// writer racing the current one panics the whole process with
+	// "concurrent write to websocket connection".
+	go w.readLoop(conn, done)
+	go w.writeLoop(conn, done)
+	go w.heartbeatLoop(conn, done)
 
 	<-done
 
@@ -220,7 +236,7 @@ func (w *Worker) run() {
 	log.Warnf(w.ctx, "Connection closed, will attempt to reconnect")
 }
 
-func (w *Worker) readLoop(done chan struct{}) {
+func (w *Worker) readLoop(conn *websocket.Conn, done chan struct{}) {
 	defer close(done)
 
 	for {
@@ -228,14 +244,6 @@ func (w *Worker) readLoop(done chan struct{}) {
 		case <-w.ctx.Done():
 			return
 		default:
-		}
-
-		w.connMutex.Lock()
-		conn := w.conn
-		w.connMutex.Unlock()
-
-		if conn == nil {
-			return
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
@@ -256,7 +264,10 @@ func (w *Worker) readLoop(done chan struct{}) {
 	}
 }
 
-func (w *Worker) writeLoop(done chan struct{}) {
+// writeLoop is the single writer of data frames on conn. All data messages
+// must go through sendChan; nothing else may call WriteMessage on conn while
+// this loop is running.
+func (w *Worker) writeLoop(conn *websocket.Conn, done chan struct{}) {
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -264,14 +275,6 @@ func (w *Worker) writeLoop(done chan struct{}) {
 		case <-done:
 			return
 		case message := <-w.sendChan:
-			w.connMutex.Lock()
-			conn := w.conn
-			w.connMutex.Unlock()
-
-			if conn == nil {
-				return
-			}
-
 			log.Debugf(w.ctx, "WebSocket sending: %s", string(message))
 
 			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
@@ -286,8 +289,12 @@ func (w *Worker) writeLoop(done chan struct{}) {
 	}
 }
 
-func (w *Worker) heartbeatLoop(done chan struct{}) {
-	ticker := time.NewTicker(HeartbeatInterval)
+func (w *Worker) heartbeatLoop(conn *websocket.Conn, done chan struct{}) {
+	interval := w.heartbeatInterval
+	if interval <= 0 {
+		interval = HeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -297,19 +304,12 @@ func (w *Worker) heartbeatLoop(done chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			w.connMutex.Lock()
-			conn := w.conn
-			w.connMutex.Unlock()
-
-			if conn == nil {
-				return
-			}
-
-			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
-				log.Errorf(w.ctx, "Failed to set write deadline: %v", err)
-				return
-			}
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// Pings must use WriteControl: it is the only write method that
+			// gorilla/websocket documents as safe to call concurrently with
+			// the data writes performed by writeLoop. Using WriteMessage here
+			// races writeLoop and panics the process with "concurrent write
+			// to websocket connection".
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(WriteWait)); err != nil {
 				log.Errorf(w.ctx, "Failed to send ping: %v", err)
 				return
 			}
@@ -773,7 +773,11 @@ func (w *Worker) Shutdown() {
 
 	w.connMutex.Lock()
 	if w.conn != nil {
-		if err := w.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
+		// WriteControl is safe to call concurrently with writeLoop's data
+		// writes and enforces its own deadline, so shutdown can neither panic
+		// the process nor block indefinitely on a wedged connection.
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+		if err := w.conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(WriteWait)); err != nil {
 			log.Warnf(w.ctx, "Failed to send close message: %v", err)
 		}
 		if err := w.conn.Close(); err != nil {
