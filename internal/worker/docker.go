@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+
+// invalidVolumeNameChars matches characters not allowed in Docker volume names.
+var invalidVolumeNameChars = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
@@ -514,8 +518,10 @@ func sanitizeVolumeName(imageName, digest string) string {
 		repoName = imageName
 	}
 
-	// Sanitize the repository name for use in volume name
-	baseName := strings.ReplaceAll(repoName, "/", "-")
+	// Sanitize the repository name for use in volume name. Docker volume names
+	// only allow [a-zA-Z0-9_.-], so registry hosts with ports (e.g.
+	// localhost:5000/warp-agent) must have their colons replaced too.
+	baseName := invalidVolumeNameChars.ReplaceAllString(repoName, "-")
 
 	// digest format is typically "sha256:abc123..."
 	parts := strings.Split(digest, ":")
