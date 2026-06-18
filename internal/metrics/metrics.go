@@ -275,6 +275,7 @@ func shouldInitTraces() bool {
 func primeInstruments(ctx context.Context, set *instruments) {
 	set.connected.Record(ctx, 0)
 	set.tasksActive.Add(ctx, 0)
+	set.tasksMaxConcurrent.Record(ctx, 0)
 	set.tasksClaimed.Add(ctx, 0)
 	set.tasksRejected.Add(ctx, 0,
 		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),

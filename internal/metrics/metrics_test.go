@@ -171,6 +171,30 @@ func TestSetConnectedEmitsGauge(t *testing.T) {
 	}
 }
 
+func TestSetMaxConcurrentEmitsGauge(t *testing.T) {
+	reader := withTestReader(t, Config{WorkerID: "w1", Backend: "docker"})
+
+	SetMaxConcurrent(0)
+	rm := collect(t, reader)
+
+	maxConcurrent := findMetric(t, rm, "oz_worker_tasks_max_concurrent")
+	g, ok := maxConcurrent.Data.(metricdata.Gauge[int64])
+	if !ok {
+		t.Fatalf("expected Gauge[int64], got %T", maxConcurrent.Data)
+	}
+	if len(g.DataPoints) != 1 || g.DataPoints[0].Value != 0 {
+		t.Errorf("max concurrent gauge = %+v, want value 0", g.DataPoints)
+	}
+
+	SetMaxConcurrent(4)
+	rm = collect(t, reader)
+	maxConcurrent = findMetric(t, rm, "oz_worker_tasks_max_concurrent")
+	g = maxConcurrent.Data.(metricdata.Gauge[int64])
+	if len(g.DataPoints) != 1 || g.DataPoints[0].Value != 4 {
+		t.Errorf("max concurrent gauge = %+v, want value 4", g.DataPoints)
+	}
+}
+
 func TestRecordTaskRejectedTagsReason(t *testing.T) {
 	reader := withTestReader(t, Config{WorkerID: "w1", Backend: "docker"})
 
@@ -223,6 +247,7 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 	want := []string{
 		"oz_worker_connected",
 		"oz_worker_tasks_active",
+		"oz_worker_tasks_max_concurrent",
 		"oz_worker_tasks_rejected_total",
 		"oz_worker_tasks_completed_total",
 		"oz_worker_task_failures_total",
