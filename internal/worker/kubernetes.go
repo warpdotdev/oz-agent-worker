@@ -50,6 +50,13 @@ const (
 	maxLogBytes = 1 << 20 // 1 MiB
 )
 
+// Tunables for waiting on stale task Job deletion before recreating. These are
+// package-level vars (not consts) so tests can shrink them and avoid real waits.
+var (
+	jobDeletionPollInterval = 200 * time.Millisecond
+	jobDeletionTimeout      = 30 * time.Second
+)
+
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
 	WorkerID              string
@@ -282,7 +289,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
-	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
+	if err := b.createTaskJob(ctx, job); err != nil {
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
 	}
 
@@ -931,6 +938,65 @@ func (b *KubernetesBackend) readContainerLogs(ctx context.Context, podName, cont
 		return "", err
 	}
 	return string(data), nil
+}
+
+// createTaskJob creates the task Job idempotently.
+//
+// The task Job name is fully deterministic per execution, so an idled or
+// cancelled task that left its Job in place (cleanup is intentionally skipped on
+// context cancellation) makes the next dispatch of that same task collide on
+// create with an AlreadyExists error. When that happens we delete the stale Job,
+// wait until it is fully gone, and retry the create exactly once. Any other
+// create error is returned unchanged so the non-collision path behaves
+// identically to a plain Create.
+func (b *KubernetesBackend) createTaskJob(ctx context.Context, job *batchv1.Job) error {
+	_, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+
+	log.Infof(ctx, "Kubernetes Job %s already exists; deleting stale Job and retrying create", job.Name)
+	if delErr := b.deleteJob(ctx, job.Name); delErr != nil {
+		return fmt.Errorf("failed to delete stale Kubernetes Job %s before recreating: %w", job.Name, delErr)
+	}
+	if waitErr := b.waitForJobDeletion(ctx, job.Name); waitErr != nil {
+		return waitErr
+	}
+
+	_, err = b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	return err
+}
+
+// waitForJobDeletion polls until the named Job is fully gone (NotFound). It
+// returns early if ctx is cancelled and errors out after a bounded timeout so a
+// stuck deletion never blocks task dispatch forever.
+func (b *KubernetesBackend) waitForJobDeletion(ctx context.Context, jobName string) error {
+	deadlineCtx, cancel := context.WithTimeout(ctx, jobDeletionTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(jobDeletionPollInterval)
+	defer ticker.Stop()
+
+	for {
+		_, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(deadlineCtx, jobName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadlineCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("timed out waiting for stale Kubernetes Job %s to be deleted: deletion appears stuck", jobName)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (b *KubernetesBackend) deleteJob(ctx context.Context, jobName string) error {
