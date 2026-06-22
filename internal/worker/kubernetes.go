@@ -67,6 +67,7 @@ type KubernetesBackendConfig struct {
 	ExtraAnnotations      map[string]string
 	ActiveDeadlineSeconds *int64
 	TTLSecondsAfterFinish *int32
+	PreserveFailedJobs    *bool
 	WorkspaceSizeLimit    *resource.Quantity
 	UnschedulableTimeout  *time.Duration
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
@@ -128,7 +129,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 }
 
 // ExecuteTask runs the agent in a Kubernetes Job.
-func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (retErr error) {
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
 	}
@@ -295,6 +296,10 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
 			return
 		}
+		if b.shouldPreserveFailedJob(retErr) {
+			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for debugging", jobName)
+			return
+		}
 		if !b.config.NoCleanup {
 			if err := b.deleteJob(context.Background(), jobName); err != nil {
 				log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
@@ -403,6 +408,16 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 		}
 	}
+}
+
+func (b *KubernetesBackend) shouldPreserveFailedJob(err error) bool {
+	if err == nil || b.config.NoCleanup {
+		return false
+	}
+	if b.config.PreserveFailedJobs != nil {
+		return *b.config.PreserveFailedJobs
+	}
+	return true
 }
 
 // Shutdown intentionally does not delete task Jobs.

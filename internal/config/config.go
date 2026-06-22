@@ -67,6 +67,7 @@ type KubernetesConfig struct {
 	ExtraAnnotations      map[string]string `yaml:"extra_annotations"`
 	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
+	PreserveFailedJobs    *bool             `yaml:"preserve_failed_jobs"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
 	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's

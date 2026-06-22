@@ -280,6 +280,7 @@ backend:
     extra_annotations:
       owner: "oz"
     active_deadline_seconds: 1800
+    preserve_failed_jobs: false
     workspace_size_limit: "10Gi"
     unschedulable_timeout: "2m"
     pod_template:
@@ -324,6 +325,9 @@ backend:
 	}
 	if cfg.Backend.Kubernetes.WorkspaceSizeLimit != "10Gi" {
 		t.Fatalf("workspace_size_limit = %v, want 10Gi", cfg.Backend.Kubernetes.WorkspaceSizeLimit)
+	}
+	if cfg.Backend.Kubernetes.PreserveFailedJobs == nil || *cfg.Backend.Kubernetes.PreserveFailedJobs {
+		t.Fatalf("preserve_failed_jobs = %v, want false", cfg.Backend.Kubernetes.PreserveFailedJobs)
 	}
 	if cfg.Backend.Kubernetes.UnschedulableTimeout == nil || *cfg.Backend.Kubernetes.UnschedulableTimeout != "2m" {
 		t.Fatalf("unschedulable_timeout = %v, want 2m", cfg.Backend.Kubernetes.UnschedulableTimeout)

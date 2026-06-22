@@ -20,6 +20,9 @@ import (
 func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
+func boolPtr(value bool) *bool {
+	return &value
+}
 
 func TestSanitizeKubernetesJobNameUsesHashSuffix(t *testing.T) {
 	first := sanitizeKubernetesJobName("Task A")
@@ -956,6 +959,143 @@ func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
 
 	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected Job %s to be preserved after context cancellation, got %v", jobName, err)
+	}
+}
+func TestExecuteTaskPreservesFailedJobByDefault(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			failedJob := createdJob.DeepCopy()
+			failedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionTrue,
+					Reason: "BackoffLimitExceeded",
+				},
+			}
+			jobWatch.Modify(failedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("expected failed job error, got %v", err)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task Job to be created")
+	}
+	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), createdJob.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected failed Job %s to be preserved, got %v", createdJob.Name, err)
+	}
+	for _, action := range fakeClient.Actions() {
+		if action.Matches("delete", "jobs") {
+			t.Fatalf("expected no delete action for failed Job, got %v", action)
+		}
+	}
+}
+
+func TestExecuteTaskDeletesFailedJobWhenPreservationDisabled(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			failedJob := createdJob.DeepCopy()
+			failedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionTrue,
+					Reason: "BackoffLimitExceeded",
+				},
+			}
+			jobWatch.Modify(failedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:           "worker-123",
+			Namespace:          "agents",
+			PreserveFailedJobs: boolPtr(false),
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("expected failed job error, got %v", err)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task Job to be created")
+	}
+	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), createdJob.Name, metav1.GetOptions{}); err == nil {
+		t.Fatalf("expected failed Job %s to be deleted when preservation is disabled", createdJob.Name)
 	}
 }
 

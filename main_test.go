@@ -74,6 +74,7 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 					"owner": "oz",
 				},
 				ActiveDeadlineSeconds: int64Ptr(900),
+				PreserveFailedJobs:    boolPtr(false),
 				WorkspaceSizeLimit:    "8Gi",
 				UnschedulableTimeout:  stringPtr("2m"),
 				PodTemplate: rawYAMLNodeFromString(t, `
@@ -121,6 +122,9 @@ containers:
 	}
 	if wc.Kubernetes.WorkspaceSizeLimit == nil || wc.Kubernetes.WorkspaceSizeLimit.String() != "8Gi" {
 		t.Fatalf("WorkspaceSizeLimit = %v, want 8Gi", wc.Kubernetes.WorkspaceSizeLimit)
+	}
+	if wc.Kubernetes.PreserveFailedJobs == nil || *wc.Kubernetes.PreserveFailedJobs {
+		t.Fatalf("PreserveFailedJobs = %v, want false", wc.Kubernetes.PreserveFailedJobs)
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 2*time.Minute {
 		t.Fatalf("UnschedulableTimeout = %v, want 2m", wc.Kubernetes.UnschedulableTimeout)
