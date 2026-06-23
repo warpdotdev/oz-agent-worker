@@ -201,6 +201,132 @@ go build -o oz-agent-worker
 ./oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
+## GitHub PR Integration
+
+Self-hosted Kubernetes workers can be triggered from GitHub PR comments using an `@oz-agent` mention pattern, equivalent to the `respond-to-comment.yml` workflow in [`oz-agent-action`](https://github.com/warpdotdev/oz-agent-action) but routing work to your own k8s cluster.
+
+### How it works
+
+The trigger workflow runs on standard GitHub-hosted runners. It does not install the `oz` CLI; instead it calls the Warp REST API directly with `config.worker_host` set to your worker ID. Warp routes the task to whichever connected worker matches that ID — your k8s deployment. The Oz agent then runs inside your cluster, checks out the PR branch, makes the requested changes, and replies to the comment.
+
+```
+Developer comments "@oz-agent fix the null check"
+  └─► GitHub Actions workflow fires (GitHub-hosted runner)
+       └─► POST https://app.warp.dev/api/v1/agent/runs
+             { config: { worker_host: "your-k8s-worker-id" } }
+              └─► Task routed to your oz-agent-worker in k8s
+                   └─► Oz checks out PR branch, implements fix,
+                       commits, pushes, replies to comment
+```
+
+### Setup
+
+**1. Prepare your k8s worker for GitHub access**
+
+The Oz agent running in your cluster needs credentials to clone your repository and push commits. Store them as a Kubernetes Secret and inject them via `pod_template`:
+
+```yaml
+# Create a secret with your GitHub credentials
+kubectl create secret generic oz-github-creds \
+  --from-literal=GITHUB_TOKEN="ghp_..." \
+  --namespace agents
+```
+
+In your Helm values, inject the secret into task containers:
+
+```yaml
+kubernetesBackend:
+  podTemplate:
+    containers:
+      - name: task
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: oz-github-creds
+                key: GITHUB_TOKEN
+```
+
+For SSH-based cloning, mount your deploy key instead:
+
+```yaml
+kubernetesBackend:
+  podTemplate:
+    volumes:
+      - name: ssh-key
+        secret:
+          secretName: oz-github-deploy-key
+          defaultMode: 0400
+    containers:
+      - name: task
+        volumeMounts:
+          - name: ssh-key
+            mountPath: /root/.ssh
+            readOnly: true
+```
+
+**2. Add the GitHub Actions workflow to your repository**
+
+Copy `consumer-workflows/gh-pr-comment.yml` from this repository into `.github/workflows/` in the repository where you want the `@oz-agent` trigger.
+
+**3. Configure secrets and variables**
+
+In your GitHub repository settings, add:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `WARP_API_KEY` | Your Warp service account API key (team-scoped) |
+| Variable | `OZ_WORKER_ID` | The `worker_id` from your `oz-agent-worker` config (e.g. `my-k8s-worker`) |
+
+**4. Use it**
+
+Comment on any PR or inline review comment:
+
+```
+@oz-agent refactor the error handling in auth.go to use the new ErrorResponse type
+```
+
+Oz will acknowledge with 👀, run in your k8s cluster, push any commits, and reply with a summary.
+
+### Comparison: self-hosted vs. cloud runner approach
+
+| | `gh-pr-comment.yml` (this repo) | `oz-agent-action` `respond-to-comment.yml` |
+|---|---|---|
+| Oz runs on | Your k8s cluster | Warp-hosted cloud agents |
+| GitHub runner | GitHub-hosted (ubuntu-latest) | GitHub-hosted (ubuntu-latest) |
+| oz CLI needed on runner | No (curl only) | Yes (installed by the action) |
+| Output capture | Async — Oz posts its own comment | Synchronous — workflow posts reply |
+| Trigger | `@oz-agent` comment | `@oz-agent` comment |
+| Self-hosted runner support | Yes (change `runs-on`) | Requires Linux (apt-installable) |
+
+### Running on self-hosted GitHub Actions runners
+
+If you also run self-hosted GitHub Actions runners (e.g., in the same k8s cluster), change `runs-on` in the workflow to your runner label:
+
+```yaml
+jobs:
+  trigger:
+    runs-on: [self-hosted, linux, my-org-runners]
+```
+
+The workflow only needs `curl`, `jq`, and the `gh` CLI available on the runner. No `oz` CLI is needed.
+
+### Customizing the prompt
+
+The consumer workflow passes a structured prompt to Oz. Modify the `PROMPT` variable in the workflow to add team-specific instructions, coding standards, or technology-specific context:
+
+```yaml
+PROMPT="...
+
+## Team conventions
+- All Go errors must be wrapped with fmt.Errorf and include context
+- Run 'go test ./...' before committing
+
+${PROMPT}"
+```
+
+Alternatively, set a `skill` in the API payload to provide reusable base instructions that can be maintained separately from the workflow file.
+
 ## Environment Variables for Task Containers
 
 Use `-e` / `--env` to pass environment variables into task containers:
