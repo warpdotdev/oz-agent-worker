@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -51,6 +52,7 @@ type Config struct {
 	Docker     *DockerBackendConfig
 	Direct     *DirectBackendConfig
 	Kubernetes *KubernetesBackendConfig
+	Command    *CommandBackendConfig
 }
 
 type Worker struct {
@@ -63,9 +65,14 @@ type Worker struct {
 	lastHeartbeat  time.Time
 	sendChan       chan []byte
 	activeTasks    map[string]activeTask
-	tasksMutex     sync.Mutex
-	backend        Backend
-	taskSemaphore  *semaphore.Weighted // nil when unlimited
+	// dispatchedTasks tracks fire-and-forget tasks the backend handed off to a
+	// remote runtime. They are no longer executing locally, but are retained
+	// (by non-secret identifiers only) so a later cancellation can be routed to
+	// a CancelableBackend. Guarded by tasksMutex.
+	dispatchedTasks map[string]*CancelParams
+	tasksMutex      sync.Mutex
+	backend         Backend
+	taskSemaphore   *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
@@ -101,6 +108,12 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 			return nil, fmt.Errorf("direct backend selected but no direct config provided")
 		}
 		backend, err = NewDirectBackend(ctx, *config.Direct)
+	case "command":
+		if config.Command == nil {
+			cancel()
+			return nil, fmt.Errorf("command backend selected but no command config provided")
+		}
+		backend, err = NewCommandBackend(ctx, *config.Command)
 	case "docker", "":
 		if config.Docker == nil {
 			config.Docker = &DockerBackendConfig{}
@@ -128,6 +141,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		reconnectDelay:    InitialReconnectDelay,
 		sendChan:          make(chan []byte, 256),
 		activeTasks:       make(map[string]activeTask),
+		dispatchedTasks:   make(map[string]*CancelParams),
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
@@ -357,18 +371,55 @@ func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMess
 		task.cancellationSource = taskCancellationSourceUser
 		w.activeTasks[cancellation.TaskID] = task
 	}
-	w.tasksMutex.Unlock()
+	var dispatched *CancelParams
 	if !ok {
-		log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
+		if dp, dok := w.dispatchedTasks[cancellation.TaskID]; dok {
+			dispatched = dp
+			delete(w.dispatchedTasks, cancellation.TaskID)
+		}
+	}
+	w.tasksMutex.Unlock()
+
+	if ok {
+		log.Infof(w.ctx, "Cancelling task from server request: taskID=%s", cancellation.TaskID)
+		metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
+			attribute.String("source", "server"),
+			attribute.String("task.id", cancellation.TaskID),
+		)
+		task.cancel()
 		return
 	}
 
-	log.Infof(w.ctx, "Cancelling task from server request: taskID=%s", cancellation.TaskID)
-	metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
-		attribute.String("source", "server"),
-		attribute.String("task.id", cancellation.TaskID),
-	)
-	task.cancel()
+	if dispatched != nil {
+		w.cancelDispatchedTask(dispatched)
+		return
+	}
+
+	log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
+}
+
+// cancelDispatchedTask makes a best-effort attempt to cancel a task that was
+// already handed off to a remote runtime via fire-and-forget dispatch. If the
+// backend cannot cancel, the worker relies on agent-side cancellation.
+func (w *Worker) cancelDispatchedTask(params *CancelParams) {
+	cancelable, ok := w.backend.(CancelableBackend)
+	if !ok {
+		log.Infof(w.ctx, "No backend cancellation for dispatched task %s; relying on agent-side cancellation", params.TaskID)
+		return
+	}
+
+	log.Infof(w.ctx, "Requesting backend cancellation for dispatched task %s", params.TaskID)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), BackendShutdownTimeout)
+		defer cancel()
+		if err := cancelable.CancelTask(ctx, params); err != nil {
+			log.Warnf(w.ctx, "Backend cancellation failed for dispatched task %s: %v", params.TaskID, err)
+			metrics.AddTaskEvent(ctx, "cancel.failed",
+				attribute.String("reason", metrics.TaskFailureReasonCancelCommand),
+				attribute.String("task.id", params.TaskID),
+			)
+		}
+	}()
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
@@ -588,6 +639,20 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	)
 
 	err := w.backend.ExecuteTask(ctx, params)
+	if errors.Is(err, ErrTaskDispatched) {
+		// Fire-and-forget: the backend handed the task to a remote runtime that
+		// owns terminal reporting to warp-server. The worker must not finalize
+		// the task; it only retains the identifiers needed to route a later
+		// cancellation.
+		result = metrics.TaskResultDispatched
+		w.tasksMutex.Lock()
+		w.dispatchedTasks[taskID] = &CancelParams{TaskID: taskID, ExecutionID: assignment.ExecutionID}
+		w.tasksMutex.Unlock()
+		metrics.AddTaskEvent(ctx, "task.dispatched")
+		span.SetStatus(codes.Ok, "task dispatched to remote runtime")
+		log.Infof(ctx, "Task dispatched fire-and-forget; worker will not finalize: taskID=%s", taskID)
+		return
+	}
 	if err != nil {
 		if ctx.Err() == context.Canceled && w.cancellationSource(taskID) == taskCancellationSourceUser {
 			result = metrics.TaskResultCancelled
@@ -793,6 +858,10 @@ func (w *Worker) Shutdown() {
 			task.cancel()
 		}
 	}
+	// Dispatched (fire-and-forget) tasks run on the remote runtime independent
+	// of this worker; drop the in-memory cancellation registry without touching
+	// them.
+	clear(w.dispatchedTasks)
 	w.tasksMutex.Unlock()
 
 	if activeTaskCount > 0 && !preserveActiveTasks {

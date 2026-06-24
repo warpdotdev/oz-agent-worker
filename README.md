@@ -16,6 +16,7 @@ Self-hosted worker for Oz cloud agents.
   - Docker daemon access for the Docker backend
   - Local `oz` CLI access plus a writable workspace root for the Direct backend
   - Kubernetes API access plus cluster credentials for the Kubernetes backend
+  - An operator-provided dispatch command for the Command backend (dispatch to any runtime over any transport)
 
 ## Usage
 
@@ -63,6 +64,40 @@ backend:
     workspace_root: "/var/lib/oz/workspaces"
     oz_path: "/usr/local/bin/oz"
 ```
+
+### Command
+
+The command backend hands task execution to an operator-owned runtime over **any transport**, without recompiling the worker. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.). Execution is **fire-and-forget**: once the dispatch command reports success, the remote `oz` agent — launched by your runtime with the worker-provided arguments — reports task progress and terminal state directly to Warp. The worker does not finalize a dispatched task itself; it only reports a failure if the dispatch command itself fails.
+
+Example config:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+    cancel_command: "/opt/oz/cancel.sh"
+    dispatch_timeout: "60s"
+    environment:
+      - name: MY_RUNTIME_TOKEN
+```
+
+Config keys:
+
+- `dispatch_command` (required): shell command (run via `/bin/sh -c`) invoked once per task to dispatch it.
+- `cancel_command` (optional): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation.
+- `dispatch_timeout` (optional): how long the dispatch command may run before it is considered failed (humantime format, e.g. `60s`). Defaults to `60s`.
+- `environment`: extra environment variables exposed to the dispatch/cancel commands (same `name`/`value` semantics as the other backends; omit `value` to inherit from the host).
+
+The dispatch contract:
+
+- The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
+- The following non-secret variables are also set in the command's environment for convenience: `OZ_TASK_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`.
+- The JSON payload contains: `version`, `task_id`, `execution_id`, `server_root_url`, `worker_id`, `docker_image`, `base_args`, `env`, `sidecars`, and `task`. `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
+- Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
+- The cancel command (when configured) receives `OZ_TASK_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment.
+
+Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
 
 ### Kubernetes
 

@@ -2,9 +2,16 @@ package worker
 
 import (
 	"context"
+	"errors"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
+
+// ErrTaskDispatched is returned by Backend.ExecuteTask to signal a successful
+// fire-and-forget dispatch to a remote runtime. The worker treats the task as
+// accepted-but-not-finalized: it must NOT send a terminal completion message,
+// because the remote runtime/agent owns terminal reporting back to warp-server.
+var ErrTaskDispatched = errors.New("task dispatched to remote runtime")
 
 // TaskParams contains pre-processed task parameters common to all backends.
 // This provides a layer of abstraction between the wire-format TaskAssignmentMessage
@@ -49,4 +56,21 @@ type Backend interface {
 	PreservesTasksOnShutdown() bool
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
+}
+
+// CancelParams carries the minimal, non-secret identifiers needed to attempt
+// cancellation of a task that has already been handed off. It deliberately
+// excludes env/secrets so the worker need not retain secrets for the lifetime
+// of a dispatched task.
+type CancelParams struct {
+	TaskID      string
+	ExecutionID string
+}
+
+// CancelableBackend is implemented by backends that can attempt to cancel a
+// task that has already been handed off (e.g. fire-and-forget dispatch). The
+// worker invokes CancelTask when it receives a cancellation for a task that is
+// no longer executing locally.
+type CancelableBackend interface {
+	CancelTask(ctx context.Context, params *CancelParams) error
 }
