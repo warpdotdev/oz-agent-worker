@@ -354,8 +354,9 @@ func parseEnvFile(path string) (map[string]string, error) {
 }
 
 type harnessConfig struct {
-	configEnvVar string
-	configDir    string
+	configEnvVar      string
+	configDir         string
+	additionalEnvVars []string // Additional fixed environment variables to set for this harness.
 }
 
 // Used for setting configEnvVar to "workspaceDir/configDir"
@@ -363,6 +364,11 @@ var harnessConfigs = map[string]harnessConfig{
 	"claude": {
 		configEnvVar: "CLAUDE_CONFIG_DIR",
 		configDir:    ".claude",
+		// Disable alternate-screen mode so Claude Code output is captured in
+		// the scrollback buffer rather than rendered as a full-screen TUI. Without
+		// this, completed cloud agent sessions appear to contain only a single
+		// CLI line instead of the full conversation transcript.
+		additionalEnvVars: []string{"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1"},
 	},
 	"codex": {
 		configEnvVar: "CODEX_HOME",
@@ -385,5 +391,7 @@ func harnessEnvVars(workspaceDir string, params *TaskParams) []string {
 	if !ok {
 		return nil
 	}
-	return []string{fmt.Sprintf("%s=%s", config.configEnvVar, filepath.Join(workspaceDir, config.configDir))}
+	result := []string{fmt.Sprintf("%s=%s", config.configEnvVar, filepath.Join(workspaceDir, config.configDir))}
+	result = append(result, config.additionalEnvVars...)
+	return result
 }

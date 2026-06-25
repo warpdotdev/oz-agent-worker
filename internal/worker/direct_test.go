@@ -23,7 +23,8 @@ func TestDirectHarnessEnv(t *testing.T) {
 			name:    "claude",
 			harness: stringPtr("claude"),
 			want: map[string]string{
-				"CLAUDE_CONFIG_DIR": filepath.Join(workspaceDir, ".claude"),
+				"CLAUDE_CONFIG_DIR":                    filepath.Join(workspaceDir, ".claude"),
+				"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
 			},
 		},
 		{
