@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // samplePayload mirrors the worker's DispatchPayload JSON for a single task.
@@ -142,5 +144,64 @@ func TestDispatchScriptRequiresURL(t *testing.T) {
 	cmd.Stdin = strings.NewReader(samplePayload)
 	if err := cmd.Run(); err == nil {
 		t.Fatal("expected non-zero exit when OZ_DISPATCH_URL is unset")
+	}
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %q did not appear within timeout", path)
+}
+
+func TestDispatchOzLocalLaunchesBinaryWithBaseArgs(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+
+	// Stub OZ_BIN records its argv and a forwarded env var, then exits.
+	invocation := filepath.Join(dir, "invocation.txt")
+	stub := filepath.Join(dir, "oz-stub.sh")
+	script := "#!/bin/sh\n{ echo \"argv:$*\"; echo \"WITH_LOCAL_SERVER=$WITH_LOCAL_SERVER\"; } > \"" + invocation + "\"\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write stub: %v", err)
+	}
+
+	cmd := exec.Command("python3", "dispatch-oz-local.py")
+	cmd.Env = append(os.Environ(), "OZ_BIN="+stub, "OZ_LOCAL_RUN_LOG_DIR="+dir)
+	cmd.Stdin = strings.NewReader(`{"task_id":"task-1","base_args":["agent","run","--task-id","task-1"],"env":{"WITH_LOCAL_SERVER":"1"}}`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dispatch-oz-local.py failed: %v\n%s", err, out)
+	}
+
+	// The launched (detached) stub writes asynchronously.
+	waitForFile(t, invocation)
+	data, err := os.ReadFile(invocation)
+	if err != nil {
+		t.Fatalf("failed to read stub invocation: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "argv:agent run --task-id task-1") {
+		t.Errorf("stub argv = %q, want it to include the base_args", got)
+	}
+	if !strings.Contains(got, "WITH_LOCAL_SERVER=1") {
+		t.Errorf("stub env = %q, want WITH_LOCAL_SERVER=1 applied from payload env", got)
+	}
+
+	// The full payload must be persisted for inspection.
+	waitForFile(t, filepath.Join(dir, "payload-task-1.json"))
+}
+
+func TestDispatchOzLocalRequiresOzBin(t *testing.T) {
+	requirePython(t)
+	cmd := exec.Command("python3", "dispatch-oz-local.py")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	cmd.Stdin = strings.NewReader(`{"task_id":"t","base_args":["agent","run"]}`)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("expected non-zero exit when OZ_BIN is unset")
 	}
 }
