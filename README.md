@@ -100,6 +100,16 @@ Notes:
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
+- `coding_cli_sidecars` maps a harness config name (e.g. `claude`, `codex`) to a custom Docker image that will be mounted as the coding CLI sidecar for runs using that harness. When set, the worker replaces the server-provided sidecar image (or injects a new entry if the server did not send one) at the standard mount path `/mnt/{harness}-cli-sidecar`. Use this when your cluster uses a custom or internal Claude Code binary wrapper instead of the Warp-provided image. Example:
+
+```yaml
+backend:
+  kubernetes:
+    coding_cli_sidecars:
+      claude: "registry.internal.example.com/my-claude-wrapper:v1"
+```
+
+  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked
 - by default, the Kubernetes backend materializes sidecars with root init containers into `emptyDir` volumes, matching the existing behavior
 - set `use_image_volumes: true` to opt into native image volumes for sidecars; in that mode, sidecar mounts are read-only and Kubernetes/runtime support for the built-in `ImageVolume` Pod volume source is required
 - Kubernetes `1.35+` is the recommended and tested target for `use_image_volumes: true`; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes
