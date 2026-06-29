@@ -50,6 +50,15 @@ docker pull warpdotdev/oz-agent-worker@sha256:<digest>
 
 `latest` is updated to the same image when a release is published, but it is a moving tag intended for quick testing only.
 
+Each release is also mirrored to a public GCP Artifact Registry repo, alongside the `warp-agent` and `*-sidecar` images. Pull from the mirror when you prefer not to depend on Docker Hub (e.g. some self-hosted / enterprise environments):
+
+```bash
+docker pull us-east4-docker.pkg.dev/astral-field-294621/warp-public-images/oz-agent-worker:v2026-06-01-10-09-37
+docker pull us-east4-docker.pkg.dev/astral-field-294621/warp-public-images/oz-agent-worker:latest
+```
+
+The mirror carries the same immutable timestamp tags (and `latest`) as Docker Hub, and the image is byte-for-byte identical (same digest).
+
 ### Direct
 
 The direct backend executes tasks directly on the host instead of inside Docker or Kubernetes. It requires the `oz` CLI to be available on `PATH` (or configured explicitly with `backend.direct.oz_path`) and stores per-task workspaces under `backend.direct.workspace_root` (default: `/var/lib/oz/workspaces`).

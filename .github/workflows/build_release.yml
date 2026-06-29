@@ -120,6 +120,11 @@ jobs:
   docker:
     name: Build and push Docker image
     runs-on: namespace-profile-ubuntu-small
+    permissions:
+      contents: read
+      # Required to mint a GitHub OIDC token for authenticating to GCP via
+      # Workload Identity Federation when mirroring the image to Artifact Registry.
+      id-token: write
     outputs:
       image: "warpdotdev/oz-agent-worker@${{ steps.push.outputs.digest }}"
       tagged_image: ${{ steps.image-tags.outputs.primary }}
@@ -179,3 +184,40 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ inputs.version != '' && inputs.version || (inputs.docker_tag != '' && inputs.docker_tag || github.sha) }}
+
+      # Mirror the published image into the GCP Artifact Registry repo that also
+      # hosts warp-agent and the *-sidecar images, so consumers (e.g. self-hosted
+      # / enterprise) can pull the worker from the GCP mirror, not just Docker Hub.
+      # Only runs for tagged releases, since that's when the image is pushed.
+      - name: Authenticate to GCP
+        if: inputs.docker_tag != ''
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: astral-field-294621
+          workload_identity_provider: projects/643991131484/locations/global/workloadIdentityPools/github-actions/providers/warp-terraform
+          request_reason: Mirror oz-agent-worker image to the warp-public-images Artifact Registry
+
+      - name: Log in to Artifact Registry
+        if: inputs.docker_tag != ''
+        uses: docker/login-action@v4
+        with:
+          registry: us-east4-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth.outputs.auth_token }}
+
+      - name: Mirror image to GCP Artifact Registry
+        if: inputs.docker_tag != ''
+        env:
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          # Same registry/repo used by warp-agent and the *-sidecar images.
+          GCP_IMAGE: us-east4-docker.pkg.dev/astral-field-294621/warp-public-images/oz-agent-worker
+        run: |
+          # Copy the multi-architecture manifest list from Docker Hub to the GCP
+          # mirror without rebuilding, preserving the exact digest.
+          tags=("--tag" "${GCP_IMAGE}:${DOCKER_TAG}")
+          if [ "$PUBLISH_LATEST" = "true" ]; then
+            tags+=("--tag" "${GCP_IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "warpdotdev/oz-agent-worker:${DOCKER_TAG}"
