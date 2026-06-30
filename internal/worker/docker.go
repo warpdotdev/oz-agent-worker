@@ -514,8 +514,14 @@ func sanitizeVolumeName(imageName, digest string) string {
 		repoName = imageName
 	}
 
-	// Sanitize the repository name for use in volume name
-	baseName := strings.ReplaceAll(repoName, "/", "-")
+	// Local-registry image refs can contain ':' and '/', but Docker volume names
+	// only allow [a-zA-Z0-9_.-], so map every other character to '-'.
+	baseName := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-' {
+			return r
+		}
+		return '-'
+	}, repoName)
 
 	// digest format is typically "sha256:abc123..."
 	parts := strings.Split(digest, ":")
