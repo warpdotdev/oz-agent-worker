@@ -31,6 +31,14 @@ type SidecarMount struct {
 	ReadWrite bool   `json:"read_write"` // If false (default), the mount is read-only.
 }
 
+// InstanceShape is the resolved compute size for a task. Containerized backends apply it
+// as CPU/memory limits (Docker) or resource requests/limits (Kubernetes); the direct
+// backend ignores it. Mirrors warp-server's runner instance shape JSON.
+type InstanceShape struct {
+	Vcpus    int `json:"vcpus"`
+	MemoryGb int `json:"memory_gb"`
+}
+
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
 	TaskID string `json:"task_id"`
@@ -49,6 +57,10 @@ type TaskAssignmentMessage struct {
 	// AdditionalOzArgs are server-resolved supplemental arguments for the oz
 	// CLI. The worker forwards these tokens without deriving task semantics.
 	AdditionalOzArgs []string `json:"additional_oz_args,omitempty"`
+	// InstanceShape, when set, is the runner's resolved compute size. Containerized
+	// backends size the task container/pod from it; omitted when the run has no explicit
+	// runner instance shape, in which case the worker keeps its default sizing.
+	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task

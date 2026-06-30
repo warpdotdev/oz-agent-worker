@@ -635,6 +635,38 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsThreadsInstanceShape(t *testing.T) {
+	w := &Worker{
+		ctx: context.Background(),
+		config: Config{
+			ServerRootURL: "https://app.warp.dev",
+			Kubernetes:    &KubernetesBackendConfig{},
+		},
+	}
+
+	t.Run("threads shape when present", func(t *testing.T) {
+		shape := &types.InstanceShape{Vcpus: 4, MemoryGb: 16}
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:        "task-1",
+			Task:          &types.Task{ID: "task-1"},
+			InstanceShape: shape,
+		})
+		if params.InstanceShape != shape {
+			t.Fatalf("InstanceShape = %v, want %v", params.InstanceShape, shape)
+		}
+	})
+
+	t.Run("nil shape when absent", func(t *testing.T) {
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-2",
+			Task:   &types.Task{ID: "task-2"},
+		})
+		if params.InstanceShape != nil {
+			t.Fatalf("InstanceShape = %v, want nil", params.InstanceShape)
+		}
+	})
+}
+
 func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
 	w := &Worker{
 		ctx: context.Background(),

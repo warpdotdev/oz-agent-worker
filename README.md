@@ -107,6 +107,7 @@ Notes:
 - `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
+- when a run's runner specifies an instance shape, the worker sets the `task` container's CPU and memory **requests and limits** from that shape on a per-run basis, overriding any matching `resources` set on the `task` container in `pod_template` (other resource entries are preserved). Runs whose runner has no instance shape keep your `pod_template`/cluster defaults unchanged. The Docker backend applies the same shape as container CPU/memory limits; the Direct backend runs on the host and does not enforce shapes
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
 
 ```yaml

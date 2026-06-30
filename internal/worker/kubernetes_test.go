@@ -554,6 +554,135 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 		t.Fatalf("FROM_CLI = %q, want %q", envMap["FROM_CLI"], "1")
 	}
 }
+func TestApplyInstanceShapeToContainer(t *testing.T) {
+	const giB = int64(1) << 30
+
+	t.Run("nil shape is a no-op", func(t *testing.T) {
+		c := &corev1.Container{
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			},
+		}
+		applyInstanceShapeToContainer(c, nil)
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.String() != "250m" {
+			t.Fatalf("cpu request = %q, want 250m (unchanged)", got.String())
+		}
+		if c.Resources.Limits != nil {
+			t.Fatalf("limits should remain nil, got %v", c.Resources.Limits)
+		}
+	})
+
+	t.Run("full shape sets requests and limits", func(t *testing.T) {
+		c := &corev1.Container{}
+		applyInstanceShapeToContainer(c, &types.InstanceShape{Vcpus: 2, MemoryGb: 8})
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.Value() != 2 {
+			t.Fatalf("cpu request = %d, want 2", got.Value())
+		}
+		if got := c.Resources.Limits[corev1.ResourceCPU]; got.Value() != 2 {
+			t.Fatalf("cpu limit = %d, want 2", got.Value())
+		}
+		if got := c.Resources.Requests[corev1.ResourceMemory]; got.Value() != 8*giB {
+			t.Fatalf("memory request = %d, want %d", got.Value(), 8*giB)
+		}
+		if got := c.Resources.Limits[corev1.ResourceMemory]; got.Value() != 8*giB {
+			t.Fatalf("memory limit = %d, want %d", got.Value(), 8*giB)
+		}
+	})
+
+	t.Run("cpu-only shape leaves memory unset", func(t *testing.T) {
+		c := &corev1.Container{}
+		applyInstanceShapeToContainer(c, &types.InstanceShape{Vcpus: 1})
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.Value() != 1 {
+			t.Fatalf("cpu request = %d, want 1", got.Value())
+		}
+		if _, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			t.Fatal("expected no memory request for cpu-only shape")
+		}
+		if _, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			t.Fatal("expected no memory limit for cpu-only shape")
+		}
+	})
+}
+
+func TestMergeResourceRequirements(t *testing.T) {
+	base := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("500m"),
+		},
+	}
+	override := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+	}
+	merged := mergeResourceRequirements(base, override)
+
+	if got := merged.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4 (override wins)", got.Value())
+	}
+	if got := merged.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4 (override wins)", got.Value())
+	}
+	// Memory request is preserved from base since the override does not set it.
+	if got := merged.Requests[corev1.ResourceMemory]; got.Value() != int64(1)<<30 {
+		t.Fatalf("memory request = %d, want %d (preserved from base)", got.Value(), int64(1)<<30)
+	}
+}
+
+// A runner instance shape must override the matching pod-template task-container
+// resources, while leaving unrelated entries from the template intact.
+func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			PodTemplate: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "task",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("1Gi"),
+							},
+							Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mainContainer := corev1.Container{Name: "task", Image: "ubuntu:22.04"}
+	applyInstanceShapeToContainer(&mainContainer, &types.InstanceShape{Vcpus: 4, MemoryGb: 16})
+
+	podSpec := backend.buildTaskPodSpec(nil, nil, mainContainer)
+
+	var tc *corev1.Container
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == "task" {
+			tc = &podSpec.Containers[i]
+			break
+		}
+	}
+	if tc == nil {
+		t.Fatal("expected task container")
+	}
+	if got := tc.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4 (runner shape overrides template)", got.Value())
+	}
+	if got := tc.Resources.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4 (runner shape overrides template)", got.Value())
+	}
+	if got := tc.Resources.Requests[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory request = %d, want %d", got.Value(), int64(16)<<30)
+	}
+	if got := tc.Resources.Limits[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory limit = %d, want %d (runner shape adds a limit)", got.Value(), int64(16)<<30)
+	}
+}
+
 func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
 	err := validateTaskSidecars([]types.SidecarMount{
 		{
