@@ -52,7 +52,7 @@ Add `InstanceShape *types.InstanceShape` to `TaskParams` and copy `assignment.In
 ### 4. Docker backend
 When `params.InstanceShape != nil`, set `hostConfig.Resources` before `ContainerCreate`, per positive axis (PRODUCT 5, 6, 10):
 - `NanoCPUs = int64(vcpus) * 1_000_000_000`
-- `Memory = int64(memoryGb) << 30` (bytes)
+- `Memory = int64(memoryGb) << 30` (bytes), with `MemorySwap` pinned to the same value so `memory_gb` is a hard ceiling (no extra swap) regardless of host swap configuration, matching the Kubernetes memory limit.
 
 Docker enforces these as ceilings (no request concept). OOM handling already exists (`containerWasOOMKilled`, PRODUCT 7).
 
@@ -61,7 +61,7 @@ When `params.InstanceShape != nil`, set the `task` container's `Resources` reque
 - CPU: `resource.NewQuantity(int64(vcpus), resource.DecimalSI)`
 - Memory: `resource.NewQuantity(int64(memoryGb)<<30, resource.BinarySI)` (Gi)
 
-Apply in `buildTaskPodSpec` so the runner shape overrides `pod_template` task-container resources when present, and leaves them untouched when absent (PRODUCT 9). `k8s.io/apimachinery/pkg/api/resource` is already imported. Setting requests == limits yields Guaranteed QoS and predictable provisioning that mirrors the requested SKU; this is the chosen default (see Risks for the requests-only alternative).
+Apply in `buildTaskPodSpec` so the runner shape overrides `pod_template` task-container resources when present, and leaves them untouched when absent (PRODUCT 9). `k8s.io/apimachinery/pkg/api/resource` is already imported. Setting requests == limits pins the task container to the requested size (predictable provisioning mirroring the SKU); this is the chosen default (see Risks for the requests-only alternative). Only the task container is sized — the `setup`/`copy-sidecar` init containers are not — so the pod is not strictly Guaranteed QoS, but the task container's requests still drive scheduling (node fit) and its limits drive enforcement.
 
 ### 6. Direct backend
 No change beyond accepting the new `TaskParams` field. The shape is ignored (PRODUCT 11).
@@ -81,7 +81,7 @@ No new chart value is required — the shape is dynamic per-run. Update `charts/
 Two-repo change, but tightly coupled by an identical wire contract, so it is sequenced rather than fanned out. Land the additive wire field + server populate (`warp-server`) and the worker field + backend application (`oz-agent-worker`) as two PRs; because the field is optional both can merge in either order without breaking dispatch (PRODUCT 12). Within `oz-agent-worker` the Docker and Kubernetes backend edits touch separate files and could be split across local sub-agents on separate worktree branches (`oz/runner-shape-docker`, `oz/runner-shape-k8s`), but the wire/`TaskParams` change they both depend on is small and shared, so the coordination overhead outweighs the wall-clock savings — implement sequentially in one branch per repo.
 
 ## Risks and mitigations
-- **Kubernetes Guaranteed QoS vs operator policy.** Setting requests == limits can collide with a cluster `LimitRange`/`ResourceQuota` or make pods unschedulable on small nodes. *Mitigation:* the shape only applies when a runner explicitly sets one (opt-in); document the `pod_template` override semantics; if operators need burstable QoS, a follow-up can expose a requests-vs-limits policy. The requests-only alternative was considered and rejected as the default because it does not actually bound memory (no OOM ceiling), diverging from Warp-hosted behavior.
+- **Kubernetes requests == limits vs operator policy.** Setting requests == limits can collide with a cluster `LimitRange`/`ResourceQuota` or make pods unschedulable on small nodes. *Mitigation:* the shape only applies when a runner explicitly sets one (opt-in); document the `pod_template` override semantics; if operators need burstable task pods, a follow-up can expose a requests-vs-limits policy. The requests-only alternative was considered and rejected as the default because it does not actually bound memory (no hard limit), diverging from Warp-hosted behavior.
 - **Docker OOM / CPU throttling surprise.** A too-small `memory_gb` will OOM-kill the task. *Mitigation:* existing OOM classification reports it clearly; self-hosted operators own the shape values.
 - **Rollout ordering.** *Mitigation:* additive `omitempty` pointer field; neither side hard-requires the other (PRODUCT 12), validated by compatibility tests.
 - **Wire drift between the two hand-copied structs.** *Mitigation:* identical JSON tags matching `RunnerInstanceShape`; assert the exact `instance_shape` JSON shape in both repos' tests.

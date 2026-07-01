@@ -1020,6 +1020,82 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 }
 
+// End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the
+// created Job's task container as requests and limits (else-branch, no pod_template).
+func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:        "task-1",
+		DockerImage:   "ubuntu:22.04",
+		BaseArgs:      []string{"run"},
+		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
+	})
+	if err != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task job to be created")
+	}
+
+	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	if got := taskContainer.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4", got.Value())
+	}
+	if got := taskContainer.Resources.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4", got.Value())
+	}
+	if got := taskContainer.Resources.Requests[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory request = %d, want %d", got.Value(), int64(16)<<30)
+	}
+	if got := taskContainer.Resources.Limits[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory limit = %d, want %d", got.Value(), int64(16)<<30)
+	}
+}
+
 func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()

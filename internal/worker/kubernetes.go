@@ -538,8 +538,10 @@ func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, 
 
 // applyInstanceShapeToContainer sets CPU/memory requests and limits on the container from
 // the instance shape. Each axis is applied only when positive, so a partial shape overrides
-// only the resource it specifies. requests == limits gives the task pod Guaranteed QoS for
-// the axes the runner sizes. A nil shape is a no-op, leaving pod-template/cluster defaults.
+// only the resource it specifies. Setting requests == limits pins the task container to the
+// requested size, which drives pod scheduling (node fit) and in-pod enforcement. Only the
+// task container is sized here (the setup/sidecar init containers are not), so the pod is
+// not strictly Guaranteed QoS. A nil shape is a no-op, leaving pod-template/cluster defaults.
 func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceShape) {
 	if shape == nil {
 		return

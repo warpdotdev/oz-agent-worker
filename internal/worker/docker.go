@@ -205,7 +205,10 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 // dockerResourcesForShape maps an instance shape to Docker container resource limits.
 // Each axis is applied only when positive; a nil shape (or non-positive axes) yields no
-// limits, so the container runs unconstrained as it does without a runner shape.
+// limits, so the container runs unconstrained as it does without a runner shape. Memory is
+// a hard cap: MemorySwap is pinned to Memory so the container cannot exceed memory_gb via
+// swap, matching the Kubernetes backend's memory limit and the requested SKU size regardless
+// of host swap configuration.
 func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	var res container.Resources
 	if shape == nil {
@@ -215,7 +218,9 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 		res.NanoCPUs = int64(shape.Vcpus) * 1_000_000_000
 	}
 	if shape.MemoryGb > 0 {
-		res.Memory = int64(shape.MemoryGb) << 30
+		memoryBytes := int64(shape.MemoryGb) << 30
+		res.Memory = memoryBytes
+		res.MemorySwap = memoryBytes
 	}
 	return res
 }
