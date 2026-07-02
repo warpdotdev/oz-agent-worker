@@ -33,10 +33,11 @@ type SidecarMount struct {
 
 // InstanceShape is the resolved compute size for a task. Containerized backends apply it
 // as CPU/memory limits (Docker) or resource requests/limits (Kubernetes); the direct
-// backend ignores it. Mirrors warp-server's runner instance shape JSON.
+// backend ignores it. Mirrors warp-server's runner instance shape JSON; unset axes are
+// omitted on the wire, and backends additionally treat non-positive axes as unset.
 type InstanceShape struct {
-	Vcpus    int `json:"vcpus"`
-	MemoryGb int `json:"memory_gb"`
+	Vcpus    int `json:"vcpus,omitempty"`
+	MemoryGb int `json:"memory_gb,omitempty"`
 }
 
 // TaskAssignmentMessage is sent from server to worker when a task is available
