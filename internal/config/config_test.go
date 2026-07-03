@@ -56,6 +56,37 @@ backend:
 	}
 }
 
+func TestLoadKubernetesCodingCLISidecars(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "k8s-worker"
+backend:
+  kubernetes:
+    namespace: "agents"
+    coding_cli_sidecars:
+      claude: "registry.internal.example.com/my-claude-wrapper:v1"
+      codex: "registry.internal.example.com/my-codex-wrapper:v2"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend to be set")
+	}
+	sidecars := cfg.Backend.Kubernetes.CodingCLISidecars
+	if len(sidecars) != 2 {
+		t.Fatalf("coding_cli_sidecars count = %d, want 2", len(sidecars))
+	}
+	if sidecars["claude"] != "registry.internal.example.com/my-claude-wrapper:v1" {
+		t.Errorf("claude = %q, want %q", sidecars["claude"], "registry.internal.example.com/my-claude-wrapper:v1")
+	}
+	if sidecars["codex"] != "registry.internal.example.com/my-codex-wrapper:v2" {
+		t.Errorf("codex = %q, want %q", sidecars["codex"], "registry.internal.example.com/my-codex-wrapper:v2")
+	}
+}
+
 func TestLoadMinimalConfig(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "minimal"
