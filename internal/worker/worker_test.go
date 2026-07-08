@@ -573,6 +573,137 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 	})
 }
 
+func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
+	newWorker := func(codingCLISidecars map[string]string) *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				Kubernetes: &KubernetesBackendConfig{
+					CodingCLISidecars: codingCLISidecars,
+				},
+			},
+		}
+	}
+
+	strPtr := func(s string) *string { return &s }
+
+	// harnessTask builds a task whose agent config snapshot advertises the given
+	// harness type. A nil harnessType produces a snapshot with a harness whose
+	// Type pointer is nil.
+	harnessTask := func(harnessType *string) *types.Task {
+		return &types.Task{
+			ID: "task-1",
+			AgentConfigSnapshot: &types.AmbientAgentConfig{
+				Harness: &types.Harness{Type: harnessType},
+			},
+		}
+	}
+
+	findSidecar := func(sidecars []types.SidecarMount, mountPath string) (types.SidecarMount, bool) {
+		for _, s := range sidecars {
+			if s.MountPath == mountPath {
+				return s, true
+			}
+		}
+		return types.SidecarMount{}, false
+	}
+
+	t.Run("overrides server-provided coding CLI sidecar at mount path", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID:       "task-1",
+			Task:         harnessTask(strPtr("claude")),
+			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
+			AdditionalSidecars: []types.SidecarMount{
+				{Image: "docker.io/warpdotdev/claude-cli:latest", MountPath: "/mnt/claude-cli-sidecar", ReadWrite: true},
+			},
+		})
+
+		got, ok := findSidecar(params.Sidecars, "/mnt/claude-cli-sidecar")
+		if !ok {
+			t.Fatalf("expected coding CLI sidecar at /mnt/claude-cli-sidecar, got %+v", params.Sidecars)
+		}
+		if got.Image != "registry.internal/my-claude:v1" {
+			t.Errorf("image = %q, want %q", got.Image, "registry.internal/my-claude:v1")
+		}
+		// Overriding only replaces the image; other mount options are preserved.
+		if !got.ReadWrite {
+			t.Error("expected ReadWrite to be preserved on overridden sidecar")
+		}
+		// No new sidecar should be injected: the /agent + claude sidecars remain.
+		if len(params.Sidecars) != 2 {
+			t.Fatalf("sidecar count = %d, want 2: %+v", len(params.Sidecars), params.Sidecars)
+		}
+		// The warp-agent sidecar at /agent must be untouched.
+		if agent, ok := findSidecar(params.Sidecars, "/agent"); !ok || agent.Image != "docker.io/warpdotdev/warp-agent:latest" {
+			t.Errorf("agent sidecar = %+v, want image docker.io/warpdotdev/warp-agent:latest", agent)
+		}
+	})
+
+	t.Run("injects coding CLI sidecar when server did not provide one", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task:   harnessTask(strPtr("claude")),
+		})
+
+		got, ok := findSidecar(params.Sidecars, "/mnt/claude-cli-sidecar")
+		if !ok {
+			t.Fatalf("expected injected coding CLI sidecar at /mnt/claude-cli-sidecar, got %+v", params.Sidecars)
+		}
+		if got.Image != "registry.internal/my-claude:v1" {
+			t.Errorf("image = %q, want %q", got.Image, "registry.internal/my-claude:v1")
+		}
+	})
+
+	t.Run("trims whitespace from harness type", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task:   harnessTask(strPtr("  claude  ")),
+		})
+		if _, ok := findSidecar(params.Sidecars, "/mnt/claude-cli-sidecar"); !ok {
+			t.Fatalf("expected coding CLI sidecar at /mnt/claude-cli-sidecar, got %+v", params.Sidecars)
+		}
+	})
+
+	t.Run("no override when harness type not configured", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task:   harnessTask(strPtr("codex")),
+		})
+		if _, ok := findSidecar(params.Sidecars, "/mnt/codex-cli-sidecar"); ok {
+			t.Error("did not expect coding CLI sidecar for unconfigured harness")
+		}
+		if _, ok := findSidecar(params.Sidecars, "/mnt/claude-cli-sidecar"); ok {
+			t.Error("did not expect claude coding CLI sidecar for codex harness")
+		}
+	})
+
+	t.Run("no override when configured image is empty", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": ""})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task:   harnessTask(strPtr("claude")),
+		})
+		if _, ok := findSidecar(params.Sidecars, "/mnt/claude-cli-sidecar"); ok {
+			t.Error("did not expect coding CLI sidecar when configured image is empty")
+		}
+	})
+
+	t.Run("no override when task has no harness snapshot", func(t *testing.T) {
+		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
+		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+			TaskID: "task-1",
+			Task:   &types.Task{ID: "task-1"},
+		})
+		if len(params.Sidecars) != 0 {
+			t.Errorf("expected no sidecars when task has no harness, got %d: %+v", len(params.Sidecars), params.Sidecars)
+		}
+	})
+}
+
 func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 	newWorker := func() *Worker {
 		return &Worker{

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -493,6 +494,37 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		})
 	}
 	sidecars = append(sidecars, assignment.AdditionalSidecars...)
+
+	// Apply worker-configured coding CLI sidecar overrides.
+	// For each harness entry in the worker's coding_cli_sidecars config, replace the
+	// server-provided sidecar image at /mnt/{harness}-cli-sidecar or inject a new entry
+	// when the server did not send one (e.g. because no Warp-side image is configured).
+	if w.config.Kubernetes != nil && len(w.config.Kubernetes.CodingCLISidecars) > 0 {
+		if task != nil && task.AgentConfigSnapshot != nil &&
+			task.AgentConfigSnapshot.Harness != nil &&
+			task.AgentConfigSnapshot.Harness.Type != nil {
+			harnessType := strings.TrimSpace(*task.AgentConfigSnapshot.Harness.Type)
+			if customImage, ok := w.config.Kubernetes.CodingCLISidecars[harnessType]; ok && customImage != "" {
+				mountPath := fmt.Sprintf("/mnt/%s-cli-sidecar", harnessType)
+				overridden := false
+				for i, s := range sidecars {
+					if s.MountPath == mountPath {
+						log.Infof(w.ctx, "Overriding server coding CLI sidecar %s with configured image %s for harness %s", s.Image, customImage, harnessType)
+						sidecars[i].Image = customImage
+						overridden = true
+						break
+					}
+				}
+				if !overridden {
+					log.Infof(w.ctx, "Injecting configured coding CLI sidecar %s for harness %s at %s", customImage, harnessType, mountPath)
+					sidecars = append(sidecars, types.SidecarMount{
+						Image:     customImage,
+						MountPath: mountPath,
+					})
+				}
+			}
+		}
+	}
 
 	return &TaskParams{
 		TaskID:        assignment.TaskID,

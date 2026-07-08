@@ -196,3 +196,37 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 		t.Fatalf("UnschedulableTimeout = %v, want 0", wc.Kubernetes.UnschedulableTimeout)
 	}
 }
+
+func TestMergeConfigKubernetesCodingCLISidecars(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "worker-123",
+		Backend: config.BackendConfig{
+			Kubernetes: &config.KubernetesConfig{
+				CodingCLISidecars: map[string]string{
+					"claude": "registry.internal/my-claude:v1",
+				},
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend config")
+	}
+	if got := wc.Kubernetes.CodingCLISidecars["claude"]; got != "registry.internal/my-claude:v1" {
+		t.Errorf("CodingCLISidecars[claude] = %q, want %q", got, "registry.internal/my-claude:v1")
+	}
+
+	// mergeConfig must copy the map rather than alias the file config's map, so a
+	// later mutation of the file config does not leak into the merged worker config.
+	fileConfig.Backend.Kubernetes.CodingCLISidecars["claude"] = "mutated"
+	if got := wc.Kubernetes.CodingCLISidecars["claude"]; got != "registry.internal/my-claude:v1" {
+		t.Errorf("expected merged config to be insulated from file config mutation, got %q", got)
+	}
+}

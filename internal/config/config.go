@@ -69,6 +69,14 @@ type KubernetesConfig struct {
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
 	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
+	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
+	// Docker image. When set, the worker overrides the server-provided sidecar image for
+	// that harness (or injects a new sidecar entry if the server did not send one),
+	// mounting it at /mnt/{harness}-cli-sidecar. Use this to bring your own Claude Code
+	// wrapper or custom harness binary instead of the Warp-provided sidecar image.
+	// The custom image must place the harness binary in the path where the Warp agent
+	// entrypoint expects it (e.g. /usr/local/bin for most sidecar layouts).
+	CodingCLISidecars map[string]string `yaml:"coding_cli_sidecars"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
 	// required fields at runtime. Declarative task Job configuration such as
 	// serviceAccountName, imagePullSecrets, node selectors, tolerations,

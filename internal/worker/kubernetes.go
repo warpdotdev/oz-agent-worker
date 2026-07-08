@@ -69,6 +69,10 @@ type KubernetesBackendConfig struct {
 	TTLSecondsAfterFinish *int32
 	WorkspaceSizeLimit    *resource.Quantity
 	UnschedulableTimeout  *time.Duration
+	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
+	// Docker image for the coding CLI sidecar. When non-empty for a task's harness,
+	// the worker overrides or injects the sidecar at /mnt/{harness}-cli-sidecar.
+	CodingCLISidecars map[string]string
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
 	// task container env in file or Helm config should be set in PodTemplate.
 	TaskEnv map[string]string
