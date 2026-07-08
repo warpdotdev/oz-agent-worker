@@ -3,6 +3,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "oz-agent-worker.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "oz-agent-worker.labels" . | nindent 4 }}
 subjects:

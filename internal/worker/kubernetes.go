@@ -669,6 +669,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
+	preflightRes := preflightResourceRequirements()
 	if b.config.UseImageVolumes {
 		podSpec.InitContainers = nil
 		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
@@ -678,6 +679,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				Image:           b.config.PreflightImage,
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "test -d " + startupPreflightImageMountPath},
+				Resources:       preflightRes,
 				VolumeMounts: []corev1.VolumeMount{
 					{
 						Name:      startupPreflightImageVolumeName,
@@ -695,6 +697,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "true"},
 				SecurityContext: rootSecurityContext(),
+				Resources:       preflightRes,
 			},
 		}
 		podSpec.Containers = []corev1.Container{
@@ -703,6 +706,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				Image:           b.config.PreflightImage,
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "true"},
+				Resources:       preflightRes,
 			},
 		}
 	}
@@ -1169,6 +1173,24 @@ func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return result
+}
+
+// preflightResourceRequirements returns fixed, minimal cpu/memory requests and
+// limits for the startup preflight Job containers. The preflight runs once at
+// startup and does essentially no work (busybox true / test -d), so these
+// values are intentionally tiny. They satisfy admission policies that require
+// all containers to declare resource requests and limits.
+func preflightResourceRequirements() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("10m"),
+			corev1.ResourceMemory: resource.MustParse("16Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+	}
 }
 
 func rootSecurityContext() *corev1.SecurityContext {
