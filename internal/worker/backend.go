@@ -33,6 +33,11 @@ type TaskParams struct {
 	// by any additional sidecars from the assignment. Backends that don't use sidecars
 	// can ignore this.
 	Sidecars []types.SidecarMount
+
+	// InstanceShape, when non-nil, is the resolved compute size for this task.
+	// Containerized backends apply it as CPU/memory limits (Docker) or resource
+	// requests/limits (Kubernetes). Backends that cannot enforce a shape (direct) ignore it.
+	InstanceShape *types.InstanceShape
 }
 
 // Backend defines the interface for task execution backends.

@@ -92,6 +92,9 @@ kubernetesBackend:
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
+  # Note: when a run's runner specifies an instance shape, the worker sets the task
+  # container's CPU/memory requests and limits from that shape per run, overriding any
+  # matching resources set on the "task" container here (other entries are preserved).
   podTemplate: {}
 
 # Metrics export uses the OpenTelemetry autoexport package, so the operator

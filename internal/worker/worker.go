@@ -495,13 +495,14 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	sidecars = append(sidecars, assignment.AdditionalSidecars...)
 
 	return &TaskParams{
-		TaskID:      assignment.TaskID,
-		ExecutionID: assignment.ExecutionID,
-		Task:        task,
-		EnvVars:     envVars,
-		BaseArgs:    baseArgs,
-		DockerImage: dockerImage,
-		Sidecars:    sidecars,
+		TaskID:        assignment.TaskID,
+		ExecutionID:   assignment.ExecutionID,
+		Task:          task,
+		EnvVars:       envVars,
+		BaseArgs:      baseArgs,
+		DockerImage:   dockerImage,
+		Sidecars:      sidecars,
+		InstanceShape: assignment.InstanceShape,
 	}
 }
 

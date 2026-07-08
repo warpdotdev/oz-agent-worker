@@ -137,7 +137,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	binds = append(binds, b.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
-		Binds: binds,
+		Binds:     binds,
+		Resources: dockerResourcesForShape(params.InstanceShape),
 	}
 
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -200,6 +201,28 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
 	return nil
+}
+
+// dockerResourcesForShape maps an instance shape to Docker container resource limits.
+// Each axis is applied only when positive; a nil shape (or non-positive axes) yields no
+// limits, so the container runs unconstrained as it does without a runner shape. Memory is
+// a hard cap: MemorySwap is pinned to Memory so the container cannot exceed memory_gb via
+// swap, matching the Kubernetes backend's memory limit and the requested SKU size regardless
+// of host swap configuration.
+func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
+	var res container.Resources
+	if shape == nil {
+		return res
+	}
+	if shape.Vcpus > 0 {
+		res.NanoCPUs = int64(shape.Vcpus) * 1_000_000_000
+	}
+	if shape.MemoryGb > 0 {
+		memoryBytes := int64(shape.MemoryGb) << 30
+		res.Memory = memoryBytes
+		res.MemorySwap = memoryBytes
+	}
+	return res
 }
 
 // Shutdown closes the Docker client.

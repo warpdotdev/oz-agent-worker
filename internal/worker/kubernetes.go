@@ -257,6 +257,11 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}
 
+	// Size the task container from the runner's instance shape when one is set. Self-hosted
+	// compute is operator-owned, so this is applied as-is (the server does the entitlement
+	// capping). A nil shape leaves pod-template/cluster defaults untouched.
+	applyInstanceShapeToContainer(&mainContainer, params.InstanceShape)
+
 	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
 
 	backoffLimit := int32(0)
@@ -521,11 +526,60 @@ func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, 
 		if mainContainer.Lifecycle != nil {
 			tc.Lifecycle = mainContainer.Lifecycle
 		}
+		// Runner instance shape (carried on mainContainer.Resources) overrides the matching
+		// pod-template task-container resources per axis, preserving unrelated entries.
+		tc.Resources = mergeResourceRequirements(tc.Resources, mainContainer.Resources)
 	} else {
 		podSpec.Containers = append(podSpec.Containers, mainContainer)
 	}
 
 	return podSpec
+}
+
+// applyInstanceShapeToContainer sets CPU/memory requests and limits on the container from
+// the instance shape. Each axis is applied only when positive, so a partial shape overrides
+// only the resource it specifies. Setting requests == limits pins the task container to the
+// requested size, which drives pod scheduling (node fit) and in-pod enforcement. Only the
+// task container is sized here (the setup/sidecar init containers are not), so the pod is
+// not strictly Guaranteed QoS. A nil shape is a no-op, leaving pod-template/cluster defaults.
+func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceShape) {
+	if shape == nil {
+		return
+	}
+	setResource := func(name corev1.ResourceName, qty resource.Quantity) {
+		if c.Resources.Requests == nil {
+			c.Resources.Requests = corev1.ResourceList{}
+		}
+		if c.Resources.Limits == nil {
+			c.Resources.Limits = corev1.ResourceList{}
+		}
+		c.Resources.Requests[name] = qty
+		c.Resources.Limits[name] = qty
+	}
+	if shape.Vcpus > 0 {
+		setResource(corev1.ResourceCPU, *resource.NewQuantity(int64(shape.Vcpus), resource.DecimalSI))
+	}
+	if shape.MemoryGb > 0 {
+		setResource(corev1.ResourceMemory, *resource.NewQuantity(int64(shape.MemoryGb)<<30, resource.BinarySI))
+	}
+}
+
+// mergeResourceRequirements overlays override's requests/limits onto base per resource
+// name, preserving base entries for resources the override does not set.
+func mergeResourceRequirements(base, override corev1.ResourceRequirements) corev1.ResourceRequirements {
+	for name, qty := range override.Requests {
+		if base.Requests == nil {
+			base.Requests = corev1.ResourceList{}
+		}
+		base.Requests[name] = qty
+	}
+	for name, qty := range override.Limits {
+		if base.Limits == nil {
+			base.Limits = corev1.ResourceList{}
+		}
+		base.Limits[name] = qty
+	}
+	return base
 }
 
 func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
