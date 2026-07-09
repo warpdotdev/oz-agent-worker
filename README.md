@@ -367,6 +367,16 @@ shows up as a distinct series.
 - `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
   runtime metadata, useful for joining other series by labels.
 
+### Grafana dashboard
+
+A ready-to-import Grafana dashboard and Prometheus alerting rules are available in the [`grafana/`](grafana/) directory:
+
+- [`grafana/oz-agent-worker-overview.json`](grafana/oz-agent-worker-overview.json) — importable Grafana 10+ dashboard covering all `oz_worker_*` metrics
+- [`grafana/alerts.yaml`](grafana/alerts.yaml) — Prometheus alerting rules for connectivity, saturation, and task failures
+- [`grafana/README.md`](grafana/README.md) — import instructions for Grafana UI, API, and Prometheus Operator
+
+Quick import via Grafana UI: **Dashboards → Import → Upload JSON file** → select `grafana/oz-agent-worker-overview.json` → choose your Prometheus datasource.
+
 ### Sample dashboards / alerts
 
 Direct mappings for the questions enterprise operators most commonly ask:
