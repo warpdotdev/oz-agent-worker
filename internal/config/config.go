@@ -83,10 +83,7 @@ type KubernetesConfig struct {
 	// resources, and env must be configured here.
 	PodTemplate *RawYAMLNode `yaml:"pod_template"`
 	// PreflightResources holds optional cpu/memory requests and limits for the
-	// startup preflight Job containers. When unset, the worker uses small
-	// built-in defaults (10m CPU / 16Mi memory requests; 100m CPU / 64Mi memory
-	// limits) that satisfy admission policies requiring all containers to declare
-	// resource constraints.
+	// startup preflight Job containers.
 	PreflightResources *RawYAMLNode `yaml:"preflight_resources"`
 }
 
