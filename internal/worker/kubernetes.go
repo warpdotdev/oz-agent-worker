@@ -1182,11 +1182,7 @@ func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
 // preflightResourceRequirements returns the cpu/memory requests and limits for
 // the startup preflight Job containers. When the backend config supplies
 // PreflightResources, those values are used. Otherwise the built-in defaults
-// are returned (10m CPU / 16Mi memory requests; 100m CPU / 64Mi memory
-// limits). The preflight runs once at startup and does essentially no work
-// (busybox true / test -d), so these defaults are intentionally tiny. They
-// satisfy admission policies that require all containers to declare resource
-// requests and limits.
+// are returned.
 func (b *KubernetesBackend) preflightResourceRequirements() corev1.ResourceRequirements {
 	if b.config.PreflightResources != nil {
 		return *b.config.PreflightResources
