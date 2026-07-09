@@ -942,17 +942,40 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
 				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, b.podEventFailureError(pod, "failed to mount a volume", event))
 			}
+			if event.Reason == "Preempting" {
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodPreempted, b.podEventFailureError(pod, "was preempted by the Kubernetes scheduler", event))
+			}
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
 		reason := metrics.TaskFailureReasonJobFailed
-		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
+		podDetail := strings.ToLower(pod.Status.Reason + " " + pod.Status.Message)
+		switch {
+		case isPreemptedPod(pod):
+			reason = metrics.TaskFailureReasonPodPreempted
+		case strings.Contains(podDetail, "deadline"):
 			reason = metrics.TaskFailureReasonActiveDeadline
 		}
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.podFailureError(pod))
 	}
 
 	return nil
+}
+
+// isPreemptedPod returns true when a pod was preempted (evicted by the
+// scheduler to make room for higher-priority workloads). Kubernetes sets
+// Pod.Status.Reason to "Evicted" for all eviction causes, but preemption
+// events use reason "Preempting" and the eviction message typically contains
+// the word "preempt". We match both signals so detection works across
+// different Kubernetes versions and admission plugins.
+func isPreemptedPod(pod *corev1.Pod) bool {
+	if pod.Status.Reason == "Evicted" {
+		msg := strings.ToLower(pod.Status.Message)
+		if strings.Contains(msg, "preempt") {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *KubernetesBackend) collectPodLogs(ctx context.Context, pods []corev1.Pod) string {

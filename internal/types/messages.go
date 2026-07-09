@@ -82,6 +82,10 @@ type TaskFailedMessage struct {
 	TaskID    string     `json:"task_id"`
 	Message   string     `json:"message"`
 	TaskState *TaskState `json:"task_state,omitempty"`
+	// FailureReason is the structured, machine-readable reason for the failure
+	// (e.g. "container_oom", "pod_preempted"). Used by the server for observability
+	// and timeline display without needing to parse the human-readable Message.
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task

@@ -44,14 +44,22 @@ func taskFailureLabels(err error) (phase, reason string) {
 }
 
 // userFacingTaskError returns a user-friendly error message for a task execution
-// failure. Well-known infrastructure errors (context cancellation, deadline exceeded)
-// are translated into clear, actionable messages instead of exposing raw Go error strings.
+// failure. Well-known infrastructure errors (context cancellation, deadline exceeded,
+// OOM, preemption) are translated into clear, actionable messages instead of exposing
+// raw Go error strings.
 func userFacingTaskError(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again."
 	case errors.Is(err, context.DeadlineExceeded):
 		return "The task exceeded its maximum allowed execution time and was terminated. Consider breaking the task into smaller steps or increasing the timeout."
+	}
+	_, reason := taskFailureLabels(err)
+	switch reason {
+	case "container_oom":
+		return "The task container was terminated because it ran out of memory (OOM killed). Consider increasing the runner memory limit or reducing the task's memory usage."
+	case "pod_preempted":
+		return "The task pod was preempted by the Kubernetes scheduler (evicted to make room for higher-priority workloads). The run was not checkpointed — please retry. Consider using higher-priority pods or nodes with sufficient capacity."
 	default:
 		return fmt.Sprintf("Failed to execute task: %v", err)
 	}
