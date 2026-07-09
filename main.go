@@ -319,10 +319,17 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
+		// Resolve network_mode: only from config file (no CLI flag).
+		var networkMode string
+		if fileConfig != nil && fileConfig.Backend.Docker != nil {
+			networkMode = fileConfig.Backend.Docker.NetworkMode
+		}
+
 		wc.Docker = &worker.DockerBackendConfig{
-			NoCleanup: noCleanup,
-			Volumes:   volumes,
-			Env:       mergedEnv,
+			NoCleanup:   noCleanup,
+			Volumes:     volumes,
+			Env:         mergedEnv,
+			NetworkMode: networkMode,
 		}
 	}
 
