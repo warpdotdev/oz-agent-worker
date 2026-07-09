@@ -79,6 +79,10 @@ type KubernetesBackendConfig struct {
 	// PodTemplate, when non-nil, is the declarative PodSpec template for task
 	// Jobs. Worker-required fields are overlaid at execution time.
 	PodTemplate *corev1.PodSpec
+	// PreflightResources, when non-nil, overrides the default cpu/memory
+	// requests and limits applied to startup preflight Job containers.
+	// Defaults: requests 10m CPU / 16Mi memory; limits 100m CPU / 64Mi memory.
+	PreflightResources *corev1.ResourceRequirements
 }
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
@@ -669,7 +673,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
-	preflightRes := preflightResourceRequirements()
+	preflightRes := b.preflightResourceRequirements()
 	if b.config.UseImageVolumes {
 		podSpec.InitContainers = nil
 		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
@@ -1175,12 +1179,18 @@ func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
 	return result
 }
 
-// preflightResourceRequirements returns fixed, minimal cpu/memory requests and
-// limits for the startup preflight Job containers. The preflight runs once at
-// startup and does essentially no work (busybox true / test -d), so these
-// values are intentionally tiny. They satisfy admission policies that require
-// all containers to declare resource requests and limits.
-func preflightResourceRequirements() corev1.ResourceRequirements {
+// preflightResourceRequirements returns the cpu/memory requests and limits for
+// the startup preflight Job containers. When the backend config supplies
+// PreflightResources, those values are used. Otherwise the built-in defaults
+// are returned (10m CPU / 16Mi memory requests; 100m CPU / 64Mi memory
+// limits). The preflight runs once at startup and does essentially no work
+// (busybox true / test -d), so these defaults are intentionally tiny. They
+// satisfy admission policies that require all containers to declare resource
+// requests and limits.
+func (b *KubernetesBackend) preflightResourceRequirements() corev1.ResourceRequirements {
+	if b.config.PreflightResources != nil {
+		return *b.config.PreflightResources
+	}
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("10m"),

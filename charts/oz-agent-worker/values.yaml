@@ -96,6 +96,19 @@ kubernetesBackend:
   # container's CPU/memory requests and limits from that shape per run, overriding any
   # matching resources set on the "task" container here (other entries are preserved).
   podTemplate: {}
+  # Optional: cpu/memory requests and limits applied to the startup preflight
+  # Job containers. When omitted the worker uses built-in defaults (10m CPU /
+  # 16Mi memory requests; 100m CPU / 64Mi memory limits) that satisfy admission
+  # policies requiring all containers to declare resource constraints.
+  # Example:
+  #   preflightResources:
+  #     requests:
+  #       cpu: 10m
+  #       memory: 16Mi
+  #     limits:
+  #       cpu: 100m
+  #       memory: 64Mi
+  preflightResources: {}
 
 # Metrics export uses the OpenTelemetry autoexport package, so the operator
 # selects the exporter via standard OpenTelemetry environment variables. When
