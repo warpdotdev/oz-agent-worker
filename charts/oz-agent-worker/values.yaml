@@ -97,9 +97,7 @@ kubernetesBackend:
   # matching resources set on the "task" container here (other entries are preserved).
   podTemplate: {}
   # Optional: cpu/memory requests and limits applied to the startup preflight
-  # Job containers. When omitted the worker uses built-in defaults (10m CPU /
-  # 16Mi memory requests; 100m CPU / 64Mi memory limits) that satisfy admission
-  # policies requiring all containers to declare resource constraints.
+  # Job containers. When omitted the worker applies default resource constraints.
   # Example:
   #   preflightResources:
   #     requests:
