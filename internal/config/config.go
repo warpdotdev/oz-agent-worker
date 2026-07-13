@@ -82,6 +82,9 @@ type KubernetesConfig struct {
 	// serviceAccountName, imagePullSecrets, node selectors, tolerations,
 	// resources, and env must be configured here.
 	PodTemplate *RawYAMLNode `yaml:"pod_template"`
+	// PreflightResources holds optional cpu/memory requests and limits for the
+	// startup preflight Job containers.
+	PreflightResources *RawYAMLNode `yaml:"preflight_resources"`
 }
 
 // RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation

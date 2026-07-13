@@ -57,3 +57,7 @@ data:
         pod_template:
 {{ toYaml .Values.kubernetesBackend.podTemplate | indent 10 }}
         {{- end }}
+        {{- if .Values.kubernetesBackend.preflightResources }}
+        preflight_resources:
+{{ toYaml .Values.kubernetesBackend.preflightResources | indent 10 }}
+        {{- end }}

@@ -201,6 +201,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			workspaceSizeLimit    *resource.Quantity
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
+			preflightResources    *corev1.ResourceRequirements
 		)
 
 		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
@@ -244,6 +245,17 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 				}
 				podTemplate = &ps
 			}
+			if kc.PreflightResources != nil {
+				yamlBytes, err := yaml.Marshal(kc.PreflightResources.Node)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("failed to marshal backend.kubernetes.preflight_resources: %w", err)
+				}
+				var rr corev1.ResourceRequirements
+				if err := sigsk8syaml.Unmarshal(yamlBytes, &rr); err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.preflight_resources: %w", err)
+				}
+				preflightResources = &rr
+			}
 		}
 
 		wc.Kubernetes = &worker.KubernetesBackendConfig{
@@ -267,6 +279,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			UnschedulableTimeout:  unschedulableTimeout,
 			TaskEnv:               copyStringMap(cliEnv),
 			PodTemplate:           podTemplate,
+			PreflightResources:    preflightResources,
 		}
 	case "direct":
 		// Merge env: config file first, then CLI overlay.
