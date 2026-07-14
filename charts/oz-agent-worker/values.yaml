@@ -24,8 +24,8 @@ warp:
     name: oz-agent-worker
     key: WARP_API_KEY
     value: ""
-  webSocketURL: wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws
-  serverRootURL: https://staging.warp.dev
+  webSocketURL: wss://oz.warp.dev/api/v1/selfhosted/worker/ws
+  serverRootURL: https://app.warp.dev
 
 worker:
   workerId: ""
