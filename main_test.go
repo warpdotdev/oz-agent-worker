@@ -172,6 +172,84 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	}
 }
 
+func TestValidateServerURLs(t *testing.T) {
+	tests := []struct {
+		name          string
+		webSocketURL  string
+		serverRootURL string
+		wantErr       bool
+	}{
+		{
+			name:          "remote ws with loopback root is rejected",
+			webSocketURL:  "wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws",
+			serverRootURL: "http://localhost:8080",
+			wantErr:       true,
+		},
+		{
+			name:          "remote ws with loopback IP root is rejected",
+			webSocketURL:  "wss://oz.warp.dev/api/v1/selfhosted/worker/ws",
+			serverRootURL: "http://127.0.0.1:8080",
+			wantErr:       true,
+		},
+		{
+			name:          "remote ws with host.docker.internal root is rejected",
+			webSocketURL:  "wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws",
+			serverRootURL: "http://host.docker.internal:8080",
+			wantErr:       true,
+		},
+		{
+			name:          "remote ws with remote root is allowed",
+			webSocketURL:  "wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws",
+			serverRootURL: "https://staging.warp.dev",
+			wantErr:       false,
+		},
+		{
+			name:          "all-local setup is allowed",
+			webSocketURL:  "ws://localhost:8082/api/v1/selfhosted/worker/ws",
+			serverRootURL: "http://localhost:8080",
+			wantErr:       false,
+		},
+		{
+			name:          "empty values skip validation",
+			webSocketURL:  "",
+			serverRootURL: "",
+			wantErr:       false,
+		},
+		{
+			name:          "unparseable server root url is rejected",
+			webSocketURL:  "wss://oz.warp.dev/api/v1/selfhosted/worker/ws",
+			serverRootURL: "://not-a-url",
+			wantErr:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateServerURLs(tc.webSocketURL, tc.serverRootURL)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateServerURLs(%q, %q) = nil, want error", tc.webSocketURL, tc.serverRootURL)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateServerURLs(%q, %q) = %v, want nil", tc.webSocketURL, tc.serverRootURL, err)
+			}
+		})
+	}
+}
+
+func TestMergeConfigRejectsLoopbackServerRootWithRemoteWebSocket(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	CLI.Backend = "kubernetes"
+	CLI.WorkerID = "cli-worker"
+	CLI.WebSocketURL = "wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws"
+	CLI.ServerRootURL = "http://localhost:8080"
+
+	if _, err := mergeConfig(nil); err == nil {
+		t.Fatal("expected mergeConfig to reject a loopback server-root-url with a remote web-socket-url")
+	}
+}
+
 func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
