@@ -138,7 +138,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	executionID := taskExecutionID(params)
-	jobName := sanitizeKubernetesJobName(executionID)
+	jobName := kubernetesTaskJobName(params.TaskID, executionID)
 	jobLabels := b.baseLabels(params.TaskID, executionID)
 	jobAnnotations := copyStringMap(b.config.ExtraAnnotations)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
@@ -1047,23 +1047,50 @@ func copyStringMap(values map[string]string) map[string]string {
 	return result
 }
 
-func sanitizeKubernetesJobName(taskID string) string {
-	suffix := sanitizeKubernetesNameFragment(taskID)
-	if suffix == "" {
-		suffix = "task"
+// taskJobExecIDSuffixLen is how many trailing characters of the execution ID are
+// appended after the full run ID in a task Job name. It disambiguates re-executions
+// (follow-up/handoff) of the same run while keeping the Job name within Kubernetes'
+// 63-character limit for the job-name label the controller stamps on Pods.
+const taskJobExecIDSuffixLen = 8
+
+// kubernetesTaskJobName builds the task Job name as oz-task-<run>-exec-<exec-suffix>.
+// The Job controller appends a random suffix when it creates the task Pod, so the Pod
+// name becomes oz-task-<run>-exec-<exec-suffix>-<random>. The full run ID is embedded so
+// Jobs and Pods stay greppable by run, while a short execution-ID suffix keeps the name
+// unique across re-executions of the same run. The run fragment is truncated only as a
+// defensive fallback so the name stays within the 63-character limit; a standard
+// 36-character UUID run ID always fits without truncation.
+func kubernetesTaskJobName(runID, executionID string) string {
+	execFragment := lastKubernetesIDFragment(executionID, taskJobExecIDSuffixLen)
+	if execFragment == "" {
+		execFragment = "exec"
 	}
 
-	hash := kubernetesLabelHash(taskID)
-	maxSuffixLength := 63 - len("oz-task--") - len(hash)
-	if len(suffix) > maxSuffixLength {
-		suffix = suffix[:maxSuffixLength]
-		suffix = strings.Trim(suffix, "-")
+	const prefix, sep = "oz-task-", "-exec-"
+	maxRunLen := 63 - len(prefix) - len(sep) - len(execFragment)
+	if maxRunLen < 0 {
+		maxRunLen = 0
 	}
-	if suffix == "" {
-		suffix = "task"
+	runFragment := sanitizeKubernetesNameFragment(runID)
+	if len(runFragment) > maxRunLen {
+		runFragment = strings.Trim(runFragment[:maxRunLen], "-")
+	}
+	if runFragment == "" {
+		runFragment = "run"
 	}
 
-	return fmt.Sprintf("oz-task-%s-%s", suffix, hash)
+	return prefix + runFragment + sep + execFragment
+}
+
+// lastKubernetesIDFragment returns a DNS-label-safe fragment built from the last n
+// characters of the sanitized id. It returns an empty string when id has no usable
+// characters, so callers can substitute a fallback.
+func lastKubernetesIDFragment(id string, n int) string {
+	sanitized := sanitizeKubernetesNameFragment(id)
+	if len(sanitized) > n {
+		sanitized = strings.Trim(sanitized[len(sanitized)-n:], "-")
+	}
+	return sanitized
 }
 
 func sanitizeKubernetesLabelValue(value string) string {
