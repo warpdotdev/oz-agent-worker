@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -167,6 +169,10 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	idleOnComplete := CLI.IdleOnComplete
 	if idleOnComplete == "" && fileConfig != nil && fileConfig.IdleOnComplete != nil {
 		idleOnComplete = *fileConfig.IdleOnComplete
+	}
+
+	if err := validateServerURLs(CLI.WebSocketURL, CLI.ServerRootURL); err != nil {
+		return worker.Config{}, err
 	}
 
 	wc := worker.Config{
@@ -367,6 +373,63 @@ func parseEnvFlags(raw []string) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+// validateServerURLs guards against a worker that connects to a remote Warp
+// server while advertising a loopback/localhost task-facing server root URL.
+//
+// The server root URL is passed to the oz CLI (via --server-root-url and
+// WARP_SERVER_ROOT_URL) and is used to build the run and session links that
+// surface in outbound notifications (Slack, GitHub, Linear, etc.). When a
+// deployed worker talks to a remote server but reports a localhost root URL,
+// those links point at localhost and are unreachable for anyone reading the
+// notification. All-local setups (e.g. script/oz-local, where both URLs are
+// loopback) remain valid.
+func validateServerURLs(webSocketURL, serverRootURL string) error {
+	if webSocketURL == "" || serverRootURL == "" {
+		return nil
+	}
+
+	wsLoopback, err := isLoopbackURL(webSocketURL)
+	if err != nil {
+		return fmt.Errorf("invalid --web-socket-url %q: %w", webSocketURL, err)
+	}
+	rootLoopback, err := isLoopbackURL(serverRootURL)
+	if err != nil {
+		return fmt.Errorf("invalid --server-root-url %q: %w", serverRootURL, err)
+	}
+
+	if !wsLoopback && rootLoopback {
+		return fmt.Errorf(
+			"--server-root-url %q points at a loopback/localhost host but --web-socket-url %q targets a remote Warp server; "+
+				"task-facing run and session links (shown in Slack/GitHub/Linear notifications) would point at localhost and be unreachable. "+
+				"Set --server-root-url (Helm: warp.serverRootURL) to the public base URL of the Warp environment, e.g. https://staging.warp.dev or https://app.warp.dev",
+			serverRootURL, webSocketURL)
+	}
+	return nil
+}
+
+// isLoopbackURL reports whether the host of rawURL is a loopback/local-only
+// host (localhost, a loopback IP such as 127.0.0.1 or ::1, or the Docker
+// bridge alias host.docker.internal). It returns an error when rawURL cannot
+// be parsed or has no host.
+func isLoopbackURL(rawURL string) (bool, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false, err
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false, fmt.Errorf("URL has no host")
+	}
+	switch strings.ToLower(host) {
+	case "localhost", "host.docker.internal":
+		return true, nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true, nil
+	}
+	return false, nil
 }
 
 func copyStringMap(values map[string]string) map[string]string {

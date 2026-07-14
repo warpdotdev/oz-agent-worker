@@ -24,6 +24,17 @@ warp:
     name: oz-agent-worker
     key: WARP_API_KEY
     value: ""
+  # webSocketURL is the Warp server the worker connects to.
+  # serverRootURL is the public base URL of that same environment; the worker
+  # passes it to the oz CLI, which uses it to build the run and session links
+  # shown in outbound notifications (Slack, GitHub, Linear, etc.).
+  #
+  # These MUST point at the same environment, and serverRootURL must be a public
+  # URL (never localhost/127.0.0.1/host.docker.internal) for a deployed worker,
+  # otherwise notification links will be unreachable. The worker fails to start
+  # if webSocketURL is remote while serverRootURL is a loopback host.
+  #   Production: wss://oz.warp.dev/...        + https://app.warp.dev
+  #   Staging:    wss://oz.staging.warp.dev/... + https://staging.warp.dev
   webSocketURL: wss://oz.warp.dev/api/v1/selfhosted/worker/ws
   serverRootURL: https://app.warp.dev
 
