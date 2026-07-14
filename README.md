@@ -212,6 +212,162 @@ go build -o oz-agent-worker
 ./oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
 
+## Security and Sandboxing
+
+Oz agents run inside isolated containers on the worker host. The table below summarizes
+what each backend isolates and what it does not:
+
+| Isolation dimension | Docker backend | Kubernetes backend | Direct backend |
+|---|---|---|---|
+| Process | ✅ Container per task | ✅ Pod per task | ⚠️ Host process |
+| Filesystem | ✅ Ephemeral container FS | ✅ Ephemeral pod FS | ⚠️ Host filesystem |
+| Resource (CPU/memory) | ✅ Limits when runner shape set | ✅ Requests/limits when runner shape set | ❌ None |
+| Network egress | ⚠️ Default bridge (unrestricted) | ⚠️ Cluster default (see NetworkPolicy) | ❌ None |
+
+**The Direct backend provides no container boundary.** Tasks run as host processes with
+access to the host network, filesystem, and process space. It is not appropriate for
+environments where agents must be prevented from reaching internal infrastructure.
+
+### Docker: Restricting network access
+
+By default, each task container joins Docker's default bridge network, which gives the
+container outbound connectivity to anything the worker host can reach — including internal
+infrastructure. You can restrict this in two ways:
+
+#### 1. Isolated Docker network (`network_mode`)
+
+Set `backend.docker.network_mode` to attach task containers to a specific Docker network
+instead of the default bridge:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    network_mode: "none"  # no networking; agent cannot make outbound connections
+```
+
+Or attach to a restricted network you manage:
+
+```yaml
+backend:
+  docker:
+    network_mode: "restricted-net"  # your Docker network with limited egress
+```
+
+Accepted values are any string accepted by Docker's `--network` flag:
+- `"none"` — no networking at all (maximum isolation)
+- A named network — attaches the container to that network
+- `"host"` — full host network access (expands rather than restricts egress; not recommended for security-sensitive use)
+- Empty string / omitted — Docker's default bridge (current behavior)
+
+The worker passes the value to Docker verbatim; an invalid name surfaces as a task
+failure at container creation time.
+
+#### 2. Egress proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
+
+Route all HTTP/HTTPS traffic through a filtering proxy you operate by injecting the
+standard proxy environment variables:
+
+```yaml
+backend:
+  docker:
+    environment:
+      - name: HTTP_PROXY
+        value: "http://proxy.internal.example.com:3128"
+      - name: HTTPS_PROXY
+        value: "http://proxy.internal.example.com:3128"
+      - name: NO_PROXY
+        value: "oz.warp.dev,app.warp.dev,localhost,127.0.0.1"
+```
+
+Include `oz.warp.dev` and `app.warp.dev` in `NO_PROXY` so the worker's WebSocket
+connection and agent task-status calls bypass the proxy.
+
+**Limitations:** `HTTP_PROXY`/`HTTPS_PROXY` are honored by most HTTP client libraries
+(Go, Python, Node.js) but not by raw TCP connections, UDP, or DNS resolvers. For full
+protocol coverage, combine the proxy with a restricted Docker network and host-level
+iptables rules.
+
+### Kubernetes: NetworkPolicy
+
+Task pods are labeled with `oz-task-id` and `oz-worker-id` by the worker. You can write
+a `NetworkPolicy` that selects on these labels to restrict what task pods can reach:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-oz-task-egress
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      oz-worker-id: my-worker
+  policyTypes:
+    - Egress
+  egress:
+    # Allow task pods to reach Warp control plane
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8      # block RFC-1918 internal ranges
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+NetworkPolicy enforcement requires a CNI plugin that implements it (Calico, Cilium,
+Weave, etc.). The default kubenet and flannel CNI plugins do not enforce NetworkPolicy
+resources. The worker does not create NetworkPolicy resources; you manage them in your
+cluster.
+
+You can also use `backend.kubernetes.pod_template` to set pod-level security contexts,
+service accounts with restricted permissions, or custom labels for policy selectors:
+
+```yaml
+backend:
+  kubernetes:
+    namespace: agents
+    pod_template:
+      metadata:
+        labels:
+          security-tier: restricted
+      containers:
+        - name: task
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+```
+
+For Kubernetes, you can also inject proxy env vars via `pod_template`:
+
+```yaml
+backend:
+  kubernetes:
+    pod_template:
+      containers:
+        - name: task
+          env:
+            - name: HTTP_PROXY
+              value: "http://proxy.internal.example.com:3128"
+            - name: HTTPS_PROXY
+              value: "http://proxy.internal.example.com:3128"
+            - name: NO_PROXY
+              value: "oz.warp.dev,app.warp.dev,10.0.0.0/8"
+```
+
+### Warp-hosted cloud agents
+
+Warp-hosted runs execute in ephemeral Namespace.so microVMs that are strongly isolated
+from the host and from other tenants. These sandboxes cannot reach customer internal
+infrastructure by default. Enterprise customers who need agents to access internal
+services use self-hosted workers.
+
 ## Environment Variables for Task Containers
 
 Use `-e` / `--env` to pass environment variables into task containers:

@@ -24,9 +24,14 @@ const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
-	NoCleanup bool
-	Volumes   []string
-	Env       map[string]string
+	NoCleanup   bool
+	Volumes     []string
+	Env         map[string]string
+	// NetworkMode sets the Docker network the task container joins.
+	// Accepts any value Docker's --network flag accepts: a named network
+	// (e.g. "restricted-net"), "none" (no networking), "host", or empty
+	// string (Docker's default bridge network).
+	NetworkMode string
 }
 
 func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient *client.Client, containerID string) bool {
@@ -137,8 +142,9 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	binds = append(binds, b.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
-		Binds:     binds,
-		Resources: dockerResourcesForShape(params.InstanceShape),
+		Binds:       binds,
+		Resources:   dockerResourcesForShape(params.InstanceShape),
+		NetworkMode: container.NetworkMode(b.config.NetworkMode),
 	}
 
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{

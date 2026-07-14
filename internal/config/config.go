@@ -40,6 +40,11 @@ type BackendConfig struct {
 type DockerConfig struct {
 	Volumes     []string   `yaml:"volumes"`
 	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+	// NetworkMode sets the Docker network the task container joins.
+	// Accepts any value Docker's --network flag accepts: a named network
+	// (e.g. "restricted-net"), "none" (no networking), "host", or empty
+	// string (Docker's default bridge network).
+	NetworkMode string `yaml:"network_mode"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.
