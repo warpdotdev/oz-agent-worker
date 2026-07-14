@@ -136,7 +136,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 }
 
 // ExecuteTask runs the agent in a Kubernetes Job.
-func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (retErr error) {
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
 	}
@@ -299,19 +299,24 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
 	}
 
-	deleted := false
 	defer func() {
-		if deleted {
-			return
-		}
 		if ctx.Err() != nil {
 			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
 			return
 		}
-		if !b.config.NoCleanup {
-			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
-			}
+		if b.config.NoCleanup {
+			return
+		}
+		// Preserve failed task Jobs (and their pods) so operators can inspect logs
+		// and pod state after the fact. They are garbage-collected by the Job's
+		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
+		// Jobs are deleted immediately to keep the namespace clean.
+		if retErr != nil {
+			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
+			return
+		}
+		if err := b.deleteJob(context.Background(), jobName); err != nil {
+			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
 	}()
 
@@ -427,6 +432,13 @@ func (b *KubernetesBackend) Shutdown(ctx context.Context) {
 	log.Infof(ctx, "Preserving Kubernetes task Jobs during worker shutdown")
 }
 
+// taskJobTTLSecondsAfterFinished returns the value applied to a task Job's
+// TTLSecondsAfterFinished. It bounds how long finished Jobs that the worker
+// leaves in place - failed Jobs (kept for post-mortem debugging) and Jobs
+// orphaned by worker disruption - and their pods survive before the Kubernetes
+// Job TTL controller deletes them. Successful Jobs are deleted immediately by the
+// worker, so this does not delay their cleanup. Returns nil when cleanup is
+// disabled, so those Jobs are retained indefinitely.
 func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
 	if b.config.NoCleanup {
 		return nil

@@ -1203,6 +1203,148 @@ func TestTaskJobTTLDisabledWhenCleanupDisabled(t *testing.T) {
 	}
 }
 
+func TestTaskJobTTLDefaultsToTwentyFourHours(t *testing.T) {
+	backend := &KubernetesBackend{}
+	ttl := backend.taskJobTTLSecondsAfterFinished()
+	if ttl == nil {
+		t.Fatal("expected non-nil ttlSecondsAfterFinished by default")
+	}
+	if *ttl != int32(24*60*60) {
+		t.Fatalf("expected default ttlSecondsAfterFinished of 24h (86400), got %d", *ttl)
+	}
+}
+
+// On success the worker actively deletes the task Job (and its pod) so the
+// namespace stays clean.
+func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completed := createdJob.DeepCopy()
+			completed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completed)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	if err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	}); err != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	}
+
+	jobs, err := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("expected successful task Job to be deleted, got %d", len(jobs.Items))
+	}
+}
+
+// On failure the worker leaves the task Job (and its pod) in place so it can be
+// inspected; the Job's TTLSecondsAfterFinished handles eventual cleanup.
+func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			failed := createdJob.DeepCopy()
+			failed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+			}
+			jobWatch.Modify(failed)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	err := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if err == nil {
+		t.Fatal("expected ExecuteTask to return an error for a failed Job")
+	}
+
+	jobs, listErr := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if listErr != nil {
+		t.Fatalf("failed to list jobs: %v", listErr)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected failed task Job to be preserved, got %d", len(jobs.Items))
+	}
+}
+
 func TestRunStartupPreflightCreatesLegacyRootInitJobAndWaitsForPodCreationByDefault(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	const preflightImage = "registry.internal/platform/preflight:1.0"

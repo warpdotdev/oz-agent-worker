@@ -184,8 +184,11 @@ task pods independently (for example with separate node pools, selectors,
 tolerations, or disruption budgets) so worker rotation does not imply task pod
 eviction.
 
-When cleanup is enabled, completed task Jobs are still cleaned up by normal
-worker cleanup when observed, with Kubernetes Job TTL as a fallback.
+When cleanup is enabled, successful task Jobs are deleted immediately by the
+worker when it observes completion, while failed task Jobs (and Jobs orphaned by
+worker disruption) are left in place for post-mortem debugging and cleaned up by
+the Kubernetes Job TTL (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
+When cleanup is disabled, no TTL is set and task Jobs remain indefinitely.
 
 Recommended namespace-scoped permissions for the worker are:
 

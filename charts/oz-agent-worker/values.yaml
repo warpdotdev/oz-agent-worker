@@ -24,8 +24,8 @@ warp:
     name: oz-agent-worker
     key: WARP_API_KEY
     value: ""
-  webSocketURL: wss://oz.warp.dev/api/v1/selfhosted/worker/ws
-  serverRootURL: https://app.warp.dev
+  webSocketURL: wss://oz.staging.warp.dev/api/v1/selfhosted/worker/ws
+  serverRootURL: https://staging.warp.dev
 
 worker:
   workerId: ""
@@ -83,9 +83,12 @@ kubernetesBackend:
   extraLabels: {}
   extraAnnotations: {}
   activeDeadlineSeconds: null
-  # Fallback cleanup for task Jobs that finish after the worker pod that created
-  # them has been disrupted. When worker.cleanup=false, the worker does not set
-  # a TTL so Jobs remain available for debugging.
+  # How long finished task Jobs that the worker leaves in place are retained before
+  # the Kubernetes Job TTL controller deletes them (and their pods). This covers
+  # failed task Jobs, which are kept for post-mortem debugging, and Jobs orphaned by
+  # worker disruption. Successful task Jobs are deleted immediately by the worker, so
+  # this does not keep them around. Defaults to 24h (86400s). When worker.cleanup=false
+  # the worker sets no TTL, so these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
