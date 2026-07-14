@@ -120,6 +120,7 @@ const (
 	TaskFailureReasonInvalidImage    = "invalid_image"
 	TaskFailureReasonActiveDeadline  = "active_deadline"
 	TaskFailureReasonCleanup         = "cleanup"
+	TaskFailureReasonPodPreempted    = "pod_preempted"
 )
 
 var (
@@ -158,6 +159,7 @@ var (
 		TaskFailureReasonInvalidImage,
 		TaskFailureReasonActiveDeadline,
 		TaskFailureReasonCleanup,
+		TaskFailureReasonPodPreempted,
 	}
 )
 
