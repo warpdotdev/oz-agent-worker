@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -15,6 +17,14 @@ import (
 )
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
+
+// oomScoreAdjOzAgent is the OOM score adjustment applied to the oz agent
+// process after it is spawned. A negative value makes the process less likely
+// to be OOM-killed by the kernel, so memory-hungry child processes (e.g.
+// `cargo build`) are targeted first. The range is [-1000, 1000]; negative
+// values require CAP_SYS_RESOURCE. This adjustment is best-effort: if the
+// worker lacks the capability, a warning is logged and execution continues.
+const oomScoreAdjOzAgent = -300
 
 // validateTaskIDForPath ensures task IDs are safe to use as a single path component.
 func validateTaskIDForPath(taskID string) error {
@@ -234,11 +244,24 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	log.Infof(ctx, "Running oz agent in workspace %s", workspaceDir)
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
 		if ctx.Err() != nil {
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err))
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent failed to start: %w", err))
+	}
+
+	// Protect the oz agent process from OOM killing. Child processes that the
+	// agent spawns (e.g. cargo build) may use far more memory and should be
+	// targeted by the kernel's OOM killer first.
+	setOOMScoreAdj(ctx, cmd.Process.Pid, oomScoreAdjOzAgent)
+
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+		}
+		reason, msg := classifyAgentExitError(ctx, err)
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("%s: %w", msg, err))
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
@@ -304,6 +327,49 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitCo
 		)
 		log.Warnf(ctx, "Failed to remove workspace %s: %v", workspaceDir, err)
 	}
+}
+
+// setOOMScoreAdj writes the Linux OOM score adjustment for the given pid.
+// A negative score makes the process less likely to be OOM-killed; writing
+// negative values requires CAP_SYS_RESOURCE. This function is best-effort:
+// on non-Linux systems or when the worker lacks the required capability, the
+// error is logged as a warning and execution continues uninterrupted.
+func setOOMScoreAdj(ctx context.Context, pid int, score int) {
+	path := fmt.Sprintf("/proc/%d/oom_score_adj", pid)
+	data := fmt.Sprintf("%d\n", score)
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		log.Warnf(ctx, "Failed to set OOM score adj for oz agent (pid %d) to %d: %v"+
+			" — the agent process is unprotected from OOM killing", pid, score, err)
+		return
+	}
+	log.Infof(ctx, "Set OOM score adj for oz agent (pid %d) to %d"+
+		" (child processes that use more memory will be killed first)", pid, score)
+}
+
+// classifyAgentExitError inspects the exit error of the oz agent process and
+// returns the appropriate failure reason constant and a user-facing message.
+// It detects SIGKILL exits, which may indicate the oz agent process itself was
+// OOM-killed, and records a dedicated span event for observability.
+func classifyAgentExitError(ctx context.Context, err error) (reason, message string) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if status.Signaled() && status.Signal() == syscall.SIGKILL {
+				log.Errorf(ctx, "oz agent process was killed by SIGKILL — possible OOM kill.\n"+
+					"Hint: the kernel may have targeted the agent process instead of a memory-hungry\n"+
+					"child (e.g. `cargo build`). Check kernel logs (dmesg) for OOM kill events.")
+				metrics.AddTaskEvent(ctx, "agent.sigkill_detected",
+					attribute.String("signal", "SIGKILL"),
+					attribute.String("hint", "possible_oom_kill"),
+				)
+				return metrics.TaskFailureReasonAgentOOM,
+					"The agent process was unexpectedly killed (SIGKILL — possible out-of-memory)." +
+						" Check VM memory usage and kernel OOM logs (dmesg). Consider reducing" +
+						" parallelism (e.g. CARGO_BUILD_JOBS=1) or increasing available memory."
+			}
+		}
+	}
+	return metrics.TaskFailureReasonAgentInvocation, "oz agent exited with error"
 }
 
 // runCommand executes a shell command with the given working directory and environment.

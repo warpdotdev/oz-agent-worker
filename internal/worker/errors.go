@@ -47,11 +47,16 @@ func taskFailureLabels(err error) (phase, reason string) {
 // failure. Well-known infrastructure errors (context cancellation, deadline exceeded)
 // are translated into clear, actionable messages instead of exposing raw Go error strings.
 func userFacingTaskError(err error) string {
+	var failure *backendFailureError
 	switch {
 	case errors.Is(err, context.Canceled):
 		return "The task was interrupted due to an infrastructure issue (context canceled). This is typically transient — please try again."
 	case errors.Is(err, context.DeadlineExceeded):
 		return "The task exceeded its maximum allowed execution time and was terminated. Consider breaking the task into smaller steps or increasing the timeout."
+	case errors.As(err, &failure) && failure.reason == metrics.TaskFailureReasonAgentOOM:
+		return "The agent process was unexpectedly killed (possible out-of-memory)." +
+			" Check VM memory usage and kernel OOM logs (dmesg)." +
+			" Consider reducing parallelism (e.g. CARGO_BUILD_JOBS=1) or increasing available memory."
 	default:
 		return fmt.Sprintf("Failed to execute task: %v", err)
 	}
