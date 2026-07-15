@@ -21,21 +21,49 @@ func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
 
-func TestSanitizeKubernetesJobNameUsesHashSuffix(t *testing.T) {
-	first := sanitizeKubernetesJobName("Task A")
-	second := sanitizeKubernetesJobName("Task-A")
+func TestKubernetesTaskJobNameEmbedsFullRunIDAndExecSuffix(t *testing.T) {
+	runID := "019f5de4-bfd1-762e-92ed-199c971abcba"
+	execID := "019f5df0-aaaa-bbbb-cccc-abcdef012345"
 
-	if first == second {
-		t.Fatalf("expected distinct job names for distinct task IDs, got %q", first)
+	name := kubernetesTaskJobName(runID, execID)
+	want := "oz-task-019f5de4-bfd1-762e-92ed-199c971abcba-exec-ef012345"
+	if name != want {
+		t.Fatalf("job name = %q, want %q", name, want)
 	}
-	if !strings.HasPrefix(first, "oz-task-task-a-") {
-		t.Fatalf("unexpected job name prefix: %q", first)
+	if !strings.Contains(name, runID) {
+		t.Fatalf("expected full run ID %q in job name %q", runID, name)
 	}
-	if len(first) > 63 {
-		t.Fatalf("job name too long: %d", len(first))
+	if len(name) > 63 {
+		t.Fatalf("job name too long: %d", len(name))
 	}
-	if strings.ContainsAny(first, "_.") {
-		t.Fatalf("job name contains invalid DNS label characters: %q", first)
+	if strings.ContainsAny(name, "_.") {
+		t.Fatalf("job name contains invalid DNS label characters: %q", name)
+	}
+}
+
+func TestKubernetesTaskJobNameFallsBackForEmptyIDs(t *testing.T) {
+	if name := kubernetesTaskJobName("", ""); name != "oz-task-run-exec-exec" {
+		t.Fatalf("job name = %q, want %q", name, "oz-task-run-exec-exec")
+	}
+}
+
+func TestKubernetesTaskJobNameSanitizesIDs(t *testing.T) {
+	// Uppercase and non-DNS characters are lowercased/replaced; short IDs are used in full.
+	if name := kubernetesTaskJobName("RUN_1", "exec.2"); name != "oz-task-run-1-exec-exec-2" {
+		t.Fatalf("job name = %q, want %q", name, "oz-task-run-1-exec-exec-2")
+	}
+}
+
+func TestKubernetesTaskJobNameTruncatesOverlongRunID(t *testing.T) {
+	// A pathologically long run ID is truncated so the Job name fits in 63 chars,
+	// but the execution suffix (the uniqueness discriminator) is preserved.
+	longRunID := strings.Repeat("a", 100)
+	name := kubernetesTaskJobName(longRunID, "019f5df0-aaaa-bbbb-cccc-abcdef012345")
+	if len(name) > 63 {
+		t.Fatalf("job name too long: %d (%q)", len(name), name)
+	}
+	if !strings.HasSuffix(name, "-exec-ef012345") {
+		t.Fatalf("expected execution suffix preserved, got %q", name)
 	}
 }
 
@@ -782,11 +810,11 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
 	}
-	if createdJob.Name != sanitizeKubernetesJobName("execution-1") {
-		t.Fatalf("job name = %q, want %q", createdJob.Name, sanitizeKubernetesJobName("execution-1"))
+	if createdJob.Name != kubernetesTaskJobName("task-1", "execution-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, kubernetesTaskJobName("task-1", "execution-1"))
 	}
-	if createdJob.Name == sanitizeKubernetesJobName("task-1") {
-		t.Fatalf("job name should be execution-scoped, got task-scoped name %q", createdJob.Name)
+	if createdJob.Name == kubernetesTaskJobName("task-1", "task-1") {
+		t.Fatalf("job name should include the execution ID, got %q", createdJob.Name)
 	}
 	if createdJob.Labels[kubernetesTaskIDLabel] != "task-1" {
 		t.Fatalf("task label = %q, want %q", createdJob.Labels[kubernetesTaskIDLabel], "task-1")
@@ -944,8 +972,8 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
 	}
-	if createdJob.Name != sanitizeKubernetesJobName("task-1") {
-		t.Fatalf("job name = %q, want %q", createdJob.Name, sanitizeKubernetesJobName("task-1"))
+	if createdJob.Name != kubernetesTaskJobName("task-1", "task-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, kubernetesTaskJobName("task-1", "task-1"))
 	}
 	if createdJob.Labels[kubernetesExecutionIDLabel] != "task-1" {
 		t.Fatalf("fallback execution label = %q, want %q", createdJob.Labels[kubernetesExecutionIDLabel], "task-1")
