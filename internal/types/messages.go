@@ -113,6 +113,14 @@ type Harness struct {
 	Type *string `json:"type,omitempty"`
 }
 
+// IsOz returns true when the harness is the built-in Oz harness (nil, empty,
+// or explicitly "oz"). Third-party harnesses (claude, codex, gemini, …) carry
+// their own model on the harness config, so the top-level model_id should not
+// be forwarded to them as --model.
+func (h *Harness) IsOz() bool {
+	return h == nil || h.Type == nil || *h.Type == "" || *h.Type == "oz"
+}
+
 // HarnessAuthSecrets holds authentication secrets for third-party harnesses.
 // Only the secret for the harness specified gets injected into the environment.
 type HarnessAuthSecrets struct {

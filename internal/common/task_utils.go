@@ -27,7 +27,9 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	if task.AgentConfigSnapshot != nil {
-		if task.AgentConfigSnapshot.ModelID != nil {
+		// Only emit --model for Oz runs; for third-party harnesses, the client
+		// resolves the model from the task snapshot's harness config.
+		if task.AgentConfigSnapshot.Harness.IsOz() && task.AgentConfigSnapshot.ModelID != nil {
 			if modelID := strings.TrimSpace(*task.AgentConfigSnapshot.ModelID); modelID != "" {
 				args = append(args, "--model", modelID)
 			}
