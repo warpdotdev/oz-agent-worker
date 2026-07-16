@@ -82,7 +82,12 @@ kubernetesBackend:
   teardownCommand: ""
   extraLabels: {}
   extraAnnotations: {}
-  activeDeadlineSeconds: null
+  # Hard wall-clock cap on how long a single task Job (and its pod) may run
+  # before Kubernetes terminates it and marks the Job failed with a
+  # DeadlineExceeded condition. This is a safety backstop against tasks whose
+  # process never exits, so worker pods cannot linger indefinitely.
+  # Defaults to 8h (28800s); set to null to disable the cap.
+  activeDeadlineSeconds: 28800
   # How long finished task Jobs that the worker leaves in place are retained before
   # the Kubernetes Job TTL controller deletes them (and their pods). This covers
   # failed task Jobs, which are kept for post-mortem debugging, and Jobs orphaned by
