@@ -279,6 +279,20 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
+		{
+			// The top-level model_id targets the Oz harness. Third-party harnesses
+			// resolve their model from the task snapshot's harness config, so leaking
+			// the Oz model id via --model would cause them to reject the run.
+			name: "does not forward Oz top-level model_id to a third-party harness",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ModelID: strPtr("claude-4-8-opus-high"),
+					Harness: &types.Harness{Type: strPtr("claude")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--harness", "claude", "--idle-on-complete"},
+		},
 	}
 
 	for _, tt := range tests {
