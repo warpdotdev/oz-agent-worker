@@ -67,16 +67,17 @@ type Config struct {
 // a single MeterProvider. Helpers read this struct atomically so that Init can
 // hot-swap from the no-op set to the SDK-backed set without locking.
 type instruments struct {
-	connected          metric.Int64Gauge
-	tasksActive        metric.Int64UpDownCounter
-	tasksMaxConcurrent metric.Int64Gauge
-	tasksClaimed       metric.Int64Counter
-	tasksRejected      metric.Int64Counter
-	tasksCompleted     metric.Int64Counter
-	taskDuration       metric.Float64Histogram
-	taskFailures       metric.Int64Counter
-	wsReconnects       metric.Int64Counter
-	workerInfo         metric.Int64Gauge
+	connected                  metric.Int64Gauge
+	tasksActive                metric.Int64UpDownCounter
+	tasksMaxConcurrent         metric.Int64Gauge
+	tasksClaimed               metric.Int64Counter
+	tasksRejected              metric.Int64Counter
+	tasksCompleted             metric.Int64Counter
+	taskDuration               metric.Float64Histogram
+	taskFailures               metric.Int64Counter
+	wsReconnects               metric.Int64Counter
+	workerInfo                 metric.Int64Gauge
+	sandboxStartupFailures     metric.Int64Counter
 }
 
 // activeInstruments is the current instrument set. It always points to a
@@ -295,6 +296,11 @@ func primeInstruments(ctx context.Context, set *instruments) {
 			)
 		}
 	}
+	for _, reason := range taskFailureReasons {
+		set.sandboxStartupFailures.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("reason", reason)),
+		)
+	}
 	for _, r := range []string{WSReconnectReasonDialFailed, WSReconnectReasonRemoteClose} {
 		set.wsReconnects.Add(ctx, 0,
 			metric.WithAttributes(attribute.String("reason", r)),
@@ -394,17 +400,25 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandboxStartupFailures, err := m.Int64Counter(
+		"oz_worker_task_sandbox_startup_failures_total",
+		metric.WithDescription("Task failures that occurred within the sandbox startup window, labeled by failure reason. A spike indicates systemic sandbox provisioning or image-pull issues."),
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
-		connected:          connected,
-		tasksActive:        tasksActive,
-		tasksMaxConcurrent: tasksMaxConcurrent,
-		tasksClaimed:       tasksClaimed,
-		tasksRejected:      tasksRejected,
-		tasksCompleted:     tasksCompleted,
-		taskDuration:       taskDuration,
-		taskFailures:       taskFailures,
-		wsReconnects:       wsReconnects,
-		workerInfo:         workerInfo,
+		connected:              connected,
+		tasksActive:            tasksActive,
+		tasksMaxConcurrent:     tasksMaxConcurrent,
+		tasksClaimed:           tasksClaimed,
+		tasksRejected:          tasksRejected,
+		tasksCompleted:         tasksCompleted,
+		taskDuration:           taskDuration,
+		taskFailures:           taskFailures,
+		wsReconnects:           wsReconnects,
+		workerInfo:             workerInfo,
+		sandboxStartupFailures: sandboxStartupFailures,
 	}, nil
 }
 
@@ -485,6 +499,16 @@ func RecordTaskFailure(phase, reason string) {
 // (e.g. "dial_failed", "remote_close").
 func RecordWebsocketReconnect(reason string) {
 	current().wsReconnects.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("reason", reason)),
+	)
+}
+
+// RecordSandboxStartupFailure records a task failure that occurred within the
+// sandbox startup window. reason should be one of the TaskFailureReason* constants.
+// A sustained increase in this counter indicates systemic sandbox startup issues
+// such as slow image pulls, cluster resource pressure, or admission failures.
+func RecordSandboxStartupFailure(reason string) {
+	current().sandboxStartupFailures.Add(context.Background(), 1,
 		metric.WithAttributes(attribute.String("reason", reason)),
 	)
 }

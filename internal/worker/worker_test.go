@@ -324,6 +324,78 @@ func TestUserFacingTaskError(t *testing.T) {
 			err:  errors.New("boom"),
 			want: "Failed to execute task: boom",
 		},
+		{
+			name: "active deadline backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonActiveDeadline,
+				errors.New("job deadline exceeded"),
+			),
+			want: "The agent sandbox did not complete before the job deadline was exceeded. This may indicate slow container image pulls, cluster resource pressure, or sandbox startup delays — please try again.",
+		},
+		{
+			name: "container start backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonContainerStart,
+				errors.New("failed to start container"),
+			),
+			want: "The agent sandbox failed to start. This may indicate a container image issue, insufficient cluster resources, or a configuration problem — please try again.",
+		},
+		{
+			name: "container create backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonContainerCreate,
+				errors.New("failed to create container"),
+			),
+			want: "The agent sandbox failed to start. This may indicate a container image issue, insufficient cluster resources, or a configuration problem — please try again.",
+		},
+		{
+			name: "sidecar prep backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonSidecarPrep,
+				errors.New("sidecar prep failed"),
+			),
+			want: "The agent sandbox failed to prepare its required dependencies. This may indicate a container image issue or a network connectivity problem — please try again.",
+		},
+		{
+			name: "image pull backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonImagePull,
+				errors.New("pull failed"),
+			),
+			want: "The agent sandbox could not pull its container image. Verify the image is accessible from the worker and try again.",
+		},
+		{
+			name: "unschedulable backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonUnschedulable,
+				errors.New("pod unschedulable"),
+			),
+			want: "The agent sandbox could not be scheduled due to insufficient cluster resources. Check available capacity and try again.",
+		},
+		{
+			name: "container OOM backend failure",
+			err: newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonContainerOOM,
+				errors.New("oom killed"),
+			),
+			want: "The agent sandbox ran out of memory and was terminated. Consider breaking the task into smaller steps or requesting a larger runner.",
+		},
+		{
+			name: "wrapped backend failure preserves reason-specific message",
+			err: fmt.Errorf("outer: %w", newBackendFailure(
+				metrics.TaskFailurePhaseBackend,
+				metrics.TaskFailureReasonImagePull,
+				errors.New("pull failed"),
+			)),
+			want: "The agent sandbox could not pull its container image. Verify the image is accessible from the worker and try again.",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

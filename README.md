@@ -365,6 +365,13 @@ shows up as a distinct series.
   classification for task failures, such as `phase="backend"` with
   `reason="image_pull"`, `reason="unschedulable"`, or
   `reason="container_oom"`.
+- `oz_worker_task_sandbox_startup_failures_total{reason}` (counter): task
+  failures that occurred within the first 5 minutes of task assignment,
+  labeled by failure reason. A sustained increase indicates systemic sandbox
+  startup issues such as slow image pulls, cluster resource pressure, or
+  admission failures. This counter is a subset of `oz_worker_task_failures_total`
+  and is intended to help triage startup-specific regressions separately from
+  long-running task failures.
 - `oz_worker_websocket_reconnects_total{reason}` (counter): reconnect
   attempts; spikes indicate flapping workers.
 - `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
@@ -386,6 +393,12 @@ Direct mappings for the questions enterprise operators most commonly ask:
   `sum by (phase, reason) (rate(oz_worker_task_failures_total[5m]))`
 - **Reconnect storms:**
   `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
+- **Sandbox startup failures:**
+  `sum(rate(oz_worker_task_sandbox_startup_failures_total[5m])) > 0`
+  Broken down by reason:
+  `sum by (reason) (rate(oz_worker_task_sandbox_startup_failures_total[5m]))`
+  Alert when `reason="active_deadline"` or `reason="image_pull"` are non-zero
+  to catch systemic provisioning regressions early.
 
 ## License
 

@@ -85,6 +85,7 @@ func TestHelpersSafeBeforeInit(t *testing.T) {
 	RecordTaskCompleted(TaskResultFailed, 1*time.Second)
 	RecordTaskCompleted(TaskResultCancelled, 500*time.Millisecond)
 	RecordTaskFailure(TaskFailurePhaseBackend, TaskFailureReasonImagePull)
+	RecordSandboxStartupFailure(TaskFailureReasonActiveDeadline)
 	RecordWebsocketReconnect("dial_failed")
 	SetWorkerInfo("v0.0.0", "docker", "test")
 	ctx, span := StartTaskSpan(context.Background(), "task-1", "test task")
@@ -252,6 +253,7 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 		"oz_worker_tasks_completed_total",
 		"oz_worker_task_failures_total",
 		"oz_worker_websocket_reconnects_total",
+		"oz_worker_task_sandbox_startup_failures_total",
 	}
 	for _, name := range want {
 		findMetric(t, rm, name) // fails the test if missing
@@ -333,6 +335,32 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 				t.Errorf("oz_worker_task_duration_seconds was emitted at startup; expected to remain absent until first task")
 			}
 		}
+	}
+}
+
+func TestRecordSandboxStartupFailureTagsReason(t *testing.T) {
+	reader := withTestReader(t, Config{WorkerID: "w1", Backend: "kubernetes"})
+
+	RecordSandboxStartupFailure(TaskFailureReasonActiveDeadline)
+	RecordSandboxStartupFailure(TaskFailureReasonActiveDeadline)
+	RecordSandboxStartupFailure(TaskFailureReasonImagePull)
+
+	rm := collect(t, reader)
+	startupFailures := findMetric(t, rm, "oz_worker_task_sandbox_startup_failures_total")
+	sum, ok := startupFailures.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("expected Sum[int64], got %T", startupFailures.Data)
+	}
+	byReason := map[string]int64{}
+	for _, dp := range sum.DataPoints {
+		v, _ := dp.Attributes.Value("reason")
+		byReason[v.AsString()] = dp.Value
+	}
+	if got := byReason[TaskFailureReasonActiveDeadline]; got != 2 {
+		t.Errorf("active_deadline count = %d, want 2", got)
+	}
+	if got := byReason[TaskFailureReasonImagePull]; got != 1 {
+		t.Errorf("image_pull count = %d, want 1", got)
 	}
 }
 
