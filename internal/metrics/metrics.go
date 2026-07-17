@@ -109,6 +109,7 @@ const (
 	TaskFailureReasonWorkspaceSetup  = "workspace_setup"
 	TaskFailureReasonSetupCommand    = "setup_command"
 	TaskFailureReasonAgentInvocation = "agent_invocation"
+	TaskFailureReasonAgentOOM        = "agent_oom"
 	TaskFailureReasonTeardownCommand = "teardown_command"
 	TaskFailureReasonJobCreate       = "job_create"
 	TaskFailureReasonJobWatch        = "job_watch"
@@ -147,6 +148,7 @@ var (
 		TaskFailureReasonWorkspaceSetup,
 		TaskFailureReasonSetupCommand,
 		TaskFailureReasonAgentInvocation,
+		TaskFailureReasonAgentOOM,
 		TaskFailureReasonTeardownCommand,
 		TaskFailureReasonJobCreate,
 		TaskFailureReasonJobWatch,

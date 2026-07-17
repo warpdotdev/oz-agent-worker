@@ -20,6 +20,27 @@ import (
 	sigsk8syaml "sigs.k8s.io/yaml"
 )
 
+// workerOOMScoreAdj is the OOM score adjustment applied to the worker process
+// itself at startup. A negative value makes this long-lived process less likely
+// to be OOM-killed, protecting task lifecycle management and server reconnects.
+// Writing negative values requires CAP_SYS_RESOURCE; the adjustment is
+// best-effort and execution continues unaffected if the capability is missing.
+const workerOOMScoreAdj = -500
+
+// protectWorkerFromOOM writes a protective OOM score adjustment for the
+// current process. It is best-effort: failures are logged and silently ignored
+// so the worker continues normally even when the capability is unavailable
+// (e.g. running as a non-privileged user without CAP_SYS_RESOURCE).
+func protectWorkerFromOOM(ctx context.Context) {
+	data := fmt.Sprintf("%d\n", workerOOMScoreAdj)
+	if err := os.WriteFile("/proc/self/oom_score_adj", []byte(data), 0o644); err != nil {
+		log.Warnf(ctx, "Failed to set worker OOM score adj to %d: %v"+
+			" — the worker process is unprotected from OOM killing", workerOOMScoreAdj, err)
+		return
+	}
+	log.Infof(ctx, "Set worker OOM score adj to %d (worker process is less likely to be OOM-killed)", workerOOMScoreAdj)
+}
+
 // Version is the build-time version string. Override at link time with
 // -ldflags="-X main.Version=...".
 var Version = "dev"
@@ -52,6 +73,11 @@ func main() {
 	)
 
 	log.SetLevel(CLI.LogLevel)
+
+	// Protect the worker process itself from OOM killing. The worker manages
+	// task lifecycle and reconnects to the server; losing it is more disruptive
+	// than an individual oz agent process being killed.
+	protectWorkerFromOOM(ctx)
 
 	// Parse config file if provided.
 	var fileConfig *config.FileConfig
