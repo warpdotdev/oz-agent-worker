@@ -31,6 +31,12 @@ const (
 	BackendShutdownTimeout = 10 * time.Second
 
 	warpServerRootURLEnv = "WARP_SERVER_ROOT_URL"
+
+	// sandboxStartupWindow is the duration after task assignment within which a
+	// task failure is classified as a sandbox startup failure. Failures that
+	// occur within this window are likely caused by slow image pulls, container
+	// scheduling delays, or admission failures rather than task-execution errors.
+	sandboxStartupWindow = 5 * time.Minute
 )
 
 type Config struct {
@@ -613,6 +619,17 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		span.RecordError(err)
 		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
+		sandboxStartupDuration := time.Since(receivedAt)
+		if sandboxStartupDuration < sandboxStartupWindow {
+			log.Warnf(ctx, "Task failed within sandbox startup window (taskID=%s, duration=%v, failure.phase=%s, failure.reason=%s): possible sandbox startup issue",
+				taskID, sandboxStartupDuration.Round(time.Millisecond), phase, reason)
+			metrics.RecordSandboxStartupFailure(reason)
+			metrics.AddTaskEvent(ctx, "task.sandbox_startup_failure",
+				attribute.String("failure.phase", phase),
+				attribute.String("failure.reason", reason),
+				attribute.Float64("startup.duration_seconds", sandboxStartupDuration.Seconds()),
+			)
+		}
 		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
