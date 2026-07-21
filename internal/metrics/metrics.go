@@ -46,7 +46,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
-
 )
 
 // scopeName is the instrumentation-scope name used for all worker metrics.

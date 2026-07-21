@@ -89,10 +89,10 @@ type TaskCompletedMessage struct {
 
 // TaskFailedMessage is sent from worker to server if task launch fails
 type TaskFailedMessage struct {
-	TaskID        string     `json:"task_id"`
-	Message       string     `json:"message"`
-	TaskState     *TaskState `json:"task_state,omitempty"`
-	FailureCause  string     `json:"failure_cause,omitempty"`
+	TaskID       string     `json:"task_id"`
+	Message      string     `json:"message"`
+	TaskState    *TaskState `json:"task_state,omitempty"`
+	FailureCause string     `json:"failure_cause,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task

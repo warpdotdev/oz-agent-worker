@@ -136,4 +136,3 @@ func signalFromExitCode(exitCode int) (int, bool) {
 	sig := exitCode - 128
 	return sig, sig > 0
 }
-
