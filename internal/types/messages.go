@@ -5,6 +5,36 @@ import (
 	"time"
 )
 
+// TaskFailure is the bounded, additive failure envelope sent with task_failed.
+// The fields intentionally contain only normalized process/platform evidence;
+// raw command output and unbounded error strings remain in Message.
+type TaskFailure struct {
+	Kind       string `json:"kind,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	Signal     *int   `json:"signal,omitempty"`
+	SignalName string `json:"signal_name,omitempty"`
+	OOMKilled  bool   `json:"oom_killed,omitempty"`
+	Evicted    bool   `json:"evicted,omitempty"`
+}
+
+const (
+	TaskFailureKindOperatorShutdown      = "operator_shutdown"
+	TaskFailureKindRuntimeCrash          = "runtime_crash"
+	TaskFailureKindWorkerDisconnect      = "worker_disconnect"
+	TaskFailureKindOOM                   = "oom"
+	TaskFailureKindEviction              = "eviction"
+	TaskFailureKindInfrastructureTimeout = "infrastructure_timeout"
+	TaskFailureKindBackendFailure        = "backend_failure"
+	TaskFailureKindUserError             = "user_error"
+)
+
+// WorkerDrainingMessage is sent best-effort before a graceful worker shutdown.
+type WorkerDrainingMessage struct {
+	WorkerID      string   `json:"worker_id"`
+	Reason        string   `json:"reason"`
+	ActiveTaskIDs []string `json:"active_task_ids,omitempty"`
+}
+
 // MessageType represents the type of WebSocket message
 type MessageType string
 
@@ -15,6 +45,7 @@ const (
 	MessageTypeTaskFailed       MessageType = "task_failed"
 	MessageTypeTaskRejected     MessageType = "task_rejected"
 	MessageTypeTaskCancellation MessageType = "task_cancellation"
+	MessageTypeWorkerDraining   MessageType = "worker_draining"
 	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
@@ -79,9 +110,10 @@ type TaskCompletedMessage struct {
 
 // TaskFailedMessage is sent from worker to server if task launch fails
 type TaskFailedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID    string       `json:"task_id"`
+	Message   string       `json:"message"`
+	TaskState *TaskState   `json:"task_state,omitempty"`
+	Failure   *TaskFailure `json:"failure,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
@@ -100,6 +132,9 @@ type TaskCancellationMessage struct {
 type TaskState string
 
 const (
+	TaskStateSucceeded TaskState = "SUCCEEDED"
+	TaskStateFailed    TaskState = "FAILED"
+	TaskStateError     TaskState = "ERROR"
 	TaskStateCancelled TaskState = "CANCELLED"
 )
 

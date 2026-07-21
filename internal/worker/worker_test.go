@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -100,6 +101,67 @@ func TestTaskFailureLabels(t *testing.T) {
 				t.Fatalf("taskFailureLabels() = (%q, %q), want (%q, %q)", phase, reason, tt.wantPhase, tt.wantReason)
 			}
 		})
+	}
+}
+
+func TestTaskFailureMetadataSignalExits(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		exitCode   string
+		signal     int
+		signalName string
+	}{
+		{name: "sigterm", exitCode: "143", signal: 15, signalName: "SIGTERM"},
+		{name: "sigabrt", exitCode: "134", signal: 6, signalName: "SIGABRT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := exec.Command("sh", "-c", "exit "+tc.exitCode).Run()
+			if err == nil {
+				t.Fatal("expected command to exit non-zero")
+			}
+			failure := taskFailureMetadata(err, "")
+			if failure.Kind != types.TaskFailureKindRuntimeCrash {
+				t.Fatalf("failure kind = %q, want %q", failure.Kind, types.TaskFailureKindRuntimeCrash)
+			}
+			if failure.ExitCode == nil || *failure.ExitCode != tc.signal+128 {
+				t.Fatalf("exit code = %v, want %d", failure.ExitCode, tc.signal+128)
+			}
+			if failure.Signal == nil || *failure.Signal != tc.signal {
+				t.Fatalf("signal = %v, want %d", failure.Signal, tc.signal)
+			}
+			if failure.SignalName != tc.signalName {
+				t.Fatalf("signal name = %q, want %q", failure.SignalName, tc.signalName)
+			}
+			if taskFailureState(failure) != types.TaskStateError {
+				t.Fatalf("task state = %q, want %q", taskFailureState(failure), types.TaskStateError)
+			}
+		})
+	}
+}
+
+func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) {
+	exitCode := 143
+	signal := 15
+	failure := &types.TaskFailure{
+		Kind:       types.TaskFailureKindRuntimeCrash,
+		ExitCode:   &exitCode,
+		Signal:     &signal,
+		SignalName: "SIGTERM",
+	}
+	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
+	if err := w.sendTaskFailed("task-1", "terminated", types.TaskStateError, failure); err != nil {
+		t.Fatalf("sendTaskFailed returned error: %v", err)
+	}
+	msg := readWebSocketMessage(t, w.sendChan)
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to decode task_failed: %v", err)
+	}
+	if failed.TaskState == nil || *failed.TaskState != types.TaskStateError {
+		t.Fatalf("task state = %v, want %q", failed.TaskState, types.TaskStateError)
+	}
+	if failed.Failure == nil || failed.Failure.Kind != types.TaskFailureKindRuntimeCrash {
+		t.Fatalf("failure envelope = %#v, want runtime_crash", failed.Failure)
 	}
 }
 
@@ -906,6 +968,35 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	}
 	if !backend.shutdownCalled {
 		t.Fatal("expected backend shutdown to be called")
+	}
+}
+
+func TestWorkerShutdownAdvertisesDrain(t *testing.T) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	w := &Worker{
+		ctx:      workerCtx,
+		cancel:   cancel,
+		sendChan: make(chan []byte, 2),
+		activeTasks: map[string]activeTask{
+			"task-1": {cancel: func() {}},
+		},
+		backend: &preservingShutdownRecordingBackend{},
+	}
+
+	w.Shutdown()
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeWorkerDraining {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeWorkerDraining)
+	}
+	var draining types.WorkerDrainingMessage
+	if err := json.Unmarshal(msg.Data, &draining); err != nil {
+		t.Fatalf("failed to decode worker_draining: %v", err)
+	}
+	if draining.Reason != types.TaskFailureKindOperatorShutdown {
+		t.Fatalf("drain reason = %q, want %q", draining.Reason, types.TaskFailureKindOperatorShutdown)
+	}
+	if len(draining.ActiveTaskIDs) != 1 || draining.ActiveTaskIDs[0] != "task-1" {
+		t.Fatalf("active task IDs = %#v, want [task-1]", draining.ActiveTaskIDs)
 	}
 }
 

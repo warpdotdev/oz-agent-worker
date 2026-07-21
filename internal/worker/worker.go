@@ -604,16 +604,20 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 		result = metrics.TaskResultFailed
 		phase, reason := taskFailureLabels(err)
+		failure := taskFailureMetadata(err, w.cancellationSource(taskID))
+		finalState := taskFailureState(failure)
 		metrics.RecordTaskFailure(phase, reason)
+		metrics.RecordTaskFailureKind(failure.Kind)
 		metrics.AddTaskEvent(ctx, "task.failed",
 			attribute.String("failure.phase", phase),
 			attribute.String("failure.reason", reason),
+			attribute.String("failure.kind", failure.Kind),
 			attribute.String("error.message", err.Error()),
 		)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), finalState, failure); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
 		return
@@ -735,11 +739,13 @@ func (w *Worker) sendTaskCompleted(taskID, message string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskFailed(taskID, message string) error {
+func (w *Worker) sendTaskFailed(taskID, message string, taskState types.TaskState, failure *types.TaskFailure) error {
 	failedMsg := types.TaskFailedMessage{
 		TaskID:  taskID,
 		Message: message,
+		Failure: failure,
 	}
+	failedMsg.TaskState = &taskState
 
 	data, err := json.Marshal(failedMsg)
 	if err != nil {
@@ -776,6 +782,19 @@ func (w *Worker) Shutdown() {
 
 	w.tasksMutex.Lock()
 	activeTaskCount := len(w.activeTasks)
+	activeTaskIDs := make([]string, 0, activeTaskCount)
+	for taskID := range w.activeTasks {
+		activeTaskIDs = append(activeTaskIDs, taskID)
+	}
+	w.tasksMutex.Unlock()
+	if activeTaskCount > 0 || w.conn != nil {
+		if err := w.sendWorkerDraining(activeTaskIDs); err != nil {
+			log.Warnf(w.ctx, "Failed to advertise worker drain: %v", err)
+		} else {
+			metrics.RecordWorkerDraining()
+		}
+	}
+	w.tasksMutex.Lock()
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
@@ -821,4 +840,23 @@ func (w *Worker) Shutdown() {
 	w.connMutex.Unlock()
 
 	log.Infof(w.ctx, "Worker shutdown complete")
+}
+
+func (w *Worker) sendWorkerDraining(activeTaskIDs []string) error {
+	data, err := json.Marshal(types.WorkerDrainingMessage{
+		WorkerID:      w.config.WorkerID,
+		Reason:        types.TaskFailureKindOperatorShutdown,
+		ActiveTaskIDs: activeTaskIDs,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal worker draining message: %w", err)
+	}
+	msgBytes, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeWorkerDraining,
+		Data: data,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+	return w.sendMessage(msgBytes)
 }

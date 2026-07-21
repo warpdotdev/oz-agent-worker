@@ -4,21 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
+	"syscall"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 type backendFailureError struct {
-	phase  string
-	reason string
-	err    error
+	phase   string
+	reason  string
+	err     error
+	failure *types.TaskFailure
 }
 
 func newBackendFailure(phase, reason string, err error) error {
+	return newBackendFailureWithMetadata(phase, reason, err, nil)
+}
+
+func newBackendFailureWithMetadata(phase, reason string, err error, failure *types.TaskFailure) error {
 	if err == nil {
 		return nil
 	}
-	return &backendFailureError{phase: phase, reason: reason, err: err}
+	return &backendFailureError{phase: phase, reason: reason, err: err, failure: failure}
 }
 
 func (e *backendFailureError) Error() string {
@@ -44,8 +52,8 @@ func taskFailureLabels(err error) (phase, reason string) {
 }
 
 // userFacingTaskError returns a user-friendly error message for a task execution
-// failure. Well-known infrastructure errors (context cancellation, deadline exceeded)
-// are translated into clear, actionable messages instead of exposing raw Go error strings.
+// failure. Well-known infrastructure errors are translated into actionable text
+// instead of exposing raw Go error strings.
 func userFacingTaskError(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -55,4 +63,106 @@ func userFacingTaskError(err error) string {
 	default:
 		return fmt.Sprintf("Failed to execute task: %v", err)
 	}
+}
+
+func taskFailureMetadata(err error, source taskCancellationSource) *types.TaskFailure {
+	failure := &types.TaskFailure{}
+	var wrapped *backendFailureError
+	if errors.As(err, &wrapped) && wrapped.failure != nil {
+		copy := *wrapped.failure
+		return &copy
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		failure.Kind = types.TaskFailureKindInfrastructureTimeout
+		return failure
+	}
+	if errors.Is(err, context.Canceled) {
+		if source == taskCancellationSourceShutdown {
+			failure.Kind = types.TaskFailureKindOperatorShutdown
+		} else {
+			failure.Kind = types.TaskFailureKindRuntimeCrash
+		}
+		return failure
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			exitCode := status.ExitStatus()
+			if status.Signaled() {
+				sig := int(status.Signal())
+				exitCode = 128 + sig
+				failure.Signal = &sig
+				failure.SignalName = signalNameForExit(sig)
+			} else if sig, ok := signalFromExitCode(exitCode); ok {
+				failure.Signal = &sig
+				failure.SignalName = signalNameForExit(sig)
+			}
+			if exitCode >= 128 {
+				failure.ExitCode = &exitCode
+				if source == taskCancellationSourceShutdown && failure.SignalName == "SIGTERM" {
+					failure.Kind = types.TaskFailureKindOperatorShutdown
+				} else {
+					failure.Kind = types.TaskFailureKindRuntimeCrash
+				}
+				return failure
+			}
+		}
+	}
+
+	if errors.As(err, &wrapped) {
+		switch wrapped.reason {
+		case metrics.TaskFailureReasonContainerOOM:
+			failure.Kind = types.TaskFailureKindOOM
+			failure.OOMKilled = true
+		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
+			failure.Kind = types.TaskFailureKindInfrastructureTimeout
+		case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
+			failure.Kind = types.TaskFailureKindUserError
+		default:
+			failure.Kind = types.TaskFailureKindBackendFailure
+		}
+		return failure
+	}
+
+	failure.Kind = types.TaskFailureKindBackendFailure
+	return failure
+}
+
+func signalFromExitCode(exitCode int) (int, bool) {
+	if exitCode < 129 || exitCode > 192 {
+		return 0, false
+	}
+	sig := exitCode - 128
+	return sig, sig > 0
+}
+
+func signalNameForExit(signal int) string {
+	switch syscall.Signal(signal) {
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGQUIT:
+		return "SIGQUIT"
+	case syscall.SIGABRT:
+		return "SIGABRT"
+	case syscall.SIGKILL:
+		return "SIGKILL"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	default:
+		if signal > 0 {
+			return fmt.Sprintf("SIG%d", signal)
+		}
+		return ""
+	}
+}
+
+func taskFailureState(failure *types.TaskFailure) types.TaskState {
+	if failure == nil || failure.Kind == types.TaskFailureKindUserError || failure.Kind == "" {
+		return types.TaskStateFailed
+	}
+	return types.TaskStateError
 }
