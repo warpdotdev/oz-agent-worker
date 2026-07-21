@@ -104,6 +104,56 @@ func TestTaskFailureLabels(t *testing.T) {
 	}
 }
 
+func TestClassifyFailure(t *testing.T) {
+	// Helpers to build pre-classified backend errors (as Docker/k8s backends would).
+	oomErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerOOM, errors.New("oom"), types.TaskFailureCauseOOM)
+	evictionErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, errors.New("evicted"), types.TaskFailureCauseEviction)
+	setupErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("bad setup"), "")
+	badImageErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInvalidImage, errors.New("bad image"), "")
+	genericBackendErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerExit, errors.New("exit 1"))
+
+	// Get real signal-exit errors from a subprocess.
+	sigterm143 := exec.Command("sh", "-c", "exit 143").Run()
+	sigabrt134 := exec.Command("sh", "-c", "exit 134").Run()
+
+	cases := []struct {
+		name   string
+		err    error
+		source taskCancellationSource
+		want   string
+	}{
+		// Signal exits — subprocess killed by OS
+		{"sigterm/143 without shutdown", sigterm143, "", types.TaskFailureCauseRuntimeCrash},
+		{"sigterm/143 during shutdown", sigterm143, taskCancellationSourceShutdown, types.TaskFailureCauseOperatorShutdown},
+		{"sigabrt/134", sigabrt134, "", types.TaskFailureCauseRuntimeCrash},
+		// Context errors
+		{"deadline exceeded", context.DeadlineExceeded, "", types.TaskFailureCauseInfrastructureTimeout},
+		{"context canceled (not shutdown)", context.Canceled, "", types.TaskFailureCauseRuntimeCrash},
+		{"context canceled (shutdown)", context.Canceled, taskCancellationSourceShutdown, types.TaskFailureCauseOperatorShutdown},
+		// Pre-classified backend causes (Docker/k8s set these directly)
+		{"oom pre-classified", oomErr, "", types.TaskFailureCauseOOM},
+		{"eviction pre-classified", evictionErr, "", types.TaskFailureCauseEviction},
+		// Backend reason-based classification (no pre-classified cause)
+		{"workspace setup failure", setupErr, "", types.TaskFailureCauseUserError},
+		{"invalid image", badImageErr, "", types.TaskFailureCauseUserError},
+		{"generic backend failure", genericBackendErr, "", types.TaskFailureCauseBackendFailure},
+		// Unknown errors
+		{"unknown error", errors.New("mystery"), "", types.TaskFailureCauseBackendFailure},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err == nil {
+				t.Skip("subprocess did not return the expected error")
+			}
+			got := classifyFailure(tc.err, tc.source)
+			if got != tc.want {
+				t.Fatalf("classifyFailure() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTaskFailureMetadataSignalExits(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
