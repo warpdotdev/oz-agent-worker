@@ -94,14 +94,12 @@ func taskFailureMetadata(err error, source taskCancellationSource) *types.TaskFa
 				sig := int(status.Signal())
 				exitCode = 128 + sig
 				failure.Signal = &sig
-				failure.SignalName = signalNameForExit(sig)
 			} else if sig, ok := signalFromExitCode(exitCode); ok {
 				failure.Signal = &sig
-				failure.SignalName = signalNameForExit(sig)
 			}
 			if exitCode >= 128 {
 				failure.ExitCode = &exitCode
-				if source == taskCancellationSourceShutdown && failure.SignalName == "SIGTERM" {
+				if source == taskCancellationSourceShutdown && failure.Signal != nil && *failure.Signal == int(syscall.SIGTERM) {
 					failure.Kind = types.TaskFailureKindOperatorShutdown
 				} else {
 					failure.Kind = types.TaskFailureKindRuntimeCrash
@@ -136,29 +134,6 @@ func signalFromExitCode(exitCode int) (int, bool) {
 	}
 	sig := exitCode - 128
 	return sig, sig > 0
-}
-
-// signalNameForExit normalizes numeric Unix signals into stable names for the failure envelope.
-func signalNameForExit(signal int) string {
-	switch syscall.Signal(signal) {
-	case syscall.SIGHUP:
-		return "SIGHUP"
-	case syscall.SIGINT:
-		return "SIGINT"
-	case syscall.SIGQUIT:
-		return "SIGQUIT"
-	case syscall.SIGABRT:
-		return "SIGABRT"
-	case syscall.SIGKILL:
-		return "SIGKILL"
-	case syscall.SIGTERM:
-		return "SIGTERM"
-	default:
-		if signal > 0 {
-			return fmt.Sprintf("SIG%d", signal)
-		}
-		return ""
-	}
 }
 
 func taskFailureState(failure *types.TaskFailure) types.TaskState {

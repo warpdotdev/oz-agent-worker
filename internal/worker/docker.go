@@ -204,7 +204,6 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 			} else if signal, ok := signalFromExitCode(exitCode); ok {
 				failure.Kind = types.TaskFailureKindRuntimeCrash
 				failure.Signal = &signal
-				failure.SignalName = signalNameForExit(signal)
 			} else {
 				failure.Kind = types.TaskFailureKindBackendFailure
 			}

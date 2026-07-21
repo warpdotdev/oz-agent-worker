@@ -9,12 +9,11 @@ import (
 // The fields intentionally contain only normalized process/platform evidence;
 // raw command output and unbounded error strings remain in Message.
 type TaskFailure struct {
-	Kind       string `json:"kind,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
-	Signal     *int   `json:"signal,omitempty"`
-	SignalName string `json:"signal_name,omitempty"`
-	OOMKilled  bool   `json:"oom_killed,omitempty"`
-	Evicted    bool   `json:"evicted,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	Signal    *int   `json:"signal,omitempty"`
+	OOMKilled bool   `json:"oom_killed,omitempty"`
+	Evicted   bool   `json:"evicted,omitempty"`
 }
 
 const (

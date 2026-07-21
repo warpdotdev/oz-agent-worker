@@ -106,13 +106,12 @@ func TestTaskFailureLabels(t *testing.T) {
 
 func TestTaskFailureMetadataSignalExits(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		exitCode   string
-		signal     int
-		signalName string
+		name     string
+		exitCode string
+		signal   int
 	}{
-		{name: "sigterm", exitCode: "143", signal: 15, signalName: "SIGTERM"},
-		{name: "sigabrt", exitCode: "134", signal: 6, signalName: "SIGABRT"},
+		{name: "sigterm", exitCode: "143", signal: 15},
+		{name: "sigabrt", exitCode: "134", signal: 6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := exec.Command("sh", "-c", "exit "+tc.exitCode).Run()
@@ -129,9 +128,6 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 			if failure.Signal == nil || *failure.Signal != tc.signal {
 				t.Fatalf("signal = %v, want %d", failure.Signal, tc.signal)
 			}
-			if failure.SignalName != tc.signalName {
-				t.Fatalf("signal name = %q, want %q", failure.SignalName, tc.signalName)
-			}
 			if taskFailureState(failure) != types.TaskStateError {
 				t.Fatalf("task state = %q, want %q", taskFailureState(failure), types.TaskStateError)
 			}
@@ -143,10 +139,9 @@ func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) 
 	exitCode := 143
 	signal := 15
 	failure := &types.TaskFailure{
-		Kind:       types.TaskFailureKindRuntimeCrash,
-		ExitCode:   &exitCode,
-		Signal:     &signal,
-		SignalName: "SIGTERM",
+		Kind:     types.TaskFailureKindRuntimeCrash,
+		ExitCode: &exitCode,
+		Signal:   &signal,
 	}
 	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
 	if err := w.sendTaskFailed("task-1", "terminated", types.TaskStateError, failure); err != nil {

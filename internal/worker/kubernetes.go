@@ -96,13 +96,11 @@ func taskFailureForTerminated(terminated *corev1.ContainerStateTerminated) *type
 	if terminated.Signal > 0 {
 		signal := int(terminated.Signal)
 		failure.Signal = &signal
-		failure.SignalName = signalNameForExit(signal)
 		failure.Kind = types.TaskFailureKindRuntimeCrash
 		return failure
 	}
 	if signal, ok := signalFromExitCode(int(terminated.ExitCode)); ok {
 		failure.Signal = &signal
-		failure.SignalName = signalNameForExit(signal)
 		failure.Kind = types.TaskFailureKindRuntimeCrash
 		return failure
 	}
