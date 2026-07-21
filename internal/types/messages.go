@@ -124,7 +124,6 @@ type TaskCancellationMessage struct {
 type TaskState string
 
 const (
-	TaskStateSucceeded TaskState = "SUCCEEDED"
 	TaskStateFailed    TaskState = "FAILED"
 	TaskStateError     TaskState = "ERROR"
 	TaskStateCancelled TaskState = "CANCELLED"
