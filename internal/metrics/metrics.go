@@ -46,6 +46,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 // scopeName is the instrumentation-scope name used for all worker metrics.
@@ -71,21 +73,15 @@ func RecordTaskFailureKind(kind string) {
 	)
 }
 
-// RecordWorkerDraining records a graceful shutdown without exposing task IDs
-// or host details as labels.
-func RecordWorkerDraining() {
-	current().workerDraining.Add(context.Background(), 1)
-}
-
 func boundedFailureKind(kind string) string {
 	switch kind {
-	case TaskFailureKindOperatorShutdown, TaskFailureKindRuntimeCrash,
-		TaskFailureKindWorkerDisconnect, TaskFailureKindOOM,
-		TaskFailureKindEviction, TaskFailureKindInfrastructureTimeout,
-		TaskFailureKindBackendFailure, TaskFailureKindUserError:
+	case types.TaskFailureKindOperatorShutdown, types.TaskFailureKindRuntimeCrash,
+		types.TaskFailureKindWorkerDisconnect, types.TaskFailureKindOOM,
+		types.TaskFailureKindEviction, types.TaskFailureKindInfrastructureTimeout,
+		types.TaskFailureKindBackendFailure, types.TaskFailureKindUserError:
 		return kind
 	default:
-		return TaskFailureKindBackendFailure
+		return types.TaskFailureKindBackendFailure
 	}
 }
 
@@ -101,7 +97,6 @@ type instruments struct {
 	tasksCompleted     metric.Int64Counter
 	taskDuration       metric.Float64Histogram
 	taskFailures       metric.Int64Counter
-	workerDraining     metric.Int64Counter
 	wsReconnects       metric.Int64Counter
 	workerInfo         metric.Int64Gauge
 }
@@ -123,38 +118,30 @@ const (
 	TaskFailurePhaseBackend    = "backend"
 	TaskFailurePhaseCleanup    = "cleanup"
 
-	TaskFailureReasonUnknown             = "unknown"
-	TaskFailureReasonTaskTimeout         = "task_timeout"
-	TaskFailureReasonTaskCancelled       = "task_cancelled"
-	TaskFailureReasonImagePull           = "image_pull"
-	TaskFailureReasonSidecarPrep         = "sidecar_prep"
-	TaskFailureReasonContainerCreate     = "container_create"
-	TaskFailureReasonContainerStart      = "container_start"
-	TaskFailureReasonContainerWait       = "container_wait"
-	TaskFailureReasonContainerExit       = "container_exit"
-	TaskFailureReasonContainerOOM        = "container_oom"
-	TaskFailureReasonWorkspaceSetup      = "workspace_setup"
-	TaskFailureReasonSetupCommand        = "setup_command"
-	TaskFailureReasonAgentInvocation     = "agent_invocation"
-	TaskFailureReasonTeardownCommand     = "teardown_command"
-	TaskFailureReasonJobCreate           = "job_create"
-	TaskFailureReasonJobWatch            = "job_watch"
-	TaskFailureReasonJobFailed           = "job_failed"
-	TaskFailureReasonPodWatch            = "pod_watch"
-	TaskFailureReasonUnschedulable       = "unschedulable"
-	TaskFailureReasonVolumeMount         = "volume_mount"
-	TaskFailureReasonInitContainer       = "init_container"
-	TaskFailureReasonInvalidImage        = "invalid_image"
-	TaskFailureReasonActiveDeadline      = "active_deadline"
-	TaskFailureReasonCleanup             = "cleanup"
-	TaskFailureKindOperatorShutdown      = "operator_shutdown"
-	TaskFailureKindRuntimeCrash          = "runtime_crash"
-	TaskFailureKindWorkerDisconnect      = "worker_disconnect"
-	TaskFailureKindOOM                   = "oom"
-	TaskFailureKindEviction              = "eviction"
-	TaskFailureKindInfrastructureTimeout = "infrastructure_timeout"
-	TaskFailureKindBackendFailure        = "backend_failure"
-	TaskFailureKindUserError             = "user_error"
+	TaskFailureReasonUnknown         = "unknown"
+	TaskFailureReasonTaskTimeout     = "task_timeout"
+	TaskFailureReasonTaskCancelled   = "task_cancelled"
+	TaskFailureReasonImagePull       = "image_pull"
+	TaskFailureReasonSidecarPrep     = "sidecar_prep"
+	TaskFailureReasonContainerCreate = "container_create"
+	TaskFailureReasonContainerStart  = "container_start"
+	TaskFailureReasonContainerWait   = "container_wait"
+	TaskFailureReasonContainerExit   = "container_exit"
+	TaskFailureReasonContainerOOM    = "container_oom"
+	TaskFailureReasonWorkspaceSetup  = "workspace_setup"
+	TaskFailureReasonSetupCommand    = "setup_command"
+	TaskFailureReasonAgentInvocation = "agent_invocation"
+	TaskFailureReasonTeardownCommand = "teardown_command"
+	TaskFailureReasonJobCreate       = "job_create"
+	TaskFailureReasonJobWatch        = "job_watch"
+	TaskFailureReasonJobFailed       = "job_failed"
+	TaskFailureReasonPodWatch        = "pod_watch"
+	TaskFailureReasonUnschedulable   = "unschedulable"
+	TaskFailureReasonVolumeMount     = "volume_mount"
+	TaskFailureReasonInitContainer   = "init_container"
+	TaskFailureReasonInvalidImage    = "invalid_image"
+	TaskFailureReasonActiveDeadline  = "active_deadline"
+	TaskFailureReasonCleanup         = "cleanup"
 )
 
 var (
@@ -415,13 +402,6 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
-	workerDraining, err := m.Int64Counter(
-		"oz_worker_draining_total",
-		metric.WithDescription("Graceful worker shutdowns advertised to the control plane."),
-	)
-	if err != nil {
-		return nil, err
-	}
 	wsReconnects, err := m.Int64Counter(
 		"oz_worker_websocket_reconnects_total",
 		metric.WithDescription("Total WebSocket reconnect attempts since process start."),
@@ -445,7 +425,6 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 		tasksCompleted:     tasksCompleted,
 		taskDuration:       taskDuration,
 		taskFailures:       taskFailures,
-		workerDraining:     workerDraining,
 		wsReconnects:       wsReconnects,
 		workerInfo:         workerInfo,
 	}, nil

@@ -971,35 +971,6 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	}
 }
 
-func TestWorkerShutdownAdvertisesDrain(t *testing.T) {
-	workerCtx, cancel := context.WithCancel(context.Background())
-	w := &Worker{
-		ctx:      workerCtx,
-		cancel:   cancel,
-		sendChan: make(chan []byte, 2),
-		activeTasks: map[string]activeTask{
-			"task-1": {cancel: func() {}},
-		},
-		backend: &preservingShutdownRecordingBackend{},
-	}
-
-	w.Shutdown()
-	msg := readWebSocketMessage(t, w.sendChan)
-	if msg.Type != types.MessageTypeWorkerDraining {
-		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeWorkerDraining)
-	}
-	var draining types.WorkerDrainingMessage
-	if err := json.Unmarshal(msg.Data, &draining); err != nil {
-		t.Fatalf("failed to decode worker_draining: %v", err)
-	}
-	if draining.Reason != types.TaskFailureKindOperatorShutdown {
-		t.Fatalf("drain reason = %q, want %q", draining.Reason, types.TaskFailureKindOperatorShutdown)
-	}
-	if len(draining.ActiveTaskIDs) != 1 || draining.ActiveTaskIDs[0] != "task-1" {
-		t.Fatalf("active task IDs = %#v, want [task-1]", draining.ActiveTaskIDs)
-	}
-}
-
 func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	cancel()

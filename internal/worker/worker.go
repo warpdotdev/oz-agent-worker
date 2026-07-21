@@ -782,18 +782,7 @@ func (w *Worker) Shutdown() {
 
 	w.tasksMutex.Lock()
 	activeTaskCount := len(w.activeTasks)
-	activeTaskIDs := make([]string, 0, activeTaskCount)
-	for taskID := range w.activeTasks {
-		activeTaskIDs = append(activeTaskIDs, taskID)
-	}
 	w.tasksMutex.Unlock()
-	if activeTaskCount > 0 || w.conn != nil {
-		if err := w.sendWorkerDraining(activeTaskIDs); err != nil {
-			log.Warnf(w.ctx, "Failed to advertise worker drain: %v", err)
-		} else {
-			metrics.RecordWorkerDraining()
-		}
-	}
 	w.tasksMutex.Lock()
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
@@ -840,23 +829,4 @@ func (w *Worker) Shutdown() {
 	w.connMutex.Unlock()
 
 	log.Infof(w.ctx, "Worker shutdown complete")
-}
-
-func (w *Worker) sendWorkerDraining(activeTaskIDs []string) error {
-	data, err := json.Marshal(types.WorkerDrainingMessage{
-		WorkerID:      w.config.WorkerID,
-		Reason:        types.TaskFailureKindOperatorShutdown,
-		ActiveTaskIDs: activeTaskIDs,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to marshal worker draining message: %w", err)
-	}
-	msgBytes, err := json.Marshal(types.WebSocketMessage{
-		Type: types.MessageTypeWorkerDraining,
-		Data: data,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to marshal websocket message: %w", err)
-	}
-	return w.sendMessage(msgBytes)
 }

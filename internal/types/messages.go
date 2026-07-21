@@ -28,13 +28,6 @@ const (
 	TaskFailureKindUserError             = "user_error"
 )
 
-// WorkerDrainingMessage is sent best-effort before a graceful worker shutdown.
-type WorkerDrainingMessage struct {
-	WorkerID      string   `json:"worker_id"`
-	Reason        string   `json:"reason"`
-	ActiveTaskIDs []string `json:"active_task_ids,omitempty"`
-}
-
 // MessageType represents the type of WebSocket message
 type MessageType string
 
@@ -45,7 +38,6 @@ const (
 	MessageTypeTaskFailed       MessageType = "task_failed"
 	MessageTypeTaskRejected     MessageType = "task_rejected"
 	MessageTypeTaskCancellation MessageType = "task_cancellation"
-	MessageTypeWorkerDraining   MessageType = "worker_draining"
 	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
