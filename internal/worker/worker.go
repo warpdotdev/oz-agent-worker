@@ -778,8 +778,6 @@ func (w *Worker) Shutdown() {
 
 	w.tasksMutex.Lock()
 	activeTaskCount := len(w.activeTasks)
-	w.tasksMutex.Unlock()
-	w.tasksMutex.Lock()
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
