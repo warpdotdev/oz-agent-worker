@@ -605,7 +605,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		result = metrics.TaskResultFailed
 		phase, reason := taskFailureLabels(err)
 		failure := classifyFailure(err, w.cancellationSource(taskID))
-		finalState := taskFailureState(failure)
+		finalState := classifyFailureState(failure)
 		metrics.RecordTaskFailure(phase, reason)
 		metrics.RecordTaskFailureKind(failure.Kind)
 		metrics.AddTaskEvent(ctx, "task.failed",

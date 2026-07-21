@@ -148,7 +148,7 @@ func signalFromExitCode(exitCode int) (int, bool) {
 	return sig, sig > 0
 }
 
-func taskFailureState(failure *types.TaskFailure) types.TaskState {
+func classifyFailureState(failure *types.TaskFailure) types.TaskState {
 	if failure == nil || failure.Kind == types.TaskFailureKindUserError || failure.Kind == "" {
 		return types.TaskStateFailed
 	}

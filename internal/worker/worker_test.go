@@ -128,8 +128,8 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 			if failure.Signal == nil || *failure.Signal != tc.signal {
 				t.Fatalf("signal = %v, want %d", failure.Signal, tc.signal)
 			}
-			if taskFailureState(failure) != types.TaskStateError {
-				t.Fatalf("task state = %q, want %q", taskFailureState(failure), types.TaskStateError)
+			if classifyFailureState(failure) != types.TaskStateError {
+				t.Fatalf("task state = %q, want %q", classifyFailureState(failure), types.TaskStateError)
 			}
 		})
 	}
