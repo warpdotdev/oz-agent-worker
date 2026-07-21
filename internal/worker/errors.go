@@ -65,6 +65,11 @@ func userFacingTaskError(err error) string {
 	}
 }
 
+// taskFailureMetadata inspects a task execution error and returns a structured
+// TaskFailure envelope describing why it failed. It distinguishes two root causes:
+// signal exits from the agent subprocess (operator_shutdown, runtime_crash) and
+// failures from backend infrastructure code — Docker, Kubernetes — that ran
+// before or after the agent process (oom, eviction, user_error, backend_failure, etc.).
 func taskFailureMetadata(err error, source taskCancellationSource) *types.TaskFailure {
 	failure := &types.TaskFailure{}
 	var wrapped *backendFailureError
