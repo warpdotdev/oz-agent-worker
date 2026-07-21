@@ -86,6 +86,10 @@ func taskFailureMetadata(err error, source taskCancellationSource) *types.TaskFa
 		return failure
 	}
 
+	// Path 1: the agent subprocess exited with a signal or signal-encoded exit code.
+	// Extracts the numeric signal, then classifies as operator_shutdown when the
+	// worker is gracefully shutting down and the signal is SIGTERM, or runtime_crash
+	// for any other signal exit (SIGABRT, SIGKILL, etc.).
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
@@ -109,6 +113,9 @@ func taskFailureMetadata(err error, source taskCancellationSource) *types.TaskFa
 		}
 	}
 
+	// Path 2: the failure came from backend infrastructure code (Docker, Kubernetes)
+	// before or after the agent process, not from the agent process itself.
+	// Classifies by the reason the backend recorded (OOM, timeout, bad image, etc.).
 	if errors.As(err, &wrapped) {
 		switch wrapped.reason {
 		case metrics.TaskFailureReasonContainerOOM:
