@@ -138,6 +138,7 @@ func signalFromExitCode(exitCode int) (int, bool) {
 	return sig, sig > 0
 }
 
+// signalNameForExit normalizes numeric Unix signals into stable names for the failure envelope.
 func signalNameForExit(signal int) string {
 	switch syscall.Signal(signal) {
 	case syscall.SIGHUP:
