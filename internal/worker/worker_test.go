@@ -118,7 +118,7 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected command to exit non-zero")
 			}
-			failure := taskFailureMetadata(err, "")
+			failure := classifyFailure(err, "")
 			if failure.Kind != types.TaskFailureKindRuntimeCrash {
 				t.Fatalf("failure kind = %q, want %q", failure.Kind, types.TaskFailureKindRuntimeCrash)
 			}
