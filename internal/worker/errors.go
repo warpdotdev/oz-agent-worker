@@ -12,21 +12,21 @@ import (
 )
 
 type backendFailureError struct {
-	phase   string
-	reason  string
-	err     error
-	failure *types.TaskFailure
+	phase  string
+	reason string
+	err    error
+	cause  string // pre-classified failure cause; empty when not pre-classified
 }
 
 func newBackendFailure(phase, reason string, err error) error {
-	return newBackendFailureWithMetadata(phase, reason, err, nil)
+	return newBackendFailureWithMetadata(phase, reason, err, "")
 }
 
-func newBackendFailureWithMetadata(phase, reason string, err error, failure *types.TaskFailure) error {
+func newBackendFailureWithMetadata(phase, reason string, err error, cause string) error {
 	if err == nil {
 		return nil
 	}
-	return &backendFailureError{phase: phase, reason: reason, err: err, failure: failure}
+	return &backendFailureError{phase: phase, reason: reason, err: err, cause: cause}
 }
 
 func (e *backendFailureError) Error() string {
@@ -65,30 +65,25 @@ func userFacingTaskError(err error) string {
 	}
 }
 
-// classifyFailure inspects a task execution error and returns a structured
-// TaskFailure envelope describing why it failed. It distinguishes two root causes:
-// signal exits from the agent subprocess (operator_shutdown, runtime_crash) and
-// failures from backend infrastructure code — Docker, Kubernetes — that ran
-// before or after the agent process (oom, eviction, user_error, backend_failure, etc.).
-func classifyFailure(err error, source taskCancellationSource) *types.TaskFailure {
-	failure := &types.TaskFailure{}
+// classifyFailure inspects a task execution error and returns the failure cause.
+// It distinguishes two root causes: signal exits from the agent subprocess
+// (operator_shutdown, runtime_crash) and failures from backend infrastructure
+// code — Docker, Kubernetes — that ran before or after the agent process
+// (oom, eviction, user_error, backend_failure, etc.).
+func classifyFailure(err error, source taskCancellationSource) string {
 	var wrapped *backendFailureError
-	if errors.As(err, &wrapped) && wrapped.failure != nil {
-		copy := *wrapped.failure
-		return &copy
+	if errors.As(err, &wrapped) && wrapped.cause != "" {
+		return wrapped.cause
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		failure.Cause = types.TaskFailureCauseInfrastructureTimeout
-		return failure
+		return types.TaskFailureCauseInfrastructureTimeout
 	}
 	if errors.Is(err, context.Canceled) {
 		if source == taskCancellationSourceShutdown {
-			failure.Cause = types.TaskFailureCauseOperatorShutdown
-		} else {
-			failure.Cause = types.TaskFailureCauseRuntimeCrash
+			return types.TaskFailureCauseOperatorShutdown
 		}
-		return failure
+		return types.TaskFailureCauseRuntimeCrash
 	}
 
 	// Path 1: the agent subprocess exited with a signal or signal-encoded exit code.
@@ -108,11 +103,9 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 			}
 			if exitCode >= 128 {
 				if source == taskCancellationSourceShutdown && sig == int(syscall.SIGTERM) {
-					failure.Cause = types.TaskFailureCauseOperatorShutdown
-				} else {
-					failure.Cause = types.TaskFailureCauseRuntimeCrash
+					return types.TaskFailureCauseOperatorShutdown
 				}
-				return failure
+				return types.TaskFailureCauseRuntimeCrash
 			}
 		}
 	}
@@ -123,19 +116,17 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 	if errors.As(err, &wrapped) {
 		switch wrapped.reason {
 		case metrics.TaskFailureReasonContainerOOM:
-			failure.Cause = types.TaskFailureCauseOOM
+			return types.TaskFailureCauseOOM
 		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
-			failure.Cause = types.TaskFailureCauseInfrastructureTimeout
+			return types.TaskFailureCauseInfrastructureTimeout
 		case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
-			failure.Cause = types.TaskFailureCauseUserError
+			return types.TaskFailureCauseUserError
 		default:
-			failure.Cause = types.TaskFailureCauseBackendFailure
+			return types.TaskFailureCauseBackendFailure
 		}
-		return failure
 	}
 
-	failure.Cause = types.TaskFailureCauseBackendFailure
-	return failure
+	return types.TaskFailureCauseBackendFailure
 }
 
 func signalFromExitCode(exitCode int) (int, bool) {

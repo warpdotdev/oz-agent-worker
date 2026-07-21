@@ -197,15 +197,15 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 				reason = metrics.TaskFailureReasonContainerOOM
 			}
 			exitCode := int(status.StatusCode)
-			failure := &types.TaskFailure{}
+			var cause string
 			if oomKilled {
-				failure.Cause = types.TaskFailureCauseOOM
+				cause = types.TaskFailureCauseOOM
 			} else if _, ok := signalFromExitCode(exitCode); ok {
-				failure.Cause = types.TaskFailureCauseRuntimeCrash
+				cause = types.TaskFailureCauseRuntimeCrash
 			} else {
-				failure.Cause = types.TaskFailureCauseBackendFailure
+				cause = types.TaskFailureCauseBackendFailure
 			}
-			return newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), failure)
+			return newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), cause)
 		}
 	}
 

@@ -117,20 +117,17 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected command to exit non-zero")
 			}
-			failure := classifyFailure(err, "")
-			if failure.Cause != types.TaskFailureCauseRuntimeCrash {
-				t.Fatalf("failure kind = %q, want %q", failure.Cause, types.TaskFailureCauseRuntimeCrash)
+			cause := classifyFailure(err, "")
+			if cause != types.TaskFailureCauseRuntimeCrash {
+				t.Fatalf("failure cause = %q, want %q", cause, types.TaskFailureCauseRuntimeCrash)
 			}
 		})
 	}
 }
 
-func TestTaskFailedMessageIncludesFailureEnvelope(t *testing.T) {
-	failure := &types.TaskFailure{
-		Cause: types.TaskFailureCauseRuntimeCrash,
-	}
+func TestTaskFailedMessageIncludesFailureCause(t *testing.T) {
 	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
-	if err := w.sendTaskFailed("task-1", "terminated", failure); err != nil {
+	if err := w.sendTaskFailed("task-1", "terminated", types.TaskFailureCauseRuntimeCrash); err != nil {
 		t.Fatalf("sendTaskFailed returned error: %v", err)
 	}
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -138,8 +135,8 @@ func TestTaskFailedMessageIncludesFailureEnvelope(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &failed); err != nil {
 		t.Fatalf("failed to decode task_failed: %v", err)
 	}
-	if failed.Failure == nil || failed.Failure.Cause != types.TaskFailureCauseRuntimeCrash {
-		t.Fatalf("failure envelope = %#v, want runtime_crash", failed.Failure)
+	if failed.FailureCause != types.TaskFailureCauseRuntimeCrash {
+		t.Fatalf("failure_cause = %q, want %q", failed.FailureCause, types.TaskFailureCauseRuntimeCrash)
 	}
 }
 
