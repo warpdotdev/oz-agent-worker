@@ -9,7 +9,7 @@ import (
 // The fields intentionally contain only normalized process/platform evidence;
 // raw command output and unbounded error strings remain in Message.
 type TaskFailure struct {
-	Kind      string `json:"kind,omitempty"`
+	Cause     string `json:"cause,omitempty"`
 	ExitCode  *int   `json:"exit_code,omitempty"`
 	Signal    *int   `json:"signal,omitempty"`
 	OOMKilled bool   `json:"oom_killed,omitempty"`
@@ -17,14 +17,14 @@ type TaskFailure struct {
 }
 
 const (
-	TaskFailureKindOperatorShutdown      = "operator_shutdown"
-	TaskFailureKindRuntimeCrash          = "runtime_crash"
-	TaskFailureKindWorkerDisconnect      = "worker_disconnect"
-	TaskFailureKindOOM                   = "oom"
-	TaskFailureKindEviction              = "eviction"
-	TaskFailureKindInfrastructureTimeout = "infrastructure_timeout"
-	TaskFailureKindBackendFailure        = "backend_failure"
-	TaskFailureKindUserError             = "user_error"
+	TaskFailureCauseOperatorShutdown      = "operator_shutdown"
+	TaskFailureCauseRuntimeCrash          = "runtime_crash"
+	TaskFailureCauseWorkerDisconnect      = "worker_disconnect"
+	TaskFailureCauseOOM                   = "oom"
+	TaskFailureCauseEviction              = "eviction"
+	TaskFailureCauseInfrastructureTimeout = "infrastructure_timeout"
+	TaskFailureCauseBackendFailure        = "backend_failure"
+	TaskFailureCauseUserError             = "user_error"
 )
 
 // MessageType represents the type of WebSocket message

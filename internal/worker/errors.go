@@ -79,14 +79,14 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		failure.Kind = types.TaskFailureKindInfrastructureTimeout
+		failure.Cause = types.TaskFailureCauseInfrastructureTimeout
 		return failure
 	}
 	if errors.Is(err, context.Canceled) {
 		if source == taskCancellationSourceShutdown {
-			failure.Kind = types.TaskFailureKindOperatorShutdown
+			failure.Cause = types.TaskFailureCauseOperatorShutdown
 		} else {
-			failure.Kind = types.TaskFailureKindRuntimeCrash
+			failure.Cause = types.TaskFailureCauseRuntimeCrash
 		}
 		return failure
 	}
@@ -109,9 +109,9 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 			if exitCode >= 128 {
 				failure.ExitCode = &exitCode
 				if source == taskCancellationSourceShutdown && failure.Signal != nil && *failure.Signal == int(syscall.SIGTERM) {
-					failure.Kind = types.TaskFailureKindOperatorShutdown
+					failure.Cause = types.TaskFailureCauseOperatorShutdown
 				} else {
-					failure.Kind = types.TaskFailureKindRuntimeCrash
+					failure.Cause = types.TaskFailureCauseRuntimeCrash
 				}
 				return failure
 			}
@@ -124,19 +124,19 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 	if errors.As(err, &wrapped) {
 		switch wrapped.reason {
 		case metrics.TaskFailureReasonContainerOOM:
-			failure.Kind = types.TaskFailureKindOOM
+			failure.Cause = types.TaskFailureCauseOOM
 			failure.OOMKilled = true
 		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
-			failure.Kind = types.TaskFailureKindInfrastructureTimeout
+			failure.Cause = types.TaskFailureCauseInfrastructureTimeout
 		case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
-			failure.Kind = types.TaskFailureKindUserError
+			failure.Cause = types.TaskFailureCauseUserError
 		default:
-			failure.Kind = types.TaskFailureKindBackendFailure
+			failure.Cause = types.TaskFailureCauseBackendFailure
 		}
 		return failure
 	}
 
-	failure.Kind = types.TaskFailureKindBackendFailure
+	failure.Cause = types.TaskFailureCauseBackendFailure
 	return failure
 }
 
@@ -149,7 +149,7 @@ func signalFromExitCode(exitCode int) (int, bool) {
 }
 
 func classifyFailureState(failure *types.TaskFailure) types.TaskState {
-	if failure == nil || failure.Kind == types.TaskFailureKindUserError || failure.Kind == "" {
+	if failure == nil || failure.Cause == types.TaskFailureCauseUserError || failure.Cause == "" {
 		return types.TaskStateFailed
 	}
 	return types.TaskStateError

@@ -89,22 +89,22 @@ func taskFailureForTerminated(terminated *corev1.ContainerStateTerminated) *type
 	exitCode := int(terminated.ExitCode)
 	failure := &types.TaskFailure{ExitCode: &exitCode}
 	if terminated.Reason == "OOMKilled" {
-		failure.Kind = types.TaskFailureKindOOM
+		failure.Cause = types.TaskFailureCauseOOM
 		failure.OOMKilled = true
 		return failure
 	}
 	if terminated.Signal > 0 {
 		signal := int(terminated.Signal)
 		failure.Signal = &signal
-		failure.Kind = types.TaskFailureKindRuntimeCrash
+		failure.Cause = types.TaskFailureCauseRuntimeCrash
 		return failure
 	}
 	if signal, ok := signalFromExitCode(int(terminated.ExitCode)); ok {
 		failure.Signal = &signal
-		failure.Kind = types.TaskFailureKindRuntimeCrash
+		failure.Cause = types.TaskFailureCauseRuntimeCrash
 		return failure
 	}
-	failure.Kind = types.TaskFailureKindBackendFailure
+	failure.Cause = types.TaskFailureCauseBackendFailure
 	return failure
 }
 
@@ -941,7 +941,7 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
 	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
-		failure := &types.TaskFailure{Kind: types.TaskFailureKindEviction, Evicted: true}
+		failure := &types.TaskFailure{Cause: types.TaskFailureCauseEviction, Evicted: true}
 		return newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), failure)
 	}
 

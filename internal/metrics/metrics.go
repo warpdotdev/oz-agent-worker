@@ -65,9 +65,9 @@ type Config struct {
 	Version string
 }
 
-// RecordTaskFailureKind records a bounded failure kind. It intentionally uses
+// RecordTaskFailureCause records a bounded failure kind. It intentionally uses
 // the existing failure counter so old dashboards continue to work.
-func RecordTaskFailureKind(kind string) {
+func RecordTaskFailureCause(kind string) {
 	current().taskFailures.Add(context.Background(), 1,
 		metric.WithAttributes(attribute.String("failure_kind", boundedFailureKind(kind))),
 	)
@@ -75,13 +75,13 @@ func RecordTaskFailureKind(kind string) {
 
 func boundedFailureKind(kind string) string {
 	switch kind {
-	case types.TaskFailureKindOperatorShutdown, types.TaskFailureKindRuntimeCrash,
-		types.TaskFailureKindWorkerDisconnect, types.TaskFailureKindOOM,
-		types.TaskFailureKindEviction, types.TaskFailureKindInfrastructureTimeout,
-		types.TaskFailureKindBackendFailure, types.TaskFailureKindUserError:
+	case types.TaskFailureCauseOperatorShutdown, types.TaskFailureCauseRuntimeCrash,
+		types.TaskFailureCauseWorkerDisconnect, types.TaskFailureCauseOOM,
+		types.TaskFailureCauseEviction, types.TaskFailureCauseInfrastructureTimeout,
+		types.TaskFailureCauseBackendFailure, types.TaskFailureCauseUserError:
 		return kind
 	default:
-		return types.TaskFailureKindBackendFailure
+		return types.TaskFailureCauseBackendFailure
 	}
 }
 

@@ -119,8 +119,8 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 				t.Fatal("expected command to exit non-zero")
 			}
 			failure := classifyFailure(err, "")
-			if failure.Kind != types.TaskFailureKindRuntimeCrash {
-				t.Fatalf("failure kind = %q, want %q", failure.Kind, types.TaskFailureKindRuntimeCrash)
+			if failure.Cause != types.TaskFailureCauseRuntimeCrash {
+				t.Fatalf("failure kind = %q, want %q", failure.Cause, types.TaskFailureCauseRuntimeCrash)
 			}
 			if failure.ExitCode == nil || *failure.ExitCode != tc.signal+128 {
 				t.Fatalf("exit code = %v, want %d", failure.ExitCode, tc.signal+128)
@@ -139,7 +139,7 @@ func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) 
 	exitCode := 143
 	signal := 15
 	failure := &types.TaskFailure{
-		Kind:     types.TaskFailureKindRuntimeCrash,
+		Cause:    types.TaskFailureCauseRuntimeCrash,
 		ExitCode: &exitCode,
 		Signal:   &signal,
 	}
@@ -155,7 +155,7 @@ func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) 
 	if failed.TaskState == nil || *failed.TaskState != types.TaskStateError {
 		t.Fatalf("task state = %v, want %q", failed.TaskState, types.TaskStateError)
 	}
-	if failed.Failure == nil || failed.Failure.Kind != types.TaskFailureKindRuntimeCrash {
+	if failed.Failure == nil || failed.Failure.Cause != types.TaskFailureCauseRuntimeCrash {
 		t.Fatalf("failure envelope = %#v, want runtime_crash", failed.Failure)
 	}
 }
