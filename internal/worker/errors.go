@@ -148,9 +148,3 @@ func signalFromExitCode(exitCode int) (int, bool) {
 	return sig, sig > 0
 }
 
-func classifyFailureState(failure *types.TaskFailure) types.TaskState {
-	if failure == nil || failure.Cause == types.TaskFailureCauseUserError || failure.Cause == "" {
-		return types.TaskStateFailed
-	}
-	return types.TaskStateError
-}

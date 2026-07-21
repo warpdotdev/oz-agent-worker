@@ -605,7 +605,6 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		result = metrics.TaskResultFailed
 		phase, reason := taskFailureLabels(err)
 		failure := classifyFailure(err, w.cancellationSource(taskID))
-		finalState := classifyFailureState(failure)
 		metrics.RecordTaskFailure(phase, reason)
 		metrics.AddTaskEvent(ctx, "task.failed",
 			attribute.String("failure.phase", phase),
@@ -615,7 +614,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		span.RecordError(err)
 		span.SetStatus(codes.Error, reason)
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), finalState, failure); statusErr != nil {
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), failure); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
 		return
@@ -737,13 +736,12 @@ func (w *Worker) sendTaskCompleted(taskID, message string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskFailed(taskID, message string, taskState types.TaskState, failure *types.TaskFailure) error {
+func (w *Worker) sendTaskFailed(taskID, message string, failure *types.TaskFailure) error {
 	failedMsg := types.TaskFailedMessage{
 		TaskID:  taskID,
 		Message: message,
 		Failure: failure,
 	}
-	failedMsg.TaskState = &taskState
 
 	data, err := json.Marshal(failedMsg)
 	if err != nil {

@@ -128,14 +128,11 @@ func TestTaskFailureMetadataSignalExits(t *testing.T) {
 			if failure.Signal == nil || *failure.Signal != tc.signal {
 				t.Fatalf("signal = %v, want %d", failure.Signal, tc.signal)
 			}
-			if classifyFailureState(failure) != types.TaskStateError {
-				t.Fatalf("task state = %q, want %q", classifyFailureState(failure), types.TaskStateError)
-			}
 		})
 	}
 }
 
-func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) {
+func TestTaskFailedMessageIncludesFailureEnvelope(t *testing.T) {
 	exitCode := 143
 	signal := 15
 	failure := &types.TaskFailure{
@@ -144,16 +141,13 @@ func TestTaskFailedMessageIncludesFailureEnvelopeAndExplicitState(t *testing.T) 
 		Signal:   &signal,
 	}
 	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
-	if err := w.sendTaskFailed("task-1", "terminated", types.TaskStateError, failure); err != nil {
+	if err := w.sendTaskFailed("task-1", "terminated", failure); err != nil {
 		t.Fatalf("sendTaskFailed returned error: %v", err)
 	}
 	msg := readWebSocketMessage(t, w.sendChan)
 	var failed types.TaskFailedMessage
 	if err := json.Unmarshal(msg.Data, &failed); err != nil {
 		t.Fatalf("failed to decode task_failed: %v", err)
-	}
-	if failed.TaskState == nil || *failed.TaskState != types.TaskStateError {
-		t.Fatalf("task state = %v, want %q", failed.TaskState, types.TaskStateError)
 	}
 	if failed.Failure == nil || failed.Failure.Cause != types.TaskFailureCauseRuntimeCrash {
 		t.Fatalf("failure envelope = %#v, want runtime_crash", failed.Failure)
