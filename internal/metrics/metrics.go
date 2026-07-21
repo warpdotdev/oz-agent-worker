@@ -47,7 +47,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 // scopeName is the instrumentation-scope name used for all worker metrics.
@@ -63,25 +62,6 @@ type Config struct {
 	Backend string
 	// Version is the build version of the worker binary; may be empty.
 	Version string
-}
-
-// RecordTaskFailureCause records the failure cause label on the task failure counter.
-func RecordTaskFailureCause(kind string) {
-	current().taskFailures.Add(context.Background(), 1,
-		metric.WithAttributes(attribute.String("failure_cause", boundedFailureKind(kind))),
-	)
-}
-
-func boundedFailureKind(kind string) string {
-	switch kind {
-	case types.TaskFailureCauseOperatorShutdown, types.TaskFailureCauseRuntimeCrash,
-		types.TaskFailureCauseWorkerDisconnect, types.TaskFailureCauseOOM,
-		types.TaskFailureCauseEviction, types.TaskFailureCauseInfrastructureTimeout,
-		types.TaskFailureCauseBackendFailure, types.TaskFailureCauseUserError:
-		return kind
-	default:
-		return types.TaskFailureCauseBackendFailure
-	}
 }
 
 // instruments holds the full set of synchronous OTel instruments created from
