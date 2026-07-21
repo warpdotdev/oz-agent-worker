@@ -65,11 +65,10 @@ type Config struct {
 	Version string
 }
 
-// RecordTaskFailureCause records a bounded failure kind. It intentionally uses
-// the existing failure counter so old dashboards continue to work.
+// RecordTaskFailureCause records the failure cause label on the task failure counter.
 func RecordTaskFailureCause(kind string) {
 	current().taskFailures.Add(context.Background(), 1,
-		metric.WithAttributes(attribute.String("failure_kind", boundedFailureKind(kind))),
+		metric.WithAttributes(attribute.String("failure_cause", boundedFailureKind(kind))),
 	)
 }
 
