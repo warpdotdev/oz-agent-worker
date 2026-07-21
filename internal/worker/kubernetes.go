@@ -86,26 +86,14 @@ type KubernetesBackendConfig struct {
 }
 
 func taskFailureForTerminated(terminated *corev1.ContainerStateTerminated) *types.TaskFailure {
-	exitCode := int(terminated.ExitCode)
-	failure := &types.TaskFailure{ExitCode: &exitCode}
 	if terminated.Reason == "OOMKilled" {
-		failure.Cause = types.TaskFailureCauseOOM
-		failure.OOMKilled = true
-		return failure
+		return &types.TaskFailure{Cause: types.TaskFailureCauseOOM}
 	}
-	if terminated.Signal > 0 {
-		signal := int(terminated.Signal)
-		failure.Signal = &signal
-		failure.Cause = types.TaskFailureCauseRuntimeCrash
-		return failure
+	_, isSignalExit := signalFromExitCode(int(terminated.ExitCode))
+	if terminated.Signal > 0 || isSignalExit {
+		return &types.TaskFailure{Cause: types.TaskFailureCauseRuntimeCrash}
 	}
-	if signal, ok := signalFromExitCode(int(terminated.ExitCode)); ok {
-		failure.Signal = &signal
-		failure.Cause = types.TaskFailureCauseRuntimeCrash
-		return failure
-	}
-	failure.Cause = types.TaskFailureCauseBackendFailure
-	return failure
+	return &types.TaskFailure{Cause: types.TaskFailureCauseBackendFailure}
 }
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
@@ -941,7 +929,7 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
 	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
-		failure := &types.TaskFailure{Cause: types.TaskFailureCauseEviction, Evicted: true}
+		failure := &types.TaskFailure{Cause: types.TaskFailureCauseEviction}
 		return newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), failure)
 	}
 

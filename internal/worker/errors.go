@@ -99,16 +99,15 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 	if errors.As(err, &exitErr) {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			exitCode := status.ExitStatus()
+			var sig int
 			if status.Signaled() {
-				sig := int(status.Signal())
+				sig = int(status.Signal())
 				exitCode = 128 + sig
-				failure.Signal = &sig
-			} else if sig, ok := signalFromExitCode(exitCode); ok {
-				failure.Signal = &sig
+			} else if s, ok := signalFromExitCode(exitCode); ok {
+				sig = s
 			}
 			if exitCode >= 128 {
-				failure.ExitCode = &exitCode
-				if source == taskCancellationSourceShutdown && failure.Signal != nil && *failure.Signal == int(syscall.SIGTERM) {
+				if source == taskCancellationSourceShutdown && sig == int(syscall.SIGTERM) {
 					failure.Cause = types.TaskFailureCauseOperatorShutdown
 				} else {
 					failure.Cause = types.TaskFailureCauseRuntimeCrash
@@ -125,7 +124,6 @@ func classifyFailure(err error, source taskCancellationSource) *types.TaskFailur
 		switch wrapped.reason {
 		case metrics.TaskFailureReasonContainerOOM:
 			failure.Cause = types.TaskFailureCauseOOM
-			failure.OOMKilled = true
 		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
 			failure.Cause = types.TaskFailureCauseInfrastructureTimeout
 		case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:

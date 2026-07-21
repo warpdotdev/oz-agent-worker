@@ -5,21 +5,14 @@ import (
 	"time"
 )
 
-// TaskFailure is the bounded, additive failure envelope sent with task_failed.
-// The fields intentionally contain only normalized process/platform evidence;
-// raw command output and unbounded error strings remain in Message.
+// TaskFailure is the bounded failure envelope sent with task_failed.
 type TaskFailure struct {
-	Cause     string `json:"cause,omitempty"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	Signal    *int   `json:"signal,omitempty"`
-	OOMKilled bool   `json:"oom_killed,omitempty"`
-	Evicted   bool   `json:"evicted,omitempty"`
+	Cause string `json:"cause,omitempty"`
 }
 
 const (
 	TaskFailureCauseOperatorShutdown      = "operator_shutdown"
 	TaskFailureCauseRuntimeCrash          = "runtime_crash"
-	TaskFailureCauseWorkerDisconnect      = "worker_disconnect"
 	TaskFailureCauseOOM                   = "oom"
 	TaskFailureCauseEviction              = "eviction"
 	TaskFailureCauseInfrastructureTimeout = "infrastructure_timeout"
@@ -123,8 +116,6 @@ type TaskCancellationMessage struct {
 type TaskState string
 
 const (
-	TaskStateFailed    TaskState = "FAILED"
-	TaskStateError     TaskState = "ERROR"
 	TaskStateCancelled TaskState = "CANCELLED"
 )
 
