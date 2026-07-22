@@ -146,6 +146,38 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 	}
 }
 
+func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "env.txt")
+	b := newTestCommandBackend(t, CommandBackendConfig{
+		DispatchCommand: "env > " + outFile,
+		// Operator attempts to override well-known vars — they must not take effect.
+		Env: map[string]string{
+			"OZ_RUN_ID":          "operator-injected",
+			"OZ_EXECUTION_ID":    "operator-injected",
+			"OZ_WORKER_BACKEND": "operator-injected",
+		},
+	})
+
+	if result := b.ExecuteTask(context.Background(), testTaskParams()); result.Error != nil || result.Outcome != ExecuteOutcomeSpawned {
+		t.Fatalf("ExecuteTask() = %+v, want ExecuteOutcomeSpawned with no error", result)
+	}
+
+	data, err := os.ReadFile(outFile) // #nosec G304 -- test-controlled temp path.
+	if err != nil {
+		t.Fatalf("failed to read captured env: %v", err)
+	}
+	env := string(data)
+	if !strings.Contains(env, "OZ_RUN_ID=task-1") {
+		t.Errorf("OZ_RUN_ID must be the actual task ID, not overridable by operator Env; got:\n%s", env)
+	}
+	if !strings.Contains(env, "OZ_EXECUTION_ID=exec-1") {
+		t.Errorf("OZ_EXECUTION_ID must be the actual execution ID, not overridable by operator Env; got:\n%s", env)
+	}
+	if !strings.Contains(env, "OZ_WORKER_BACKEND=command") {
+		t.Errorf("OZ_WORKER_BACKEND must be 'command', not overridable by operator Env; got:\n%s", env)
+	}
+}
+
 func TestNewCommandBackendRequiresDispatchCommand(t *testing.T) {
 	if _, err := NewCommandBackend(context.Background(), CommandBackendConfig{}); err == nil {
 		t.Fatal("expected error for empty dispatch command")

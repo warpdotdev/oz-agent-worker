@@ -142,14 +142,21 @@ func (b *CommandBackend) Shutdown(ctx context.Context) {
 }
 
 // commandEnv builds the subprocess environment: the host environment overlaid
-// with the well-known OZ_* vars and the operator-configured Env. Task env vars
-// (which may include secrets) are deliberately excluded — they travel only in
-// the JSON payload on stdin.
+// with the operator-configured Env and then the well-known OZ_* vars. Task env
+// vars (which may include secrets) are deliberately excluded — they travel only
+// in the JSON payload on stdin.
+//
+// Well-known OZ_* vars (OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, etc.)
+// are applied last so that operator-configured Env entries can never clobber
+// them. mergeEnvVars uses last-wins semantics within the override slice, so
+// position determines precedence.
 func (b *CommandBackend) commandEnv(wellKnown []string) []string {
-	overlay := make([]string, 0, len(wellKnown)+len(b.config.Env))
-	overlay = append(overlay, wellKnown...)
+	overlay := make([]string, 0, len(b.config.Env)+len(wellKnown))
 	for key, value := range b.config.Env {
 		overlay = append(overlay, fmt.Sprintf("%s=%s", key, value))
 	}
+	// Well-known vars are appended last so they always take precedence over
+	// any identically-named key in the operator-configured Env.
+	overlay = append(overlay, wellKnown...)
 	return mergeEnvVars(os.Environ(), overlay)
 }
