@@ -86,7 +86,9 @@ type KubernetesBackendConfig struct {
 }
 
 // terminatedExitCode returns the terminated container's exit status,
-// normalized to 128+signal for signal terminations.
+// normalized to 128+signal for signal terminations — the form failure-cause
+// classification keys on to tell crashes and operator shutdowns apart from
+// ordinary failures.
 func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 	if terminated.Signal > 0 {
 		return 128 + int(terminated.Signal)

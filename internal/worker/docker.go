@@ -195,6 +195,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 			if b.containerWasOOMKilled(ctx, dockerClient, containerID) {
 				metricsReason = metrics.TaskFailureReasonContainerOOM
 			}
+			// Docker's StatusCode is already signal-coded (e.g. 137, 143), so it is
+			// recorded as-is for failure-cause classification.
 			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metricsReason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), int(status.StatusCode))
 		}
 	}
