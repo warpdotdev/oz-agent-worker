@@ -110,6 +110,9 @@ const (
 	TaskFailureReasonSetupCommand    = "setup_command"
 	TaskFailureReasonAgentInvocation = "agent_invocation"
 	TaskFailureReasonTeardownCommand = "teardown_command"
+	TaskFailureReasonDispatchCommand = "dispatch_command"
+	TaskFailureReasonDispatchTimeout = "dispatch_timeout"
+	TaskFailureReasonCancelCommand   = "cancel_command"
 	TaskFailureReasonJobCreate       = "job_create"
 	TaskFailureReasonJobWatch        = "job_watch"
 	TaskFailureReasonJobFailed       = "job_failed"
@@ -127,6 +130,7 @@ var (
 		TaskResultSucceeded,
 		TaskResultFailed,
 		TaskResultCancelled,
+		TaskResultDispatched,
 	}
 	taskFailurePhases = []string{
 		TaskFailurePhaseAssignment,
@@ -148,6 +152,9 @@ var (
 		TaskFailureReasonSetupCommand,
 		TaskFailureReasonAgentInvocation,
 		TaskFailureReasonTeardownCommand,
+		TaskFailureReasonDispatchCommand,
+		TaskFailureReasonDispatchTimeout,
+		TaskFailureReasonCancelCommand,
 		TaskFailureReasonJobCreate,
 		TaskFailureReasonJobWatch,
 		TaskFailureReasonJobFailed,
@@ -460,6 +467,10 @@ const (
 	TaskResultSucceeded TaskResult = "succeeded"
 	TaskResultFailed    TaskResult = "failed"
 	TaskResultCancelled TaskResult = "cancelled"
+	// TaskResultDispatched is recorded when a backend hands a task off to a
+	// remote runtime (fire-and-forget) rather than running it to completion
+	// on the worker.
+	TaskResultDispatched TaskResult = "dispatched"
 )
 
 // RecordTaskCompleted records a completed task, regardless of outcome, along

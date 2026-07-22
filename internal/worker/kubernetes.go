@@ -136,9 +136,9 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 }
 
 // ExecuteTask runs the agent in a Kubernetes Job.
-func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (retErr error) {
+func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
 	executionID := taskExecutionID(params)
@@ -296,7 +296,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
 	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err)))
 	}
 
 	defer func() {
@@ -311,7 +311,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		// and pod state after the fact. They are garbage-collected by the Job's
 		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
 		// Jobs are deleted immediately to keep the namespace clean.
-		if retErr != nil {
+		if res.Error != nil {
 			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
 			return
 		}
@@ -322,13 +322,13 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to watch Job %s: %w", jobName, err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to watch Job %s: %w", jobName, err)))
 	}
 	defer jobWatcher.Stop()
 
 	podWatcher, err := b.watchTaskPods(ctx, executionID)
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err)))
 	}
 	defer podWatcher.Stop()
 
@@ -339,7 +339,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		select {
 		case <-ctx.Done():
 			log.Infof(ctx, "Stopping local watch for Kubernetes Job %s after task context cancellation", jobName)
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 
 		case event, ok := <-jobWatcher.ResultChan():
 			if !ok {
@@ -347,7 +347,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)))
 				}
 				continue
 			}
@@ -356,7 +356,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)))
 				}
 				continue
 			}
@@ -365,7 +365,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				continue
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
-				return result.err
+				return result.outcome()
 			}
 
 		case event, ok := <-podWatcher.ResultChan():
@@ -374,7 +374,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				podWatcher.Stop()
 				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)))
 				}
 				continue
 			}
@@ -383,7 +383,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				podWatcher.Stop()
 				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)))
 				}
 				continue
 			}
@@ -396,7 +396,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				if logs != "" {
 					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
 				}
-				return failure
+				return executeError(failure)
 			}
 
 		case <-safetyTicker.C:
@@ -404,24 +404,28 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
 				if apierrors.IsNotFound(err) && ctx.Err() != nil {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 				}
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err))
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err)))
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
-				return result.err
+				return result.outcome()
 			}
 
 			pods, err := b.listTaskPods(ctx, executionID)
 			if err != nil {
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err))
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)))
 			}
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
-				return failure
+				return executeError(failure)
 			}
 		}
 	}
 }
+
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// Kubernetes-backend task.
+func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 // Shutdown intentionally does not delete task Jobs.
 //
@@ -454,6 +458,14 @@ func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
 // select loop with a nil error (success) or a non-nil error (failure).
 type jobResult struct {
 	err error
+}
+
+// outcome converts a terminal jobResult into ExecuteTask's result.
+func (r *jobResult) outcome() ExecuteResult {
+	if r.err != nil {
+		return executeError(r.err)
+	}
+	return executeCompleted()
 }
 
 // handleJobState checks whether a Job has reached a terminal state and, if so,

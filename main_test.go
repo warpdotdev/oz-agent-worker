@@ -172,6 +172,74 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	}
 }
 
+func TestMergeConfigCommandFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	CLI.ServerRootURL = "https://app.warp.dev"
+	CLI.Env = []string{"CLI_ONLY=1"}
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				CancelCommand:   "/opt/oz/cancel.sh",
+				DispatchTimeout: "30s",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "command" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "command")
+	}
+	if wc.Command == nil {
+		t.Fatal("expected command backend config")
+	}
+	if wc.Command.DispatchCommand != "/opt/oz/dispatch.sh" {
+		t.Errorf("DispatchCommand = %q, want %q", wc.Command.DispatchCommand, "/opt/oz/dispatch.sh")
+	}
+	if wc.Command.CancelCommand != "/opt/oz/cancel.sh" {
+		t.Errorf("CancelCommand = %q, want %q", wc.Command.CancelCommand, "/opt/oz/cancel.sh")
+	}
+	if wc.Command.DispatchTimeout != 30*time.Second {
+		t.Errorf("DispatchTimeout = %v, want 30s", wc.Command.DispatchTimeout)
+	}
+	if wc.Command.ServerRootURL != "https://app.warp.dev" {
+		t.Errorf("ServerRootURL = %q, want %q", wc.Command.ServerRootURL, "https://app.warp.dev")
+	}
+	if wc.Command.WorkerID != "command-worker" {
+		t.Errorf("WorkerID = %q, want %q", wc.Command.WorkerID, "command-worker")
+	}
+	if wc.Command.Env["CLI_ONLY"] != "1" {
+		t.Errorf("Env[CLI_ONLY] = %q, want %q", wc.Command.Env["CLI_ONLY"], "1")
+	}
+}
+
+func TestMergeConfigCommandInvalidDispatchTimeout(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				DispatchTimeout: "nope",
+			},
+		},
+	}
+
+	if _, err := mergeConfig(fileConfig); err == nil {
+		t.Fatal("expected error for invalid dispatch_timeout")
+	}
+}
+
 func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
