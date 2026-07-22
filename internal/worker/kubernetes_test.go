@@ -1102,14 +1102,14 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:        "task-1",
 		DockerImage:   "ubuntu:22.04",
 		BaseArgs:      []string{"run"},
 		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
 	})
-	if err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
@@ -1297,12 +1297,12 @@ func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
-	}); err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	}); result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
 	}
 
 	jobs, err := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
@@ -1362,12 +1362,12 @@ func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
 	})
-	if err == nil {
+	if result.Outcome != ExecuteOutcomeError {
 		t.Fatal("expected ExecuteTask to return an error for a failed Job")
 	}
 
