@@ -127,6 +127,7 @@ const (
 	TaskFailureReasonJobCreate       TaskFailureReason = "job_create"
 	TaskFailureReasonJobWatch        TaskFailureReason = "job_watch"
 	TaskFailureReasonJobFailed       TaskFailureReason = "job_failed"
+	TaskFailureReasonEvicted         TaskFailureReason = "evicted"
 	TaskFailureReasonPodWatch        TaskFailureReason = "pod_watch"
 	TaskFailureReasonUnschedulable   TaskFailureReason = "unschedulable"
 	TaskFailureReasonVolumeMount     TaskFailureReason = "volume_mount"
@@ -165,6 +166,7 @@ var (
 		TaskFailureReasonJobCreate,
 		TaskFailureReasonJobWatch,
 		TaskFailureReasonJobFailed,
+		TaskFailureReasonEvicted,
 		TaskFailureReasonPodWatch,
 		TaskFailureReasonUnschedulable,
 		TaskFailureReasonVolumeMount,

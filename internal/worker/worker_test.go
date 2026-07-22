@@ -106,15 +106,16 @@ func TestTaskFailureLabels(t *testing.T) {
 }
 
 func TestClassifyFailure(t *testing.T) {
-	// Helpers to build pre-classified backend errors (as Docker/k8s backends would).
-	oomErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerOOM, errors.New("oom"), types.TaskFailureCauseOOM)
-	evictionErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, errors.New("evicted"), types.TaskFailureCauseEviction)
-	setupErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("bad setup"), "")
-	badImageErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInvalidImage, errors.New("bad image"), "")
+	// Backend failures as backends report them: metrics facts only; the cause
+	// is derived here by classifyFailure.
+	oomErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerOOM, errors.New("oom"))
+	evictionErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonEvicted, errors.New("evicted"))
+	setupErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("bad setup"))
+	badImageErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInvalidImage, errors.New("bad image"))
 	genericBackendErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerExit, errors.New("exit 1"))
 
 	// Agent signal exits as the direct backend reports them: a real subprocess
-	// exit decoded by agentExitCode and wrapped via newAgentExitFailure.
+	// exit decoded by agentExitCode and recorded on the failure.
 	sigterm143 := agentExitFailureFromSubprocess(t, 143)
 	sigabrt134 := agentExitFailureFromSubprocess(t, 134)
 
@@ -132,10 +133,9 @@ func TestClassifyFailure(t *testing.T) {
 		{"deadline exceeded", context.DeadlineExceeded, "", types.TaskFailureCauseInfrastructureTimeout},
 		{"context canceled (not shutdown)", context.Canceled, "", types.TaskFailureCauseRuntimeCrash},
 		{"context canceled (shutdown)", context.Canceled, taskCancellationSourceShutdown, types.TaskFailureCauseOperatorShutdown},
-		// Pre-classified backend causes (Docker/k8s set these directly)
-		{"oom pre-classified", oomErr, "", types.TaskFailureCauseOOM},
-		{"eviction pre-classified", evictionErr, "", types.TaskFailureCauseEviction},
-		// Backend reason-based classification (no pre-classified cause)
+		// Reason-derived causes
+		{"oom reason", oomErr, "", types.TaskFailureCauseOOM},
+		{"eviction reason", evictionErr, "", types.TaskFailureCauseEviction},
 		{"workspace setup failure", setupErr, "", types.TaskFailureCauseUserError},
 		{"invalid image", badImageErr, "", types.TaskFailureCauseUserError},
 		{"generic backend failure", genericBackendErr, "", types.TaskFailureCauseBackendFailure},
@@ -168,7 +168,7 @@ func agentExitFailureFromSubprocess(t *testing.T, exitCode int) error {
 	if !ok || code != exitCode {
 		t.Fatalf("agentExitCode() = (%d, %t), want (%d, true)", code, ok, exitCode)
 	}
-	return newAgentExitFailure(fmt.Errorf("oz agent exited with error: %w", err), code)
+	return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err), code)
 }
 
 func TestAgentExitCode(t *testing.T) {

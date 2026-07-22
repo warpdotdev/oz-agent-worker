@@ -242,7 +242,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		}
 		wrapped := fmt.Errorf("oz agent exited with error: %w", err)
 		if exitCode, ok := agentExitCode(err); ok {
-			return newAgentExitFailure(wrapped, exitCode)
+			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped, exitCode)
 		}
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped)
 	}

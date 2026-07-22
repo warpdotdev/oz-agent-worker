@@ -39,16 +39,11 @@ func userFacingTaskError(err error) string {
 }
 
 // classifyFailure maps a task execution failure to the failure cause reported
-// to warp-server. Backends classify the mechanics they can observe (OOM,
-// eviction, exit codes) on the TaskFailure they return; this overlays
-// worker-lifecycle context backends cannot see — whether a cancellation or
-// agent signal exit happened because the worker itself was shutting down.
+// to warp-server. It derives the cause from the facts backends record on
+// TaskFailure (metrics reason, exit status) plus worker-lifecycle context
+// backends cannot see — whether a cancellation or signal exit happened
+// because the worker itself was shutting down.
 func classifyFailure(err error, source taskCancellationSource) types.TaskFailureCause {
-	var failure *TaskFailure
-	if errors.As(err, &failure) && failure.cause != "" {
-		return failure.cause
-	}
-
 	if errors.Is(err, context.DeadlineExceeded) {
 		return types.TaskFailureCauseInfrastructureTimeout
 	}
@@ -59,38 +54,31 @@ func classifyFailure(err error, source taskCancellationSource) types.TaskFailure
 		return types.TaskFailureCauseRuntimeCrash
 	}
 
-	// Signal-coded agent exit (128+N): SIGTERM while the worker is gracefully
-	// shutting down is the operator stopping the worker; any other signal exit
-	// (SIGABRT, SIGKILL, etc.) is a crash.
-	if failure != nil && failure.agentExitCode >= 128 {
-		if source == taskCancellationSourceShutdown && failure.agentExitCode-128 == int(syscall.SIGTERM) {
+	var failure *TaskFailure
+	if !errors.As(err, &failure) {
+		return types.TaskFailureCauseBackendFailure
+	}
+
+	switch failure.metricsReason {
+	case metrics.TaskFailureReasonContainerOOM:
+		return types.TaskFailureCauseOOM
+	case metrics.TaskFailureReasonEvicted:
+		return types.TaskFailureCauseEviction
+	case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
+		return types.TaskFailureCauseInfrastructureTimeout
+	case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
+		return types.TaskFailureCauseUserError
+	}
+
+	// Signal-coded exit (128+N): SIGTERM while the worker is gracefully
+	// shutting down is the operator stopping the worker; any other signal
+	// exit (SIGABRT, SIGKILL, etc.) is a crash.
+	if failure.exitCode >= 128 {
+		if source == taskCancellationSourceShutdown && failure.exitCode-128 == int(syscall.SIGTERM) {
 			return types.TaskFailureCauseOperatorShutdown
 		}
 		return types.TaskFailureCauseRuntimeCrash
 	}
 
-	// No backend-classified cause: fall back to the reason the backend recorded
-	// (OOM, timeout, bad image, etc.).
-	if failure != nil {
-		switch failure.metricsReason {
-		case metrics.TaskFailureReasonContainerOOM:
-			return types.TaskFailureCauseOOM
-		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
-			return types.TaskFailureCauseInfrastructureTimeout
-		case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
-			return types.TaskFailureCauseUserError
-		default:
-			return types.TaskFailureCauseBackendFailure
-		}
-	}
-
 	return types.TaskFailureCauseBackendFailure
-}
-
-func signalFromExitCode(exitCode int) (int, bool) {
-	if exitCode < 129 || exitCode > 192 {
-		return 0, false
-	}
-	sig := exitCode - 128
-	return sig, sig > 0
 }

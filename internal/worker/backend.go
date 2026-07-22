@@ -54,21 +54,18 @@ type Backend interface {
 }
 
 // TaskFailure is the structured error backends return from ExecuteTask when
-// task execution fails. Backends record metrics labels and the failure
-// mechanics they can observe; worker-level policy derives the failure cause
-// reported to warp-server from these fields plus lifecycle context backends
+// task execution fails. Backends record only the facts they observe (metrics
+// labels and the failing process's exit status); the failure cause reported
+// to warp-server is derived from these facts plus lifecycle context backends
 // cannot see.
 type TaskFailure struct {
 	// metricsPhase and metricsReason label the worker's task-failure metrics.
 	metricsPhase  metrics.TaskFailurePhase
 	metricsReason metrics.TaskFailureReason
-	// cause is the backend-classified failure cause reported to warp-server;
-	// empty when the backend cannot classify beyond mechanics.
-	cause types.TaskFailureCause
-	// agentExitCode is the agent subprocess's exit code, normalized to
-	// 128+signal for signal terminations. Zero means no exit code was observed.
-	agentExitCode int
-	err           error
+	// exitCode is the failing process's exit status, normalized to 128+signal
+	// for signal terminations. Zero means no exit status was observed.
+	exitCode int
+	err      error
 }
 
 func (e *TaskFailure) Error() string {
@@ -80,25 +77,17 @@ func (e *TaskFailure) Unwrap() error {
 }
 
 func newBackendFailure(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error) error {
-	return newBackendFailureWithCause(metricsPhase, metricsReason, err, "")
-}
-
-func newBackendFailureWithCause(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, cause types.TaskFailureCause) error {
 	if err == nil {
 		return nil
 	}
-	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, cause: cause}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err}
 }
 
-// newAgentExitFailure records an agent subprocess exit with its normalized exit code.
-func newAgentExitFailure(err error, agentExitCode int) error {
+// newBackendFailureWithExitCode additionally records the failing process's
+// exit status, normalized to 128+signal for signal terminations.
+func newBackendFailureWithExitCode(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, exitCode int) error {
 	if err == nil {
 		return nil
 	}
-	return &TaskFailure{
-		metricsPhase:  metrics.TaskFailurePhaseBackend,
-		metricsReason: metrics.TaskFailureReasonAgentInvocation,
-		err:           err,
-		agentExitCode: agentExitCode,
-	}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, exitCode: exitCode}
 }
