@@ -251,9 +251,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	return nil
 }
 
-// agentExitCode extracts the agent subprocess's exit code from a cmd.Run error,
-// normalized to 128+signal for signal terminations. ok is false when the error
-// does not carry a process exit status.
+// agentExitCode extracts the agent subprocess's exit code from a cmd.Run error.
+// os/exec reports signal deaths as exit code -1 rather than a signal-coded
+// status, so the signal is recovered from the wait status and normalized to
+// 128+signal. ok is false when the error does not carry a process exit status
+// (e.g. the binary never launched).
 func agentExitCode(err error) (exitCode int, ok bool) {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
