@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// TaskFailureCause* are the wire values for TaskFailedMessage.FailureCause.
+// They form a protocol contract with warp-server, which maps each cause to a
+// terminal run state and fault attribution; they are intentionally coarser
+// than the worker's internal metrics failure reasons.
 const (
 	TaskFailureCauseOperatorShutdown      = "operator_shutdown"
 	TaskFailureCauseRuntimeCrash          = "runtime_crash"

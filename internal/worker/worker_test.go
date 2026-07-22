@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -106,15 +107,16 @@ func TestTaskFailureLabels(t *testing.T) {
 
 func TestClassifyFailure(t *testing.T) {
 	// Helpers to build pre-classified backend errors (as Docker/k8s backends would).
-	oomErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerOOM, errors.New("oom"), types.TaskFailureCauseOOM)
-	evictionErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, errors.New("evicted"), types.TaskFailureCauseEviction)
-	setupErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("bad setup"), "")
-	badImageErr := newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInvalidImage, errors.New("bad image"), "")
+	oomErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerOOM, errors.New("oom"), types.TaskFailureCauseOOM)
+	evictionErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, errors.New("evicted"), types.TaskFailureCauseEviction)
+	setupErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("bad setup"), "")
+	badImageErr := newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInvalidImage, errors.New("bad image"), "")
 	genericBackendErr := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerExit, errors.New("exit 1"))
 
-	// Get real signal-exit errors from a subprocess.
-	sigterm143 := exec.Command("sh", "-c", "exit 143").Run()
-	sigabrt134 := exec.Command("sh", "-c", "exit 134").Run()
+	// Agent signal exits as the direct backend reports them: a real subprocess
+	// exit decoded by agentExitCode and wrapped via newAgentExitFailure.
+	sigterm143 := agentExitFailureFromSubprocess(t, 143)
+	sigabrt134 := agentExitFailureFromSubprocess(t, 134)
 
 	cases := []struct {
 		name   string
@@ -154,25 +156,50 @@ func TestClassifyFailure(t *testing.T) {
 	}
 }
 
-func TestTaskFailureMetadataSignalExits(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		exitCode string
-	}{
-		{name: "sigterm", exitCode: "143"},
-		{name: "sigabrt", exitCode: "134"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := exec.Command("sh", "-c", "exit "+tc.exitCode).Run()
-			if err == nil {
-				t.Fatal("expected command to exit non-zero")
-			}
-			cause := classifyFailure(err, "")
-			if cause != types.TaskFailureCauseRuntimeCrash {
-				t.Fatalf("failure cause = %q, want %q", cause, types.TaskFailureCauseRuntimeCrash)
-			}
-		})
+// agentExitFailureFromSubprocess builds the error the direct backend returns for
+// a real subprocess that exited with the given signal-coded exit code.
+func agentExitFailureFromSubprocess(t *testing.T, exitCode int) error {
+	t.Helper()
+	err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", exitCode)).Run()
+	if err == nil {
+		t.Fatalf("expected exit %d to produce an error", exitCode)
 	}
+	code, ok := agentExitCode(err)
+	if !ok || code != exitCode {
+		t.Fatalf("agentExitCode() = (%d, %t), want (%d, true)", code, ok, exitCode)
+	}
+	return newAgentExitFailure(fmt.Errorf("oz agent exited with error: %w", err), code)
+}
+
+func TestAgentExitCode(t *testing.T) {
+	t.Run("signal termination normalizes to 128+signal", func(t *testing.T) {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to start subprocess: %v", err)
+		}
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("failed to signal subprocess: %v", err)
+		}
+		err := cmd.Wait()
+		code, ok := agentExitCode(err)
+		if !ok || code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("agentExitCode() = (%d, %t), want (%d, true)", code, ok, 128+int(syscall.SIGTERM))
+		}
+	})
+
+	t.Run("plain exit code passes through", func(t *testing.T) {
+		err := exec.Command("sh", "-c", "exit 2").Run()
+		code, ok := agentExitCode(err)
+		if !ok || code != 2 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (2, true)", code, ok)
+		}
+	})
+
+	t.Run("non-exit error", func(t *testing.T) {
+		if code, ok := agentExitCode(errors.New("boom")); ok || code != 0 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (0, false)", code, ok)
+		}
+	})
 }
 
 func TestTaskFailedMessageIncludesFailureCause(t *testing.T) {

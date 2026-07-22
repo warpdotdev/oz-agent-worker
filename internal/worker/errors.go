@@ -4,38 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"syscall"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
-
-type backendFailureError struct {
-	phase  string
-	reason string
-	err    error
-	cause  string // pre-classified failure cause; empty when not pre-classified
-}
-
-func newBackendFailure(phase, reason string, err error) error {
-	return newBackendFailureWithMetadata(phase, reason, err, "")
-}
-
-func newBackendFailureWithMetadata(phase, reason string, err error, cause string) error {
-	if err == nil {
-		return nil
-	}
-	return &backendFailureError{phase: phase, reason: reason, err: err, cause: cause}
-}
-
-func (e *backendFailureError) Error() string {
-	return e.err.Error()
-}
-
-func (e *backendFailureError) Unwrap() error {
-	return e.err
-}
 
 func taskFailureLabels(err error) (phase, reason string) {
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -44,7 +17,7 @@ func taskFailureLabels(err error) (phase, reason string) {
 	if errors.Is(err, context.Canceled) {
 		return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled
 	}
-	var failure *backendFailureError
+	var failure *TaskFailure
 	if errors.As(err, &failure) {
 		return failure.phase, failure.reason
 	}
@@ -65,15 +38,15 @@ func userFacingTaskError(err error) string {
 	}
 }
 
-// classifyFailure inspects a task execution error and returns the failure cause.
-// It distinguishes two root causes: signal exits from the agent subprocess
-// (operator_shutdown, runtime_crash) and failures from backend infrastructure
-// code — Docker, Kubernetes — that ran before or after the agent process
-// (oom, eviction, user_error, backend_failure, etc.).
+// classifyFailure maps a task execution failure to the wire failure cause.
+// Backends classify the mechanics they can observe (OOM, eviction, exit
+// codes) on the TaskFailure they return; this overlays worker-lifecycle
+// context backends cannot see — whether a cancellation or agent signal exit
+// happened because the worker itself was shutting down.
 func classifyFailure(err error, source taskCancellationSource) string {
-	var wrapped *backendFailureError
-	if errors.As(err, &wrapped) && wrapped.cause != "" {
-		return wrapped.cause
+	var failure *TaskFailure
+	if errors.As(err, &failure) && failure.cause != "" {
+		return failure.cause
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -86,35 +59,20 @@ func classifyFailure(err error, source taskCancellationSource) string {
 		return types.TaskFailureCauseRuntimeCrash
 	}
 
-	// Path 1: the agent subprocess exited with a signal or signal-encoded exit code.
-	// Extracts the numeric signal, then classifies as operator_shutdown when the
-	// worker is gracefully shutting down and the signal is SIGTERM, or runtime_crash
-	// for any other signal exit (SIGABRT, SIGKILL, etc.).
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-			exitCode := status.ExitStatus()
-			var sig int
-			if status.Signaled() {
-				sig = int(status.Signal())
-				exitCode = 128 + sig
-			} else if s, ok := signalFromExitCode(exitCode); ok {
-				sig = s
-			}
-			if exitCode >= 128 {
-				if source == taskCancellationSourceShutdown && sig == int(syscall.SIGTERM) {
-					return types.TaskFailureCauseOperatorShutdown
-				}
-				return types.TaskFailureCauseRuntimeCrash
-			}
+	// Signal-coded agent exit (128+N): SIGTERM while the worker is gracefully
+	// shutting down is the operator stopping the worker; any other signal exit
+	// (SIGABRT, SIGKILL, etc.) is a crash.
+	if failure != nil && failure.agentExitCode >= 128 {
+		if source == taskCancellationSourceShutdown && failure.agentExitCode-128 == int(syscall.SIGTERM) {
+			return types.TaskFailureCauseOperatorShutdown
 		}
+		return types.TaskFailureCauseRuntimeCrash
 	}
 
-	// Path 2: the failure came from backend infrastructure code (Docker, Kubernetes)
-	// before or after the agent process, not from the agent process itself.
-	// Classifies by the reason the backend recorded (OOM, timeout, bad image, etc.).
-	if errors.As(err, &wrapped) {
-		switch wrapped.reason {
+	// No backend-classified cause: fall back to the reason the backend recorded
+	// (OOM, timeout, bad image, etc.).
+	if failure != nil {
+		switch failure.reason {
 		case metrics.TaskFailureReasonContainerOOM:
 			return types.TaskFailureCauseOOM
 		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:

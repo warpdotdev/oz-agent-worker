@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -238,11 +240,33 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		if ctx.Err() != nil {
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err))
+		wrapped := fmt.Errorf("oz agent exited with error: %w", err)
+		if exitCode, ok := agentExitCode(err); ok {
+			return newAgentExitFailure(wrapped, exitCode)
+		}
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped)
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
 	return nil
+}
+
+// agentExitCode extracts the agent subprocess's exit code from a cmd.Run error,
+// normalized to 128+signal for signal terminations. ok is false when the error
+// does not carry a process exit status.
+func agentExitCode(err error) (exitCode int, ok bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	status, isWaitStatus := exitErr.Sys().(syscall.WaitStatus)
+	if !isWaitStatus {
+		return 0, false
+	}
+	if status.Signaled() {
+		return 128 + int(status.Signal()), true
+	}
+	return status.ExitStatus(), true
 }
 
 // Shutdown cleans up any workspace directories left behind under the workspace root.

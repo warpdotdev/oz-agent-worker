@@ -205,7 +205,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 			} else {
 				cause = types.TaskFailureCauseBackendFailure
 			}
-			return newBackendFailureWithMetadata(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), cause)
+			return newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, reason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), cause)
 		}
 	}
 

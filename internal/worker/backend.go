@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -42,11 +43,60 @@ type TaskParams struct {
 
 // Backend defines the interface for task execution backends.
 type Backend interface {
-	// ExecuteTask runs the agent for the given task parameters.
+	// ExecuteTask runs the agent for the given task parameters. Execution
+	// failures are returned as (or wrapped around) *TaskFailure.
 	ExecuteTask(ctx context.Context, params *TaskParams) error
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
+}
+
+// TaskFailure is the structured error backends return from ExecuteTask when
+// task execution fails. Backends record metrics labels and the failure
+// mechanics they can observe; worker-level policy derives the wire failure
+// cause from these fields plus lifecycle context backends cannot see.
+type TaskFailure struct {
+	phase  string
+	reason string
+	// cause is the backend-classified failure cause (types.TaskFailureCause*);
+	// empty when the backend cannot classify beyond mechanics.
+	cause string
+	// agentExitCode is the agent subprocess's exit code, normalized to
+	// 128+signal for signal terminations. Zero means no exit code was observed.
+	agentExitCode int
+	err           error
+}
+
+func (e *TaskFailure) Error() string {
+	return e.err.Error()
+}
+
+func (e *TaskFailure) Unwrap() error {
+	return e.err
+}
+
+func newBackendFailure(phase, reason string, err error) error {
+	return newBackendFailureWithCause(phase, reason, err, "")
+}
+
+func newBackendFailureWithCause(phase, reason string, err error, cause string) error {
+	if err == nil {
+		return nil
+	}
+	return &TaskFailure{phase: phase, reason: reason, err: err, cause: cause}
+}
+
+// newAgentExitFailure records an agent subprocess exit with its normalized exit code.
+func newAgentExitFailure(err error, agentExitCode int) error {
+	if err == nil {
+		return nil
+	}
+	return &TaskFailure{
+		phase:         metrics.TaskFailurePhaseBackend,
+		reason:        metrics.TaskFailureReasonAgentInvocation,
+		err:           err,
+		agentExitCode: agentExitCode,
+	}
 }
