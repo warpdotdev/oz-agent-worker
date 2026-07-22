@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"syscall"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailureReason) {
@@ -38,47 +36,12 @@ func userFacingTaskError(err error) string {
 	}
 }
 
-// classifyFailure maps a task execution failure to the failure cause reported
-// to warp-server. It derives the cause from the facts backends record on
-// TaskFailure (metrics reason, exit status) plus worker-lifecycle context
-// backends cannot see — whether a cancellation or signal exit happened
-// because the worker itself was shutting down.
-func classifyFailure(err error, source taskCancellationSource) types.TaskFailureCause {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return types.TaskFailureCauseInfrastructureTimeout
-	}
-	if errors.Is(err, context.Canceled) {
-		if source == taskCancellationSourceShutdown {
-			return types.TaskFailureCauseOperatorShutdown
-		}
-		return types.TaskFailureCauseRuntimeCrash
-	}
-
+// failureExitCode returns the exit status recorded on the failure, or 0 when
+// none was observed.
+func failureExitCode(err error) int {
 	var failure *TaskFailure
-	if !errors.As(err, &failure) {
-		return types.TaskFailureCauseBackendFailure
+	if errors.As(err, &failure) {
+		return failure.exitCode
 	}
-
-	switch failure.metricsReason {
-	case metrics.TaskFailureReasonContainerOOM:
-		return types.TaskFailureCauseOOM
-	case metrics.TaskFailureReasonEvicted:
-		return types.TaskFailureCauseEviction
-	case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:
-		return types.TaskFailureCauseInfrastructureTimeout
-	case metrics.TaskFailureReasonWorkspaceSetup, metrics.TaskFailureReasonSetupCommand, metrics.TaskFailureReasonInvalidImage:
-		return types.TaskFailureCauseUserError
-	}
-
-	// Signal-coded exit (128+N): SIGTERM while the worker is gracefully
-	// shutting down is the operator stopping the worker; any other signal
-	// exit (SIGABRT, SIGKILL, etc.) is a crash.
-	if failure.exitCode >= 128 {
-		if source == taskCancellationSourceShutdown && failure.exitCode-128 == int(syscall.SIGTERM) {
-			return types.TaskFailureCauseOperatorShutdown
-		}
-		return types.TaskFailureCauseRuntimeCrash
-	}
-
-	return types.TaskFailureCauseBackendFailure
+	return 0
 }

@@ -5,22 +5,6 @@ import (
 	"time"
 )
 
-// TaskFailureCause is the wire value for TaskFailedMessage.FailureCause.
-// It forms a protocol contract with warp-server, which maps each cause to a
-// terminal run state and fault attribution; causes are intentionally coarser
-// than the worker's internal metrics failure reasons.
-type TaskFailureCause string
-
-const (
-	TaskFailureCauseOperatorShutdown      TaskFailureCause = "operator_shutdown"
-	TaskFailureCauseRuntimeCrash          TaskFailureCause = "runtime_crash"
-	TaskFailureCauseOOM                   TaskFailureCause = "oom"
-	TaskFailureCauseEviction              TaskFailureCause = "eviction"
-	TaskFailureCauseInfrastructureTimeout TaskFailureCause = "infrastructure_timeout"
-	TaskFailureCauseBackendFailure        TaskFailureCause = "backend_failure"
-	TaskFailureCauseUserError             TaskFailureCause = "user_error"
-)
-
 // MessageType represents the type of WebSocket message
 type MessageType string
 
@@ -93,12 +77,19 @@ type TaskCompletedMessage struct {
 	TaskState *TaskState `json:"task_state,omitempty"`
 }
 
-// TaskFailedMessage is sent from worker to server if task launch fails
+// TaskFailedMessage is sent from worker to server if task launch fails.
+// FailureReason, ExitCode, and ShuttingDown are the facts warp-server
+// classifies fault attribution from: FailureReason carries the worker's
+// metrics failure-reason value, ExitCode is the failing process's exit status
+// normalized to 128+signal, and ShuttingDown reports whether the worker was
+// gracefully shutting down when the task failed.
 type TaskFailedMessage struct {
-	TaskID       string           `json:"task_id"`
-	Message      string           `json:"message"`
-	TaskState    *TaskState       `json:"task_state,omitempty"`
-	FailureCause TaskFailureCause `json:"failure_cause,omitempty"`
+	TaskID        string     `json:"task_id"`
+	Message       string     `json:"message"`
+	TaskState     *TaskState `json:"task_state,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	ExitCode      int        `json:"exit_code,omitempty"`
+	ShuttingDown  bool       `json:"shutting_down,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
