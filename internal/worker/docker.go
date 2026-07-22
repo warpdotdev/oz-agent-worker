@@ -197,7 +197,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 				reason = metrics.TaskFailureReasonContainerOOM
 			}
 			exitCode := int(status.StatusCode)
-			var cause string
+			var cause types.TaskFailureCause
 			if oomKilled {
 				cause = types.TaskFailureCauseOOM
 			} else if _, ok := signalFromExitCode(exitCode); ok {

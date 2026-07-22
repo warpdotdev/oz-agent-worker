@@ -62,8 +62,8 @@ func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
 		name       string
 		err        error
-		wantPhase  string
-		wantReason string
+		wantPhase  metrics.TaskFailurePhase
+		wantReason metrics.TaskFailureReason
 	}{
 		{
 			name:       "deadline exceeded",
@@ -122,7 +122,7 @@ func TestClassifyFailure(t *testing.T) {
 		name   string
 		err    error
 		source taskCancellationSource
-		want   string
+		want   types.TaskFailureCause
 	}{
 		// Signal exits — subprocess killed by OS
 		{"sigterm/143 without shutdown", sigterm143, "", types.TaskFailureCauseRuntimeCrash},

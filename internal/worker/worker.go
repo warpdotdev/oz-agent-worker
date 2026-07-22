@@ -607,12 +607,12 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		cause := classifyFailure(err, w.cancellationSource(taskID))
 		metrics.RecordTaskFailure(phase, reason)
 		metrics.AddTaskEvent(ctx, "task.failed",
-			attribute.String("failure.phase", phase),
-			attribute.String("failure.reason", reason),
+			attribute.String("failure.phase", string(phase)),
+			attribute.String("failure.reason", string(reason)),
 			attribute.String("error.message", err.Error()),
 		)
 		span.RecordError(err)
-		span.SetStatus(codes.Error, reason)
+		span.SetStatus(codes.Error, string(reason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
 		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), cause); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
@@ -736,7 +736,7 @@ func (w *Worker) sendTaskCompleted(taskID, message string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskFailed(taskID, message, cause string) error {
+func (w *Worker) sendTaskFailed(taskID, message string, cause types.TaskFailureCause) error {
 	failedMsg := types.TaskFailedMessage{
 		TaskID:       taskID,
 		Message:      message,

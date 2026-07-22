@@ -10,7 +10,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
-func taskFailureLabels(err error) (phase, reason string) {
+func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailureReason) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskTimeout
 	}
@@ -43,7 +43,7 @@ func userFacingTaskError(err error) string {
 // codes) on the TaskFailure they return; this overlays worker-lifecycle
 // context backends cannot see — whether a cancellation or agent signal exit
 // happened because the worker itself was shutting down.
-func classifyFailure(err error, source taskCancellationSource) string {
+func classifyFailure(err error, source taskCancellationSource) types.TaskFailureCause {
 	var failure *TaskFailure
 	if errors.As(err, &failure) && failure.cause != "" {
 		return failure.cause

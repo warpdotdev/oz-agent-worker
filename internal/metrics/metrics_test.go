@@ -285,9 +285,9 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		TaskFailurePhaseBackend + "/" + TaskFailureReasonImagePull,
-		TaskFailurePhaseBackend + "/" + TaskFailureReasonTaskCancelled,
-		TaskFailurePhaseCleanup + "/" + TaskFailureReasonCleanup,
+		string(TaskFailurePhaseBackend) + "/" + string(TaskFailureReasonImagePull),
+		string(TaskFailurePhaseBackend) + "/" + string(TaskFailureReasonTaskCancelled),
+		string(TaskFailurePhaseCleanup) + "/" + string(TaskFailureReasonCleanup),
 	} {
 		if !failureSeries[want] {
 			t.Errorf("oz_worker_task_failures_total missing primed series for %s", want)

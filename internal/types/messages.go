@@ -5,18 +5,20 @@ import (
 	"time"
 )
 
-// TaskFailureCause* are the wire values for TaskFailedMessage.FailureCause.
-// They form a protocol contract with warp-server, which maps each cause to a
-// terminal run state and fault attribution; they are intentionally coarser
+// TaskFailureCause is the wire value for TaskFailedMessage.FailureCause.
+// It forms a protocol contract with warp-server, which maps each cause to a
+// terminal run state and fault attribution; causes are intentionally coarser
 // than the worker's internal metrics failure reasons.
+type TaskFailureCause string
+
 const (
-	TaskFailureCauseOperatorShutdown      = "operator_shutdown"
-	TaskFailureCauseRuntimeCrash          = "runtime_crash"
-	TaskFailureCauseOOM                   = "oom"
-	TaskFailureCauseEviction              = "eviction"
-	TaskFailureCauseInfrastructureTimeout = "infrastructure_timeout"
-	TaskFailureCauseBackendFailure        = "backend_failure"
-	TaskFailureCauseUserError             = "user_error"
+	TaskFailureCauseOperatorShutdown      TaskFailureCause = "operator_shutdown"
+	TaskFailureCauseRuntimeCrash          TaskFailureCause = "runtime_crash"
+	TaskFailureCauseOOM                   TaskFailureCause = "oom"
+	TaskFailureCauseEviction              TaskFailureCause = "eviction"
+	TaskFailureCauseInfrastructureTimeout TaskFailureCause = "infrastructure_timeout"
+	TaskFailureCauseBackendFailure        TaskFailureCause = "backend_failure"
+	TaskFailureCauseUserError             TaskFailureCause = "user_error"
 )
 
 // MessageType represents the type of WebSocket message
@@ -93,10 +95,10 @@ type TaskCompletedMessage struct {
 
 // TaskFailedMessage is sent from worker to server if task launch fails
 type TaskFailedMessage struct {
-	TaskID       string     `json:"task_id"`
-	Message      string     `json:"message"`
-	TaskState    *TaskState `json:"task_state,omitempty"`
-	FailureCause string     `json:"failure_cause,omitempty"`
+	TaskID       string           `json:"task_id"`
+	Message      string           `json:"message"`
+	TaskState    *TaskState       `json:"task_state,omitempty"`
+	FailureCause TaskFailureCause `json:"failure_cause,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task

@@ -85,7 +85,7 @@ type KubernetesBackendConfig struct {
 	PreflightResources *corev1.ResourceRequirements
 }
 
-func taskFailureCauseForTerminated(terminated *corev1.ContainerStateTerminated) string {
+func taskFailureCauseForTerminated(terminated *corev1.ContainerStateTerminated) types.TaskFailureCause {
 	if terminated.Reason == "OOMKilled" {
 		return types.TaskFailureCauseOOM
 	}
@@ -1422,7 +1422,7 @@ func isImmediateContainerFailure(reason string) bool {
 	}
 }
 
-func classifyJobFailure(job *batchv1.Job) string {
+func classifyJobFailure(job *batchv1.Job) metrics.TaskFailureReason {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
 			continue
@@ -1435,7 +1435,7 @@ func classifyJobFailure(job *batchv1.Job) string {
 	return metrics.TaskFailureReasonJobFailed
 }
 
-func classifyWaitingReason(reason string, initContainer bool) string {
+func classifyWaitingReason(reason string, initContainer bool) metrics.TaskFailureReason {
 	switch reason {
 	case "ErrImagePull", "ImagePullBackOff":
 		return metrics.TaskFailureReasonImagePull
@@ -1454,7 +1454,7 @@ func classifyWaitingReason(reason string, initContainer bool) string {
 	}
 }
 
-func classifyTerminatedReason(reason string) string {
+func classifyTerminatedReason(reason string) metrics.TaskFailureReason {
 	if reason == "OOMKilled" {
 		return metrics.TaskFailureReasonContainerOOM
 	}

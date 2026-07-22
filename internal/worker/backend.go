@@ -58,11 +58,11 @@ type Backend interface {
 // mechanics they can observe; worker-level policy derives the wire failure
 // cause from these fields plus lifecycle context backends cannot see.
 type TaskFailure struct {
-	phase  string
-	reason string
-	// cause is the backend-classified failure cause (types.TaskFailureCause*);
-	// empty when the backend cannot classify beyond mechanics.
-	cause string
+	phase  metrics.TaskFailurePhase
+	reason metrics.TaskFailureReason
+	// cause is the backend-classified failure cause; empty when the backend
+	// cannot classify beyond mechanics.
+	cause types.TaskFailureCause
 	// agentExitCode is the agent subprocess's exit code, normalized to
 	// 128+signal for signal terminations. Zero means no exit code was observed.
 	agentExitCode int
@@ -77,11 +77,11 @@ func (e *TaskFailure) Unwrap() error {
 	return e.err
 }
 
-func newBackendFailure(phase, reason string, err error) error {
+func newBackendFailure(phase metrics.TaskFailurePhase, reason metrics.TaskFailureReason, err error) error {
 	return newBackendFailureWithCause(phase, reason, err, "")
 }
 
-func newBackendFailureWithCause(phase, reason string, err error, cause string) error {
+func newBackendFailureWithCause(phase metrics.TaskFailurePhase, reason metrics.TaskFailureReason, err error, cause types.TaskFailureCause) error {
 	if err == nil {
 		return nil
 	}
