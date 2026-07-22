@@ -67,7 +67,7 @@ backend:
 
 ### Command
 
-The command backend hands task execution to an operator-owned runtime over **any transport**, without recompiling the worker. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.). Execution is **fire-and-forget**: once the dispatch command reports success, the remote `oz` agent — launched by your runtime with the worker-provided arguments — reports task progress and terminal state directly to Warp. The worker does not finalize a dispatched task itself; it only reports a failure if the dispatch command itself fails.
+The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
 
 Example config:
 
@@ -92,12 +92,30 @@ Config keys:
 The dispatch contract:
 
 - The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
-- The following non-secret variables are also set in the command's environment for convenience: `OZ_TASK_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`.
-- The JSON payload contains: `version`, `task_id`, `execution_id`, `server_root_url`, `worker_id`, `docker_image`, `base_args`, `env`, `sidecars`, and `task`. `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
+- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`.
+- The JSON payload looks like:
+
+  ```json
+  {
+    "version": 1,
+    "run_id": "...",
+    "execution_id": "...",
+    "server_root_url": "https://app.warp.dev",
+    "worker_id": "my-worker",
+    "docker_image": "ubuntu:22.04",
+    "base_args": ["agent", "run", "--task-id", "...", "--server-root-url", "..."],
+    "env": { "GITHUB_ACCESS_TOKEN": "...", "...": "..." },
+    "sidecars": [ { "image": "...", "mount_path": "/agent", "read_write": false } ],
+    "task": { "id": "...", "title": "...", "task_definition": { "prompt": "..." } }
+  }
+  ```
+
+  `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
 - Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
-- The cancel command (when configured) receives `OZ_TASK_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment.
+- The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment.
 
 Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
+The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
 
 ### Kubernetes
 

@@ -792,7 +792,7 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
 		ExecutionID: "execution-1",
 		DockerImage: "ubuntu:22.04",
@@ -804,8 +804,11 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
@@ -954,7 +957,7 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
@@ -966,8 +969,11 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
@@ -1161,13 +1167,14 @@ func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan error, 1)
+	done := make(chan ExecuteResult, 1)
 	go func() {
-		done <- backend.ExecuteTask(ctx, &TaskParams{
+		result := backend.ExecuteTask(ctx, &TaskParams{
 			TaskID:      "task-1",
 			DockerImage: "ubuntu:22.04",
 			BaseArgs:    []string{"run"},
 		})
+		done <- result
 	}()
 
 	var jobName string
@@ -1179,9 +1186,9 @@ func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
 	cancel()
 
 	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "context canceled") {
-			t.Fatalf("expected context cancellation error, got %v", err)
+	case result := <-done:
+		if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "context canceled") {
+			t.Fatalf("expected context cancellation error, got %+v", result)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for ExecuteTask to return")

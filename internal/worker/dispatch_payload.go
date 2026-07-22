@@ -18,7 +18,7 @@ const DispatchPayloadVersion = 1
 // environment or argv.
 type DispatchPayload struct {
 	Version       int                  `json:"version"`
-	TaskID        string               `json:"task_id"`
+	RunID         string               `json:"run_id"`
 	ExecutionID   string               `json:"execution_id"`
 	ServerRootURL string               `json:"server_root_url"`
 	WorkerID      string               `json:"worker_id"`
@@ -42,7 +42,7 @@ func NewDispatchPayload(params *TaskParams, serverRootURL, workerID string) *Dis
 
 	return &DispatchPayload{
 		Version:       DispatchPayloadVersion,
-		TaskID:        params.TaskID,
+		RunID:         params.TaskID,
 		ExecutionID:   params.ExecutionID,
 		ServerRootURL: serverRootURL,
 		WorkerID:      workerID,

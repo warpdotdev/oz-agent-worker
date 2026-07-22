@@ -40,16 +40,14 @@ type CommandBackendConfig struct {
 
 // CommandBackend hands task execution to an operator-configured command, which
 // dispatches the task to a remote runtime over any transport. Execution is
-// fire-and-forget: a successful dispatch returns ErrTaskDispatched, and the
-// remote oz agent reports terminal state to warp-server itself.
+// fire-and-forget: a successful dispatch returns ExecuteOutcomeSpawned, and
+// the remote oz agent reports terminal state to warp-server itself by running
+// oz harness-support report-shutdown.
 type CommandBackend struct {
 	config CommandBackendConfig
 }
 
-var (
-	_ Backend           = (*CommandBackend)(nil)
-	_ CancelableBackend = (*CommandBackend)(nil)
-)
+var _ Backend = (*CommandBackend)(nil)
 
 // NewCommandBackend constructs a command backend, requiring a dispatch command.
 func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*CommandBackend, error) {
@@ -60,26 +58,25 @@ func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*Comma
 		config.DispatchTimeout = defaultDispatchTimeout
 	}
 
-	hasCancel := config.CancelCommand != ""
-	log.Infof(ctx, "Using command backend (cancel command configured: %t, dispatch timeout: %s)", hasCancel, config.DispatchTimeout)
+	log.Infof(ctx, "Using command backend")
 
 	return &CommandBackend{config: config}, nil
 }
 
 // ExecuteTask dispatches the task by invoking the configured dispatch command
-// with the JSON payload on stdin. It returns ErrTaskDispatched on success.
-func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+// with the JSON payload on stdin. It returns ExecuteOutcomeSpawned on success.
+func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	payload := NewDispatchPayload(params, b.config.ServerRootURL, b.config.WorkerID)
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchCommand, fmt.Errorf("failed to marshal dispatch payload: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchCommand, fmt.Errorf("failed to marshal dispatch payload: %w", err)))
 	}
 
 	dctx, cancel := context.WithTimeout(ctx, b.config.DispatchTimeout)
 	defer cancel()
 
 	env := b.commandEnv([]string{
-		fmt.Sprintf("OZ_TASK_ID=%s", params.TaskID),
+		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
 		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
 		"OZ_WORKER_BACKEND=command",
 		fmt.Sprintf("OZ_SERVER_ROOT_URL=%s", b.config.ServerRootURL),
@@ -97,17 +94,17 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) er
 		// The parent context being cancelled means the worker is cancelling the
 		// task (user/shutdown), not a dispatch failure.
 		if ctx.Err() != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
 		// The dispatch-scoped context expiring means the command overran its budget.
 		if dctx.Err() == context.DeadlineExceeded {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchTimeout, fmt.Errorf("dispatch command timed out after %s: %w", b.config.DispatchTimeout, err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchTimeout, fmt.Errorf("dispatch command timed out after %s: %w", b.config.DispatchTimeout, err)))
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchCommand, fmt.Errorf("dispatch command failed: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonDispatchCommand, fmt.Errorf("dispatch command failed: %w", err)))
 	}
 
 	log.Infof(ctx, "Task %s dispatched successfully", params.TaskID)
-	return ErrTaskDispatched
+	return executeSpawned()
 }
 
 // CancelTask best-effort cancels a dispatched task via the configured cancel
@@ -118,7 +115,7 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 	}
 
 	env := b.commandEnv([]string{
-		fmt.Sprintf("OZ_TASK_ID=%s", params.TaskID),
+		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
 		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
 		"OZ_WORKER_BACKEND=command",
 	})
@@ -141,7 +138,7 @@ func (b *CommandBackend) PreservesTasksOnShutdown() bool { return true }
 
 // Shutdown has nothing to clean up; the backend owns no local resources.
 func (b *CommandBackend) Shutdown(ctx context.Context) {
-	log.Debugf(ctx, "Command backend shutdown (no-op)")
+	log.Debugf(ctx, "Command backend shutdown")
 }
 
 // commandEnv builds the subprocess environment: the host environment overlaid

@@ -10,9 +10,12 @@ you can both (a) verify the worker forwards the right payload to the command and
 
 It reads the ``DispatchPayload`` (JSON) on stdin and:
   1. logs a summary of what it received and writes the full payload to
-     ``OZ_LOCAL_RUN_LOG_DIR/payload-<task_id>.json`` for inspection,
+     ``OZ_LOCAL_RUN_LOG_DIR/payload-<run_id>.json`` for inspection,
   2. launches ``$OZ_BIN <base_args...>`` detached (fire-and-forget) with the
-     payload's ``env`` applied, writing the run's output to a per-task log file,
+     payload's ``env`` applied, writing the run's output to a per-task log file;
+     after the CLI exits, the same detached wrapper reports completion via
+     ``$OZ_BIN harness-support --run-id <run_id> report-shutdown``, as the
+     command backend contract requires (see ../../README.md),
   3. exits 0 once the run is launched. The agent reports its own terminal state
      to the server (base_args already carries --task-id / --server-root-url), so
      the worker does not finalize the task.
@@ -50,7 +53,7 @@ def main():
         sys.stderr.write(f"invalid dispatch payload on stdin: {exc}\n")
         return 1
 
-    task_id = payload.get("task_id", "unknown")
+    run_id = payload.get("run_id", "unknown")
     base_args = payload.get("base_args") or []
     env_overlay = payload.get("env") or {}
 
@@ -58,14 +61,14 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
 
     # Persist the full payload so the forwarded contents are easy to inspect.
-    payload_path = os.path.join(log_dir, f"payload-{task_id}.json")
+    payload_path = os.path.join(log_dir, f"payload-{run_id}.json")
     with open(payload_path, "w", encoding="utf-8") as payload_file:
         json.dump(payload, payload_file, indent=2, sort_keys=True)
 
     # Log a summary so the worker log shows exactly what was forwarded.
     sys.stderr.write(
-        "[dispatch-oz-local] task_id=%s execution_id=%s image=%s\n"
-        % (task_id, payload.get("execution_id", ""), payload.get("docker_image", ""))
+        "[dispatch-oz-local] run_id=%s execution_id=%s image=%s\n"
+        % (run_id, payload.get("execution_id", ""), payload.get("docker_image", ""))
     )
     sys.stderr.write(
         "[dispatch-oz-local] base_args: %s\n"
@@ -84,8 +87,18 @@ def main():
     child_env = dict(os.environ)
     child_env.update({str(key): str(value) for key, value in env_overlay.items()})
 
-    argv = [oz_bin, *base_args]
-    run_log_path = os.path.join(log_dir, f"oz-run-{task_id}.log")
+    run_log_path = os.path.join(log_dir, f"oz-run-{run_id}.log")
+
+    # The command backend contract requires the runtime to report completion by
+    # running `oz harness-support report-shutdown` with the run ID once the CLI
+    # exits. Chain the run and the report inside one detached shell so this
+    # dispatch command can still return immediately (fire-and-forget).
+    run_cmd = " ".join(shlex.quote(arg) for arg in [oz_bin, *base_args])
+    report_cmd = " ".join(
+        shlex.quote(arg)
+        for arg in [oz_bin, "harness-support", "--run-id", str(run_id), "report-shutdown"]
+    )
+    wrapper = f"{run_cmd}; {report_cmd}"
 
     # Launch detached so the run outlives this short-lived dispatch command,
     # matching the command backend's fire-and-forget contract.
@@ -97,7 +110,7 @@ def main():
 
     try:
         proc = subprocess.Popen(
-            argv,
+            ["/bin/sh", "-c", wrapper],
             env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=run_log,

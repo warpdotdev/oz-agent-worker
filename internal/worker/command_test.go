@@ -57,9 +57,9 @@ func TestCommandBackendDispatchesPayloadOnStdin(t *testing.T) {
 		WorkerID:        "my-worker",
 	})
 
-	err := b.ExecuteTask(context.Background(), testTaskParams())
-	if !errors.Is(err, ErrTaskDispatched) {
-		t.Fatalf("ExecuteTask() = %v, want ErrTaskDispatched", err)
+	result := b.ExecuteTask(context.Background(), testTaskParams())
+	if result.Error != nil || result.Outcome != ExecuteOutcomeSpawned {
+		t.Fatalf("ExecuteTask() = %+v, want ExecuteOutcomeSpawned with no error", result)
 	}
 
 	data, readErr := os.ReadFile(outFile) // #nosec G304 -- test-controlled temp path.
@@ -73,8 +73,8 @@ func TestCommandBackendDispatchesPayloadOnStdin(t *testing.T) {
 	if got.Version != DispatchPayloadVersion {
 		t.Errorf("Version = %d, want %d", got.Version, DispatchPayloadVersion)
 	}
-	if got.TaskID != "task-1" {
-		t.Errorf("TaskID = %q, want task-1", got.TaskID)
+	if got.RunID != "task-1" {
+		t.Errorf("RunID = %q, want task-1", got.RunID)
 	}
 	if got.DockerImage != "ubuntu:22.04" {
 		t.Errorf("DockerImage = %q", got.DockerImage)
@@ -90,21 +90,21 @@ func TestCommandBackendDispatchesPayloadOnStdin(t *testing.T) {
 	}
 }
 
-func TestCommandBackendSuccessReturnsErrTaskDispatched(t *testing.T) {
+func TestCommandBackendSuccessReturnsSpawnedOutcome(t *testing.T) {
 	b := newTestCommandBackend(t, CommandBackendConfig{DispatchCommand: "exit 0"})
-	err := b.ExecuteTask(context.Background(), testTaskParams())
-	if !errors.Is(err, ErrTaskDispatched) {
-		t.Fatalf("ExecuteTask() = %v, want ErrTaskDispatched", err)
+	result := b.ExecuteTask(context.Background(), testTaskParams())
+	if result.Error != nil || result.Outcome != ExecuteOutcomeSpawned {
+		t.Fatalf("ExecuteTask() = %+v, want ExecuteOutcomeSpawned with no error", result)
 	}
 }
 
 func TestCommandBackendNonZeroExitIsClassifiedFailure(t *testing.T) {
 	b := newTestCommandBackend(t, CommandBackendConfig{DispatchCommand: "exit 7"})
-	err := b.ExecuteTask(context.Background(), testTaskParams())
-	if errors.Is(err, ErrTaskDispatched) {
-		t.Fatal("non-zero exit must not be treated as a successful dispatch")
+	result := b.ExecuteTask(context.Background(), testTaskParams())
+	if result.Error == nil || result.Outcome != ExecuteOutcomeError {
+		t.Fatalf("non-zero exit must not be treated as a successful dispatch, got %+v", result)
 	}
-	assertBackendFailureReason(t, err, metrics.TaskFailureReasonDispatchCommand)
+	assertBackendFailureReason(t, result.Error, metrics.TaskFailureReasonDispatchCommand)
 }
 
 func TestCommandBackendTimeoutIsClassifiedFailure(t *testing.T) {
@@ -112,11 +112,11 @@ func TestCommandBackendTimeoutIsClassifiedFailure(t *testing.T) {
 		DispatchCommand: "sleep 5",
 		DispatchTimeout: 50 * time.Millisecond,
 	})
-	err := b.ExecuteTask(context.Background(), testTaskParams())
-	if errors.Is(err, ErrTaskDispatched) {
-		t.Fatal("timed-out dispatch must not be treated as success")
+	result := b.ExecuteTask(context.Background(), testTaskParams())
+	if result.Error == nil || result.Outcome != ExecuteOutcomeError {
+		t.Fatalf("timed-out dispatch must not be treated as success, got %+v", result)
 	}
-	assertBackendFailureReason(t, err, metrics.TaskFailureReasonDispatchTimeout)
+	assertBackendFailureReason(t, result.Error, metrics.TaskFailureReasonDispatchTimeout)
 }
 
 func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
@@ -126,8 +126,8 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 		Env:             map[string]string{"OPERATOR_VAR": "ok"},
 	})
 
-	if err := b.ExecuteTask(context.Background(), testTaskParams()); !errors.Is(err, ErrTaskDispatched) {
-		t.Fatalf("ExecuteTask() = %v, want ErrTaskDispatched", err)
+	if result := b.ExecuteTask(context.Background(), testTaskParams()); result.Error != nil || result.Outcome != ExecuteOutcomeSpawned {
+		t.Fatalf("ExecuteTask() = %+v, want ExecuteOutcomeSpawned with no error", result)
 	}
 
 	data, err := os.ReadFile(outFile) // #nosec G304 -- test-controlled temp path.
@@ -135,8 +135,8 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 		t.Fatalf("failed to read captured env: %v", err)
 	}
 	env := string(data)
-	if !strings.Contains(env, "OZ_TASK_ID=task-1") {
-		t.Errorf("expected OZ_TASK_ID in subprocess env, got:\n%s", env)
+	if !strings.Contains(env, "OZ_RUN_ID=task-1") {
+		t.Errorf("expected OZ_RUN_ID in subprocess env, got:\n%s", env)
 	}
 	if !strings.Contains(env, "OPERATOR_VAR=ok") {
 		t.Errorf("expected operator env var in subprocess env")

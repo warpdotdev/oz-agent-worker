@@ -20,7 +20,7 @@ Optional environment:
   OZ_DISPATCH_TIMEOUT_SECS  Request timeout in seconds (default 30).
 
 Also provided by the worker (no need to set these yourself):
-  OZ_TASK_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, OZ_SERVER_ROOT_URL, OZ_DOCKER_IMAGE
+  OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, OZ_SERVER_ROOT_URL, OZ_DOCKER_IMAGE
 
 Exit semantics (the contract the command backend relies on):
   exit 0    => task accepted for dispatch; the remote runtime now owns it and
@@ -48,7 +48,7 @@ def transform(payload):
 
     return {
         "run": {
-            "task_id": payload["task_id"],
+            "run_id": payload["run_id"],
             "execution_id": payload.get("execution_id", ""),
             "image": payload.get("docker_image", ""),
             # base_args is the `oz agent run ...` argv the runtime should exec.
@@ -90,7 +90,7 @@ def main():
 
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
-    request.add_header("X-Oz-Task-Id", os.environ.get("OZ_TASK_ID", ""))
+    request.add_header("X-Oz-Run-Id", os.environ.get("OZ_RUN_ID", ""))
     auth = os.environ.get("OZ_DISPATCH_AUTH_HEADER")
     if auth:
         request.add_header("Authorization", auth)

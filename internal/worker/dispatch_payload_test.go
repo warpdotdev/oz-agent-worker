@@ -25,8 +25,8 @@ func TestNewDispatchPayload(t *testing.T) {
 	if got.Version != DispatchPayloadVersion {
 		t.Errorf("Version = %d, want %d", got.Version, DispatchPayloadVersion)
 	}
-	if got.TaskID != "task-1" || got.ExecutionID != "exec-1" {
-		t.Errorf("identifiers = (%q, %q), want (task-1, exec-1)", got.TaskID, got.ExecutionID)
+	if got.RunID != "task-1" || got.ExecutionID != "exec-1" {
+		t.Errorf("identifiers = (%q, %q), want (task-1, exec-1)", got.RunID, got.ExecutionID)
 	}
 	if got.ServerRootURL != "https://app.warp.dev" || got.WorkerID != "my-worker" {
 		t.Errorf("server/worker = (%q, %q)", got.ServerRootURL, got.WorkerID)
@@ -73,7 +73,7 @@ func TestNewDispatchPayloadMarshalsSnakeCaseKeys(t *testing.T) {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
 	for _, key := range []string{
-		"version", "task_id", "execution_id", "server_root_url", "worker_id",
+		"version", "run_id", "execution_id", "server_root_url", "worker_id",
 		"docker_image", "base_args", "env", "sidecars", "task",
 	} {
 		if _, ok := generic[key]; !ok {

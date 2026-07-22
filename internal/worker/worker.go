@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -35,13 +34,18 @@ const (
 )
 
 type Config struct {
-	APIKey             string
-	WorkerID           string
-	WebSocketURL       string
-	ServerRootURL      string
-	LogLevel           string
-	BackendType        string // "docker", "direct", or "kubernetes"
-	MaxConcurrentTasks int    // 0 means unlimited
+	APIKey        string
+	WorkerID      string
+	WebSocketURL  string
+	ServerRootURL string
+	LogLevel      string
+	BackendType   string // "docker", "direct", or "kubernetes"
+	// MaxConcurrentTasks caps how many tasks may execute locally at once
+	// (0 means unlimited). A task's slot is released when the backend's
+	// ExecuteTask returns, so for backends that spawn tasks fire-and-forget
+	// (e.g. command), a slot is held only for the brief dispatch and the limit
+	// effectively does not bound the number of remote tasks running at once.
+	MaxConcurrentTasks int
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
@@ -65,14 +69,9 @@ type Worker struct {
 	lastHeartbeat  time.Time
 	sendChan       chan []byte
 	activeTasks    map[string]activeTask
-	// dispatchedTasks tracks fire-and-forget tasks the backend handed off to a
-	// remote runtime. They are no longer executing locally, but are retained
-	// (by non-secret identifiers only) so a later cancellation can be routed to
-	// a CancelableBackend. Guarded by tasksMutex.
-	dispatchedTasks map[string]*CancelParams
-	tasksMutex      sync.Mutex
-	backend         Backend
-	taskSemaphore   *semaphore.Weighted // nil when unlimited
+	tasksMutex     sync.Mutex
+	backend        Backend
+	taskSemaphore  *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
@@ -88,6 +87,13 @@ type activeTask struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	cancellationSource taskCancellationSource
+	// executionID is retained so a cancellation can hand the backend full
+	// CancelParams without needing the original assignment.
+	executionID string
+	// spawned marks a task whose backend returned ExecuteOutcomeSpawned: it no
+	// longer executes locally, but the entry is kept so a later cancellation
+	// can be routed to the backend's CancelTask.
+	spawned bool
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -141,7 +147,6 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		reconnectDelay:    InitialReconnectDelay,
 		sendChan:          make(chan []byte, 256),
 		activeTasks:       make(map[string]activeTask),
-		dispatchedTasks:   make(map[string]*CancelParams),
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
@@ -367,53 +372,45 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
 	w.tasksMutex.Lock()
 	task, ok := w.activeTasks[cancellation.TaskID]
-	if ok && task.cancellationSource == "" {
-		task.cancellationSource = taskCancellationSourceUser
-		w.activeTasks[cancellation.TaskID] = task
-	}
-	var dispatched *CancelParams
-	if !ok {
-		if dp, dok := w.dispatchedTasks[cancellation.TaskID]; dok {
-			dispatched = dp
-			delete(w.dispatchedTasks, cancellation.TaskID)
+	if ok {
+		if task.cancellationSource == "" {
+			task.cancellationSource = taskCancellationSourceUser
+			w.activeTasks[cancellation.TaskID] = task
+		}
+		if task.spawned {
+			// executeTask has already returned for a spawned task, so no
+			// deferred cleanup will remove the entry; drop it now that the
+			// cancellation is being routed to the backend.
+			delete(w.activeTasks, cancellation.TaskID)
 		}
 	}
 	w.tasksMutex.Unlock()
 
-	if ok {
-		log.Infof(w.ctx, "Cancelling task from server request: taskID=%s", cancellation.TaskID)
-		metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
-			attribute.String("source", "server"),
-			attribute.String("task.id", cancellation.TaskID),
-		)
-		task.cancel()
+	if !ok {
+		log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
 		return
 	}
 
-	if dispatched != nil {
-		w.cancelDispatchedTask(dispatched)
-		return
-	}
-
-	log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
+	log.Infof(w.ctx, "Cancelling task from server request: taskID=%s", cancellation.TaskID)
+	metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
+		attribute.String("source", "server"),
+		attribute.String("task.id", cancellation.TaskID),
+	)
+	// Every backend gets the same cancellation contract: its cancelation hook
+	// is invoked explicitly, and then its execution context is canceled..
+	w.cancelTaskOnBackend(&CancelParams{TaskID: cancellation.TaskID, ExecutionID: task.executionID})
+	task.cancel()
 }
 
-// cancelDispatchedTask makes a best-effort attempt to cancel a task that was
-// already handed off to a remote runtime via fire-and-forget dispatch. If the
-// backend cannot cancel, the worker relies on agent-side cancellation.
-func (w *Worker) cancelDispatchedTask(params *CancelParams) {
-	cancelable, ok := w.backend.(CancelableBackend)
-	if !ok {
-		log.Infof(w.ctx, "No backend cancellation for dispatched task %s; relying on agent-side cancellation", params.TaskID)
-		return
-	}
-
-	log.Infof(w.ctx, "Requesting backend cancellation for dispatched task %s", params.TaskID)
+// cancelTaskOnBackend makes a best-effort attempt to cancel a task via the
+// backend's CancelTask.
+func (w *Worker) cancelTaskOnBackend(params *CancelParams) {
+	log.Infof(w.ctx, "Requesting backend cancellation for task %s", params.TaskID)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), BackendShutdownTimeout)
 		defer cancel()
-		if err := cancelable.CancelTask(ctx, params); err != nil {
-			log.Warnf(w.ctx, "Backend cancellation failed for dispatched task %s: %v", params.TaskID, err)
+		if err := w.backend.CancelTask(ctx, params); err != nil {
+			log.Warnf(w.ctx, "Backend cancellation failed for task %s: %v", params.TaskID, err)
 			metrics.AddTaskEvent(ctx, "cancel.failed",
 				attribute.String("reason", metrics.TaskFailureReasonCancelCommand),
 				attribute.String("task.id", params.TaskID),
@@ -475,8 +472,9 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 
 	w.tasksMutex.Lock()
 	w.activeTasks[assignment.TaskID] = activeTask{
-		ctx:    taskCtx,
-		cancel: taskCancel,
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+		executionID: assignment.ExecutionID,
 	}
 	w.tasksMutex.Unlock()
 	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
@@ -617,7 +615,11 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		taskCancel()
 		span.End()
 		w.tasksMutex.Lock()
-		delete(w.activeTasks, assignment.TaskID)
+		// Spawned tasks stay in activeTasks so a later cancellation can be
+		// routed to the backend's CancelTask; everything else is done.
+		if task, tracked := w.activeTasks[assignment.TaskID]; !tracked || !task.spawned {
+			delete(w.activeTasks, assignment.TaskID)
+		}
 		w.tasksMutex.Unlock()
 
 		if w.taskSemaphore != nil {
@@ -638,22 +640,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		attribute.String("docker.image", params.DockerImage),
 	)
 
-	err := w.backend.ExecuteTask(ctx, params)
-	if errors.Is(err, ErrTaskDispatched) {
-		// Fire-and-forget: the backend handed the task to a remote runtime that
-		// owns terminal reporting to warp-server. The worker must not finalize
-		// the task; it only retains the identifiers needed to route a later
-		// cancellation.
-		result = metrics.TaskResultDispatched
-		w.tasksMutex.Lock()
-		w.dispatchedTasks[taskID] = &CancelParams{TaskID: taskID, ExecutionID: assignment.ExecutionID}
-		w.tasksMutex.Unlock()
-		metrics.AddTaskEvent(ctx, "task.dispatched")
-		span.SetStatus(codes.Ok, "task dispatched to remote runtime")
-		log.Infof(ctx, "Task dispatched fire-and-forget; worker will not finalize: taskID=%s", taskID)
-		return
-	}
-	if err != nil {
+	executeResult := w.backend.ExecuteTask(ctx, params)
+	if executeResult.Error != nil {
+		err := executeResult.Error
 		if ctx.Err() == context.Canceled && w.cancellationSource(taskID) == taskCancellationSourceUser {
 			result = metrics.TaskResultCancelled
 			metrics.AddTaskEvent(ctx, "task.cancelled",
@@ -681,6 +670,24 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
+		return
+	}
+
+	if executeResult.Outcome == ExecuteOutcomeSpawned {
+		// If the backend spawned the task asynchronously, then we must not
+		// finalize the task now. Instead, we keep the active task record
+		// so that cancellation can be routed to the backend's CancelTask
+		// implementation later.
+		result = metrics.TaskResultDispatched
+		w.tasksMutex.Lock()
+		if task, tracked := w.activeTasks[taskID]; tracked && task.cancellationSource == "" {
+			task.spawned = true
+			w.activeTasks[taskID] = task
+		}
+		w.tasksMutex.Unlock()
+		metrics.AddTaskEvent(ctx, "task.dispatched")
+		span.SetStatus(codes.Ok, "task dispatched to remote runtime")
+		log.Infof(ctx, "Task %s dispatched", taskID)
 		return
 	}
 
@@ -858,10 +865,6 @@ func (w *Worker) Shutdown() {
 			task.cancel()
 		}
 	}
-	// Dispatched (fire-and-forget) tasks run on the remote runtime independent
-	// of this worker; drop the in-memory cancellation registry without touching
-	// them.
-	clear(w.dispatchedTasks)
 	w.tasksMutex.Unlock()
 
 	if activeTaskCount > 0 && !preserveActiveTasks {

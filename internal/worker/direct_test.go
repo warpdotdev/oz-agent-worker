@@ -110,7 +110,7 @@ func TestDirectBackendSetupCommandDoesNotReadHostGlobalGitConfig(t *testing.T) {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
 
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-unseeded"}); err == nil {
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-unseeded"}); result.Error == nil {
 		t.Fatal("expected setup git command to fail because host global git config is hidden")
 	}
 
@@ -130,8 +130,8 @@ func TestDirectBackendSetupCommandDoesNotReadHostGlobalGitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create seeded direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-seeded"}); err != nil {
-		t.Fatalf("expected setup git command to succeed after seeding isolated git config: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-seeded"}); result.Error != nil {
+		t.Fatalf("expected setup git command to succeed after seeding isolated git config: %v", result.Error)
 	}
 }
 
@@ -164,8 +164,8 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-setup"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-setup"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-setup", ".gitconfig")
@@ -214,8 +214,8 @@ git config --global user.email main@example.com
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-envfile"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-envfile"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-envfile", ".gitconfig")
@@ -271,8 +271,8 @@ git ls-remote "$TEST_REWRITE_URL"
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-smoke"}); err != nil {
-		t.Fatalf("expected main oz git command to use setup-seeded isolated git config: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-smoke"}); result.Error != nil {
+		t.Fatalf("expected main oz git command to use setup-seeded isolated git config: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-smoke", ".gitconfig")
@@ -323,8 +323,8 @@ git config --global --add url."https://x-access-token:tok@github.com/".insteadOf
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
 
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-1"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-1"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	if got, err := os.ReadFile(homeCapture); err != nil {
@@ -372,7 +372,7 @@ func TestDirectBackendRejectsUnsafeTaskID(t *testing.T) {
 	}
 
 	for _, badID := range []string{"../escape", "a/../../escape", "/abs/path", "..", ""} {
-		if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: badID}); err == nil {
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: badID}); result.Error == nil {
 			t.Fatalf("expected error for unsafe task ID %q, got nil", badID)
 		}
 	}

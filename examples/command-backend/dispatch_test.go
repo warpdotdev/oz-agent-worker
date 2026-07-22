@@ -16,7 +16,7 @@ import (
 // samplePayload mirrors the worker's DispatchPayload JSON for a single task.
 const samplePayload = `{
   "version": 1,
-  "task_id": "task-1",
+  "run_id": "task-1",
   "execution_id": "exec-1",
   "server_root_url": "https://app.warp.dev",
   "worker_id": "my-worker",
@@ -30,7 +30,7 @@ const samplePayload = `{
 // transformedBody is the shape dispatch.py's transform() produces.
 type transformedBody struct {
 	Run struct {
-		TaskID      string            `json:"task_id"`
+		RunID       string            `json:"run_id"`
 		ExecutionID string            `json:"execution_id"`
 		Image       string            `json:"image"`
 		Command     []string          `json:"command"`
@@ -72,10 +72,10 @@ func runDispatch(t *testing.T, env []string, payload string) error {
 
 func TestDispatchScriptTransformsAndPostsPayload(t *testing.T) {
 	var rawBody []byte
-	var gotTaskID, gotContentType string
+	var gotRunID, gotContentType string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawBody, _ = io.ReadAll(r.Body)
-		gotTaskID = r.Header.Get("X-Oz-Task-Id")
+		gotRunID = r.Header.Get("X-Oz-Run-Id")
 		gotContentType = r.Header.Get("Content-Type")
 		w.WriteHeader(http.StatusAccepted)
 	}))
@@ -83,7 +83,7 @@ func TestDispatchScriptTransformsAndPostsPayload(t *testing.T) {
 
 	if err := runDispatch(t, []string{
 		"OZ_DISPATCH_URL=" + srv.URL,
-		"OZ_TASK_ID=task-1",
+		"OZ_RUN_ID=task-1",
 	}, samplePayload); err != nil {
 		t.Fatalf("dispatch script returned error on 2xx: %v", err)
 	}
@@ -91,16 +91,16 @@ func TestDispatchScriptTransformsAndPostsPayload(t *testing.T) {
 	if gotContentType != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotContentType)
 	}
-	if gotTaskID != "task-1" {
-		t.Errorf("X-Oz-Task-Id = %q, want task-1", gotTaskID)
+	if gotRunID != "task-1" {
+		t.Errorf("X-Oz-Run-Id = %q, want task-1", gotRunID)
 	}
 
 	var got transformedBody
 	if err := json.Unmarshal(rawBody, &got); err != nil {
 		t.Fatalf("posted body is not the expected transformed JSON: %v\nbody: %s", err, rawBody)
 	}
-	if got.Run.TaskID != "task-1" {
-		t.Errorf("run.task_id = %q, want task-1", got.Run.TaskID)
+	if got.Run.RunID != "task-1" {
+		t.Errorf("run.run_id = %q, want task-1", got.Run.RunID)
 	}
 	if got.Run.Image != "ubuntu:22.04" {
 		t.Errorf("run.image = %q, want ubuntu:22.04", got.Run.Image)
@@ -130,7 +130,7 @@ func TestDispatchScriptFailsOnServerError(t *testing.T) {
 
 	if err := runDispatch(t, []string{
 		"OZ_DISPATCH_URL=" + srv.URL,
-		"OZ_TASK_ID=task-1",
+		"OZ_RUN_ID=task-1",
 	}, samplePayload); err == nil {
 		t.Fatal("expected non-zero exit when the endpoint returns 500")
 	}
@@ -159,27 +159,41 @@ func waitForFile(t *testing.T, path string) {
 	t.Fatalf("file %q did not appear within timeout", path)
 }
 
+func waitForFileContaining(t *testing.T, path, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), substr) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %q did not contain %q within timeout", path, substr)
+}
+
 func TestDispatchOzLocalLaunchesBinaryWithBaseArgs(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
 
-	// Stub OZ_BIN records its argv and a forwarded env var, then exits.
+	// Stub OZ_BIN appends its argv and a forwarded env var on each invocation:
+	// once for the run itself, then for the report-shutdown call.
 	invocation := filepath.Join(dir, "invocation.txt")
 	stub := filepath.Join(dir, "oz-stub.sh")
-	script := "#!/bin/sh\n{ echo \"argv:$*\"; echo \"WITH_LOCAL_SERVER=$WITH_LOCAL_SERVER\"; } > \"" + invocation + "\"\n"
+	script := "#!/bin/sh\n{ echo \"argv:$*\"; echo \"WITH_LOCAL_SERVER=$WITH_LOCAL_SERVER\"; } >> \"" + invocation + "\"\n"
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatalf("failed to write stub: %v", err)
 	}
 
 	cmd := exec.Command("python3", "dispatch-oz-local.py")
 	cmd.Env = append(os.Environ(), "OZ_BIN="+stub, "OZ_LOCAL_RUN_LOG_DIR="+dir)
-	cmd.Stdin = strings.NewReader(`{"task_id":"task-1","base_args":["agent","run","--task-id","task-1"],"env":{"WITH_LOCAL_SERVER":"1"}}`)
+	cmd.Stdin = strings.NewReader(`{"run_id":"task-1","base_args":["agent","run","--task-id","task-1"],"env":{"WITH_LOCAL_SERVER":"1"}}`)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("dispatch-oz-local.py failed: %v\n%s", err, out)
 	}
 
-	// The launched (detached) stub writes asynchronously.
-	waitForFile(t, invocation)
+	// The launched (detached) wrapper writes asynchronously: the run's argv
+	// first, then the report-shutdown argv once the run has exited.
+	waitForFileContaining(t, invocation, "report-shutdown")
 	data, err := os.ReadFile(invocation)
 	if err != nil {
 		t.Fatalf("failed to read stub invocation: %v", err)
@@ -187,6 +201,9 @@ func TestDispatchOzLocalLaunchesBinaryWithBaseArgs(t *testing.T) {
 	got := string(data)
 	if !strings.Contains(got, "argv:agent run --task-id task-1") {
 		t.Errorf("stub argv = %q, want it to include the base_args", got)
+	}
+	if !strings.Contains(got, "argv:harness-support --run-id task-1 report-shutdown") {
+		t.Errorf("stub argv = %q, want a report-shutdown invocation after the run exits", got)
 	}
 	if !strings.Contains(got, "WITH_LOCAL_SERVER=1") {
 		t.Errorf("stub env = %q, want WITH_LOCAL_SERVER=1 applied from payload env", got)
@@ -200,7 +217,7 @@ func TestDispatchOzLocalRequiresOzBin(t *testing.T) {
 	requirePython(t)
 	cmd := exec.Command("python3", "dispatch-oz-local.py")
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
-	cmd.Stdin = strings.NewReader(`{"task_id":"t","base_args":["agent","run"]}`)
+	cmd.Stdin = strings.NewReader(`{"run_id":"t","base_args":["agent","run"]}`)
 	if err := cmd.Run(); err == nil {
 		t.Fatal("expected non-zero exit when OZ_BIN is unset")
 	}

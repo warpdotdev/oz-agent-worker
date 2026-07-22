@@ -2,7 +2,7 @@
 """Reference cancel command for the oz-agent-worker "command" backend.
 
 Invoked best-effort when a dispatched task is cancelled. The worker sets
-``OZ_TASK_ID`` and ``OZ_EXECUTION_ID`` in the environment; this script POSTs them
+``OZ_RUN_ID`` and ``OZ_EXECUTION_ID`` in the environment; this script POSTs them
 to ``OZ_CANCEL_URL`` so your runtime can stop the corresponding agent. Adapt the
 request body to your runtime's API if needed.
 
@@ -30,7 +30,7 @@ def main():
 
     body = json.dumps(
         {
-            "task_id": os.environ.get("OZ_TASK_ID", ""),
+            "run_id": os.environ.get("OZ_RUN_ID", ""),
             "execution_id": os.environ.get("OZ_EXECUTION_ID", ""),
         }
     ).encode("utf-8")

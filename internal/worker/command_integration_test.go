@@ -86,12 +86,17 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 	w.handleTaskAssignment(commandTaskAssignment())
 
 	// The dispatch script writes the captured payload, then executeTask returns
-	// and the deferred cleanup empties activeTasks.
+	// and the deferred cleanup keeps the entry in activeTasks marked spawned.
 	waitFor(t, 5*time.Second, func() bool {
 		_, err := os.Stat(outFile)
 		return err == nil
 	})
-	waitFor(t, 5*time.Second, func() bool { return w.activeTaskCount() == 0 })
+	waitFor(t, 5*time.Second, func() bool {
+		w.tasksMutex.Lock()
+		defer w.tasksMutex.Unlock()
+		task, ok := w.activeTasks["task-1"]
+		return ok && task.spawned
+	})
 
 	// Verify the captured dispatch payload.
 	data, err := os.ReadFile(outFile) // #nosec G304 -- test-controlled temp path.
@@ -105,8 +110,8 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 	if payload.Version != DispatchPayloadVersion {
 		t.Errorf("Version = %d, want %d", payload.Version, DispatchPayloadVersion)
 	}
-	if payload.TaskID != "task-1" {
-		t.Errorf("TaskID = %q, want task-1", payload.TaskID)
+	if payload.RunID != "task-1" {
+		t.Errorf("RunID = %q, want task-1", payload.RunID)
 	}
 	if len(payload.BaseArgs) < 2 || payload.BaseArgs[0] != "agent" || payload.BaseArgs[1] != "run" {
 		t.Errorf("BaseArgs = %v, want to start with [agent run]", payload.BaseArgs)

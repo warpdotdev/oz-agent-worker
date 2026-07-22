@@ -11,12 +11,15 @@ import (
 )
 
 // dispatchBackend is a fake Backend that reports a successful fire-and-forget
-// dispatch. It does not implement CancelableBackend.
+// dispatch. Its CancelTask is a no-op.
 type dispatchBackend struct{}
 
-func (b *dispatchBackend) ExecuteTask(context.Context, *TaskParams) error { return ErrTaskDispatched }
-func (b *dispatchBackend) Shutdown(context.Context)                       {}
-func (b *dispatchBackend) PreservesTasksOnShutdown() bool                 { return true }
+func (b *dispatchBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
+	return executeSpawned()
+}
+func (b *dispatchBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+func (b *dispatchBackend) Shutdown(context.Context)                        {}
+func (b *dispatchBackend) PreservesTasksOnShutdown() bool                  { return true }
 
 // cancelableDispatchBackend is a dispatchBackend that also records CancelTask calls.
 type cancelableDispatchBackend struct {
@@ -31,12 +34,11 @@ func (b *cancelableDispatchBackend) CancelTask(_ context.Context, params *Cancel
 
 func newDispatchWorker(backend Backend) *Worker {
 	return &Worker{
-		ctx:             context.Background(),
-		config:          Config{},
-		sendChan:        make(chan []byte, 4),
-		activeTasks:     map[string]activeTask{"task-1": {cancel: func() {}}},
-		dispatchedTasks: make(map[string]*CancelParams),
-		backend:         backend,
+		ctx:         context.Background(),
+		config:      Config{},
+		sendChan:    make(chan []byte, 4),
+		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}, executionID: "exec-1"}},
+		backend:     backend,
 	}
 }
 
@@ -58,17 +60,17 @@ func TestExecuteTaskDispatchedSuppressesTerminalMessage(t *testing.T) {
 		msg := readWebSocketMessage(t, w.sendChan)
 		t.Fatalf("expected no terminal message after dispatch, got %q", msg.Type)
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
-		t.Error("dispatched task should be removed from active tasks")
-	}
 	w.tasksMutex.Lock()
-	cp, ok := w.dispatchedTasks["task-1"]
+	task, ok := w.activeTasks["task-1"]
 	w.tasksMutex.Unlock()
 	if !ok {
-		t.Fatal("dispatched task should be registered in dispatchedTasks")
+		t.Fatal("spawned task should remain in activeTasks")
 	}
-	if cp.TaskID != "task-1" || cp.ExecutionID != "exec-1" {
-		t.Errorf("dispatched cancel params = %+v, want {task-1 exec-1}", cp)
+	if !task.spawned {
+		t.Error("spawned task entry should be marked spawned")
+	}
+	if task.executionID != "exec-1" {
+		t.Errorf("executionID = %q, want exec-1", task.executionID)
 	}
 }
 
@@ -88,14 +90,22 @@ func TestExecuteTaskDispatchedReleasesSemaphore(t *testing.T) {
 	}
 }
 
-func TestHandleTaskCancellationRoutesToCancelableBackend(t *testing.T) {
+func spawnedActiveTask(executionID string) activeTask {
+	return activeTask{
+		ctx:         context.Background(),
+		cancel:      func() {},
+		executionID: executionID,
+		spawned:     true,
+	}
+}
+
+func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 	backend := &cancelableDispatchBackend{cancelCalled: make(chan *CancelParams, 1)}
 	w := &Worker{
-		ctx:             context.Background(),
-		sendChan:        make(chan []byte, 1),
-		activeTasks:     map[string]activeTask{},
-		dispatchedTasks: map[string]*CancelParams{"task-1": {TaskID: "task-1", ExecutionID: "exec-1"}},
-		backend:         backend,
+		ctx:         context.Background(),
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
+		backend:     backend,
 	}
 
 	w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "task-1"})
@@ -106,31 +116,72 @@ func TestHandleTaskCancellationRoutesToCancelableBackend(t *testing.T) {
 			t.Errorf("CancelTask params = %+v, want {task-1 exec-1}", cp)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("CancelTask was not invoked for a dispatched task")
+		t.Fatal("CancelTask was not invoked for a spawned task")
 	}
 
 	w.tasksMutex.Lock()
-	_, ok := w.dispatchedTasks["task-1"]
+	_, ok := w.activeTasks["task-1"]
 	w.tasksMutex.Unlock()
 	if ok {
-		t.Error("dispatched task should be removed after cancellation is routed")
+		t.Error("spawned task should be removed after cancellation is routed")
 	}
 }
 
-func TestHandleTaskCancellationDispatchedNoCancelSupportIsNoop(t *testing.T) {
+func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T) {
+	backend := &cancelableDispatchBackend{cancelCalled: make(chan *CancelParams, 1)}
+	taskCtx, taskCancel := context.WithCancel(context.Background())
+	defer taskCancel()
 	w := &Worker{
-		ctx:             context.Background(),
-		sendChan:        make(chan []byte, 1),
-		activeTasks:     map[string]activeTask{},
-		dispatchedTasks: map[string]*CancelParams{"task-1": {TaskID: "task-1"}},
-		backend:         &dispatchBackend{},
+		ctx:      context.Background(),
+		sendChan: make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {
+			ctx:         taskCtx,
+			cancel:      taskCancel,
+			executionID: "exec-1",
+		}},
+		backend: backend,
 	}
 
-	// Must not panic and must not emit any task status message.
+	w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "task-1"})
+
+	if taskCtx.Err() != context.Canceled {
+		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
+	}
+	select {
+	case cp := <-backend.cancelCalled:
+		if cp.TaskID != "task-1" || cp.ExecutionID != "exec-1" {
+			t.Errorf("CancelTask params = %+v, want {task-1 exec-1}", cp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelTask was not invoked for a running task")
+	}
+
+	// The entry stays until executeTask's deferred cleanup removes it.
+	w.tasksMutex.Lock()
+	task, ok := w.activeTasks["task-1"]
+	w.tasksMutex.Unlock()
+	if !ok {
+		t.Fatal("running task should remain in activeTasks until executeTask returns")
+	}
+	if task.cancellationSource != taskCancellationSourceUser {
+		t.Fatalf("cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
+	}
+}
+
+func TestHandleTaskCancellationSpawnedNoopCancelEmitsNoMessage(t *testing.T) {
+	w := &Worker{
+		ctx:         context.Background(),
+		sendChan:    make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
+		backend:     &dispatchBackend{},
+	}
+
+	// Must not panic and must not emit any task status message when the
+	// backend's CancelTask is a no-op.
 	w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "task-1"})
 
 	if len(w.sendChan) != 0 {
-		t.Fatalf("expected no message for no-cancel-support dispatched task, got %d", len(w.sendChan))
+		t.Fatalf("expected no message for no-op-cancel spawned task, got %d", len(w.sendChan))
 	}
 }
 
