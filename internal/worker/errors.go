@@ -19,7 +19,7 @@ func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailure
 	}
 	var failure *TaskFailure
 	if errors.As(err, &failure) {
-		return failure.phase, failure.reason
+		return failure.metricsPhase, failure.metricsReason
 	}
 	return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnknown
 }
@@ -45,8 +45,8 @@ func userFacingTaskError(err error) string {
 // happened because the worker itself was shutting down.
 func classifyFailure(err error, source taskCancellationSource) types.TaskFailureCause {
 	var failure *TaskFailure
-	if errors.As(err, &failure) && failure.cause != "" {
-		return failure.cause
+	if errors.As(err, &failure) && failure.wireCause != "" {
+		return failure.wireCause
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -72,7 +72,7 @@ func classifyFailure(err error, source taskCancellationSource) types.TaskFailure
 	// No backend-classified cause: fall back to the reason the backend recorded
 	// (OOM, timeout, bad image, etc.).
 	if failure != nil {
-		switch failure.reason {
+		switch failure.metricsReason {
 		case metrics.TaskFailureReasonContainerOOM:
 			return types.TaskFailureCauseOOM
 		case metrics.TaskFailureReasonActiveDeadline, metrics.TaskFailureReasonTaskTimeout:

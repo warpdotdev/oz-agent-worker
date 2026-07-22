@@ -58,11 +58,12 @@ type Backend interface {
 // mechanics they can observe; worker-level policy derives the wire failure
 // cause from these fields plus lifecycle context backends cannot see.
 type TaskFailure struct {
-	phase  metrics.TaskFailurePhase
-	reason metrics.TaskFailureReason
-	// cause is the backend-classified failure cause; empty when the backend
-	// cannot classify beyond mechanics.
-	cause types.TaskFailureCause
+	// metricsPhase and metricsReason label the worker's task-failure metrics.
+	metricsPhase  metrics.TaskFailurePhase
+	metricsReason metrics.TaskFailureReason
+	// wireCause is the backend-classified failure cause reported to warp-server;
+	// empty when the backend cannot classify beyond mechanics.
+	wireCause types.TaskFailureCause
 	// agentExitCode is the agent subprocess's exit code, normalized to
 	// 128+signal for signal terminations. Zero means no exit code was observed.
 	agentExitCode int
@@ -77,15 +78,15 @@ func (e *TaskFailure) Unwrap() error {
 	return e.err
 }
 
-func newBackendFailure(phase metrics.TaskFailurePhase, reason metrics.TaskFailureReason, err error) error {
-	return newBackendFailureWithCause(phase, reason, err, "")
+func newBackendFailure(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error) error {
+	return newBackendFailureWithCause(metricsPhase, metricsReason, err, "")
 }
 
-func newBackendFailureWithCause(phase metrics.TaskFailurePhase, reason metrics.TaskFailureReason, err error, cause types.TaskFailureCause) error {
+func newBackendFailureWithCause(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, wireCause types.TaskFailureCause) error {
 	if err == nil {
 		return nil
 	}
-	return &TaskFailure{phase: phase, reason: reason, err: err, cause: cause}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, wireCause: wireCause}
 }
 
 // newAgentExitFailure records an agent subprocess exit with its normalized exit code.
@@ -94,8 +95,8 @@ func newAgentExitFailure(err error, agentExitCode int) error {
 		return nil
 	}
 	return &TaskFailure{
-		phase:         metrics.TaskFailurePhaseBackend,
-		reason:        metrics.TaskFailureReasonAgentInvocation,
+		metricsPhase:  metrics.TaskFailurePhaseBackend,
+		metricsReason: metrics.TaskFailureReasonAgentInvocation,
 		err:           err,
 		agentExitCode: agentExitCode,
 	}

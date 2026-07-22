@@ -491,8 +491,8 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		if failure := b.detectPodFailure(ctx, pods); failure != nil {
 			return &jobResult{err: failure}
 		}
-		reason := classifyJobFailure(jobState)
-		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.jobFailureError(jobState))}
+		metricsReason := classifyJobFailure(jobState)
+		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.jobFailureError(jobState))}
 	}
 	return nil
 }
@@ -929,8 +929,8 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
 	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
-		cause := types.TaskFailureCauseEviction
-		return newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), cause)
+		wireCause := types.TaskFailureCauseEviction
+		return newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), wireCause)
 	}
 
 	for _, status := range pod.Status.InitContainerStatuses {
@@ -976,11 +976,11 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
-		reason := metrics.TaskFailureReasonJobFailed
+		metricsReason := metrics.TaskFailureReasonJobFailed
 		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
-			reason = metrics.TaskFailureReasonActiveDeadline
+			metricsReason = metrics.TaskFailureReasonActiveDeadline
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.podFailureError(pod))
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.podFailureError(pod))
 	}
 
 	return nil
