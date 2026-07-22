@@ -55,15 +55,16 @@ type Backend interface {
 
 // TaskFailure is the structured error backends return from ExecuteTask when
 // task execution fails. Backends record metrics labels and the failure
-// mechanics they can observe; worker-level policy derives the wire failure
-// cause from these fields plus lifecycle context backends cannot see.
+// mechanics they can observe; worker-level policy derives the failure cause
+// reported to warp-server from these fields plus lifecycle context backends
+// cannot see.
 type TaskFailure struct {
 	// metricsPhase and metricsReason label the worker's task-failure metrics.
 	metricsPhase  metrics.TaskFailurePhase
 	metricsReason metrics.TaskFailureReason
-	// wireCause is the backend-classified failure cause reported to warp-server;
+	// cause is the backend-classified failure cause reported to warp-server;
 	// empty when the backend cannot classify beyond mechanics.
-	wireCause types.TaskFailureCause
+	cause types.TaskFailureCause
 	// agentExitCode is the agent subprocess's exit code, normalized to
 	// 128+signal for signal terminations. Zero means no exit code was observed.
 	agentExitCode int
@@ -82,11 +83,11 @@ func newBackendFailure(metricsPhase metrics.TaskFailurePhase, metricsReason metr
 	return newBackendFailureWithCause(metricsPhase, metricsReason, err, "")
 }
 
-func newBackendFailureWithCause(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, wireCause types.TaskFailureCause) error {
+func newBackendFailureWithCause(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, cause types.TaskFailureCause) error {
 	if err == nil {
 		return nil
 	}
-	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, wireCause: wireCause}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, cause: cause}
 }
 
 // newAgentExitFailure records an agent subprocess exit with its normalized exit code.

@@ -38,15 +38,15 @@ func userFacingTaskError(err error) string {
 	}
 }
 
-// classifyFailure maps a task execution failure to the wire failure cause.
-// Backends classify the mechanics they can observe (OOM, eviction, exit
-// codes) on the TaskFailure they return; this overlays worker-lifecycle
-// context backends cannot see — whether a cancellation or agent signal exit
-// happened because the worker itself was shutting down.
+// classifyFailure maps a task execution failure to the failure cause reported
+// to warp-server. Backends classify the mechanics they can observe (OOM,
+// eviction, exit codes) on the TaskFailure they return; this overlays
+// worker-lifecycle context backends cannot see — whether a cancellation or
+// agent signal exit happened because the worker itself was shutting down.
 func classifyFailure(err error, source taskCancellationSource) types.TaskFailureCause {
 	var failure *TaskFailure
-	if errors.As(err, &failure) && failure.wireCause != "" {
-		return failure.wireCause
+	if errors.As(err, &failure) && failure.cause != "" {
+		return failure.cause
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {

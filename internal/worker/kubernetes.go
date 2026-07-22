@@ -929,8 +929,8 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
 	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
-		wireCause := types.TaskFailureCauseEviction
-		return newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), wireCause)
+		cause := types.TaskFailureCauseEviction
+		return newBackendFailureWithCause(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobFailed, b.podFailureError(pod), cause)
 	}
 
 	for _, status := range pod.Status.InitContainerStatuses {
