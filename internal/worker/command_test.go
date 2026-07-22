@@ -152,8 +152,8 @@ func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T)
 		DispatchCommand: "env > " + outFile,
 		// Operator attempts to override well-known vars — they must not take effect.
 		Env: map[string]string{
-			"OZ_RUN_ID":          "operator-injected",
-			"OZ_EXECUTION_ID":    "operator-injected",
+			"OZ_RUN_ID":         "operator-injected",
+			"OZ_EXECUTION_ID":   "operator-injected",
 			"OZ_WORKER_BACKEND": "operator-injected",
 		},
 	})
