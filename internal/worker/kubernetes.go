@@ -85,6 +85,17 @@ type KubernetesBackendConfig struct {
 	PreflightResources *corev1.ResourceRequirements
 }
 
+// terminatedExitCode returns the terminated container's exit status,
+// normalized to 128+signal for signal terminations — the form failure-cause
+// classification keys on to tell crashes and operator shutdowns apart from
+// ordinary failures.
+func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
+	if terminated.Signal > 0 {
+		return 128 + int(terminated.Signal)
+	}
+	return int(terminated.ExitCode)
+}
+
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
 	config    KubernetesBackendConfig
@@ -492,8 +503,8 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		if failure := b.detectPodFailure(ctx, pods); failure != nil {
 			return &jobResult{err: failure}
 		}
-		reason := classifyJobFailure(jobState)
-		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.jobFailureError(jobState))}
+		metricsReason := classifyJobFailure(jobState)
+		return &jobResult{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.jobFailureError(jobState))}
 	}
 	return nil
 }
@@ -929,10 +940,13 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 }
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
+	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonEvicted, b.podFailureError(pod))
+	}
 
 	for _, status := range pod.Status.InitContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated))
+			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated), terminatedExitCode(status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), b.containerWaitingFailureError(pod, "init container", status.Name, status.State.Waiting))
@@ -941,7 +955,7 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), b.containerTerminatedFailureError(pod, "container", status.Name, status.State.Terminated))
+			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), b.containerTerminatedFailureError(pod, "container", status.Name, status.State.Terminated), terminatedExitCode(status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), b.containerWaitingFailureError(pod, "container", status.Name, status.State.Waiting))
@@ -973,11 +987,11 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
-		reason := metrics.TaskFailureReasonJobFailed
+		metricsReason := metrics.TaskFailureReasonJobFailed
 		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
-			reason = metrics.TaskFailureReasonActiveDeadline
+			metricsReason = metrics.TaskFailureReasonActiveDeadline
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.podFailureError(pod))
+		return newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.podFailureError(pod))
 	}
 
 	return nil
@@ -1419,7 +1433,7 @@ func isImmediateContainerFailure(reason string) bool {
 	}
 }
 
-func classifyJobFailure(job *batchv1.Job) string {
+func classifyJobFailure(job *batchv1.Job) metrics.TaskFailureReason {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
 			continue
@@ -1432,7 +1446,7 @@ func classifyJobFailure(job *batchv1.Job) string {
 	return metrics.TaskFailureReasonJobFailed
 }
 
-func classifyWaitingReason(reason string, initContainer bool) string {
+func classifyWaitingReason(reason string, initContainer bool) metrics.TaskFailureReason {
 	switch reason {
 	case "ErrImagePull", "ImagePullBackOff":
 		return metrics.TaskFailureReasonImagePull
@@ -1451,7 +1465,7 @@ func classifyWaitingReason(reason string, initContainer bool) string {
 	}
 }
 
-func classifyTerminatedReason(reason string) string {
+func classifyTerminatedReason(reason string) metrics.TaskFailureReason {
 	if reason == "OOMKilled" {
 		return metrics.TaskFailureReasonContainerOOM
 	}

@@ -38,14 +38,14 @@ func newTestCommandBackend(t *testing.T, cfg CommandBackendConfig) *CommandBacke
 	return b
 }
 
-func assertBackendFailureReason(t *testing.T, err error, wantReason string) {
+func assertBackendFailureReason(t *testing.T, err error, wantReason metrics.TaskFailureReason) {
 	t.Helper()
-	var failure *backendFailureError
+	var failure *TaskFailure
 	if !errors.As(err, &failure) {
-		t.Fatalf("error %v is not a *backendFailureError", err)
+		t.Fatalf("error %v is not a *TaskFailure", err)
 	}
-	if failure.reason != wantReason {
-		t.Fatalf("failure reason = %q, want %q", failure.reason, wantReason)
+	if failure.metricsReason != wantReason {
+		t.Fatalf("failure reason = %q, want %q", failure.metricsReason, wantReason)
 	}
 }
 

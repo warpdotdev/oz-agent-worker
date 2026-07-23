@@ -91,38 +91,53 @@ const (
 	RejectReasonAtCapacity       = "at_capacity"
 	WSReconnectReasonDialFailed  = "dial_failed"
 	WSReconnectReasonRemoteClose = "remote_close"
+)
 
-	TaskFailurePhaseAssignment = "assignment"
-	TaskFailurePhaseBackend    = "backend"
-	TaskFailurePhaseCleanup    = "cleanup"
+// TaskFailurePhase is the bounded enum of execution phases used to label
+// task-failure metrics.
+type TaskFailurePhase string
 
-	TaskFailureReasonUnknown         = "unknown"
-	TaskFailureReasonTaskTimeout     = "task_timeout"
-	TaskFailureReasonTaskCancelled   = "task_cancelled"
-	TaskFailureReasonImagePull       = "image_pull"
-	TaskFailureReasonSidecarPrep     = "sidecar_prep"
-	TaskFailureReasonContainerCreate = "container_create"
-	TaskFailureReasonContainerStart  = "container_start"
-	TaskFailureReasonContainerWait   = "container_wait"
-	TaskFailureReasonContainerExit   = "container_exit"
-	TaskFailureReasonContainerOOM    = "container_oom"
-	TaskFailureReasonWorkspaceSetup  = "workspace_setup"
-	TaskFailureReasonSetupCommand    = "setup_command"
-	TaskFailureReasonAgentInvocation = "agent_invocation"
-	TaskFailureReasonTeardownCommand = "teardown_command"
-	TaskFailureReasonDispatchCommand = "dispatch_command"
-	TaskFailureReasonDispatchTimeout = "dispatch_timeout"
-	TaskFailureReasonCancelCommand   = "cancel_command"
-	TaskFailureReasonJobCreate       = "job_create"
-	TaskFailureReasonJobWatch        = "job_watch"
-	TaskFailureReasonJobFailed       = "job_failed"
-	TaskFailureReasonPodWatch        = "pod_watch"
-	TaskFailureReasonUnschedulable   = "unschedulable"
-	TaskFailureReasonVolumeMount     = "volume_mount"
-	TaskFailureReasonInitContainer   = "init_container"
-	TaskFailureReasonInvalidImage    = "invalid_image"
-	TaskFailureReasonActiveDeadline  = "active_deadline"
-	TaskFailureReasonCleanup         = "cleanup"
+const (
+	TaskFailurePhaseAssignment TaskFailurePhase = "assignment"
+	TaskFailurePhaseBackend    TaskFailurePhase = "backend"
+	TaskFailurePhaseCleanup    TaskFailurePhase = "cleanup"
+)
+
+// TaskFailureReason is the bounded enum of failure reasons used to label
+// task-failure metrics. Reasons are worker-internal observability labels,
+// finer-grained than (and distinct from) the wire failure causes reported
+// to warp-server.
+type TaskFailureReason string
+
+const (
+	TaskFailureReasonUnknown         TaskFailureReason = "unknown"
+	TaskFailureReasonTaskTimeout     TaskFailureReason = "task_timeout"
+	TaskFailureReasonTaskCancelled   TaskFailureReason = "task_cancelled"
+	TaskFailureReasonImagePull       TaskFailureReason = "image_pull"
+	TaskFailureReasonSidecarPrep     TaskFailureReason = "sidecar_prep"
+	TaskFailureReasonContainerCreate TaskFailureReason = "container_create"
+	TaskFailureReasonContainerStart  TaskFailureReason = "container_start"
+	TaskFailureReasonContainerWait   TaskFailureReason = "container_wait"
+	TaskFailureReasonContainerExit   TaskFailureReason = "container_exit"
+	TaskFailureReasonContainerOOM    TaskFailureReason = "container_oom"
+	TaskFailureReasonWorkspaceSetup  TaskFailureReason = "workspace_setup"
+	TaskFailureReasonSetupCommand    TaskFailureReason = "setup_command"
+	TaskFailureReasonAgentInvocation TaskFailureReason = "agent_invocation"
+	TaskFailureReasonTeardownCommand TaskFailureReason = "teardown_command"
+	TaskFailureReasonDispatchCommand TaskFailureReason = "dispatch_command"
+	TaskFailureReasonDispatchTimeout TaskFailureReason = "dispatch_timeout"
+	TaskFailureReasonCancelCommand   TaskFailureReason = "cancel_command"
+	TaskFailureReasonJobCreate       TaskFailureReason = "job_create"
+	TaskFailureReasonJobWatch        TaskFailureReason = "job_watch"
+	TaskFailureReasonJobFailed       TaskFailureReason = "job_failed"
+	TaskFailureReasonEvicted         TaskFailureReason = "evicted"
+	TaskFailureReasonPodWatch        TaskFailureReason = "pod_watch"
+	TaskFailureReasonUnschedulable   TaskFailureReason = "unschedulable"
+	TaskFailureReasonVolumeMount     TaskFailureReason = "volume_mount"
+	TaskFailureReasonInitContainer   TaskFailureReason = "init_container"
+	TaskFailureReasonInvalidImage    TaskFailureReason = "invalid_image"
+	TaskFailureReasonActiveDeadline  TaskFailureReason = "active_deadline"
+	TaskFailureReasonCleanup         TaskFailureReason = "cleanup"
 )
 
 var (
@@ -132,12 +147,12 @@ var (
 		TaskResultCancelled,
 		TaskResultDispatched,
 	}
-	taskFailurePhases = []string{
+	taskFailurePhases = []TaskFailurePhase{
 		TaskFailurePhaseAssignment,
 		TaskFailurePhaseBackend,
 		TaskFailurePhaseCleanup,
 	}
-	taskFailureReasons = []string{
+	taskFailureReasons = []TaskFailureReason{
 		TaskFailureReasonUnknown,
 		TaskFailureReasonTaskTimeout,
 		TaskFailureReasonTaskCancelled,
@@ -158,6 +173,7 @@ var (
 		TaskFailureReasonJobCreate,
 		TaskFailureReasonJobWatch,
 		TaskFailureReasonJobFailed,
+		TaskFailureReasonEvicted,
 		TaskFailureReasonPodWatch,
 		TaskFailureReasonUnschedulable,
 		TaskFailureReasonVolumeMount,
@@ -296,8 +312,8 @@ func primeInstruments(ctx context.Context, set *instruments) {
 		for _, reason := range taskFailureReasons {
 			set.taskFailures.Add(ctx, 0,
 				metric.WithAttributes(
-					attribute.String("phase", phase),
-					attribute.String("reason", reason),
+					attribute.String("phase", string(phase)),
+					attribute.String("reason", string(reason)),
 				),
 			)
 		}
@@ -482,11 +498,11 @@ func RecordTaskCompleted(result TaskResult, duration time.Duration) {
 }
 
 // RecordTaskFailure records a bounded failure mode for a task.
-func RecordTaskFailure(phase, reason string) {
+func RecordTaskFailure(phase TaskFailurePhase, reason TaskFailureReason) {
 	current().taskFailures.Add(context.Background(), 1,
 		metric.WithAttributes(
-			attribute.String("phase", phase),
-			attribute.String("reason", reason),
+			attribute.String("phase", string(phase)),
+			attribute.String("reason", string(reason)),
 		),
 	)
 }

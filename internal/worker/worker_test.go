@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,8 +69,8 @@ func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
 		name       string
 		err        error
-		wantPhase  string
-		wantReason string
+		wantPhase  metrics.TaskFailurePhase
+		wantReason metrics.TaskFailureReason
 	}{
 		{
 			name:       "deadline exceeded",
@@ -107,6 +109,110 @@ func TestTaskFailureLabels(t *testing.T) {
 				t.Fatalf("taskFailureLabels() = (%q, %q), want (%q, %q)", phase, reason, tt.wantPhase, tt.wantReason)
 			}
 		})
+	}
+}
+
+func TestFailureExitCode(t *testing.T) {
+	t.Run("recorded exit status", func(t *testing.T) {
+		err := exec.Command("sh", "-c", "exit 143").Run()
+		code, ok := agentExitCode(err)
+		if !ok || code != 143 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (143, true)", code, ok)
+		}
+		failure := newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err), code)
+		if got := failureExitCode(fmt.Errorf("wrapped: %w", failure)); got != 143 {
+			t.Fatalf("failureExitCode() = %d, want 143", got)
+		}
+	})
+
+	t.Run("no exit status", func(t *testing.T) {
+		if got := failureExitCode(errors.New("boom")); got != 0 {
+			t.Fatalf("failureExitCode() = %d, want 0", got)
+		}
+	})
+}
+
+func TestAgentExitCode(t *testing.T) {
+	t.Run("signal termination normalizes to 128+signal", func(t *testing.T) {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to start subprocess: %v", err)
+		}
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("failed to signal subprocess: %v", err)
+		}
+		err := cmd.Wait()
+		code, ok := agentExitCode(err)
+		if !ok || code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("agentExitCode() = (%d, %t), want (%d, true)", code, ok, 128+int(syscall.SIGTERM))
+		}
+	})
+
+	t.Run("plain exit code passes through", func(t *testing.T) {
+		err := exec.Command("sh", "-c", "exit 2").Run()
+		code, ok := agentExitCode(err)
+		if !ok || code != 2 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (2, true)", code, ok)
+		}
+	})
+
+	t.Run("non-exit error", func(t *testing.T) {
+		if code, ok := agentExitCode(errors.New("boom")); ok || code != 0 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (0, false)", code, ok)
+		}
+	})
+}
+
+func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
+	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
+	if err := w.sendTaskFailed("task-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143, true); err != nil {
+		t.Fatalf("sendTaskFailed returned error: %v", err)
+	}
+	msg := readWebSocketMessage(t, w.sendChan)
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to decode task_failed: %v", err)
+	}
+	if failed.FailureReason != string(metrics.TaskFailureReasonAgentInvocation) {
+		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonAgentInvocation)
+	}
+	if failed.ExitCode != 143 {
+		t.Fatalf("exit_code = %d, want 143", failed.ExitCode)
+	}
+	if !failed.ShuttingDown {
+		t.Fatal("shutting_down = false, want true")
+	}
+}
+
+func TestExecuteTaskReportsShutdownFactsOnWorkerShutdown(t *testing.T) {
+	w := &Worker{
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		activeTasks: map[string]activeTask{"task-1": {
+			cancel:             func() {},
+			cancellationSource: taskCancellationSourceShutdown,
+		}},
+		backend: &recordingBackend{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, context.Canceled)},
+	}
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.sendChan)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to unmarshal task failed message: %v", err)
+	}
+	if failed.FailureReason != string(metrics.TaskFailureReasonTaskCancelled) {
+		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonTaskCancelled)
+	}
+	if !failed.ShuttingDown {
+		t.Fatal("shutting_down = false, want true")
 	}
 }
 

@@ -8,44 +8,23 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
 
-type backendFailureError struct {
-	phase  string
-	reason string
-	err    error
-}
-
-func newBackendFailure(phase, reason string, err error) error {
-	if err == nil {
-		return nil
-	}
-	return &backendFailureError{phase: phase, reason: reason, err: err}
-}
-
-func (e *backendFailureError) Error() string {
-	return e.err.Error()
-}
-
-func (e *backendFailureError) Unwrap() error {
-	return e.err
-}
-
-func taskFailureLabels(err error) (phase, reason string) {
+func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailureReason) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskTimeout
 	}
 	if errors.Is(err, context.Canceled) {
 		return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled
 	}
-	var failure *backendFailureError
+	var failure *TaskFailure
 	if errors.As(err, &failure) {
-		return failure.phase, failure.reason
+		return failure.metricsPhase, failure.metricsReason
 	}
 	return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnknown
 }
 
 // userFacingTaskError returns a user-friendly error message for a task execution
-// failure. Well-known infrastructure errors (context cancellation, deadline exceeded)
-// are translated into clear, actionable messages instead of exposing raw Go error strings.
+// failure. Well-known infrastructure errors are translated into actionable text
+// instead of exposing raw Go error strings.
 func userFacingTaskError(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -55,4 +34,14 @@ func userFacingTaskError(err error) string {
 	default:
 		return fmt.Sprintf("Failed to execute task: %v", err)
 	}
+}
+
+// failureExitCode returns the exit status recorded on the failure, or 0 when
+// none was observed.
+func failureExitCode(err error) int {
+	var failure *TaskFailure
+	if errors.As(err, &failure) {
+		return failure.exitCode
+	}
+	return 0
 }

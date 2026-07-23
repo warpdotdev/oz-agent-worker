@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -88,7 +89,9 @@ type TaskParams struct {
 
 // Backend defines the interface for task execution backends.
 type Backend interface {
-	// ExecuteTask runs the agent for the given task parameters.
+	// ExecuteTask runs the agent for the given task parameters. Execution
+	// failures are surfaced as ExecuteOutcomeError with an error that is (or
+	// wraps) *TaskFailure.
 	ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult
 	// CancelTask makes a best-effort attempt to cancel a task. The worker
 	// invokes it for every task cancellation, alongside cancelling the
@@ -107,4 +110,43 @@ type Backend interface {
 type CancelParams struct {
 	TaskID      string
 	ExecutionID string
+}
+
+// TaskFailure is the structured error backends return from ExecuteTask when
+// task execution fails. Backends record only the facts they observe (metrics
+// labels and the failing process's exit status); the failure cause reported
+// to warp-server is derived from these facts plus lifecycle context backends
+// cannot see.
+type TaskFailure struct {
+	// metricsPhase and metricsReason label the worker's task-failure metrics.
+	metricsPhase  metrics.TaskFailurePhase
+	metricsReason metrics.TaskFailureReason
+	// exitCode is the failing process's exit status, normalized to 128+signal
+	// for signal terminations. Zero means no exit status was observed.
+	exitCode int
+	err      error
+}
+
+func (e *TaskFailure) Error() string {
+	return e.err.Error()
+}
+
+func (e *TaskFailure) Unwrap() error {
+	return e.err
+}
+
+func newBackendFailure(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err}
+}
+
+// newBackendFailureWithExitCode additionally records the failing process's
+// exit status, normalized to 128+signal for signal terminations.
+func newBackendFailureWithExitCode(metricsPhase metrics.TaskFailurePhase, metricsReason metrics.TaskFailureReason, err error, exitCode int) error {
+	if err == nil {
+		return nil
+	}
+	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, exitCode: exitCode}
 }

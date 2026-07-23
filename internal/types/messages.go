@@ -77,11 +77,19 @@ type TaskCompletedMessage struct {
 	TaskState *TaskState `json:"task_state,omitempty"`
 }
 
-// TaskFailedMessage is sent from worker to server if task launch fails
+// TaskFailedMessage is sent from worker to server if task launch fails.
+// FailureReason, ExitCode, and ShuttingDown are the facts warp-server
+// classifies fault attribution from: FailureReason carries the worker's
+// metrics failure-reason value, ExitCode is the failing process's exit status
+// normalized to 128+signal, and ShuttingDown reports whether the worker was
+// gracefully shutting down when the task failed.
 type TaskFailedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID        string     `json:"task_id"`
+	Message       string     `json:"message"`
+	TaskState     *TaskState `json:"task_state,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	ExitCode      int        `json:"exit_code,omitempty"`
+	ShuttingDown  bool       `json:"shutting_down,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task

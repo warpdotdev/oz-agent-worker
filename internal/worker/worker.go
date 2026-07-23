@@ -412,7 +412,7 @@ func (w *Worker) cancelTaskOnBackend(params *CancelParams) {
 		if err := w.backend.CancelTask(ctx, params); err != nil {
 			log.Warnf(w.ctx, "Backend cancellation failed for task %s: %v", params.TaskID, err)
 			metrics.AddTaskEvent(ctx, "cancel.failed",
-				attribute.String("reason", metrics.TaskFailureReasonCancelCommand),
+				attribute.String("reason", string(metrics.TaskFailureReasonCancelCommand)),
 				attribute.String("task.id", params.TaskID),
 			)
 		}
@@ -657,17 +657,18 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		}
 
 		result = metrics.TaskResultFailed
-		phase, reason := taskFailureLabels(err)
-		metrics.RecordTaskFailure(phase, reason)
+		metricsPhase, metricsReason := taskFailureLabels(err)
+		metrics.RecordTaskFailure(metricsPhase, metricsReason)
 		metrics.AddTaskEvent(ctx, "task.failed",
-			attribute.String("failure.phase", phase),
-			attribute.String("failure.reason", reason),
+			attribute.String("failure.phase", string(metricsPhase)),
+			attribute.String("failure.reason", string(metricsReason)),
 			attribute.String("error.message", err.Error()),
 		)
 		span.RecordError(err)
-		span.SetStatus(codes.Error, reason)
+		span.SetStatus(codes.Error, string(metricsReason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
+		shuttingDown := w.cancellationSource(taskID) == taskCancellationSourceShutdown
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), metricsReason, failureExitCode(err), shuttingDown); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
 		return
@@ -807,10 +808,13 @@ func (w *Worker) sendTaskCompleted(taskID, message string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskFailed(taskID, message string) error {
+func (w *Worker) sendTaskFailed(taskID, message string, reason metrics.TaskFailureReason, exitCode int, shuttingDown bool) error {
 	failedMsg := types.TaskFailedMessage{
-		TaskID:  taskID,
-		Message: message,
+		TaskID:        taskID,
+		Message:       message,
+		FailureReason: string(reason),
+		ExitCode:      exitCode,
+		ShuttingDown:  shuttingDown,
 	}
 
 	data, err := json.Marshal(failedMsg)
