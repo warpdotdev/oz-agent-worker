@@ -34,6 +34,17 @@ type BackendConfig struct {
 	Docker     *DockerConfig     `yaml:"docker"`
 	Direct     *DirectConfig     `yaml:"direct"`
 	Kubernetes *KubernetesConfig `yaml:"kubernetes"`
+	Command    *CommandConfig    `yaml:"command"`
+}
+
+// CommandConfig holds command-backend-specific configuration. The command
+// backend dispatches tasks to an operator-owned runtime over any transport by
+// invoking dispatch_command.
+type CommandConfig struct {
+	DispatchCommand string     `yaml:"dispatch_command" validate:"required"`
+	CancelCommand   string     `yaml:"cancel_command"`
+	DispatchTimeout string     `yaml:"dispatch_timeout"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.

@@ -25,9 +25,11 @@ type shutdownRecordingBackend struct {
 	shutdownCtxErr error
 }
 
-func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) error {
-	return nil
+func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
+	return executeCompleted()
 }
+
+func (b *shutdownRecordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
@@ -49,9 +51,14 @@ type recordingBackend struct {
 	err error
 }
 
-func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
-	return b.err
+func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
+	if b.err != nil {
+		return executeError(b.err)
+	}
+	return executeCompleted()
 }
+
+func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
@@ -283,6 +290,7 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 				cancel: taskCancel,
 			},
 		},
+		backend: &recordingBackend{},
 	}
 
 	data, err := json.Marshal(types.TaskCancellationMessage{TaskID: "task-1"})

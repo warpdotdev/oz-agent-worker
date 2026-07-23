@@ -26,7 +26,7 @@ var Version = "dev"
 
 var CLI struct {
 	ConfigFile              string   `help:"Path to YAML config file" type:"path"`
-	Backend                 string   `help:"Backend type (docker, direct, or kubernetes)" enum:"docker,direct,kubernetes," default:""`
+	Backend                 string   `help:"Backend type (docker, direct, kubernetes, or command)" enum:"docker,direct,kubernetes,command," default:""`
 	APIKey                  string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID                string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL            string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -140,6 +140,8 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			backendType = "direct"
 		} else if fileConfig.Backend.Kubernetes != nil {
 			backendType = "kubernetes"
+		} else if fileConfig.Backend.Command != nil {
+			backendType = "command"
 		} else if fileConfig.Backend.Docker != nil {
 			backendType = "docker"
 		}
@@ -313,6 +315,39 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			TeardownCommand: teardownCmd,
 			NoCleanup:       noCleanup,
 			Env:             mergedEnv,
+		}
+
+	case "command":
+		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
+		mergedEnv := make(map[string]string)
+		var dispatchCmd, cancelCmd, dispatchTimeoutStr string
+		if fileConfig != nil && fileConfig.Backend.Command != nil {
+			cc := fileConfig.Backend.Command
+			mergedEnv = config.ResolveEnv(cc.Environment)
+			dispatchCmd = cc.DispatchCommand
+			cancelCmd = cc.CancelCommand
+			dispatchTimeoutStr = cc.DispatchTimeout
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+
+		var dispatchTimeout time.Duration
+		if dispatchTimeoutStr != "" {
+			d, err := time.ParseDuration(dispatchTimeoutStr)
+			if err != nil {
+				return worker.Config{}, fmt.Errorf("invalid backend.command.dispatch_timeout %q: %w", dispatchTimeoutStr, err)
+			}
+			dispatchTimeout = d
+		}
+
+		wc.Command = &worker.CommandBackendConfig{
+			DispatchCommand: dispatchCmd,
+			CancelCommand:   cancelCmd,
+			DispatchTimeout: dispatchTimeout,
+			Env:             mergedEnv,
+			ServerRootURL:   CLI.ServerRootURL,
+			WorkerID:        workerID,
 		}
 
 	default: // docker

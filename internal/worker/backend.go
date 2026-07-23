@@ -7,6 +7,52 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
+// ExecuteOutcome describes how a backend handled a task in ExecuteTask.
+type ExecuteOutcome int
+
+const (
+	// ExecuteOutcomeError means the task did not run to completion: it failed
+	// to start, failed while running, or was cancelled. ExecuteResult.Error
+	// carries the details.
+	ExecuteOutcomeError ExecuteOutcome = iota
+	// ExecuteOutcomeCompleted means the task was started and the backend
+	// waited for it to finish successfully.
+	//
+	// The worker holds a concurrency slot until the task completes. After
+	// the task completes, the worker also sends a terminal completion
+	// message to the server.
+	ExecuteOutcomeCompleted
+	// ExecuteOutcomeSpawned means the task was started but the backend did not
+	// wait for completion.
+	//
+	// The worker treats the task as accepted-but-not-finalized and must NOT
+	// send a terminal completion message. Because ExecuteTask returns at
+	// hand-off, a spawned task holds its concurrency slot only for the
+	// duration of the dispatch, so MaxConcurrentTasks does not bound the
+	// number of spawned tasks running remotely.
+	ExecuteOutcomeSpawned
+)
+
+// ExecuteResult contains the outcome of a backend's ExecuteTask call.
+//
+// Error is set only when Outcome is ExecuteOutcomeError.
+type ExecuteResult struct {
+	Outcome ExecuteOutcome
+	Error   error
+}
+
+func executeError(err error) ExecuteResult {
+	return ExecuteResult{Outcome: ExecuteOutcomeError, Error: err}
+}
+
+func executeCompleted() ExecuteResult {
+	return ExecuteResult{Outcome: ExecuteOutcomeCompleted}
+}
+
+func executeSpawned() ExecuteResult {
+	return ExecuteResult{Outcome: ExecuteOutcomeSpawned}
+}
+
 // TaskParams contains pre-processed task parameters common to all backends.
 // This provides a layer of abstraction between the wire-format TaskAssignmentMessage
 // and the backend interface, so backends don't need to handle common concerns like
@@ -44,13 +90,26 @@ type TaskParams struct {
 // Backend defines the interface for task execution backends.
 type Backend interface {
 	// ExecuteTask runs the agent for the given task parameters. Execution
-	// failures are returned as (or wrapped around) *TaskFailure.
-	ExecuteTask(ctx context.Context, params *TaskParams) error
+	// failures are surfaced as ExecuteOutcomeError with an error that is (or
+	// wraps) *TaskFailure.
+	ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult
+	// CancelTask makes a best-effort attempt to cancel a task. The worker
+	// invokes it for every task cancellation, alongside cancelling the
+	// ExecuteTask context.
+	CancelTask(ctx context.Context, params *CancelParams) error
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
+}
+
+// CancelParams carries the minimal, non-secret identifiers a backend needs to
+// cancel a task. It deliberately excludes env/secrets so the worker need not
+// retain secrets for the lifetime of a spawned task.
+type CancelParams struct {
+	TaskID      string
+	ExecutionID string
 }
 
 // TaskFailure is the structured error backends return from ExecuteTask when

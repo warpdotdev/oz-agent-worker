@@ -407,6 +407,76 @@ func TestLoadFileNotFound(t *testing.T) {
 	}
 }
 
+func TestLoadValidCommandConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "command-worker"
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+    cancel_command: "/opt/oz/cancel.sh"
+    dispatch_timeout: "30s"
+    environment:
+      - name: MY_VAR
+        value: "hello"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Command == nil {
+		t.Fatal("expected command backend to be set")
+	}
+	if cfg.Backend.Docker != nil {
+		t.Error("docker backend should be nil")
+	}
+	if cfg.Backend.Command.DispatchCommand != "/opt/oz/dispatch.sh" {
+		t.Errorf("dispatch_command = %q, want %q", cfg.Backend.Command.DispatchCommand, "/opt/oz/dispatch.sh")
+	}
+	if cfg.Backend.Command.CancelCommand != "/opt/oz/cancel.sh" {
+		t.Errorf("cancel_command = %q, want %q", cfg.Backend.Command.CancelCommand, "/opt/oz/cancel.sh")
+	}
+	if cfg.Backend.Command.DispatchTimeout != "30s" {
+		t.Errorf("dispatch_timeout = %q, want %q", cfg.Backend.Command.DispatchTimeout, "30s")
+	}
+	if len(cfg.Backend.Command.Environment) != 1 {
+		t.Errorf("environment count = %d, want 1", len(cfg.Backend.Command.Environment))
+	}
+}
+
+func TestLoadCommandConfigRequiresDispatchCommand(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "command-worker"
+backend:
+  command:
+    cancel_command: "/opt/oz/cancel.sh"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for missing dispatch_command")
+	}
+	if !strings.Contains(err.Error(), "DispatchCommand") && !strings.Contains(err.Error(), "required") {
+		t.Errorf("error = %v, want it to mention the required dispatch command", err)
+	}
+}
+
+func TestLoadCommandAndDockerBackendsError(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+  docker:
+    volumes: []
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error when command and docker backends are both set")
+	}
+}
+
 func TestLoadIdleOnComplete(t *testing.T) {
 	t.Run("parses idle_on_complete when set", func(t *testing.T) {
 		path := writeTestConfig(t, `

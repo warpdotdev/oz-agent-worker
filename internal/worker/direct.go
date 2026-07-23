@@ -129,10 +129,10 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 }
 
 // ExecuteTask runs the agent directly on the host.
-func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	taskID := params.TaskID
 	if err := validateTaskIDForPath(taskID); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))
 	}
 
 	// Determine working directory: shared target dir or per-task workspace.
@@ -145,13 +145,13 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		// Create per-task workspace directory.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
 		if err := os.MkdirAll(workspaceDir, 0700); err != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err)))
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
 	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir)
 	if err != nil {
-		return err
+		return executeError(err)
 	}
 	defer cleanupGitConfig()
 	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
@@ -172,11 +172,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	// 2. Create temp environment file for setup script to write to.
 	envFile, err := os.CreateTemp(workspaceDir, "oz-env-*")
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create environment file: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create environment file: %w", err)))
 	}
 	envFilePath := envFile.Name()
 	if err := envFile.Close(); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to close environment file: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to close environment file: %w", err)))
 	}
 	defer func() {
 		if err := os.Remove(envFilePath); err != nil && !os.IsNotExist(err) {
@@ -205,9 +205,9 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
 		if err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv); err != nil {
 			if ctx.Err() != nil {
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 			}
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err)))
 		}
 	}
 
@@ -238,17 +238,17 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
 		wrapped := fmt.Errorf("oz agent exited with error: %w", err)
 		if exitCode, ok := agentExitCode(err); ok {
-			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped, exitCode)
+			return executeError(newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped, exitCode))
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped))
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
-	return nil
+	return executeCompleted()
 }
 
 // agentExitCode extracts the agent subprocess's exit code from a cmd.Run error.
@@ -271,6 +271,10 @@ func agentExitCode(err error) (exitCode int, ok bool) {
 	}
 	return status.ExitStatus(), true
 }
+
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// direct-backend task.
+func (b *DirectBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 // Shutdown cleans up any workspace directories left behind under the workspace root.
 func (b *DirectBackend) Shutdown(ctx context.Context) {

@@ -96,7 +96,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 }
 
 // ExecuteTask runs the agent in a Docker container.
-func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -104,13 +104,13 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	authStr := b.getRegistryAuth(ctx, imageName)
 	if err := b.pullImage(ctx, imageName, authStr); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
 
 	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
 	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
 	// Start with common env vars, then append backend-specific config env vars.
@@ -146,7 +146,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		HostConfig: hostConfig,
 	})
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err)))
 	}
 
 	containerID := resp.ID
@@ -163,7 +163,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	}()
 
 	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
 	}
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
@@ -172,7 +172,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	select {
 	case err := <-waitResult.Error:
 		if err != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerWait, fmt.Errorf("error waiting for container: %w", err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerWait, fmt.Errorf("error waiting for container: %w", err)))
 		}
 	case status := <-waitResult.Result:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
@@ -197,12 +197,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 			}
 			// Docker's StatusCode is already signal-coded (e.g. 137, 143), so it is
 			// recorded as-is for failure-cause classification.
-			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metricsReason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), int(status.StatusCode))
+			return executeError(newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metricsReason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), int(status.StatusCode)))
 		}
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
-	return nil
+	return executeCompleted()
 }
 
 // dockerResourcesForShape maps an instance shape to Docker container resource limits.
@@ -226,6 +226,10 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	}
 	return res
 }
+
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// Docker-backend task.
+func (b *DockerBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
