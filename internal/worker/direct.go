@@ -79,6 +79,15 @@ type DirectBackendConfig struct {
 	TeardownCommand string
 	NoCleanup       bool
 	Env             map[string]string
+	// HarnessConfigDirs maps a harness name (e.g. "claude", "codex") to a host
+	// directory path. When set, the backend copies the specified host directory
+	// into the workspace's per-task harness config directory before task
+	// execution. This makes local plugins and user settings available to the
+	// harness inside each isolated task workspace.
+	//
+	// If the source directory does not exist the seed step is silently skipped
+	// so that the worker can be configured ahead of any actual plugin install.
+	HarnessConfigDirs map[string]string
 }
 
 // DirectBackend executes tasks directly on the host without Docker.
@@ -190,6 +199,13 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	}
 	envVars = mergeEnvVars(envVars, harnessEnvVars(workspaceDir, params))
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
+
+	// 3a. Seed harness config dir from host if configured.
+	if !usingTargetDir {
+		if err := b.seedHarnessConfigDir(ctx, workspaceDir, params); err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, err))
+		}
+	}
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
@@ -390,4 +406,48 @@ func harnessEnvVars(workspaceDir string, params *TaskParams) []string {
 		return nil
 	}
 	return []string{fmt.Sprintf("%s=%s", config.configEnvVar, filepath.Join(workspaceDir, config.configDir))}
+}
+
+// seedHarnessConfigDir copies the operator-configured host harness config
+// directory into the task workspace's harness config directory.
+//
+// This lets per-user Claude Code (or Codex) plugins and settings be available
+// in each task's isolated config directory without leaking writes between
+// concurrent tasks.
+//
+// If the configured host directory does not exist the step is silently skipped
+// so that the worker can be configured ahead of any actual plugin install.
+func (b *DirectBackend) seedHarnessConfigDir(ctx context.Context, workspaceDir string, params *TaskParams) error {
+	if len(b.config.HarnessConfigDirs) == 0 ||
+		params == nil ||
+		params.Task == nil ||
+		params.Task.AgentConfigSnapshot == nil ||
+		params.Task.AgentConfigSnapshot.Harness == nil ||
+		params.Task.AgentConfigSnapshot.Harness.Type == nil {
+		return nil
+	}
+
+	harnessType := strings.TrimSpace(*params.Task.AgentConfigSnapshot.Harness.Type)
+	hostSrcDir, ok := b.config.HarnessConfigDirs[harnessType]
+	if !ok || hostSrcDir == "" {
+		return nil
+	}
+
+	harnessConf, ok := harnessConfigs[harnessType]
+	if !ok {
+		return nil
+	}
+
+	// Silently skip when the host source directory does not exist.
+	if _, err := os.Stat(hostSrcDir); os.IsNotExist(err) {
+		log.Infof(ctx, "Harness config dir %q does not exist; skipping seed for harness %q", hostSrcDir, harnessType)
+		return nil
+	}
+
+	destDir := filepath.Join(workspaceDir, harnessConf.configDir)
+	log.Infof(ctx, "Seeding harness config dir for %q from %q into %q", harnessType, hostSrcDir, destDir)
+	if err := os.CopyFS(destDir, os.DirFS(hostSrcDir)); err != nil {
+		return fmt.Errorf("failed to seed harness config dir for %q from %q: %w", harnessType, hostSrcDir, err)
+	}
+	return nil
 }
