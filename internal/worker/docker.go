@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -242,6 +245,32 @@ func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
 
+// isDockerNetworkError returns true when err is a network-level failure (dial,
+// timeout, connection refused) that suggests the Docker registry may be
+// unreachable. These errors are distinct from authentication failures or
+// missing images and typically indicate a network-connectivity or IP-allowlist
+// issue between the worker and Docker Hub (e.g. Docker Hub added a new egress
+// IP not yet allowlisted). See REMOTE-2322.
+func isDockerNetworkError(err error) bool {
+	var netErr *net.OpError
+	var urlErr *url.Error
+	switch {
+	case errors.As(err, &netErr):
+		return true
+	case errors.As(err, &urlErr):
+		// url.Error wraps net.OpError for dial/timeout errors.
+		return true
+	default:
+		// Fall back to string matching for errors surfaced as plain strings
+		// by the Docker client (e.g. "context deadline exceeded").
+		msg := err.Error()
+		return strings.Contains(msg, "connection refused") ||
+			strings.Contains(msg, "no such host") ||
+			strings.Contains(msg, "dial tcp") ||
+			strings.Contains(msg, "i/o timeout")
+	}
+}
+
 // pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
 // Docker only downloads changed layers, so this is efficient even if the image exists locally.
 func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string) error {
@@ -252,6 +281,14 @@ func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr
 	}
 	reader, err := b.dockerClient.ImagePull(ctx, imageName, pullOptions)
 	if err != nil {
+		if isDockerNetworkError(err) {
+			return fmt.Errorf(
+				"failed to pull image %s: network connectivity error reaching Docker Hub — "+
+					"this may indicate that Docker Hub has added new egress IP addresses that "+
+					"are not yet allowlisted in this environment's network configuration: %w",
+				imageName, err,
+			)
+		}
 		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
 	}
 	defer func() {
