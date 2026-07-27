@@ -78,11 +78,9 @@ type TaskCompletedMessage struct {
 }
 
 // TaskFailedMessage is sent from worker to server if task launch fails.
-// FailureReason and ExitCode are the facts warp-server derives fault
-// attribution from: FailureReason is the worker-classified failure reason (a
-// metrics.TaskFailureReason value, including graceful_shutdown when the task
-// died because the worker was shutting down), and ExitCode is the failing
-// process's exit status normalized to 128+signal.
+// FailureReason is the worker-classified failure reason (a
+// metrics.TaskFailureReason value) and ExitCode is the failing process's
+// exit status normalized to 128+signal.
 type TaskFailedMessage struct {
 	TaskID        string     `json:"task_id"`
 	Message       string     `json:"message"`

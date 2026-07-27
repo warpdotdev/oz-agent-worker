@@ -104,21 +104,15 @@ const (
 )
 
 // TaskFailureReason is the bounded enum of failure reasons used to label
-// task-failure metrics. The reason is also reported verbatim to warp-server
-// as the task_failed failure_reason, where it drives fault attribution and
-// the error category. warp-server mirrors these values in its
-// workerFailureReason type (logic/ai/ambient_agents/workers/selfhosted/websocket.go);
-// when adding a reason here, add it there too.
+// task-failure metrics and reported to warp-server on task_failed messages.
+// warp-server mirrors these values in its workerFailureReason type; when
+// adding a reason here, add it there too.
 type TaskFailureReason string
 
 const (
-	TaskFailureReasonUnknown       TaskFailureReason = "unknown"
-	TaskFailureReasonTaskTimeout   TaskFailureReason = "task_timeout"
-	TaskFailureReasonTaskCancelled TaskFailureReason = "task_cancelled"
-	// TaskFailureReasonGracefulShutdown reports a task that died because the
-	// operator was gracefully stopping the worker: the shutdown cancelled the
-	// task, or the agent process exited to the SIGTERM the shutdown delivered.
-	// It is classified by the worker lifecycle layer, not by backends.
+	TaskFailureReasonUnknown          TaskFailureReason = "unknown"
+	TaskFailureReasonTaskTimeout      TaskFailureReason = "task_timeout"
+	TaskFailureReasonTaskCancelled    TaskFailureReason = "task_cancelled"
 	TaskFailureReasonGracefulShutdown TaskFailureReason = "graceful_shutdown"
 	TaskFailureReasonImagePull        TaskFailureReason = "image_pull"
 	TaskFailureReasonSidecarPrep      TaskFailureReason = "sidecar_prep"
