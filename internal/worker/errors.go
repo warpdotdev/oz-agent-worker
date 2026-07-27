@@ -4,9 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"syscall"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
+
+// sigtermExitCode is a process exit status normalized to 128+signal for a
+// SIGTERM termination — the signal a graceful worker shutdown delivers to
+// running agent processes.
+const sigtermExitCode = 128 + int(syscall.SIGTERM)
+
+// classifyFailureReason layers worker lifecycle context onto the backend's
+// failure facts: a failure observed while the worker was gracefully shutting
+// down — the shutdown cancelled the task, or the agent process died to the
+// shutdown's SIGTERM — is reclassified as graceful_shutdown. Backends cannot
+// see shutdown state, and warp-server uses the reported reason directly for
+// fault attribution, so the worker owns this classification.
+func classifyFailureReason(reason metrics.TaskFailureReason, exitCode int, shuttingDown bool) metrics.TaskFailureReason {
+	if shuttingDown && (reason == metrics.TaskFailureReasonTaskCancelled || exitCode == sigtermExitCode) {
+		return metrics.TaskFailureReasonGracefulShutdown
+	}
+	return reason
+}
 
 func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailureReason) {
 	if errors.Is(err, context.DeadlineExceeded) {

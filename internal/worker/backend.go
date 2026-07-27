@@ -114,9 +114,10 @@ type CancelParams struct {
 
 // TaskFailure is the structured error backends return from ExecuteTask when
 // task execution fails. Backends record only the facts they observe (metrics
-// labels and the failing process's exit status); the failure cause reported
-// to warp-server is derived from these facts plus lifecycle context backends
-// cannot see.
+// labels and the failing process's exit status); the worker layers lifecycle
+// context backends cannot see (graceful shutdown) onto the failure reason
+// before reporting it to warp-server, which derives fault attribution from
+// the reason and exit code.
 type TaskFailure struct {
 	// metricsPhase and metricsReason label the worker's task-failure metrics.
 	metricsPhase  metrics.TaskFailurePhase

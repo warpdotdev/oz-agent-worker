@@ -165,7 +165,7 @@ func TestAgentExitCode(t *testing.T) {
 
 func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
 	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
-	if err := w.sendTaskFailed("task-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143, true); err != nil {
+	if err := w.sendTaskFailed("task-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143); err != nil {
 		t.Fatalf("sendTaskFailed returned error: %v", err)
 	}
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -179,12 +179,33 @@ func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
 	if failed.ExitCode != 143 {
 		t.Fatalf("exit_code = %d, want 143", failed.ExitCode)
 	}
-	if !failed.ShuttingDown {
-		t.Fatal("shutting_down = false, want true")
+}
+
+func TestClassifyFailureReason(t *testing.T) {
+	tests := []struct {
+		name         string
+		reason       metrics.TaskFailureReason
+		exitCode     int
+		shuttingDown bool
+		want         metrics.TaskFailureReason
+	}{
+		{"cancelled during shutdown", metrics.TaskFailureReasonTaskCancelled, 0, true, metrics.TaskFailureReasonGracefulShutdown},
+		{"sigterm exit during shutdown", metrics.TaskFailureReasonAgentInvocation, sigtermExitCode, true, metrics.TaskFailureReasonGracefulShutdown},
+		{"cancelled outside shutdown", metrics.TaskFailureReasonTaskCancelled, 0, false, metrics.TaskFailureReasonTaskCancelled},
+		{"sigterm exit outside shutdown", metrics.TaskFailureReasonAgentInvocation, sigtermExitCode, false, metrics.TaskFailureReasonAgentInvocation},
+		{"unrelated failure during shutdown", metrics.TaskFailureReasonSetupCommand, 2, true, metrics.TaskFailureReasonSetupCommand},
+		{"sigkill exit during shutdown", metrics.TaskFailureReasonContainerExit, 137, true, metrics.TaskFailureReasonContainerExit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyFailureReason(tt.reason, tt.exitCode, tt.shuttingDown); got != tt.want {
+				t.Fatalf("classifyFailureReason(%q, %d, %t) = %q, want %q", tt.reason, tt.exitCode, tt.shuttingDown, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestExecuteTaskReportsShutdownFactsOnWorkerShutdown(t *testing.T) {
+func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),
 		config:   Config{},
@@ -208,11 +229,8 @@ func TestExecuteTaskReportsShutdownFactsOnWorkerShutdown(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &failed); err != nil {
 		t.Fatalf("failed to unmarshal task failed message: %v", err)
 	}
-	if failed.FailureReason != string(metrics.TaskFailureReasonTaskCancelled) {
-		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonTaskCancelled)
-	}
-	if !failed.ShuttingDown {
-		t.Fatal("shutting_down = false, want true")
+	if failed.FailureReason != string(metrics.TaskFailureReasonGracefulShutdown) {
+		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonGracefulShutdown)
 	}
 }
 
