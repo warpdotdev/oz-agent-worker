@@ -136,6 +136,358 @@ func TestKubernetesTaskWrapperScriptDelegatesToEntrypoint(t *testing.T) {
 		t.Fatalf("expected wrapper script to rely on entrypoint shutdown reporting, got:\n%s", script)
 	}
 }
+func TestBuildInitRestartPolicyMap(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	containers := []corev1.Container{
+		{Name: "sidecar", RestartPolicy: &always},
+		{Name: "setup"},                  // no RestartPolicy
+		{Name: "other", RestartPolicy: &always},
+	}
+	m := buildInitRestartPolicyMap(containers)
+	if m["sidecar"] != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("sidecar policy = %q, want %q", m["sidecar"], corev1.ContainerRestartPolicyAlways)
+	}
+	if _, ok := m["setup"]; ok {
+		t.Fatal("expected setup container to be absent from map (no RestartPolicy set)")
+	}
+	if m["other"] != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("other policy = %q, want %q", m["other"], corev1.ContainerRestartPolicyAlways)
+	}
+}
+
+// Native sidecars (init containers with restartPolicy: Always) exit with
+// SIGTERM when the kubelet shuts down the pod after the main task container
+// completes. JVM-based services always exit with code 143 (128 + SIGTERM 15).
+// inspectPodFailure must ignore these exits — Kubernetes itself does not
+// count them against pod or Job success.
+func TestInspectPodFailureIgnoresNativeSidecarExit143(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "oz-agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "oz-task-exec-pod",
+			Namespace: "oz-agents",
+			Labels:    map[string]string{"job-name": "oz-task-job"},
+		},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{
+				// Native sidecar: JVM-based ZooKeeper.
+				{Name: "zookeeper", Image: "confluentinc/cp-zookeeper:7.5.0", RestartPolicy: &always},
+				// Native sidecar: Kafka.
+				{Name: "kafka", Image: "confluentinc/cp-kafka:7.5.0", RestartPolicy: &always},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "zookeeper",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 143, // SIGTERM exit code produced by JVM
+						},
+					},
+				},
+				{
+					Name: "kafka",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 143,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := backend.inspectPodFailure(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("expected no failure for native sidecar exit 143, got: %v", err)
+	}
+}
+
+// Non-native init containers (no restartPolicy) that exit non-zero must still
+// be reported as task failures — only native sidecars are exempt.
+func TestInspectPodFailureReportsRegularInitContainerExit(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "oz-agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+
+	// Regular init container (e.g., the copy-sidecar or setup init container)
+	// with no restartPolicy — this is a true init container, not a native sidecar.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "oz-task-exec-pod",
+			Namespace: "oz-agents",
+			Labels:    map[string]string{"job-name": "oz-task-job"},
+		},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{
+				{Name: "setup"}, // no RestartPolicy — regular init container
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "setup",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := backend.inspectPodFailure(context.Background(), pod)
+	if err == nil {
+		t.Fatal("expected failure for regular init container non-zero exit, got nil")
+	}
+	if !strings.Contains(err.Error(), "init container setup") {
+		t.Fatalf("expected error to name the failing init container, got %q", err)
+	}
+}
+
+// Mixed pod: native sidecars exit 143 (expected) alongside a regular init
+// container that exits 0. Only non-sidecar failures should be reported.
+func TestInspectPodFailureIgnoresMixedNativeSidecarsAndPassedSetup(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "oz-agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "oz-task-pod", Namespace: "oz-agents"},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{
+				{Name: "elasticsearch", RestartPolicy: &always},
+				{Name: "setup"}, // regular init container that succeeded
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "elasticsearch",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+					},
+				},
+				{
+					Name: "setup",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+					},
+				},
+			},
+		},
+	}
+
+	if err := backend.inspectPodFailure(context.Background(), pod); err != nil {
+		t.Fatalf("expected no failure when native sidecar exits 143 and setup exits 0, got: %v", err)
+	}
+}
+
+// End-to-end regression test for the race: the pod watch delivers a native
+// sidecar exit-143 event before the Job controller sets JobComplete. The
+// worker must ignore the sidecar exit (fix #1: inspectPodFailure skips native
+// sidecars) and continue waiting until the Job watch delivers Complete.
+func TestExecuteTaskSucceedsWhenNativeSidecarExits143BeforeJobComplete(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+
+	// The pod watch fires a native sidecar exit-143 event first, simulating the
+	// race where the pod watch arrives before the Job controller marks Complete.
+	// After a brief delay the job watch fires Job Complete — this is the event
+	// that should ultimately resolve the task as successful.
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(50 * time.Millisecond) // Job Complete arrives after the pod event
+			if createdJob == nil {
+				return
+			}
+			completed := createdJob.DeepCopy()
+			completed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completed)
+		}()
+		return true, jobWatch, nil
+	})
+
+	// The pod watch fires a pod event with native sidecar exit-143 first —
+	// this is the event that used to trigger the false failure before the fix.
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond) // pod event arrives before Job Complete
+			podWatch.Modify(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "oz-task-exec-pod",
+					Namespace: "oz-agents",
+					Labels:    map[string]string{"job-name": "oz-task-job"},
+				},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						// ZooKeeper declared as a native sidecar.
+						{Name: "zookeeper", RestartPolicy: &always},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "zookeeper",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									ExitCode: 143, // JVM SIGTERM exit code
+								},
+							},
+						},
+					},
+				},
+			})
+		}()
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "oz-agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected success when native sidecar exits 143 before Job Complete, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("expected ExecuteOutcomeCompleted, got %v", result.Outcome)
+	}
+}
+
+// Regression test for the race guard: if a pod failure is detected from the
+// pod watch but the Job is already marked Complete, the worker must return
+// success rather than failure. This covers the edge case where a stale or
+// transient pod event arrives after the Job has succeeded.
+func TestExecuteTaskJobCompleteWinsOverTransientPodFailure(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+
+	// The job watcher does not deliver any events — the job is only marked
+	// complete via the GET reactor (simulating that the job watch hasn't caught
+	// up yet when the pod watch fires a transient failure).
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, jobWatch, nil
+	})
+
+	// GET /jobs/<name>: returns the job as Complete — the job is already done.
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createdJob == nil {
+			return false, nil, nil
+		}
+		completed := createdJob.DeepCopy()
+		completed.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+		}
+		return true, completed, nil
+	})
+
+	// The pod watch fires a pod in Failed phase — this would normally trigger a
+	// task failure, but since the Job is already Complete the race guard must
+	// return success.
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			podWatch.Modify(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "oz-task-exec-pod",
+					Namespace: "oz-agents",
+					Labels:    map[string]string{"job-name": "oz-task-job"},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed, // transient pod failure event
+				},
+			})
+		}()
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "oz-agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected success when Job is Complete despite transient pod failure, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("expected ExecuteOutcomeCompleted, got %v", result.Outcome)
+	}
+}
+
 func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	ctx := context.Background()

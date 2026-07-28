@@ -392,6 +392,14 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				continue
 			}
 			if failure := b.inspectPodFailure(ctx, pod); failure != nil {
+				// Before reporting failure, verify the Job has not already succeeded.
+				// Native sidecar terminations (e.g. JVM exit 143 on SIGTERM) arrive
+				// via the pod watch before the Job controller stamps JobComplete, so
+				// a succeeded Job takes precedence over any transient pod event.
+				if jobState, getErr := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{}); getErr == nil && jobComplete(jobState) {
+					log.Infof(ctx, "Task %s execution completed successfully (pod event arrived before Job Complete; pod detail: %v)", params.TaskID, failure)
+					return executeCompleted()
+				}
 				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
 				if logs != "" {
 					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
@@ -929,8 +937,21 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 }
 
 func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
+	// Build a lookup of init container name → restart policy so we can identify
+	// native sidecars. Kubernetes native sidecars are init containers declared
+	// with restartPolicy: Always. Kubernetes itself excludes their exit codes
+	// from pod and Job success determination, so we must also skip them here.
+	// A JVM-based sidecar (ZooKeeper, Kafka, Elasticsearch) always exits 143
+	// (SIGTERM + 128) on clean shutdown — treating that as a task failure would
+	// be a false positive.
+	initRestartPolicy := buildInitRestartPolicyMap(pod.Spec.InitContainers)
 
 	for _, status := range pod.Status.InitContainerStatuses {
+		// Skip native sidecars: Kubernetes does not count their exit codes
+		// against the pod or Job when determining success or failure.
+		if initRestartPolicy[status.Name] == corev1.ContainerRestartPolicyAlways {
+			continue
+		}
 		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
 			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated))
 		}
@@ -1408,6 +1429,21 @@ func (b *KubernetesBackend) shouldFailUnschedulablePod(pod *corev1.Pod) bool {
 		return false
 	}
 	return time.Since(pod.CreationTimestamp.Time) >= *b.config.UnschedulableTimeout
+}
+
+// buildInitRestartPolicyMap returns a map of init container name to its restart
+// policy, built from the pod spec. Containers without an explicit restart policy
+// are not included. This is used to identify Kubernetes native sidecars, which
+// are init containers with restartPolicy: Always. Kubernetes excludes such
+// containers from pod and Job failure determination.
+func buildInitRestartPolicyMap(initContainers []corev1.Container) map[string]corev1.ContainerRestartPolicy {
+	m := make(map[string]corev1.ContainerRestartPolicy, len(initContainers))
+	for _, c := range initContainers {
+		if c.RestartPolicy != nil {
+			m[c.Name] = *c.RestartPolicy
+		}
+	}
+	return m
 }
 
 func isImmediateContainerFailure(reason string) bool {
