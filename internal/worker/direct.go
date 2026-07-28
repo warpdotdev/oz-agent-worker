@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -238,11 +240,36 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		if ctx.Err() != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
-		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err)))
+		wrapped := fmt.Errorf("oz agent exited with error: %w", err)
+		if exitCode, ok := agentExitCode(err); ok {
+			return executeError(newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped, exitCode))
+		}
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped))
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
 	return executeCompleted()
+}
+
+// agentExitCode extracts the agent subprocess's exit code from a cmd.Run error.
+// os/exec reports signal deaths as exit code -1 rather than a signal-coded
+// status, so the signal is recovered from the wait status and normalized to
+// 128+signal — the form failure-cause classification keys on to tell crashes
+// and operator shutdowns apart from ordinary failures. ok is false when the
+// error does not carry a process exit status (e.g. the binary never launched).
+func agentExitCode(err error) (exitCode int, ok bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	status, isWaitStatus := exitErr.Sys().(syscall.WaitStatus)
+	if !isWaitStatus {
+		return 0, false
+	}
+	if status.Signaled() {
+		return 128 + int(status.Signal()), true
+	}
+	return status.ExitStatus(), true
 }
 
 // CancelTask is a no-op: cancelling the ExecuteTask context fully stops a

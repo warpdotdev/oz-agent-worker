@@ -77,11 +77,16 @@ type TaskCompletedMessage struct {
 	TaskState *TaskState `json:"task_state,omitempty"`
 }
 
-// TaskFailedMessage is sent from worker to server if task launch fails
+// TaskFailedMessage is sent from worker to server if task launch fails.
+// FailureReason is the worker-classified failure reason (a
+// metrics.TaskFailureReason value) and ExitCode is the failing process's
+// exit status normalized to 128+signal.
 type TaskFailedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID        string     `json:"task_id"`
+	Message       string     `json:"message"`
+	TaskState     *TaskState `json:"task_state,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	ExitCode      int        `json:"exit_code,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
