@@ -11,16 +11,6 @@ import (
 
 const sigtermExitCode = 128 + int(syscall.SIGTERM)
 
-// classifyFailureReason reclassifies failures caused by a graceful worker
-// shutdown (task cancelled, or agent killed by the shutdown's SIGTERM) as
-// graceful_shutdown.
-func classifyFailureReason(reason metrics.TaskFailureReason, exitCode int, shuttingDown bool) metrics.TaskFailureReason {
-	if shuttingDown && (reason == metrics.TaskFailureReasonTaskCancelled || exitCode == sigtermExitCode) {
-		return metrics.TaskFailureReasonGracefulShutdown
-	}
-	return reason
-}
-
 func taskFailureLabels(err error) (metrics.TaskFailurePhase, metrics.TaskFailureReason) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskTimeout

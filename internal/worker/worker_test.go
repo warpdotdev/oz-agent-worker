@@ -181,30 +181,6 @@ func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
 	}
 }
 
-func TestClassifyFailureReason(t *testing.T) {
-	tests := []struct {
-		name         string
-		reason       metrics.TaskFailureReason
-		exitCode     int
-		shuttingDown bool
-		want         metrics.TaskFailureReason
-	}{
-		{"cancelled during shutdown", metrics.TaskFailureReasonTaskCancelled, 0, true, metrics.TaskFailureReasonGracefulShutdown},
-		{"sigterm exit during shutdown", metrics.TaskFailureReasonAgentInvocation, sigtermExitCode, true, metrics.TaskFailureReasonGracefulShutdown},
-		{"cancelled outside shutdown", metrics.TaskFailureReasonTaskCancelled, 0, false, metrics.TaskFailureReasonTaskCancelled},
-		{"sigterm exit outside shutdown", metrics.TaskFailureReasonAgentInvocation, sigtermExitCode, false, metrics.TaskFailureReasonAgentInvocation},
-		{"unrelated failure during shutdown", metrics.TaskFailureReasonSetupCommand, 2, true, metrics.TaskFailureReasonSetupCommand},
-		{"sigkill exit during shutdown", metrics.TaskFailureReasonContainerExit, 137, true, metrics.TaskFailureReasonContainerExit},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := classifyFailureReason(tt.reason, tt.exitCode, tt.shuttingDown); got != tt.want {
-				t.Fatalf("classifyFailureReason(%q, %d, %t) = %q, want %q", tt.reason, tt.exitCode, tt.shuttingDown, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),

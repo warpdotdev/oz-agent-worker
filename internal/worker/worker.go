@@ -659,8 +659,13 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		result = metrics.TaskResultFailed
 		metricsPhase, metricsReason := taskFailureLabels(err)
 		exitCode := failureExitCode(err)
-		shuttingDown := w.cancellationSource(taskID) == taskCancellationSourceShutdown
-		metricsReason = classifyFailureReason(metricsReason, exitCode, shuttingDown)
+		// Reclassify failures caused by a graceful worker shutdown (task
+		// cancelled, or agent killed by the shutdown's SIGTERM) as
+		// graceful_shutdown.
+		if w.cancellationSource(taskID) == taskCancellationSourceShutdown &&
+			(metricsReason == metrics.TaskFailureReasonTaskCancelled || exitCode == sigtermExitCode) {
+			metricsReason = metrics.TaskFailureReasonGracefulShutdown
+		}
 		metrics.RecordTaskFailure(metricsPhase, metricsReason)
 		metrics.AddTaskEvent(ctx, "task.failed",
 			attribute.String("failure.phase", string(metricsPhase)),
