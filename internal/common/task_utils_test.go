@@ -65,7 +65,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--computer-use", "--harness", "claude", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--no-computer-use", "--harness", "claude", "--idle-on-complete"},
 		},
 		{
 			name: "skips --harness when harness type is nil",
@@ -312,6 +312,27 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--no-computer-use", "--idle-on-complete"},
 		},
 		{
+			name: "adds --no-computer-use by default for a third-party harness",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: strPtr("codex")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--no-computer-use", "--harness", "codex", "--idle-on-complete"},
+		},
+		{
+			name: "adds --computer-use for a third-party harness when explicitly enabled",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseEnabled: boolPtr(true),
+					Harness:            &types.Harness{Type: strPtr("codex")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--harness", "codex", "--idle-on-complete"},
+		},
+		{
 			// The top-level model_id targets the Oz harness. Third-party harnesses
 			// resolve their model from the task snapshot's harness config, so leaking
 			// the Oz model id via --model would cause them to reject the run.
@@ -323,7 +344,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--harness", "claude", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--no-computer-use", "--harness", "claude", "--idle-on-complete"},
 		},
 	}
 
