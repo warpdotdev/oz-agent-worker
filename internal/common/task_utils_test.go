@@ -29,7 +29,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{IdleOnComplete: "30m"},
-			expected: []string{"agent", "run", "--idle-on-complete", "15m"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete", "15m"},
 		},
 		{
 			name: "falls back to worker idle_on_complete when task timeout not set",
@@ -37,7 +37,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{IdleOnComplete: "30m"},
-			expected: []string{"agent", "run", "--idle-on-complete", "30m"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete", "30m"},
 		},
 		{
 			name: "uses oz cli default when neither task nor worker timeout is set",
@@ -45,7 +45,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "ignores non-positive task idle_timeout_minutes and falls back to worker value",
@@ -55,7 +55,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{IdleOnComplete: "20m"},
-			expected: []string{"agent", "run", "--idle-on-complete", "20m"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete", "20m"},
 		},
 		{
 			name: "adds --harness when harness type is set",
@@ -65,7 +65,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--harness", "claude", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--harness", "claude", "--idle-on-complete"},
 		},
 		{
 			name: "skips --harness when harness type is nil",
@@ -75,7 +75,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "still appends other config-derived args before idle timeout",
@@ -86,7 +86,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--model", "claude-sonnet-4", "--idle-on-complete", "12m"},
+			expected: []string{"agent", "run", "--model", "claude-sonnet-4", "--computer-use", "--idle-on-complete", "12m"},
 		},
 		{
 			name: "passes --bedrock-inference-role when inference_providers.aws.role_arn is set",
@@ -106,6 +106,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				"run",
 				"--model",
 				"claude-sonnet-4",
+				"--computer-use",
 				"--bedrock-inference-role",
 				"arn:aws:iam::123456789012:role/BedrockInference",
 				"--idle-on-complete",
@@ -127,6 +128,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{
 				"agent",
 				"run",
+				"--computer-use",
 				"--bedrock-inference-role",
 				"arn:aws:iam::123456789012:role/BedrockInference",
 				"--bedrock-role-region",
@@ -150,6 +152,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{
 				"agent",
 				"run",
+				"--computer-use",
 				"--bedrock-inference-role",
 				"arn:aws:iam::123456789012:role/BedrockInference",
 				"--idle-on-complete",
@@ -165,7 +168,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "skips --bedrock-inference-role when aws block is opted out",
@@ -180,7 +183,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "adds --share public:view when session_sharing.public_access is VIEWER",
@@ -192,7 +195,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--share", "public:view", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--share", "public:view", "--idle-on-complete"},
 		},
 		{
 			name: "adds --share public:edit when session_sharing.public_access is EDITOR",
@@ -204,7 +207,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--share", "public:edit", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--share", "public:edit", "--idle-on-complete"},
 		},
 		{
 			name: "skips --share public when session_sharing is absent",
@@ -212,7 +215,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "does not forward --conversation even when AgentConversationID is set; the embedded warp CLI reads it off task metadata",
@@ -221,7 +224,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConversationID: strPtr("abc-123"),
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "skips --share public when public_access is nil",
@@ -231,7 +234,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "silently omits --share public for unsupported access levels (defensive: FULL rejected earlier)",
@@ -243,7 +246,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
 			name: "adds snapshot controls when configured",
@@ -257,6 +260,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			opts: TaskAugmentOptions{},
 			expected: []string{
 				"agent", "run",
+				"--computer-use",
 				"--no-snapshot",
 				"--snapshot-upload-timeout", "90s",
 				"--snapshot-script-timeout", "45s",
@@ -269,7 +273,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{AdditionalOzArgs: []string{"--skip-initial-turn"}},
-			expected: []string{"agent", "run", "--skip-initial-turn", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--skip-initial-turn", "--idle-on-complete"},
 		},
 		{
 			name: "does not emit supplemental oz args when none are provided",
@@ -277,7 +281,35 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 				AgentConfigSnapshot: &types.AmbientAgentConfig{},
 			},
 			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--idle-on-complete"},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
+		{
+			name: "adds --computer-use by default when computer_use_enabled is unset",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
+		{
+			name: "adds --computer-use when computer_use_enabled is true",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseEnabled: boolPtr(true),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
+		{
+			name: "adds --no-computer-use when computer_use_enabled is false",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseEnabled: boolPtr(false),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--no-computer-use", "--idle-on-complete"},
 		},
 		{
 			// The top-level model_id targets the Oz harness. Third-party harnesses

@@ -54,13 +54,12 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		// Pass computer use setting if explicitly configured.
-		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
-			if *task.AgentConfigSnapshot.ComputerUseEnabled {
-				args = append(args, "--computer-use")
-			} else {
-				args = append(args, "--no-computer-use")
-			}
+		// Pass the computer use setting. Enabled by default; an explicit
+		// false disables it. Mirrors warp-server's IsComputerUseEnabled.
+		if task.AgentConfigSnapshot.ComputerUseEnabled == nil || *task.AgentConfigSnapshot.ComputerUseEnabled {
+			args = append(args, "--computer-use")
+		} else {
+			args = append(args, "--no-computer-use")
 		}
 
 		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
