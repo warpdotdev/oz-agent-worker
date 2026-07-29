@@ -54,13 +54,17 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		// Pass computer use setting if explicitly configured.
+		// Pass the computer use setting. An explicit value wins; when unset,
+		// computer use defaults to enabled for Oz-harness runs and disabled
+		// for third-party harnesses. Mirrors warp-server's IsComputerUseEnabled.
+		computerUseEnabled := task.AgentConfigSnapshot.Harness.IsOz()
 		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
-			if *task.AgentConfigSnapshot.ComputerUseEnabled {
-				args = append(args, "--computer-use")
-			} else {
-				args = append(args, "--no-computer-use")
-			}
+			computerUseEnabled = *task.AgentConfigSnapshot.ComputerUseEnabled
+		}
+		if computerUseEnabled {
+			args = append(args, "--computer-use")
+		} else {
+			args = append(args, "--no-computer-use")
 		}
 
 		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
