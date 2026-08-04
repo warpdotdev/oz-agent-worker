@@ -270,6 +270,218 @@ func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
 		}
 	}
 }
+
+func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
+	sidecarPolicy := corev1.ContainerRestartPolicyAlways
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+	podSpec := corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{Name: "copy-sidecar-0"},
+			{Name: "zookeeper", RestartPolicy: &sidecarPolicy},
+		},
+	}
+
+	t.Run("restartable sidecar SIGTERM exit does not fail the task", func(t *testing.T) {
+		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+						},
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("expected no failure for terminated restartable sidecar, got %v", err)
+		}
+	})
+
+	t.Run("plain init container exit still fails the task", func(t *testing.T) {
+		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "copy-sidecar-0",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+						},
+					},
+				},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "init container copy-sidecar-0") {
+			t.Fatalf("expected init container failure, got %v", err)
+		}
+	})
+
+	t.Run("sidecar exit does not mask task container failure", func(t *testing.T) {
+		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodFailed,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+						},
+					},
+				},
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "task",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 2},
+						},
+					},
+				},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "container task") || !strings.Contains(err.Error(), "exited with code 2") {
+			t.Fatalf("expected task container failure attribution, got %v", err)
+		}
+	})
+
+	t.Run("sidecar image pull failure still fails the task", func(t *testing.T) {
+		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "pull failed"},
+						},
+					},
+				},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "ImagePullBackOff") {
+			t.Fatalf("expected image pull failure, got %v", err)
+		}
+	})
+}
+
+// End-to-end regression test for the wind-down race that misreported
+// successful tasks as failed: the pod watch delivers the pod state carrying a
+// restartable sidecar's SIGTERM termination (exit 143) before the Job
+// controller stamps JobComplete. inspectPodFailure must ignore the sidecar
+// exit so the watch loop keeps waiting for the Job Complete event.
+func TestExecuteTaskSucceedsWhenSidecarExitsBeforeJobComplete(t *testing.T) {
+	sidecarPolicy := corev1.ContainerRestartPolicyAlways
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	// The Job Complete condition arrives only after the pod wind-down event
+	// below has been delivered and inspected.
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	// The pod watch fires first with the wind-down state: task container
+	// exited 0, restartable sidecar SIGTERM'd with exit 143.
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			podWatch.Modify(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "task-pod",
+					Namespace: "agents",
+					Labels:    map[string]string{"job-name": "task-job"},
+				},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						{Name: "zookeeper", RestartPolicy: &sidecarPolicy},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "zookeeper",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+							},
+						},
+					},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "task",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+							},
+						},
+					},
+				},
+			})
+		}()
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected success when sidecar exits 143 before Job Complete, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
+	}
+}
+
 func TestHandleJobStateDetectsCompletion(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	backend := &KubernetesBackend{

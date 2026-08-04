@@ -944,8 +944,18 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonEvicted, b.podFailureError(pod))
 	}
 
+	restartableSidecars := restartableInitContainerNames(pod)
+
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
+		// Init containers declared with restartPolicy: Always are native
+		// sidecar containers: the kubelet restarts them while the pod runs and
+		// stops them with SIGTERM once the main containers finish, and their
+		// exit codes never determine pod or Job outcome. Skip the exit-code
+		// check for them so normal pod wind-down (e.g. JVM services exiting
+		// 143 on SIGTERM) is not misreported as a task failure. The waiting
+		// checks below still apply to sidecars: one that cannot start blocks
+		// the task container from ever running.
+		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 && !restartableSidecars[status.Name] {
 			return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated), terminatedExitCode(status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
@@ -995,6 +1005,20 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 	}
 
 	return nil
+}
+
+// restartableInitContainerNames returns the names of init containers declared
+// with restartPolicy: Always (native sidecar containers). Kubernetes excludes
+// their exit codes from pod and Job outcome, so task failure detection must
+// not treat their terminations as fatal.
+func restartableInitContainerNames(pod *corev1.Pod) map[string]bool {
+	names := make(map[string]bool, len(pod.Spec.InitContainers))
+	for _, container := range pod.Spec.InitContainers {
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			names[container.Name] = true
+		}
+	}
+	return names
 }
 
 func (b *KubernetesBackend) collectPodLogs(ctx context.Context, pods []corev1.Pod) string {
