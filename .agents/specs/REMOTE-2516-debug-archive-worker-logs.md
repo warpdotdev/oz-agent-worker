@@ -1,14 +1,16 @@
 # REMOTE-2516: Self-hosted worker debug-archive logs
 
 ## Document status
-This is the `warpdotdev/oz-agent-worker` companion to the debug-archive product and technical contract in [`warpdotdev/warp-server#13839`](https://github.com/warpdotdev/warp-server/pull/13839). The server spec owns archive creation, authorization, storage, trigger policy, Temporal orchestration, GCP Pub/Sub fan-out, and the server half of the WebSocket protocol. This document owns the worker half: proving execution ownership, capturing Docker/Kubernetes/direct-backend logs, retaining ownership and retrievable logs for the existing cleanup grace, applying the requested content-transformer hook, uploading to a server-supplied target, and acknowledging the result.
+This is the `warpdotdev/oz-agent-worker` companion to the debug-archive product and technical contract in [`warpdotdev/warp-server#13839`](https://github.com/warpdotdev/warp-server/pull/13839). The server spec owns archive creation, authorization, storage, trigger policy, Temporal orchestration, GCP Pub/Sub fan-out, and the server half of the WebSocket protocol. This document owns the worker half: reporting the worker build on connection so the exact assigned version can be snapshotted, proving execution ownership, capturing Docker/Kubernetes/direct-backend logs, retaining ownership and retrievable logs for the existing cleanup grace, applying the requested content-transformer hook, uploading to a server-supplied target, and acknowledging the result.
 
 Both documents are required to implement REMOTE-2516. If their wire contracts differ, implementation must reconcile the specs before either PR is promoted; neither side should silently infer a different protocol.
+
+The requester additionally confirmed that the archive must preserve the client version, worker version, and server commit associated with run/execution creation, and that local client plus entrypoint-script logs are the sandbox stdout/stderr source. This companion spec implements the worker-version and self-hosted stdout/stderr portions of that decision.
 
 ## Summary
 Warp staff, run creators, and owning-team admins need a HAR-like debug archive for cloud-agent runs. For self-hosted executions, the logs live inside infrastructure controlled by `oz-agent-worker`. `warp-server` cannot query a customer's Docker daemon, Kubernetes cluster, or direct child process, and the current worker removes its task ownership record and often destroys the backend resource as soon as execution ends.
 
-V1 adds a request-driven worker protocol. `warp-server` publishes a versioned worker-control request through its existing GCP Pub/Sub fan-out and forwards `debug_archive_logs_requested`, with one immutable 30-minute presigned upload target, to every connected process using the assigned worker ID. Each process checks an exact `(run_id, execution_id)` active/cleanup-grace ownership registry. Only the process that executed the assignment snapshots logs, applies the request's content-transformer descriptor while encoding message data, uploads bounded NDJSON directly to the target, and sends `debug_archive_logs_uploaded`. Other processes silently ignore the request. Missing logs, old workers, disconnected workers, upload failures, and expired cleanup grace make only the self-hosted log source partial; they never fail or pause the cloud-agent run.
+V1 adds build provenance plus a request-driven worker protocol. Every authenticated worker connection reports the already build-stamped `main.Version`; `warp-server` snapshots the exact selected connection's value when an execution is claimed rather than reading a current version during archive collection. The server publishes a versioned worker-control request through its existing GCP Pub/Sub fan-out and forwards `debug_archive_logs_requested`, with one immutable 30-minute presigned upload target, to every connected process using the assigned worker ID. Each process checks an exact `(run_id, execution_id)` active/cleanup-grace ownership registry. Only the process that executed the assignment snapshots both stdout and stderr from the sandbox entrypoint/launcher and client process, applies the request's content-transformer descriptor while encoding message data, uploads bounded NDJSON directly to the target, and sends `debug_archive_logs_uploaded`. Other processes silently ignore the request. Missing logs, old workers, disconnected workers, upload failures, and expired cleanup grace make only the self-hosted source partial; they never fail or pause the cloud-agent run.
 
 V1 supports snapshots during an active run and retrieval after terminal reporting for the existing configured cleanup grace. It does not continuously append to one object. The design leaves room for a future mode that uploads immutable, monotonically numbered chunks while a run is active.
 
@@ -25,9 +27,11 @@ For a supported self-hosted execution:
 
 ### Supported backends
 V1 captures:
-- Docker container stdout and stderr for the exact execution container.
-- Kubernetes logs for every init container and regular container in every pod belonging to the exact execution Job, including current and best-effort previous logs after a restart.
-- Direct-backend stdout and stderr for worker-managed setup, agent, and teardown processes.
+- Docker container stdout and stderr for the exact execution container, including all output emitted by the container entrypoint/launcher script and the client process it starts.
+- Kubernetes stdout and stderr for every init container and regular container in every pod belonging to the exact execution Job, including entrypoint/launcher and client output plus current and best-effort previous logs after a restart.
+- Direct-backend stdout and stderr for the entrypoint/launcher invocation, client process, and worker-managed setup/teardown phases.
+
+These are the sandbox's local stdout/stderr streams, not separate semantic transcript sources. The worker does not filter lines by presumed process. It preserves stdout/stderr and provider container/phase metadata when available; when a provider merges streams or does not identify whether a line came from the entrypoint or child client, the output is truthfully labeled `combined`/`unknown` rather than assigned a fabricated process identity.
 
 The command backend dispatches into an opaque operator-owned runtime and has no backend log API. A worker that owns a command-backend assignment responds `unavailable` with `backend_not_supported`; it must not claim that dispatch-command stdout is the remote agent's execution log.
 
@@ -47,10 +51,18 @@ Every request is bounded to 64 MiB per execution, preserving first/last records 
 
 ### Version skew
 - An old worker ignores the unknown request; the server times out and records the source as unavailable.
+- An old worker that does not report its build version remains eligible for ordinary task execution; the server records worker provenance as `not_reported` and makes a new archive partial rather than substituting a current image tag or connection's version.
 - A new worker accepts protocol version 1 and ignores unknown optional JSON fields.
 - A new worker receiving an unsupported protocol version sends `failed` with reason `unsupported_protocol_version`.
 - A server that does not send archive requests does not change worker behavior.
 - Protocol handling is disabled only by the absence of the new server message; no worker rollout may make ordinary task execution depend on archive availability.
+
+### Worker build provenance
+`main.Version` is already stamped by release builds through `-ldflags="-X main.Version=..."`, defaults to `dev` locally, and is exported in `oz_worker_info`; it is not currently present on the WebSocket wire.
+
+Pass `main.Version` into `worker.Config` and send it as `X-Warp-Worker-Version` on every authenticated WebSocket dial and reconnect. The value is an opaque, non-secret build identifier capped at 128 UTF-8 bytes. The server validates and stores it on that exact `WorkerConnection`; when the connection is selected and successfully claims an execution, the server copies the value into the execution's set-once provenance snapshot in the claim transaction, before sandbox launch. Two processes sharing one worker ID may report different versions during a rolling deploy, so the selected connection—not worker ID, current presence, metrics, image tag, or collection-time state—is authoritative.
+
+An empty/missing header is accepted for backward compatibility and surfaced as `not_reported`; an overlong or control-character-bearing value is ignored as invalid provenance without exposing it in logs or preventing connection/task execution. Reconnects report again for future assignments but never rewrite a previously claimed execution's version. The version field is diagnostic only and is not used to negotiate the debug-log protocol.
 
 ### Security and privacy
 Worker logs may contain prompts, source code, identifiers, and secrets emitted by a process. V1 includes a versioned `ContentTransformer` hook in the request/upload path but implements only a no-op transformer, matching the server spec. Actual redaction rules are deferred. The worker:
@@ -64,6 +76,7 @@ Worker logs may contain prompts, source code, identifiers, and secrets emitted b
 The transformer is applied while NDJSON is first encoded/uploaded: only log-message `data` passes through it, while timestamps, sequence, stream/container identity, and source-error metadata remain structural. V1's no-op descriptor preserves bytes. Unsupported future descriptors return `failed/unsupported_content_transformer`; no worker silently uploads untransformed data. A future redaction implementation can therefore evolve the content rules without adding a server-side raw-object-to-transformed-object copy.
 
 ## Current state
+- `main.go:23` already exposes build-stamped `Version` and uses it for worker metrics, while `internal/worker/worker.go:187` sends only worker ID and authorization during WebSocket connection; the server cannot currently tie a worker build to an execution.
 - `internal/types/messages.go` defines only assignment, lifecycle, and cancellation message DTOs. Unknown server messages are logged and ignored.
 - `internal/worker/worker.go:323` decodes WebSocket messages synchronously on the read loop. Archive work cannot run inline there without blocking heartbeats, cancellation, or later assignments.
 - `internal/worker/worker.go:62` tracks active tasks only by run/task ID. `executeTask` removes the record immediately after terminal reporting unless the command backend spawned the task.
@@ -76,6 +89,13 @@ The transformer is applied while NDJSON is first encoded/uploaded: only log-mess
 These constraints require changes in both the shared worker lifecycle and all three supported backends; adding only a WebSocket message would race terminal cleanup and fail the primary `ANY_FAILURE` use case. The implementation must reuse the resolved grace as a post-terminal ownership/provider-cleanup deadline rather than add a second retention configuration.
 
 ## Technical design
+
+### Connection registration and build provenance
+Extend `worker.Config` with `Version` and initialize it from `main.Version`. `Worker.connect` sends `X-Warp-Worker-Version` with every WebSocket upgrade request. This is connection metadata, not a new asynchronous message: it reaches the server before that connection is eligible for task selection.
+
+The server stores the validated value on its in-memory/presence connection record. The selected connection returns its version as part of the safe claim result; `warp-server` commits it to the execution's set-once `debug_provenance_snapshot` in the same transaction that claims the execution. The worker does not send a later “current version” response to archive collection, and the debug-log upload acknowledgement need not duplicate the persisted build value.
+
+Tests use two simultaneous connections with one worker ID and different `Version` values to prove the execution receives the version of the connection that actually accepts it. Missing/invalid version metadata does not fail connection, claim, or execution, but is observably absent for the archive's partial-provenance rules.
 
 ### Wire protocol
 Add the following v1 message types to `internal/types/messages.go`.
@@ -215,6 +235,8 @@ SnapshotTaskLogs(ctx context.Context, taskID, executionID string, writer io.Writ
 
 The method writes protocol-v1 NDJSON records and returns typed errors that the coordinator maps to stable reason codes. `PartialSnapshotError` carries bounded warning codes after valid sibling data has been written; the coordinator uploads those bytes with `capture_status=partial` rather than discarding them. Other errors produce a non-upload outcome when no valid snapshot exists. The method must:
 - scope provider lookup to both exact IDs and this worker/backend;
+- include all available stdout and stderr emitted by the sandbox entrypoint/launcher and client process without content-based filtering;
+- preserve stream/container/phase identity the backend actually supplies, use `combined`/`unknown` when it does not, and never infer a process identity from log text;
 - stream rather than return log bytes;
 - honor cancellation and the supplied bounded writer;
 - make no task lifecycle changes;
@@ -240,6 +262,8 @@ Data records contain:
 - `data`
 - optional Docker `container_id`
 - optional Kubernetes `namespace`, `pod`, `container`, `container_type`, `restart_attempt`, and `previous`
+
+`phase` is provider truth, not a required process classifier. Direct execution can label launcher/client/setup/teardown phases from the handles it owns. Docker/Kubernetes provider streams commonly combine entrypoint and child-client output inside one container; those records retain their real container and stdout/stderr identity and do not fabricate which process wrote a line.
 
 The encoder passes only each data record's decoded `data` content through `ContentTransformer` before selecting UTF-8 versus base64 encoding. It does not transform schema version, kind, sequence, backend, phase, stream, timestamps, identity fields, warning codes, or truncation metadata. V1's no-op transformer is byte preserving. Provider records are not first uploaded raw and transformed in cloud storage; the first object-store upload already contains the transformed encoding.
 
@@ -289,6 +313,7 @@ The Helm chart mounts a dedicated 1-GiB `emptyDir` for the default capture root 
 `SnapshotTaskLogs`:
 - resolves the exact registered container;
 - calls Docker `ContainerLogs` with stdout, stderr, and timestamps enabled and no time-range filter;
+- preserves the complete container streams containing both the entrypoint/launcher and spawned client process without line filtering or invented process labels;
 - demultiplexes Docker's stream framing so each record has correct stdout/stderr identity;
 - emits chunked NDJSON directly to the supplied writer.
 
@@ -300,6 +325,7 @@ The Helm chart mounts a dedicated 1-GiB `emptyDir` for the default capture root 
 - sorts pods deterministically by name;
 - visits init containers and regular containers in declared order;
 - requests all available logs with timestamps and no time-range filter;
+- preserves both stdout and stderr containing each container's entrypoint/launcher and client output without line filtering or invented process labels;
 - attempts `Previous: true` before current logs for a container whose restart count is non-zero;
 - tags every output record with pod/container identity and whether it is previous/current;
 - treats a vanished pod, unavailable previous stream, or one unreadable container as a typed per-snapshot partial error while retaining readable sibling streams.
@@ -314,8 +340,8 @@ If the Kubernetes worker process is disrupted while a preserved task Job continu
 
 ### Direct adapter
 Create one task capture before setup. Replace worker-global output assignment with phase-aware multi-writers:
-- Setup stdout/stderr goes to the worker console and `phase=setup` capture.
-- Agent stdout/stderr goes to the worker console and `phase=agent` capture.
+- Setup and entrypoint/launcher stdout/stderr goes to the worker console and `phase=setup` capture.
+- The launched client process's stdout/stderr goes to the worker console and `phase=agent` capture.
 - Teardown stdout/stderr goes to the worker console and `phase=teardown` capture.
 - Capture mechanics: the archive branch of each multiwriter is a bounded non-blocking queue, not a synchronous disk write. `Write` copies a bounded chunk into the queue and immediately reports the original byte count; when the queue is full it drops archive bytes, marks `output_dropped`, and leaves the existing console sink/child process behavior unchanged. A per-task background encoder drains the queue into `TaskLogCapture`. Terminal finalization drains it under a bounded deadline before workspace cleanup, but the capture remains until cleanup grace expires. `SnapshotTaskLogs` takes a consistent watermark copy without closing an active capture. No task workspace file content is stored.
 
@@ -376,6 +402,9 @@ WebSocket transfer would burden the regular server, interfere with control messa
 ### First worker connection wins
 Multiple worker processes can use one worker ID. Selecting the first connection could leak the wrong execution or return misleading emptiness. Server-side GCP Pub/Sub fan-out plus exact active/cleanup-grace ownership makes only the process that executed the assignment authoritative; all non-owners are silent.
 
+### Query current worker version during collection
+Reading a current connection, image tag, or metrics label when the archive is assembled is simpler but becomes wrong after reconnects and rolling deploys. Reporting the build on every authenticated connection and snapshotting the exact selected connection at successful claim was selected. It adds no collection-time round trip, keeps old workers execution-compatible, and ties provenance to what actually received the execution rather than what happens to be online later.
+
 ### New archive retention versus existing cleanup grace
 An independent terminal spool/TTL would duplicate lifecycle configuration and create conflicting cleanup clocks. V1 instead keeps Docker/Kubernetes resources and exact ownership through the already-resolved idle-on-complete grace, while direct execution retains only its bounded output capture for that same interval. This can consume provider resources longer than today's immediate cleanup, so the operator chooses the existing grace and may need to lengthen it for reliable `ANY_FAILURE` collection.
 
@@ -405,6 +434,7 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 - Target abuse: authenticated control channel, method/scheme/header validation, no redirects, and no target logging.
 - Kubernetes worker replacement loses ownership: explicit V1 limitation; the archive remains partial and a future Job reattach protocol can recover it.
 - Protocol drift across repositories: explicit companion links, checked-in golden v1 fixtures on both sides, and coordinated staging tests before rollout.
+- Worker-version drift during rolling deploys: version is connection-scoped and copied exactly once from the selected successful claimant; current connection/image/metrics state is never used to backfill an execution.
 - Direct capture changes subprocess behavior: multiwriters keep the existing console sink, capture writes are non-blocking/best-effort, and exit status remains authoritative.
 - Backend snapshot errors alter task result: capture errors are isolated and never replace execution errors, status, or cleanup.
 
@@ -434,7 +464,7 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 - WVC-017: A command-backend owner reports `unavailable/backend_not_supported`, while a different command-worker process silently ignores the request.
 
 ### NDJSON and truncation
-- WVC-018: Docker, Kubernetes, and direct fixtures emit only valid schema-v1 NDJSON; every data record has bounded data, encoding, backend, phase, stream, sequence, and observed-time fields, and safe `source_error` records contain no raw provider error.
+- WVC-018: Docker, Kubernetes, and direct fixtures emit only valid schema-v1 NDJSON for all available entrypoint/launcher and client stdout/stderr; every data record has bounded data, encoding, backend, truthful phase/stream, sequence, and observed-time fields, and safe `source_error` records contain no raw provider error.
 - WVC-019: Invalid UTF-8/binary output round-trips through base64 records without corrupting the NDJSON stream.
 - WVC-020: Output below the bound is byte-complete after record decoding and reports `truncated=false`.
 - WVC-021: Output above the bound preserves valid first/last record sets, contains one truncation record with an omitted-byte lower bound, stays within the request/configured limit, and reports `truncated=true`.
@@ -452,7 +482,7 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 
 ### Docker
 - WVC-031: Exact task/execution ownership resolves exactly one container; a mismatched execution cannot read another container.
-- WVC-032: Active Docker snapshot calls the container-log API with stdout, stderr, timestamps, and no time-range filter, and demultiplexes stream identity into NDJSON.
+- WVC-032: Active Docker snapshot calls the container-log API with stdout, stderr, timestamps, and no time-range filter, retains entrypoint/launcher plus client output without line filtering, and demultiplexes stream identity into NDJSON.
 - WVC-033: Success, non-zero exit, OOM, context cancellation, and wait failure each retain the exact stopped container and ownership through cleanup grace, then remove both idempotently at the deadline.
 - WVC-034: A Docker request during cleanup grace reads the retained container; a request after container/grace cleanup is silently ignored by the former owner and becomes partial by server timeout.
 - WVC-035: Archive capture replaces the existing unbounded `io.ReadAll` diagnostic path and passes a large-log test without memory scaling with output size.
@@ -460,7 +490,7 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 ### Kubernetes
 - WVC-036: Pod selection requires exact execution, task, and worker hash labels; pods with only a colliding/mismatched label set are excluded.
 - WVC-037: Snapshot ordering is pod name, then declared init containers, then declared regular containers, with identity on every record.
-- WVC-038: Every readable current stream is captured with provider timestamps and no time filter; a restarted container also attempts and labels previous logs.
+- WVC-038: Every readable current stdout/stderr stream, including entrypoint/launcher and client output, is captured without line filtering with provider timestamps and no time filter; a restarted container also attempts and labels previous logs.
 - WVC-039: One missing/unreadable container does not discard readable siblings, emits a safe source-error record, and uploads with `capture_status=partial` plus the matching bounded warning code.
 - WVC-040: Success, failure, and cancellation retain exact Job/pod identity through cleanup grace; successful Job deletion and normal failed-Job cleanup happen at or after that deadline.
 - WVC-041: Snapshot failure does not change Job cleanup deadline, configured failed-Job TTL, task result, or Kubernetes preserve-on-worker-shutdown semantics; a TTL shorter than cleanup grace is tested/documented as potentially causing a partial archive.
@@ -468,7 +498,7 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 - WVC-043: Worker-pod replacement with a preserved Job is documented/tested as loss of process-local cleanup-grace ownership in V1, not a false successful upload by the replacement.
 
 ### Direct
-- WVC-044: Setup, agent, and teardown stdout/stderr continue to reach the worker console and are separately labeled in the task capture.
+- WVC-044: Entrypoint/launcher, launched client, setup, and teardown stdout/stderr continue to reach the worker console and are separately labeled from handles the direct backend actually owns.
 - WVC-045: One task's direct output cannot appear in another concurrent task's snapshot.
 - WVC-046: Active direct snapshot returns bytes only through its watermark while the process continues and later output remains available to a later snapshot.
 - WVC-047: Direct terminal capture remains available after per-task workspace cleanup and stores no workspace file content.
@@ -502,5 +532,12 @@ Direct execution can be teed, but Docker and Kubernetes already own provider-nat
 - WVC-069: This change has no rendered UI; computer-use visual verification is not applicable.
 - WVC-070: A no-op transformer preserves NDJSON message data exactly; a fake transformer changes only decoded `data` while timestamps, sequence, stream/container identity, warnings, and source metadata remain unchanged. The transformed NDJSON is the first cloud object uploaded, and an unsupported transformer uploads nothing.
 
+### Worker build provenance and local-log completeness
+- WVC-071: Release, local `dev`, and arbitrary test builds pass their exact `main.Version` through `worker.Config` and send it as `X-Warp-Worker-Version` on every initial WebSocket dial and reconnect before the connection can receive an assignment.
+- WVC-072: With two connected processes sharing one worker ID but reporting different versions, the server persists only the successfully selected claimant's version on the execution before sandbox launch; rejection, reconnect, later rollout, and archive collection do not overwrite it.
+- WVC-073: Missing, overlong, or control-character-bearing version metadata does not fail connection or task execution, is never logged raw, and yields the coordinated server spec's explicit `not_reported` partial-provenance behavior rather than a value derived from current image, presence, or metrics state.
+- WVC-074: Docker, Kubernetes, and direct integration fixtures emit distinguishable sentinels on both stdout and stderr from the entrypoint/launcher and launched client; every sentinel appears exactly once after NDJSON decoding unless an explicit bound/truncation or provider-partial record accounts for it.
+- WVC-075: Docker/Kubernetes fixtures whose provider cannot distinguish entrypoint from child-client output retain real stdout/stderr/container identity and use `combined`/`unknown` where appropriate; no implementation or test infers process identity from log text.
+
 ## Cross-repository completion
-Implementation is complete only when this spec's WVC-001/WVC-002/WVC-052/WVC-067/WVC-070 interoperate with the server-side VC-041, VC-076 through VC-082, VC-087, and VC-088 in `warpdotdev/warp-server#13839`. A worker-only test double or server-only fake is not sufficient evidence for the final protocol gate.
+Implementation is complete only when this spec's WVC-001/WVC-002/WVC-052/WVC-067/WVC-070 through WVC-075 interoperate with the server-side VC-041, VC-076 through VC-082, and VC-087 through VC-094 in `warpdotdev/warp-server#13839`. A worker-only test double or server-only fake is not sufficient evidence for the final protocol gate.
