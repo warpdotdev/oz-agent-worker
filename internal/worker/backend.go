@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
@@ -85,6 +86,12 @@ type TaskParams struct {
 	// Containerized backends apply it as CPU/memory limits (Docker) or resource
 	// requests/limits (Kubernetes). Backends that cannot enforce a shape (direct) ignore it.
 	InstanceShape *types.InstanceShape
+
+	// LogCapture, when non-nil, receives the task's stdout and stderr for a
+	// later debug-archive snapshot. Only the direct backend uses it: Docker and
+	// Kubernetes read provider-native logs on demand instead of keeping a
+	// second copy.
+	LogCapture *debuglog.TaskLogCapture
 }
 
 // Backend defines the interface for task execution backends.
@@ -100,8 +107,33 @@ type Backend interface {
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool
+	// SnapshotTaskLogs writes protocol-v1 NDJSON records for one exact
+	// (task, execution) pair's stdout and stderr into sink, covering the
+	// sandbox entrypoint/launcher and the client process it starts.
+	//
+	// It streams rather than buffering, makes no lifecycle change, removes no
+	// provider resource, and is safe to call while ExecuteTask is running.
+	// A backend that wrote valid data for some sources but could not read
+	// others returns *debuglog.PartialSnapshotError so the caller can upload
+	// what it has; other failures return *debuglog.SnapshotError.
+	SnapshotTaskLogs(ctx context.Context, params *SnapshotParams) error
+	// CleanupTaskResources idempotently releases the backend resources an
+	// execution retained past terminal state for log retrieval. The worker
+	// calls it when the execution's cleanup grace expires.
+	CleanupTaskResources(ctx context.Context, params *CancelParams) error
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
+}
+
+// SnapshotParams identifies the execution whose logs to snapshot and where to
+// write them.
+type SnapshotParams struct {
+	TaskID      string
+	ExecutionID string
+	// Sink owns record framing, chunk bounds, content transformation, encoding
+	// selection, sequencing, and truncation. Backends supply provider output
+	// and whatever stream and container identity the provider actually reports.
+	Sink debuglog.Sink
 }
 
 // CancelParams carries the minimal, non-secret identifiers a backend needs to

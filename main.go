@@ -11,6 +11,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
@@ -178,9 +179,11 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		ServerRootURL:           CLI.ServerRootURL,
 		LogLevel:                CLI.LogLevel,
 		BackendType:             backendType,
+		Version:                 Version,
 		MaxConcurrentTasks:      maxConcurrentTasks,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
+		DebugLogCapture:         debugLogCaptureConfig(fileConfig),
 	}
 
 	switch backendType {
@@ -402,6 +405,29 @@ func parseEnvFlags(raw []string) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+// debugLogCaptureConfig overlays any operator-supplied debug-log capture bounds
+// onto the built-in defaults. Invalid values are rejected later by the worker,
+// which disables archive capture without failing task execution.
+func debugLogCaptureConfig(fileConfig *config.FileConfig) debuglog.Config {
+	captureConfig := debuglog.DefaultConfig()
+	if fileConfig == nil || fileConfig.DebugLogCapture == nil {
+		return captureConfig
+	}
+
+	overrides := fileConfig.DebugLogCapture
+	captureConfig.Directory = overrides.Directory
+	if overrides.MaxTotalBytes != nil {
+		captureConfig.MaxTotalBytes = *overrides.MaxTotalBytes
+	}
+	if overrides.MaxExecutionBytes != nil {
+		captureConfig.MaxExecutionBytes = *overrides.MaxExecutionBytes
+	}
+	if overrides.MaxConcurrentUploads != nil {
+		captureConfig.MaxConcurrentUploads = *overrides.MaxConcurrentUploads
+	}
+	return captureConfig
 }
 
 func copyStringMap(values map[string]string) map[string]string {

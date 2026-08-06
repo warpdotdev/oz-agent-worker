@@ -77,6 +77,7 @@ type instruments struct {
 	taskFailures       metric.Int64Counter
 	wsReconnects       metric.Int64Counter
 	workerInfo         metric.Int64Gauge
+	debugArchive       *debugArchiveInstruments
 }
 
 // activeInstruments is the current instrument set. It always points to a
@@ -325,6 +326,9 @@ func primeInstruments(ctx context.Context, set *instruments) {
 			metric.WithAttributes(attribute.String("reason", r)),
 		)
 	}
+	set.debugArchive.captureBytes.Record(ctx, 0)
+	set.debugArchive.cleanupGraceCount.Record(ctx, 0)
+	set.debugArchive.requestsInFlight.Add(ctx, 0)
 }
 
 func newResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
@@ -419,6 +423,10 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	debugArchive, err := buildDebugArchiveInstruments(m)
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
 		connected:          connected,
 		tasksActive:        tasksActive,
@@ -430,6 +438,7 @@ func buildInstruments(m metric.Meter) (*instruments, error) {
 		taskFailures:       taskFailures,
 		wsReconnects:       wsReconnects,
 		workerInfo:         workerInfo,
+		debugArchive:       debugArchive,
 	}, nil
 }
 

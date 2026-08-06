@@ -116,6 +116,30 @@ kubernetesBackend:
   #       memory: 64Mi
   preflightResources: {}
 
+# Bounds for debug-archive log capture. The worker uses this space for
+# direct-execution output captures and for the request-scoped snapshot it
+# uploads; Docker and Kubernetes executions read provider logs on demand and
+# keep nothing here.
+#
+# There is deliberately no retention duration: how long an execution's logs stay
+# retrievable is the existing idle-on-complete cleanup grace (task
+# `idle_timeout_minutes`, then `worker.idleOnComplete`, then the Oz default).
+debugLogCapture:
+  # Mounts a dedicated ephemeral volume for the capture root. Disable only if
+  # the container filesystem already provides suitable scratch space.
+  enabled: true
+  # Size of the ephemeral volume. Keep it at or above maxTotalBytes so the
+  # worker's own accounting, not the volume, is the binding limit.
+  sizeLimit: 1Gi
+  # Mount path for the capture volume, used as the worker's capture root.
+  directory: /var/lib/oz/debug-logs
+  # Process-local disk budget shared by captures and request snapshots.
+  maxTotalBytes: 1073741824
+  # Per-execution retention bound. May not exceed the protocol's 64 MiB ceiling.
+  maxExecutionBytes: 67108864
+  # Concurrent snapshot/upload handlers per worker process.
+  maxConcurrentUploads: 2
+
 # Metrics export uses the OpenTelemetry autoexport package, so the operator
 # selects the exporter via standard OpenTelemetry environment variables. When
 # `metrics.enabled` is false the worker emits no metrics, matching the

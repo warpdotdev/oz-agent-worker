@@ -423,6 +423,25 @@ shows up as a distinct series.
   attempts; spikes indicate flapping workers.
 - `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
   runtime metadata, useful for joining other series by labels.
+- `oz_worker_debug_archive_requests_total{backend,ownership,outcome,reason}`
+  (counter): debug-archive log requests this worker owned. Requests for
+  executions another instance ran are silent and are not counted here.
+- `oz_worker_debug_archive_snapshot_duration_seconds{backend}` and
+  `oz_worker_debug_archive_snapshot_bytes{backend}` (histograms): cost and
+  size of producing a log snapshot.
+- `oz_worker_debug_archive_truncations_total{backend}` (counter): snapshots
+  that dropped bytes to stay within their bound.
+- `oz_worker_debug_archive_uploads_total{result}` and
+  `oz_worker_debug_archive_upload_duration_seconds{result}`: snapshot upload
+  outcomes and latency.
+- `oz_worker_debug_archive_requests_in_flight` (gauge): requests currently
+  being snapshotted or uploaded, bounded by `debugLogCapture.maxConcurrentUploads`.
+- `oz_worker_debug_archive_capture_bytes` (gauge): disk currently reserved by
+  direct-execution captures and request snapshots.
+- `oz_worker_cleanup_grace_entries` (gauge) and
+  `oz_worker_cleanup_grace_results_total{backend,result}` (counter):
+  executions retained past terminal state and the backend cleanups performed
+  when their grace expired.
 
 ### Sample dashboards / alerts
 
@@ -440,6 +459,109 @@ Direct mappings for the questions enterprise operators most commonly ask:
   `sum by (phase, reason) (rate(oz_worker_task_failures_total[5m]))`
 - **Reconnect storms:**
   `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
+
+## Debug archive log collection
+
+Warp can assemble a debug archive for a cloud-agent run. For self-hosted
+executions the logs live inside your infrastructure, so Warp asks the worker
+that actually ran the execution for a bounded snapshot instead of reaching into
+your Docker daemon, Kubernetes cluster, or host.
+
+When Warp requests logs for an execution, the worker that ran it snapshots the
+backed-up output, uploads it directly to a short-lived Warp-signed destination,
+and reports the result. Every other worker process silently ignores the request.
+Collection never blocks, delays, or fails a running agent: if logs cannot be
+captured or uploaded, the archive is simply marked partial.
+
+### Sensitive data
+
+A snapshot contains whatever the execution wrote to stdout and stderr, which
+can include prompts, source code, identifiers, and secrets a process printed.
+Treat a debug archive as sensitive. The worker itself never logs captured
+bytes, upload destinations, signed headers, local capture paths, or upload
+response bodies.
+
+### Supported backends
+
+| Backend | Source |
+| --- | --- |
+| Docker | The execution container's stdout and stderr, covering the entrypoint script and the client process it starts. |
+| Kubernetes | Every init and regular container in the execution's pods, including current and best-effort previous logs after a restart. |
+| Direct | A bounded on-disk capture of setup, agent, and teardown stdout/stderr. |
+| Command | Not supported. The dispatch command hands the task to an opaque runtime with no log API, so the worker reports the source unavailable rather than passing off dispatch output as the agent's log. |
+
+Docker and Kubernetes report one merged stream per container, so those records
+are labeled `combined` rather than attributing a line to the entrypoint or the
+client. Only direct execution owns distinct handles, so only it labels
+`setup`, `agent`, and `teardown` phases.
+
+### Sizing the cleanup grace for failure capture
+
+The worker retains an execution's log source for the cleanup grace it already
+resolves for `--idle-on-complete`, in this order:
+
+1. the run's `idle_timeout_minutes`
+2. the worker's `idle_on_complete` (`worker.idleOnComplete` in the chart)
+3. the Oz default of 45 minutes
+
+There is deliberately no separate archive retention setting: one clock governs
+both how long the agent stays available for follow-ups and how long its logs
+stay retrievable.
+
+Collection triggered by a failure has to reach the worker after the terminal
+event propagates to Warp, and the request itself allows up to 30 minutes. If
+you want reliable archives for failed runs, keep the grace comfortably longer
+than that; a shorter grace still works but produces a partial archive when it
+lapses first.
+
+**Kubernetes:** `kubernetesBackend.ttlSecondsAfterFinished` must not be shorter
+than the effective grace. The Job TTL controller deletes a finished Job's pods,
+and once they are gone their logs are gone with them regardless of the worker's
+own retention. A successful Job is now deleted at the grace deadline rather
+than immediately at task completion.
+
+**Worker replacement:** ownership is process-local. If a worker pod is replaced
+while a preserved Job keeps running, the replacement does not inherit the old
+process's ownership, and a later request for that execution yields a partial
+archive rather than an incorrect upload.
+
+### Capture bounds
+
+Each execution's snapshot is capped at 64 MiB. Output above the cap keeps the
+first and last portions with an explicit gap marker, so both the early setup
+context and the terminal failure survive.
+
+The Helm chart mounts a dedicated 1 GiB ephemeral volume for the capture root
+and renders the matching bounds:
+
+```yaml
+debugLogCapture:
+  enabled: true
+  sizeLimit: 1Gi
+  directory: /var/lib/oz/debug-logs
+  maxTotalBytes: 1073741824
+  maxExecutionBytes: 67108864
+  maxConcurrentUploads: 2
+```
+
+Outside Kubernetes, set the same bounds under `debug_log_capture` in the config
+file; an unset value uses the default above, and an unwritable root or an
+invalid bound disables archive capture without affecting task execution.
+
+The volume is scratch space, not storage: nothing in it survives worker
+replacement, and it does not extend the cleanup grace.
+
+### Compatibility
+
+Self-hosted logs in debug archives require a worker built with this protocol.
+An older worker ignores the request and Warp records the source as unavailable,
+so upgrading is safe and never required for ordinary task execution. Each
+authenticated connection reports its build version so Warp can show exactly
+which worker ran an execution; a worker that reports no version still executes
+tasks normally and is shown as not reported.
+
+The Kubernetes backend needs no additional permissions: the chart's existing
+namespace-scoped `get pods/log` grant is sufficient.
 
 ## License
 

@@ -1461,9 +1461,10 @@ func TestTaskJobTTLDefaultsToTwentyFourHours(t *testing.T) {
 	}
 }
 
-// On success the worker actively deletes the task Job (and its pod) so the
-// namespace stays clean.
-func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
+// A successful task Job is retained past terminal state so a debug-archive
+// request can still read its pods' logs, then deleted at the cleanup-grace
+// deadline to keep the namespace clean.
+func TestExecuteTaskDeletesSuccessfulJobAtCleanupGrace(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1511,6 +1512,7 @@ func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
 
 	if result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
+		ExecutionID: "execution-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
 	}); result.Error != nil {
@@ -1521,8 +1523,31 @@ func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to list jobs: %v", err)
 	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected the Job to be retained for log retrieval, got %d", len(jobs.Items))
+	}
+
+	if err := backend.CleanupTaskResources(context.Background(), &CancelParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+	}); err != nil {
+		t.Fatalf("CleanupTaskResources: %v", err)
+	}
+
+	jobs, err = fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
 	if len(jobs.Items) != 0 {
-		t.Fatalf("expected successful task Job to be deleted, got %d", len(jobs.Items))
+		t.Fatalf("expected successful task Job to be deleted at the grace deadline, got %d", len(jobs.Items))
+	}
+
+	// A repeated expiry must not fail or delete anything else.
+	if err := backend.CleanupTaskResources(context.Background(), &CancelParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+	}); err != nil {
+		t.Fatalf("repeated CleanupTaskResources: %v", err)
 	}
 }
 
@@ -1576,6 +1601,7 @@ func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
 
 	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
+		ExecutionID: "execution-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
 	})
@@ -1589,6 +1615,22 @@ func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
 	}
 	if len(jobs.Items) != 1 {
 		t.Fatalf("expected failed task Job to be preserved, got %d", len(jobs.Items))
+	}
+
+	// The grace deadline must not delete a failed Job either: it is left for
+	// the Job TTL controller so operators can inspect it.
+	if err := backend.CleanupTaskResources(context.Background(), &CancelParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+	}); err != nil {
+		t.Fatalf("CleanupTaskResources: %v", err)
+	}
+	jobs, listErr = fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if listErr != nil {
+		t.Fatalf("failed to list jobs: %v", listErr)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected failed task Job to survive the grace deadline, got %d", len(jobs.Items))
 	}
 }
 
