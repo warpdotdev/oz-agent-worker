@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
@@ -135,6 +136,17 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 // PreservesTasksOnShutdown reports true: dispatched tasks run on the operator's
 // remote runtime, independent of this worker, so worker shutdown must not cancel them.
 func (b *CommandBackend) PreservesTasksOnShutdown() bool { return true }
+
+// SnapshotTaskLogs is unsupported. The dispatch command hands the task to an
+// opaque operator-owned runtime with no log API, and the command's own stdout
+// is dispatch output, not the remote agent's execution log.
+func (b *CommandBackend) SnapshotTaskLogs(context.Context, *SnapshotParams) error {
+	return debuglog.ErrBackendNotSupported
+}
+
+// CleanupTaskResources has nothing to release: the backend retains no local
+// resource for a dispatched task.
+func (b *CommandBackend) CleanupTaskResources(context.Context, *CancelParams) error { return nil }
 
 // Shutdown has nothing to clean up; the backend owns no local resources.
 func (b *CommandBackend) Shutdown(ctx context.Context) {

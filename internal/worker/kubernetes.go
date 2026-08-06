@@ -7,9 +7,11 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
@@ -100,6 +102,21 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 type KubernetesBackend struct {
 	config    KubernetesBackendConfig
 	clientset kubernetes.Interface
+
+	// jobsMutex guards jobs, the exact (task, execution) to retained-Job
+	// registry a debug-archive request resolves against.
+	jobsMutex sync.Mutex
+	jobs      map[executionKey]*retainedJob
+}
+
+// retainedJob is a task Job kept past terminal state so its pods' logs stay
+// readable through the execution's cleanup grace.
+type retainedJob struct {
+	name string
+	// deleteAtCleanup mirrors the existing policy: a successful Job is deleted
+	// to keep the namespace clean, while a failed one is left for the Job TTL
+	// controller so operators can inspect it after the fact.
+	deleteAtCleanup bool
 }
 
 func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
@@ -138,6 +155,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 	backend := &KubernetesBackend{
 		config:    config,
 		clientset: clientset,
+		jobs:      make(map[executionKey]*retainedJob),
 	}
 	if err := backend.runStartupPreflight(ctx); err != nil {
 		return nil, err
@@ -309,26 +327,16 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err)))
 	}
+	b.registerJob(params.TaskID, executionID, jobName)
 
 	defer func() {
-		if ctx.Err() != nil {
-			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
-			return
-		}
-		if b.config.NoCleanup {
-			return
-		}
-		// Preserve failed task Jobs (and their pods) so operators can inspect logs
-		// and pod state after the fact. They are garbage-collected by the Job's
-		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
-		// Jobs are deleted immediately to keep the namespace clean.
-		if res.Error != nil {
-			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
-			return
-		}
-		if err := b.deleteJob(context.Background(), jobName); err != nil {
-			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
-		}
+		// The Job and its pods are the retained log source until the
+		// execution's cleanup grace expires, so nothing is deleted here.
+		// CleanupTaskResources applies the deletion policy at that deadline:
+		// a successful Job is deleted to keep the namespace clean, while a
+		// failed one is left for the Job TTL controller (see
+		// taskJobTTLSecondsAfterFinished) so operators can inspect it.
+		b.setJobDeleteAtCleanup(params.TaskID, executionID, res.Error == nil && ctx.Err() == nil)
 	}()
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
@@ -438,6 +446,232 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 // Kubernetes-backend task.
 func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
+func (b *KubernetesBackend) registerJob(taskID, executionID, jobName string) {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	if b.jobs == nil {
+		b.jobs = make(map[executionKey]*retainedJob)
+	}
+	b.jobs[executionKey{runID: taskID, executionID: executionID}] = &retainedJob{name: jobName}
+}
+
+func (b *KubernetesBackend) setJobDeleteAtCleanup(taskID, executionID string, deleteAtCleanup bool) {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	if entry, ok := b.jobs[executionKey{runID: taskID, executionID: executionID}]; ok {
+		entry.deleteAtCleanup = deleteAtCleanup
+	}
+}
+
+func (b *KubernetesBackend) lookupJob(taskID, executionID string) (retainedJob, bool) {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	entry, ok := b.jobs[executionKey{runID: taskID, executionID: executionID}]
+	if !ok {
+		return retainedJob{}, false
+	}
+	return *entry, true
+}
+
+func (b *KubernetesBackend) forgetJob(taskID, executionID string) {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	delete(b.jobs, executionKey{runID: taskID, executionID: executionID})
+}
+
+func (b *KubernetesBackend) ownsJob(taskID, executionID string) bool {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	_, ok := b.jobs[executionKey{runID: taskID, executionID: executionID}]
+	return ok
+}
+
+// SnapshotTaskLogs streams every container's stdout and stderr for the exact
+// execution's pods into sink, in deterministic pod-name then declared-container
+// order. Kubernetes merges a container's streams and does not say whether a
+// line came from the entrypoint or the client it starts, so records are
+// labeled combined rather than given a fabricated process identity.
+func (b *KubernetesBackend) SnapshotTaskLogs(ctx context.Context, params *SnapshotParams) error {
+	if !b.ownsJob(params.TaskID, params.ExecutionID) {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonResourceNotFound, "no Job is registered for this execution")
+	}
+
+	pods, err := b.listExecutionPods(ctx, params.TaskID, params.ExecutionID)
+	if err != nil {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonCaptureUnavailable, "failed to list the execution's pods")
+	}
+	if len(pods) == 0 {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonResourceNotFound, "the execution's pods are no longer present")
+	}
+	sort.Slice(pods, func(i, j int) bool { return pods[i].Name < pods[j].Name })
+
+	var warnings []string
+	noteWarning := func(code string) {
+		for _, existing := range warnings {
+			if existing == code {
+				return
+			}
+		}
+		warnings = append(warnings, code)
+	}
+
+	for i := range pods {
+		pod := &pods[i]
+		for _, container := range pod.Spec.InitContainers {
+			if err := b.snapshotContainer(ctx, pod, container.Name, "init", params.Sink, noteWarning); err != nil {
+				return err
+			}
+		}
+		for _, container := range pod.Spec.Containers {
+			if err := b.snapshotContainer(ctx, pod, container.Name, "regular", params.Sink, noteWarning); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(warnings) > 0 {
+		return &debuglog.PartialSnapshotError{WarningCodes: warnings}
+	}
+	return nil
+}
+
+// listExecutionPods selects pods by the exact execution, task, and worker
+// label hashes and re-verifies the returned labels, so a colliding label set
+// from another worker or execution can never contribute log bytes.
+func (b *KubernetesBackend) listExecutionPods(ctx context.Context, taskID, executionID string) ([]corev1.Pod, error) {
+	selector := strings.Join([]string{
+		fmt.Sprintf("%s=%s", kubernetesExecutionHashLabel, kubernetesLabelHash(executionID)),
+		fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+		fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID)),
+	}, ",")
+
+	podList, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, err
+	}
+
+	verified := make([]corev1.Pod, 0, len(podList.Items))
+	for _, pod := range podList.Items {
+		if pod.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash(executionID) ||
+			pod.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash(taskID) ||
+			pod.Labels[kubernetesWorkerHashLabel] != kubernetesLabelHash(b.config.WorkerID) {
+			continue
+		}
+		verified = append(verified, pod)
+	}
+	return verified, nil
+}
+
+// snapshotContainer streams one container's current logs and, when it has
+// restarted, its previous logs first. An unreadable stream becomes a safe
+// source-error record plus a warning code so readable siblings still upload.
+func (b *KubernetesBackend) snapshotContainer(
+	ctx context.Context,
+	pod *corev1.Pod,
+	containerName string,
+	containerType string,
+	sink debuglog.Sink,
+	noteWarning func(string),
+) error {
+	source := debuglog.SourceIdentity{
+		Namespace:     b.objectNamespace(pod.Namespace),
+		Pod:           pod.Name,
+		Container:     containerName,
+		ContainerType: containerType,
+	}
+	if restarts, ok := containerRestartCount(pod, containerName); ok {
+		source.RestartAttempt = &restarts
+		if restarts > 0 {
+			previous := source
+			previous.Previous = true
+			if err := b.streamContainerLogs(ctx, pod.Name, containerName, true, previous, sink); err != nil {
+				noteWarning(debuglog.WarningPreviousLogsUnavailable)
+				if sinkErr := sink.WriteSourceError(debuglog.PhaseContainer, debuglog.StreamCombined, previous, debuglog.WarningPreviousLogsUnavailable); sinkErr != nil {
+					return sinkErr
+				}
+			}
+		}
+	}
+
+	if err := b.streamContainerLogs(ctx, pod.Name, containerName, false, source, sink); err != nil {
+		noteWarning(debuglog.WarningContainerLogsUnavailable)
+		if sinkErr := sink.WriteSourceError(debuglog.PhaseContainer, debuglog.StreamCombined, source, debuglog.WarningContainerLogsUnavailable); sinkErr != nil {
+			return sinkErr
+		}
+	}
+	return nil
+}
+
+// streamContainerLogs requests all of a container's logs with provider
+// timestamps and no time-range filter, and streams them into sink under the
+// snapshot's aggregate byte bound.
+func (b *KubernetesBackend) streamContainerLogs(
+	ctx context.Context,
+	podName string,
+	containerName string,
+	previous bool,
+	source debuglog.SourceIdentity,
+	sink debuglog.Sink,
+) error {
+	request := b.clientset.CoreV1().Pods(b.config.Namespace).GetLogs(podName, &corev1.PodLogOptions{
+		Container:  containerName,
+		Timestamps: true,
+		Previous:   previous,
+	})
+	stream, err := request.Stream(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close log stream for %s/%s: %v", podName, containerName, closeErr)
+		}
+	}()
+
+	// The Kubernetes log API returns one merged stream per container, so the
+	// records are labeled combined rather than split into stdout and stderr.
+	return copyUnframedLogStream(stream, sink, source)
+}
+
+func containerRestartCount(pod *corev1.Pod, containerName string) (int32, bool) {
+	for _, status := range pod.Status.InitContainerStatuses {
+		if status.Name == containerName {
+			return status.RestartCount, true
+		}
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == containerName {
+			return status.RestartCount, true
+		}
+	}
+	return 0, false
+}
+
+// CleanupTaskResources applies the Job deletion policy once the execution's
+// cleanup grace has expired. It is idempotent and never deletes a Job the
+// worker chose to leave for TTL-based cleanup.
+//
+// The registry entry is dropped only once the deletion is confirmed (an
+// already-absent Job counts as deleted). Forgetting it first would strand a
+// Job the API server refused to delete, leaving nothing for the caller to
+// retry and pushing its removal out to the Job TTL controller.
+func (b *KubernetesBackend) CleanupTaskResources(ctx context.Context, params *CancelParams) error {
+	entry, ok := b.lookupJob(params.TaskID, params.ExecutionID)
+	if !ok {
+		return nil
+	}
+	if b.config.NoCleanup || !entry.deleteAtCleanup {
+		b.forgetJob(params.TaskID, params.ExecutionID)
+		return nil
+	}
+
+	if err := b.deleteJob(ctx, entry.name); err != nil {
+		return fmt.Errorf("failed to delete Job %s: %w", entry.name, err)
+	}
+	b.forgetJob(params.TaskID, params.ExecutionID)
+	return nil
+}
+
 // Shutdown intentionally does not delete task Jobs.
 //
 // Kubernetes Jobs are the durable execution unit for this backend. During
@@ -451,9 +685,13 @@ func (b *KubernetesBackend) Shutdown(ctx context.Context) {
 // TTLSecondsAfterFinished. It bounds how long finished Jobs that the worker
 // leaves in place - failed Jobs (kept for post-mortem debugging) and Jobs
 // orphaned by worker disruption - and their pods survive before the Kubernetes
-// Job TTL controller deletes them. Successful Jobs are deleted immediately by the
-// worker, so this does not delay their cleanup. Returns nil when cleanup is
-// disabled, so those Jobs are retained indefinitely.
+// Job TTL controller deletes them.
+//
+// A successful Job is deleted by the worker at its execution's cleanup-grace
+// deadline, not at task completion, so its logs stay readable for a debug
+// archive. This TTL must therefore be at least as long as the effective grace,
+// or the controller deletes the pods first and the archive is partial. Returns
+// nil when cleanup is disabled, so those Jobs are retained indefinitely.
 func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
 	if b.config.NoCleanup {
 		return nil

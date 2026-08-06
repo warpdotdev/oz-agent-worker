@@ -26,6 +26,26 @@ type FileConfig struct {
 	// overrides are no longer needed.
 	IdleOnComplete *string       `yaml:"idle_on_complete"`
 	Backend        BackendConfig `yaml:"backend"`
+	// DebugLogCapture bounds the disk and concurrency used to collect debug
+	// archive logs. It carries no retention duration: how long an execution's
+	// logs stay retrievable is the existing idle_on_complete cleanup grace.
+	DebugLogCapture *DebugLogCaptureConfig `yaml:"debug_log_capture"`
+}
+
+// DebugLogCaptureConfig bounds debug-archive log capture. Values left unset
+// use the worker's built-in defaults.
+type DebugLogCaptureConfig struct {
+	// Directory overrides the root beneath which captures and request
+	// snapshots are written. Empty uses the process temporary directory.
+	Directory string `yaml:"directory"`
+	// MaxTotalBytes is the process-local disk budget shared by direct-execution
+	// captures and request snapshots.
+	MaxTotalBytes *int64 `yaml:"max_total_bytes"`
+	// MaxExecutionBytes bounds one execution's retained output. It may not
+	// exceed the protocol's 64 MiB ceiling.
+	MaxExecutionBytes *int64 `yaml:"max_execution_bytes"`
+	// MaxConcurrentUploads bounds how many snapshot/upload handlers run at once.
+	MaxConcurrentUploads *int `yaml:"max_concurrent_uploads"`
 }
 
 // BackendConfig contains the backend selection.

@@ -21,6 +21,7 @@ import (
 )
 
 type shutdownRecordingBackend struct {
+	noLogSnapshotBackend
 	shutdownCalled bool
 	shutdownCtxErr error
 }
@@ -48,6 +49,7 @@ func (b *preservingShutdownRecordingBackend) PreservesTasksOnShutdown() bool {
 }
 
 type recordingBackend struct {
+	noLogSnapshotBackend
 	err error
 }
 
@@ -186,10 +188,10 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 		ctx:      context.Background(),
 		config:   Config{},
 		sendChan: make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {
+		tasks: registryWith(map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceShutdown,
-		}},
+		}}),
 		backend: &recordingBackend{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, context.Canceled)},
 	}
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
@@ -217,10 +219,10 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		ctx:      context.Background(),
 		config:   Config{},
 		sendChan: make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {
+		tasks: registryWith(map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceUser,
-		}},
+		}}),
 		backend: &recordingBackend{err: context.Canceled},
 	}
 	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
@@ -246,18 +248,18 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	if completed.Message != "Task cancelled by user request." {
 		t.Errorf("message = %q, want %q", completed.Message, "Task cancelled by user request.")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
+	if _, ok := w.tasks.Get("task-1"); ok {
 		t.Fatal("task should be removed from active tasks")
 	}
 }
 
 func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *testing.T) {
 	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
-		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": {cancel: func() {}}}),
+		backend:  &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
@@ -278,12 +280,12 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),
 		sendChan: make(chan []byte, 1),
-		activeTasks: map[string]activeTask{
+		tasks: registryWith(map[string]activeTask{
 			"task-1": {
 				ctx:    taskCtx,
 				cancel: taskCancel,
 			},
-		},
+		}),
 		backend: &recordingBackend{},
 	}
 
@@ -304,18 +306,18 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 	if taskCtx.Err() != context.Canceled {
 		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
 	}
-	if task := w.activeTasks["task-1"]; task.cancellationSource != taskCancellationSourceUser {
+	if task, _ := w.tasks.Get("task-1"); task.cancellationSource != taskCancellationSourceUser {
 		t.Fatalf("task cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
 	}
 }
 
 func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
-		backend:     &recordingBackend{},
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": {cancel: func() {}}}),
+		backend:  &recordingBackend{},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
@@ -338,18 +340,18 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	if completed.Message != "Task completed successfully" {
 		t.Errorf("message = %q, want %q", completed.Message, "Task completed successfully")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
+	if _, ok := w.tasks.Get("task-1"); ok {
 		t.Fatal("task should be removed from active tasks")
 	}
 }
 
 func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
-		backend:     &recordingBackend{err: errors.New("boom")},
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": {cancel: func() {}}}),
+		backend:  &recordingBackend{err: errors.New("boom")},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
@@ -372,18 +374,18 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	if failed.Message != "Failed to execute task: boom" {
 		t.Errorf("message = %q, want %q", failed.Message, "Failed to execute task: boom")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
+	if _, ok := w.tasks.Get("task-1"); ok {
 		t.Fatal("task should be removed from active tasks")
 	}
 }
 
 func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 	w := &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
-		backend:     &recordingBackend{err: context.DeadlineExceeded},
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": {cancel: func() {}}}),
+		backend:  &recordingBackend{err: context.DeadlineExceeded},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
@@ -478,7 +480,7 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 			return
 		}
 		defer close(serverConnClosed)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		conn.SetPingHandler(func(string) error {
 			pingsReceived.Add(1)
 			return nil
@@ -498,7 +500,7 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		t.Fatalf("failed to dial test server: %v", err)
 	}
 	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -509,7 +511,7 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		ctx:               ctx,
 		cancel:            cancel,
 		sendChan:          make(chan []byte, 256),
-		activeTasks:       make(map[string]activeTask),
+		tasks:             newTaskRegistry(),
 		heartbeatInterval: time.Millisecond,
 	}
 
@@ -535,7 +537,7 @@ flood:
 	// Tear down: cancelling the context stops writeLoop/heartbeatLoop, and
 	// closing the connection unblocks readLoop so run() returns.
 	cancel()
-	conn.Close()
+	_ = conn.Close()
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
@@ -976,10 +978,10 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &shutdownRecordingBackend{}
 	w := &Worker{
-		ctx:         workerCtx,
-		cancel:      cancel,
-		activeTasks: make(map[string]activeTask),
-		backend:     backend,
+		ctx:     workerCtx,
+		cancel:  cancel,
+		tasks:   newTaskRegistry(),
+		backend: backend,
 	}
 
 	w.Shutdown()
@@ -999,11 +1001,11 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	w := &Worker{
 		ctx:    workerCtx,
 		cancel: cancel,
-		activeTasks: map[string]activeTask{
+		tasks: registryWith(map[string]activeTask{
 			"task-1": {cancel: func() {
 				cancelledTask = true
 			}},
-		},
+		}),
 		backend: backend,
 	}
 
@@ -1021,12 +1023,12 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 	workerCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	w := &Worker{
-		ctx:         workerCtx,
-		cancel:      cancel,
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
-		activeTasks: make(map[string]activeTask),
-		backend:     &preservingShutdownRecordingBackend{},
+		ctx:      workerCtx,
+		cancel:   cancel,
+		config:   Config{},
+		sendChan: make(chan []byte, 1),
+		tasks:    newTaskRegistry(),
+		backend:  &preservingShutdownRecordingBackend{},
 	}
 
 	w.handleTaskAssignment(&types.TaskAssignmentMessage{
@@ -1034,7 +1036,7 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	})
 
-	if len(w.activeTasks) != 0 {
-		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
+	if w.tasks.Len() != 0 {
+		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", w.tasks.Len())
 	}
 }

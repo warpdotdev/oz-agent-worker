@@ -25,9 +25,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 }
 
 func (w *Worker) activeTaskCount() int {
-	w.tasksMutex.Lock()
-	defer w.tasksMutex.Unlock()
-	return len(w.activeTasks)
+	return w.tasks.Len()
 }
 
 func drainMessages(t *testing.T, ch <-chan []byte) []types.WebSocketMessage {
@@ -92,9 +90,7 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 		return err == nil
 	})
 	waitFor(t, 5*time.Second, func() bool {
-		w.tasksMutex.Lock()
-		defer w.tasksMutex.Unlock()
-		task, ok := w.activeTasks["task-1"]
+		task, ok := w.tasks.Get("task-1")
 		return ok && task.spawned
 	})
 
