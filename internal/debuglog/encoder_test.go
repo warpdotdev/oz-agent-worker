@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -358,5 +359,158 @@ func TestEncoderReportsUpstreamOmittedBytesAsTruncation(t *testing.T) {
 	}
 	if len(result.Warnings) != 1 || result.Warnings[0] != WarningOutputDropped {
 		t.Fatalf("warnings = %v, want [%s]", result.Warnings, WarningOutputDropped)
+	}
+}
+
+// TestEncoderNeverExceedsItsBound sweeps bounds from pathologically small to
+// comfortably large. The request's max_bytes is a hard ceiling on the object
+// the worker uploads, so no combination of record size, tail overshoot, and
+// truncation metadata may push the finalized snapshot past it.
+func TestEncoderNeverExceedsItsBound(t *testing.T) {
+	bounds := []int64{
+		1, 2, 16, 64,
+		maxTruncationLineBytes - 1,
+		maxTruncationLineBytes,
+		maxTruncationLineBytes + 1,
+		256, 512, 1024, 4096, 65536,
+	}
+	payloads := map[string][]byte{
+		"tiny":  []byte("x"),
+		"line":  bytes.Repeat([]byte("y"), 200),
+		"chunk": bytes.Repeat([]byte("z"), MaxChunkBytes),
+	}
+
+	for _, bound := range bounds {
+		for name, payload := range payloads {
+			t.Run(fmt.Sprintf("bound=%d/%s", bound, name), func(t *testing.T) {
+				encoder := newTestEncoder(t, bound, nil)
+				for i := 0; i < 50; i++ {
+					if err := encoder.WriteChunk(Chunk{
+						Phase:  PhaseAgent,
+						Stream: StreamStdout,
+						Data:   payload,
+					}); err != nil {
+						t.Fatalf("WriteChunk: %v", err)
+					}
+				}
+
+				var out bytes.Buffer
+				result, err := encoder.Finalize(&out)
+				if err != nil {
+					t.Fatalf("Finalize: %v", err)
+				}
+
+				if result.Bytes > bound {
+					t.Fatalf("snapshot is %d bytes, above its %d bound", result.Bytes, bound)
+				}
+				if int64(out.Len()) != result.Bytes {
+					t.Fatalf("wrote %d bytes but reported %d", out.Len(), result.Bytes)
+				}
+				// Whatever survives must still be parseable NDJSON.
+				decodeRecords(t, out.Bytes())
+			})
+		}
+	}
+}
+
+func TestEncoderKeepsWholeRecordsAndReportsTheGapAtATightBound(t *testing.T) {
+	// Room for the reserved truncation record plus a handful of data records,
+	// so the snapshot must retain some output at both ends and name the gap.
+	bound := maxTruncationLineBytes + 1200
+	encoder := newTestEncoder(t, bound, nil)
+	for i := 0; i < 200; i++ {
+		if err := encoder.WriteChunk(Chunk{
+			Phase:  PhaseAgent,
+			Stream: StreamStdout,
+			Data:   []byte(strings.Repeat("q", 40)),
+		}); err != nil {
+			t.Fatalf("WriteChunk: %v", err)
+		}
+	}
+
+	var out bytes.Buffer
+	result, err := encoder.Finalize(&out)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if result.Bytes > bound {
+		t.Fatalf("snapshot is %d bytes, above its %d bound", result.Bytes, bound)
+	}
+	if !result.Truncated {
+		t.Fatal("expected the snapshot to be marked truncated")
+	}
+
+	records := decodeRecords(t, out.Bytes())
+	truncations := 0
+	for _, record := range records {
+		if record["kind"] == KindTruncation {
+			truncations++
+		}
+	}
+	if truncations != 1 {
+		t.Fatalf("truncation record count = %d, want exactly 1", truncations)
+	}
+	if records[0]["kind"] != KindData {
+		t.Fatalf("first record kind = %v, want the earliest data retained", records[0]["kind"])
+	}
+	if records[len(records)-1]["kind"] != KindData {
+		t.Fatalf("last record kind = %v, want the newest data retained", records[len(records)-1]["kind"])
+	}
+}
+
+func TestEncoderYieldsAnEmptyObjectWhenTheBoundCannotHoldARecord(t *testing.T) {
+	// A bound this small cannot hold even the truncation record. Emitting
+	// nothing keeps the ceiling hard; the coordinator turns an empty snapshot
+	// into a classified unavailable outcome rather than uploading it.
+	encoder := newTestEncoder(t, 4, nil)
+	if err := encoder.WriteChunk(Chunk{Phase: PhaseAgent, Stream: StreamStdout, Data: []byte("dropped")}); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+
+	var out bytes.Buffer
+	result, err := encoder.Finalize(&out)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if result.Bytes != 0 {
+		t.Fatalf("snapshot is %d bytes, want an empty object", result.Bytes)
+	}
+	if result.Truncated {
+		t.Fatal("truncated must not be reported without a truncation record")
+	}
+}
+
+func TestEncoderReportsARecordTooLargeForItsBoundAsOmitted(t *testing.T) {
+	// A single record wider than a tail segment cannot be retained without
+	// overrunning the bound, so it is dropped and accounted for rather than
+	// written in full.
+	bound := maxTruncationLineBytes + 400
+	encoder := newTestEncoder(t, bound, nil)
+	if err := encoder.WriteChunk(Chunk{
+		Phase:  PhaseAgent,
+		Stream: StreamStdout,
+		Data:   bytes.Repeat([]byte("w"), 4096),
+	}); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+
+	var out bytes.Buffer
+	result, err := encoder.Finalize(&out)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if result.Bytes > bound {
+		t.Fatalf("snapshot is %d bytes, above its %d bound", result.Bytes, bound)
+	}
+	if !result.Truncated {
+		t.Fatal("dropping an oversized record must mark the snapshot truncated")
+	}
+
+	records := decodeRecords(t, out.Bytes())
+	if len(records) != 1 || records[0]["kind"] != KindTruncation {
+		t.Fatalf("records = %v, want only the truncation record", records)
+	}
+	if omitted, _ := records[0]["omitted_bytes_at_least"].(float64); omitted <= 0 {
+		t.Fatalf("omitted_bytes_at_least = %v, want the dropped record accounted for", records[0]["omitted_bytes_at_least"])
 	}
 }

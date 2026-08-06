@@ -20,6 +20,11 @@ var ErrSpoolClosed = errors.New("debuglog: spool closed")
 // Head-and-tail retention keeps both the early context of a failing execution
 // (image pull, setup) and its terminal output, at the cost of an explicit gap
 // that the caller reports as a truncation record.
+//
+// The budget is a hard ceiling on what the caller can finalize, not a target:
+// headLimit + 2*tailLimit plus the reserved truncation record never exceeds
+// maxBytes, so the object uploaded to a server-signed target can never overrun
+// the size the request asked for.
 type boundedSpool struct {
 	mu sync.Mutex
 
@@ -27,6 +32,7 @@ type boundedSpool struct {
 	tailOld *os.File
 	tailNew *os.File
 
+	maxBytes  int64
 	headLimit int64
 	tailLimit int64
 
@@ -47,8 +53,9 @@ type spoolWatermark struct {
 	omitted      int64
 }
 
-// newBoundedSpool creates a spool bounded to maxBytes total retained bytes.
-// Files are created through create so callers control mode and naming.
+// newBoundedSpool creates a spool whose finalized output never exceeds
+// maxBytes. Files are created through create so callers control mode and
+// naming.
 func newBoundedSpool(maxBytes int64, create func(suffix string) (*os.File, error)) (*boundedSpool, error) {
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("debuglog: spool budget must be positive, got %d", maxBytes)
@@ -70,31 +77,39 @@ func newBoundedSpool(maxBytes int64, create func(suffix string) (*os.File, error
 		return nil, err
 	}
 
-	// Half the budget preserves the earliest output; the remaining half is
-	// split across two rotating tail segments so the newest output survives
-	// while each rotation drops at most a quarter of the budget.
-	headLimit := maxBytes / 2
-	if headLimit <= 0 {
-		headLimit = 1
+	// The truncation record is reserved up front rather than added on top at
+	// finalization, so emitting it can never push the object past maxBytes.
+	contentBudget := maxBytes - maxTruncationLineBytes
+	if contentBudget < 0 {
+		contentBudget = 0
 	}
-	tailLimit := (maxBytes - headLimit) / 2
-	if tailLimit <= 0 {
-		tailLimit = 1
-	}
+
+	// Half the content budget preserves the earliest output; the remaining
+	// half is split across two rotating tail segments so the newest output
+	// survives while each rotation drops at most a quarter. The limits are
+	// deliberately allowed to reach zero: a budget too small to hold a whole
+	// record retains nothing rather than overrunning.
+	headLimit := contentBudget / 2
+	tailLimit := (contentBudget - headLimit) / 2
 
 	return &boundedSpool{
 		head:      head,
 		tailOld:   tailOld,
 		tailNew:   tailNew,
+		maxBytes:  maxBytes,
 		headLimit: headLimit,
 		tailLimit: tailLimit,
 	}, nil
 }
 
 // WriteLine appends one complete line, rotating tail segments when the budget
-// is exhausted. A line larger than a tail segment is retained in full to keep
-// the stream parseable; the budget is a target, not a hard per-line cap, and
-// callers bound line size with MaxChunkBytes.
+// is exhausted.
+//
+// A line that cannot fit a segment on its own is dropped and counted as
+// omitted. Writing it anyway would produce an object larger than the request
+// asked for, and truncating it would produce invalid NDJSON; dropping it keeps
+// the stream parseable and the bound hard, and the truncation record reports
+// the loss.
 func (s *boundedSpool) WriteLine(line []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -111,7 +126,12 @@ func (s *boundedSpool) WriteLine(line []byte) error {
 		return nil
 	}
 
-	if s.tailNewBytes > 0 && s.tailNewBytes+int64(len(line)) > s.tailLimit {
+	if int64(len(line)) > s.tailLimit {
+		s.omitted += int64(len(line))
+		return nil
+	}
+
+	if s.tailNewBytes+int64(len(line)) > s.tailLimit {
 		if err := s.rotateTailLocked(); err != nil {
 			return err
 		}

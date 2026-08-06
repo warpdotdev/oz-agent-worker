@@ -1035,15 +1035,45 @@ func (w *Worker) sendMessage(message []byte) error {
 	}
 }
 
-// releaseCleanupGraceEntries deletes the bytes still held for post-terminal log
-// retrieval. Backend resources are left to each backend's own shutdown
-// contract, which decides whether a task unit may outlive this process.
+// releaseCleanupGraceEntries performs the backend cleanup each cleanup-grace
+// entry was waiting for and deletes the bytes held for log retrieval.
+//
+// These executions have already reported terminal state; only their log source
+// is being retained. Ownership is process-local, so a replacement worker cannot
+// inherit the pending timer — leaving the resources behind would strand them
+// until an unrelated backstop (the Kubernetes Job TTL) eventually collected
+// them, far past the operator's chosen cleanup grace. Running the cleanup early
+// here is the same work the expiry timer would have done. Active executions are
+// untouched: they are not in cleanup grace, so each backend's own shutdown
+// contract still decides whether their task units may outlive this process.
 func (w *Worker) releaseCleanupGraceEntries() {
-	for _, entry := range w.tasks.PendingCleanups() {
+	pending := w.tasks.PendingCleanups()
+	if len(pending) == 0 {
+		return
+	}
+
+	// One bounded budget covers the whole sweep so shutdown cannot stall on an
+	// unresponsive backend.
+	ctx, cancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+	defer cancel()
+
+	log.Infof(w.ctx, "Releasing %d cleanup-grace executions during worker shutdown", len(pending))
+	for key, entry := range pending {
+		result := "succeeded"
+		if err := w.backend.CleanupTaskResources(ctx, &CancelParams{
+			TaskID:      key.runID,
+			ExecutionID: key.executionID,
+		}); err != nil {
+			result = "failed"
+			log.Warnf(w.ctx, "Backend cleanup failed during shutdown for task %s: %v", key.runID, err)
+		}
+		metrics.RecordCleanupGraceResult(entry.backendKind, result)
+
 		if entry.capture != nil {
 			entry.capture.Close()
 		}
 	}
+
 	if w.debugLogStore != nil {
 		metrics.SetDebugArchiveCaptureBytes(w.debugLogStore.ReservedBytes())
 	}

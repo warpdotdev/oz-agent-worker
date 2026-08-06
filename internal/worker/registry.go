@@ -22,7 +22,9 @@ type ownedExecution struct {
 	backendKind string
 	capture     *debuglog.TaskLogCapture
 	// cleanupTimer fires backend resource cleanup at the grace deadline. It is
-	// nil while the execution is still active.
+	// nil while the execution is still active, and is only ever touched under
+	// the registry's mutex: a zero grace fires the timer before the arming call
+	// returns, so its callback races an unguarded field.
 	cleanupTimer *time.Timer
 }
 
@@ -154,12 +156,14 @@ func (r *TaskRegistry) MoveToCleanupGrace(runID, executionID string, grace time.
 	}
 	delete(r.owned, key)
 	r.grace[key] = entry
+	// The timer is armed while the lock is held because a zero grace fires
+	// onExpiry immediately; its callback blocks on this same lock until the
+	// entry is fully published.
+	entry.cleanupTimer = time.AfterFunc(grace, onExpiry)
 	graceCount := len(r.grace)
 	r.mu.Unlock()
 
 	metrics.SetCleanupGraceEntries(graceCount)
-
-	entry.cleanupTimer = time.AfterFunc(grace, onExpiry)
 }
 
 // ReleaseCleanupGrace drops an execution's cleanup-grace entry. It is
@@ -171,15 +175,15 @@ func (r *TaskRegistry) ReleaseCleanupGrace(runID, executionID string) (*ownedExe
 	entry, ok := r.grace[key]
 	if ok {
 		delete(r.grace, key)
+		if entry.cleanupTimer != nil {
+			entry.cleanupTimer.Stop()
+		}
 	}
 	graceCount := len(r.grace)
 	r.mu.Unlock()
 
 	if !ok {
 		return nil, false
-	}
-	if entry.cleanupTimer != nil {
-		entry.cleanupTimer.Stop()
 	}
 	metrics.SetCleanupGraceEntries(graceCount)
 	return entry, true
@@ -200,13 +204,13 @@ func (r *TaskRegistry) PendingCleanups() map[executionKey]*ownedExecution {
 	r.mu.Lock()
 	entries := r.grace
 	r.grace = make(map[executionKey]*ownedExecution)
-	r.mu.Unlock()
-
 	for _, entry := range entries {
 		if entry.cleanupTimer != nil {
 			entry.cleanupTimer.Stop()
 		}
 	}
+	r.mu.Unlock()
+
 	metrics.SetCleanupGraceEntries(0)
 	return entries
 }

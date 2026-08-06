@@ -7,6 +7,11 @@
 // headers or form fields, local capture paths, or upload response bodies.
 package debuglog
 
+import (
+	"fmt"
+	"math"
+)
+
 // SchemaVersion is the NDJSON schema every snapshot record carries.
 const SchemaVersion = 1
 
@@ -129,3 +134,22 @@ type truncationRecord struct {
 	Policy              string `json:"policy"`
 	OmittedBytesAtLeast int64  `json:"omitted_bytes_at_least"`
 }
+
+// maxTruncationLineBytes is the largest a truncation record line can be, with
+// the omitted-byte count at its widest. A bounded snapshot reserves this much
+// of its budget up front so emitting the record can never push the finalized
+// object past the size the request asked for.
+var maxTruncationLineBytes = func() int64 {
+	line, err := marshalLine(truncationRecord{
+		SchemaVersion:       SchemaVersion,
+		Kind:                KindTruncation,
+		Policy:              TruncationPolicyFirstLast,
+		OmittedBytesAtLeast: math.MaxInt64,
+	})
+	if err != nil {
+		// A fixed struct of scalars cannot fail to marshal; failing loudly
+		// here beats silently reserving nothing and overrunning the bound.
+		panic(fmt.Sprintf("debuglog: failed to size the truncation record: %v", err))
+	}
+	return int64(len(line))
+}()

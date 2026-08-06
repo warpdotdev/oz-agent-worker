@@ -183,6 +183,10 @@ type FinalizeResult struct {
 
 // Finalize streams the retained head, the truncation record when bytes were
 // dropped, and the retained tail into out. The encoder's spool is released.
+//
+// The written object never exceeds the encoder's configured bound: the spool
+// caps its segments against a budget that already reserves room for the
+// truncation record.
 func (e *Encoder) Finalize(out io.Writer) (FinalizeResult, error) {
 	defer func() {
 		_ = e.spool.Close()
@@ -205,6 +209,7 @@ func (e *Encoder) Finalize(out io.Writer) (FinalizeResult, error) {
 		return FinalizeResult{}, err
 	}
 
+	truncated := false
 	if omitted > 0 {
 		line, marshalErr := marshalLine(truncationRecord{
 			SchemaVersion:       SchemaVersion,
@@ -215,10 +220,16 @@ func (e *Encoder) Finalize(out io.Writer) (FinalizeResult, error) {
 		if marshalErr != nil {
 			return FinalizeResult{}, marshalErr
 		}
-		gap, writeErr := out.Write(line)
-		written += int64(gap)
-		if writeErr != nil {
-			return FinalizeResult{}, writeErr
+		// A budget too small to hold even this record retains nothing at all,
+		// so the object stays empty and the request reports the capture as
+		// unavailable rather than shipping an over-budget object.
+		if written+int64(len(line)) <= e.spool.maxBytes {
+			gap, writeErr := out.Write(line)
+			written += int64(gap)
+			if writeErr != nil {
+				return FinalizeResult{}, writeErr
+			}
+			truncated = true
 		}
 	}
 
@@ -230,9 +241,13 @@ func (e *Encoder) Finalize(out io.Writer) (FinalizeResult, error) {
 		}
 	}
 
+	if written > e.spool.maxBytes {
+		return FinalizeResult{}, fmt.Errorf("debuglog: snapshot overran its %d byte bound", e.spool.maxBytes)
+	}
+
 	return FinalizeResult{
 		Bytes:     written,
-		Truncated: omitted > 0,
+		Truncated: truncated,
 		Warnings:  e.warnings.codes(),
 	}, nil
 }

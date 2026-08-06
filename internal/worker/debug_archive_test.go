@@ -270,6 +270,88 @@ func TestCleanupGraceExpiryReleasesBackendResourcesOnce(t *testing.T) {
 	}
 }
 
+// A worker restart must not strand the resources an execution was holding only
+// for log retrieval. Ownership and the expiry timer are process-local, so a
+// replacement worker cannot finish the job; without this the resource survives
+// until an unrelated backstop collects it, far past the operator's grace.
+func TestShutdownReleasesTerminalCleanupGraceResources(t *testing.T) {
+	backend := newSnapshotRecordingBackend(executeCompleted())
+	// A long grace guarantees the timer has not fired, so shutdown is the only
+	// thing that can release the entry.
+	w := newDebugArchiveWorker(t, backend, "60m")
+
+	w.tasks.StartTask("task-1", activeTask{cancel: func() {}, executionID: "exec-1"}, debuglog.BackendKubernetes, nil)
+	w.beginCleanupGrace(&types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "exec-1",
+		Task:        &types.Task{ID: "task-1"},
+	})
+	w.tasks.Delete("task-1")
+
+	if _, owned := w.tasks.LookupExecution("task-1", "exec-1"); !owned {
+		t.Fatal("the execution should be in cleanup grace before shutdown")
+	}
+
+	w.Shutdown()
+
+	select {
+	case params := <-backend.cleanups:
+		if params.TaskID != "task-1" || params.ExecutionID != "exec-1" {
+			t.Fatalf("cleanup params = %+v, want {task-1 exec-1}", params)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not release the cleanup-grace execution's backend resources")
+	}
+
+	if _, owned := w.tasks.LookupExecution("task-1", "exec-1"); owned {
+		t.Fatal("ownership survived shutdown")
+	}
+}
+
+func TestShutdownLeavesActiveExecutionsToTheBackendContract(t *testing.T) {
+	// An execution still running has not reported terminal state, so its task
+	// unit may legitimately outlive this process. Only each backend's own
+	// shutdown contract may decide its fate.
+	backend := newSnapshotRecordingBackend(executeCompleted())
+	w := newDebugArchiveWorker(t, backend, "60m")
+	w.tasks.StartTask("task-1", activeTask{cancel: func() {}, executionID: "exec-1"}, debuglog.BackendKubernetes, nil)
+
+	w.Shutdown()
+
+	select {
+	case params := <-backend.cleanups:
+		t.Fatalf("shutdown cleaned up an active execution: %+v", params)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestShutdownReleasesTheDirectCaptureItWasHolding(t *testing.T) {
+	backend := newSnapshotRecordingBackend(executeCompleted())
+	w := newDebugArchiveWorker(t, backend, "60m")
+
+	capture, err := w.debugLogStore.NewTaskLogCapture(nil)
+	if err != nil {
+		t.Fatalf("NewTaskLogCapture: %v", err)
+	}
+	w.tasks.StartTask("task-1", activeTask{cancel: func() {}, executionID: "exec-1"}, debuglog.BackendDirect, capture)
+	w.beginCleanupGrace(&types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "exec-1",
+		Task:        &types.Task{ID: "task-1"},
+	})
+	w.tasks.Delete("task-1")
+
+	if reserved := w.debugLogStore.ReservedBytes(); reserved == 0 {
+		t.Fatal("expected the capture to hold part of the disk budget")
+	}
+
+	w.Shutdown()
+
+	if reserved := w.debugLogStore.ReservedBytes(); reserved != 0 {
+		t.Fatalf("reserved bytes = %d after shutdown, want the capture released", reserved)
+	}
+}
+
 func TestRegistryDistinguishesExecutionsOfTheSameRun(t *testing.T) {
 	registry := newTaskRegistry()
 	registry.StartTask("run-1", activeTask{cancel: func() {}, executionID: "exec-1"}, debuglog.BackendDocker, nil)
