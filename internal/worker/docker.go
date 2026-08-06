@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/moby/moby/api/pkg/authconfig"
@@ -254,13 +255,10 @@ func (b *DockerBackend) lookupContainer(taskID, executionID string) (string, boo
 	return containerID, ok
 }
 
-func (b *DockerBackend) forgetContainer(taskID, executionID string) (string, bool) {
+func (b *DockerBackend) forgetContainer(taskID, executionID string) {
 	b.containersMutex.Lock()
 	defer b.containersMutex.Unlock()
-	key := executionKey{runID: taskID, executionID: executionID}
-	containerID, ok := b.containers[key]
-	delete(b.containers, key)
-	return containerID, ok
+	delete(b.containers, executionKey{runID: taskID, executionID: executionID})
 }
 
 // SnapshotTaskLogs streams the exact registered container's stdout and stderr
@@ -297,20 +295,43 @@ func (b *DockerBackend) SnapshotTaskLogs(ctx context.Context, params *SnapshotPa
 // CleanupTaskResources removes the container retained for log retrieval. It is
 // idempotent: an already-removed container or an unregistered execution is not
 // an error.
+//
+// The registry entry is dropped only once removal is confirmed. Forgetting it
+// first would strand a container the daemon refused to delete, because nothing
+// would remain for the caller or Shutdown to retry.
 func (b *DockerBackend) CleanupTaskResources(ctx context.Context, params *CancelParams) error {
-	containerID, ok := b.forgetContainer(params.TaskID, params.ExecutionID)
-	if !ok || containerID == "" || b.config.NoCleanup {
+	containerID, ok := b.lookupContainer(params.TaskID, params.ExecutionID)
+	if !ok || containerID == "" {
 		return nil
 	}
-	if _, err := b.dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true}); err != nil {
-		log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, err)
+	if b.config.NoCleanup {
+		b.forgetContainer(params.TaskID, params.ExecutionID)
+		return nil
 	}
+
+	if err := b.removeContainer(ctx, containerID); err != nil {
+		return err
+	}
+	b.forgetContainer(params.TaskID, params.ExecutionID)
 	return nil
+}
+
+// removeContainer deletes a container, treating an already-absent container as
+// success. Any other failure is surfaced so the caller can retry rather than
+// silently losing track of the container.
+func (b *DockerBackend) removeContainer(ctx context.Context, containerID string) error {
+	_, err := b.dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+	if err == nil || errdefs.IsNotFound(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to remove container %s: %w", containerID, err)
 }
 
 // Shutdown removes any containers still retained for log retrieval and closes
 // the Docker client. Docker task containers do not outlive the worker, so
 // leaving them behind at shutdown would leak them until an operator intervened.
+// This is the last chance to remove them, so a failure is reported loudly
+// rather than swallowed.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
 	b.containersMutex.Lock()
 	retained := b.containers
@@ -318,9 +339,9 @@ func (b *DockerBackend) Shutdown(ctx context.Context) {
 	b.containersMutex.Unlock()
 
 	if !b.config.NoCleanup {
-		for _, containerID := range retained {
-			if _, err := b.dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true}); err != nil {
-				log.Debugf(ctx, "Container %s already removed or removal failed during shutdown: %v", containerID, err)
+		for key, containerID := range retained {
+			if err := b.removeContainer(ctx, containerID); err != nil {
+				log.Warnf(ctx, "Leaving container for task %s behind after worker shutdown: %v", key.runID, err)
 			}
 		}
 	}

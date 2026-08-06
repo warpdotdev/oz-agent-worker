@@ -463,16 +463,20 @@ func (b *KubernetesBackend) setJobDeleteAtCleanup(taskID, executionID string, de
 	}
 }
 
-func (b *KubernetesBackend) forgetJob(taskID, executionID string) (retainedJob, bool) {
+func (b *KubernetesBackend) lookupJob(taskID, executionID string) (retainedJob, bool) {
 	b.jobsMutex.Lock()
 	defer b.jobsMutex.Unlock()
-	key := executionKey{runID: taskID, executionID: executionID}
-	entry, ok := b.jobs[key]
+	entry, ok := b.jobs[executionKey{runID: taskID, executionID: executionID}]
 	if !ok {
 		return retainedJob{}, false
 	}
-	delete(b.jobs, key)
 	return *entry, true
+}
+
+func (b *KubernetesBackend) forgetJob(taskID, executionID string) {
+	b.jobsMutex.Lock()
+	defer b.jobsMutex.Unlock()
+	delete(b.jobs, executionKey{runID: taskID, executionID: executionID})
 }
 
 func (b *KubernetesBackend) ownsJob(taskID, executionID string) bool {
@@ -646,14 +650,25 @@ func containerRestartCount(pod *corev1.Pod, containerName string) (int32, bool) 
 // CleanupTaskResources applies the Job deletion policy once the execution's
 // cleanup grace has expired. It is idempotent and never deletes a Job the
 // worker chose to leave for TTL-based cleanup.
+//
+// The registry entry is dropped only once the deletion is confirmed (an
+// already-absent Job counts as deleted). Forgetting it first would strand a
+// Job the API server refused to delete, leaving nothing for the caller to
+// retry and pushing its removal out to the Job TTL controller.
 func (b *KubernetesBackend) CleanupTaskResources(ctx context.Context, params *CancelParams) error {
-	entry, ok := b.forgetJob(params.TaskID, params.ExecutionID)
-	if !ok || b.config.NoCleanup || !entry.deleteAtCleanup {
+	entry, ok := b.lookupJob(params.TaskID, params.ExecutionID)
+	if !ok {
 		return nil
 	}
+	if b.config.NoCleanup || !entry.deleteAtCleanup {
+		b.forgetJob(params.TaskID, params.ExecutionID)
+		return nil
+	}
+
 	if err := b.deleteJob(ctx, entry.name); err != nil {
 		return fmt.Errorf("failed to delete Job %s: %w", entry.name, err)
 	}
+	b.forgetJob(params.TaskID, params.ExecutionID)
 	return nil
 }
 
@@ -670,9 +685,13 @@ func (b *KubernetesBackend) Shutdown(ctx context.Context) {
 // TTLSecondsAfterFinished. It bounds how long finished Jobs that the worker
 // leaves in place - failed Jobs (kept for post-mortem debugging) and Jobs
 // orphaned by worker disruption - and their pods survive before the Kubernetes
-// Job TTL controller deletes them. Successful Jobs are deleted immediately by the
-// worker, so this does not delay their cleanup. Returns nil when cleanup is
-// disabled, so those Jobs are retained indefinitely.
+// Job TTL controller deletes them.
+//
+// A successful Job is deleted by the worker at its execution's cleanup-grace
+// deadline, not at task completion, so its logs stay readable for a debug
+// archive. This TTL must therefore be at least as long as the effective grace,
+// or the controller deletes the pods first and the archive is partial. Returns
+// nil when cleanup is disabled, so those Jobs are retained indefinitely.
 func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
 	if b.config.NoCleanup {
 		return nil

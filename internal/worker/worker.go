@@ -1052,31 +1052,65 @@ func (w *Worker) releaseCleanupGraceEntries() {
 		return
 	}
 
-	// One bounded budget covers the whole sweep so shutdown cannot stall on an
-	// unresponsive backend.
-	ctx, cancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
-	defer cancel()
-
 	log.Infof(w.ctx, "Releasing %d cleanup-grace executions during worker shutdown", len(pending))
-	for key, entry := range pending {
-		result := "succeeded"
-		if err := w.backend.CleanupTaskResources(ctx, &CancelParams{
-			TaskID:      key.runID,
-			ExecutionID: key.executionID,
-		}); err != nil {
-			result = "failed"
-			log.Warnf(w.ctx, "Backend cleanup failed during shutdown for task %s: %v", key.runID, err)
-		}
-		metrics.RecordCleanupGraceResult(entry.backendKind, result)
 
-		if entry.capture != nil {
-			entry.capture.Close()
-		}
+	// Each resource gets its own budget and runs concurrently. Sharing one
+	// budget across the sweep let a single slow backend call consume it and
+	// starve every entry behind it, which on a busy worker is exactly when
+	// there is the most to release. Per-resource budgets keep the whole sweep
+	// bounded by one timeout regardless of how many entries there are.
+	var wg sync.WaitGroup
+	for key, entry := range pending {
+		wg.Add(1)
+		go func(key executionKey, entry *ownedExecution) {
+			defer wg.Done()
+			w.releaseCleanupGraceEntry(key, entry)
+		}(key, entry)
 	}
+	wg.Wait()
 
 	if w.debugLogStore != nil {
 		metrics.SetDebugArchiveCaptureBytes(w.debugLogStore.ReservedBytes())
 	}
+}
+
+// shutdownCleanupAttempts bounds how many times shutdown retries one backend
+// resource. A transient API error should not cost the resource its deletion,
+// but shutdown cannot retry indefinitely either.
+const shutdownCleanupAttempts = 3
+
+// releaseCleanupGraceEntry performs one execution's backend cleanup under its
+// own budget, retrying a transient failure, and then frees its capture.
+func (w *Worker) releaseCleanupGraceEntry(key executionKey, entry *ownedExecution) {
+	// The capture is local disk this process owns. Releasing it unconditionally
+	// is safe: a replacement worker's startup sweep removes any file left
+	// behind, so it can never accumulate the way a provider resource can.
+	defer func() {
+		if entry.capture != nil {
+			entry.capture.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+	defer cancel()
+
+	params := &CancelParams{TaskID: key.runID, ExecutionID: key.executionID}
+	var err error
+	for attempt := 1; attempt <= shutdownCleanupAttempts; attempt++ {
+		if err = w.backend.CleanupTaskResources(ctx, params); err == nil {
+			metrics.RecordCleanupGraceResult(entry.backendKind, "succeeded")
+			return
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	// The backend keeps the resource registered when deletion is unconfirmed,
+	// so its own shutdown still gets a final attempt. Naming what was left
+	// behind gives an operator something to act on if that attempt also fails.
+	metrics.RecordCleanupGraceResult(entry.backendKind, "failed")
+	log.Warnf(w.ctx, "Backend cleanup failed during shutdown for task %s; the resource remains registered for the backend's own shutdown: %v", key.runID, err)
 }
 
 func (w *Worker) Shutdown() {
