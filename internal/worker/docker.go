@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/moby/moby/api/pkg/authconfig"
@@ -15,12 +17,17 @@ import (
 	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rs/zerolog"
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+
+// maxDiagnosticLogBytes caps how much container output the worker reads into
+// memory for its own failure logging.
+const maxDiagnosticLogBytes = 1 << 20
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
@@ -43,6 +50,12 @@ type DockerBackend struct {
 	dockerClient *client.Client
 	platform     string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
 	platformSpec ocispec.Platform
+
+	// containersMutex guards containers, the exact (task, execution) to
+	// container-ID registry that makes a debug-archive request resolve one
+	// container and no other.
+	containersMutex sync.Mutex
+	containers      map[executionKey]string
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
@@ -92,6 +105,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 			OS:           versionInfo.Os,
 			Architecture: versionInfo.Arch,
 		},
+		containers: make(map[executionKey]string),
 	}, nil
 }
 
@@ -152,15 +166,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	containerID := resp.ID
 	log.Debugf(ctx, "Created Docker container: %s", containerID)
 
-	defer func() {
-		if containerID != "" && !b.config.NoCleanup {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
-			defer cleanupCancel()
-			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
-				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
-			}
-		}
-	}()
+	// Registering before start means a debug-archive request that arrives while
+	// the container is still coming up resolves the right container. The
+	// container is deliberately not removed when ExecuteTask returns: it is the
+	// retained log source until the execution's cleanup grace expires, which is
+	// what makes post-failure collection possible.
+	b.registerContainer(params.TaskID, taskExecutionID(params), containerID)
 
 	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
@@ -231,8 +242,110 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 // Docker-backend task.
 func (b *DockerBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
-// Shutdown closes the Docker client.
+func (b *DockerBackend) registerContainer(taskID, executionID, containerID string) {
+	b.containersMutex.Lock()
+	defer b.containersMutex.Unlock()
+	b.containers[executionKey{runID: taskID, executionID: executionID}] = containerID
+}
+
+func (b *DockerBackend) lookupContainer(taskID, executionID string) (string, bool) {
+	b.containersMutex.Lock()
+	defer b.containersMutex.Unlock()
+	containerID, ok := b.containers[executionKey{runID: taskID, executionID: executionID}]
+	return containerID, ok
+}
+
+func (b *DockerBackend) forgetContainer(taskID, executionID string) {
+	b.containersMutex.Lock()
+	defer b.containersMutex.Unlock()
+	delete(b.containers, executionKey{runID: taskID, executionID: executionID})
+}
+
+// SnapshotTaskLogs streams the exact registered container's stdout and stderr
+// into sink. Docker's log stream carries everything the entrypoint/launcher and
+// the client process it starts wrote, so no line filtering is applied and no
+// process identity is inferred.
+func (b *DockerBackend) SnapshotTaskLogs(ctx context.Context, params *SnapshotParams) error {
+	containerID, ok := b.lookupContainer(params.TaskID, params.ExecutionID)
+	if !ok {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonResourceNotFound, "no container is registered for this execution")
+	}
+
+	stream, err := b.dockerClient.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Timestamps: true,
+	})
+	if err != nil {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonCaptureUnavailable, "container logs are unavailable")
+	}
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			log.Warnf(ctx, "Failed to close container log stream: %v", closeErr)
+		}
+	}()
+
+	source := debuglog.SourceIdentity{ContainerID: containerID}
+	if err := copyDockerLogStream(stream, params.Sink, source); err != nil {
+		return debuglog.NewSnapshotError(types.DebugArchiveReasonSnapshotFailed, "failed to read container logs")
+	}
+	return nil
+}
+
+// CleanupTaskResources removes the container retained for log retrieval. It is
+// idempotent: an already-removed container or an unregistered execution is not
+// an error.
+//
+// The registry entry is dropped only once removal is confirmed. Forgetting it
+// first would strand a container the daemon refused to delete, because nothing
+// would remain for the caller or Shutdown to retry.
+func (b *DockerBackend) CleanupTaskResources(ctx context.Context, params *CancelParams) error {
+	containerID, ok := b.lookupContainer(params.TaskID, params.ExecutionID)
+	if !ok || containerID == "" {
+		return nil
+	}
+	if b.config.NoCleanup {
+		b.forgetContainer(params.TaskID, params.ExecutionID)
+		return nil
+	}
+
+	if err := b.removeContainer(ctx, containerID); err != nil {
+		return err
+	}
+	b.forgetContainer(params.TaskID, params.ExecutionID)
+	return nil
+}
+
+// removeContainer deletes a container, treating an already-absent container as
+// success. Any other failure is surfaced so the caller can retry rather than
+// silently losing track of the container.
+func (b *DockerBackend) removeContainer(ctx context.Context, containerID string) error {
+	_, err := b.dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+	if err == nil || errdefs.IsNotFound(err) {
+		return nil
+	}
+	return fmt.Errorf("failed to remove container %s: %w", containerID, err)
+}
+
+// Shutdown removes any containers still retained for log retrieval and closes
+// the Docker client. Docker task containers do not outlive the worker, so
+// leaving them behind at shutdown would leak them until an operator intervened.
+// This is the last chance to remove them, so a failure is reported loudly
+// rather than swallowed.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
+	b.containersMutex.Lock()
+	retained := b.containers
+	b.containers = make(map[executionKey]string)
+	b.containersMutex.Unlock()
+
+	if !b.config.NoCleanup {
+		for key, containerID := range retained {
+			if err := b.removeContainer(ctx, containerID); err != nil {
+				log.Warnf(ctx, "Leaving container for task %s behind after worker shutdown: %v", key.runID, err)
+			}
+		}
+	}
+
 	if b.dockerClient != nil {
 		if err := b.dockerClient.Close(); err != nil {
 			log.Warnf(ctx, "Failed to close Docker client: %v", err)
@@ -330,6 +443,11 @@ func (b *DockerBackend) getRegistryAuth(ctx context.Context, imageName string) s
 	return authStr
 }
 
+// getContainerLogs reads a bounded prefix of a container's output for the
+// worker's own diagnostic logging. Debug-archive collection uses
+// SnapshotTaskLogs instead, which streams under the request's byte bound; this
+// path is capped so a chatty container cannot scale worker memory with its
+// output.
 func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *client.Client, containerID string) (string, error) {
 	out, err := dockerClient.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
@@ -345,7 +463,7 @@ func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *clie
 		}
 	}()
 
-	logBytes, err := io.ReadAll(out)
+	logBytes, err := io.ReadAll(io.LimitReader(out, maxDiagnosticLogBytes))
 	if err != nil {
 		return "", err
 	}

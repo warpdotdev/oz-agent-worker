@@ -13,6 +13,14 @@ data:
     {{- if .Values.worker.idleOnComplete }}
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
     {{- end }}
+    debug_log_capture:
+      {{- if .Values.debugLogCapture.enabled }}
+      directory: {{ .Values.debugLogCapture.directory | quote }}
+      {{- end }}
+      {{- /* int64 keeps large byte counts out of YAML scientific notation. */}}
+      max_total_bytes: {{ .Values.debugLogCapture.maxTotalBytes | int64 }}
+      max_execution_bytes: {{ .Values.debugLogCapture.maxExecutionBytes | int64 }}
+      max_concurrent_uploads: {{ .Values.debugLogCapture.maxConcurrentUploads | int }}
     backend:
       kubernetes:
         namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace | quote }}

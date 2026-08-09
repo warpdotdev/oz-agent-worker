@@ -12,7 +12,9 @@ import (
 
 // dispatchBackend is a fake Backend that reports a successful fire-and-forget
 // dispatch. Its CancelTask is a no-op.
-type dispatchBackend struct{}
+type dispatchBackend struct {
+	noLogSnapshotBackend
+}
 
 func (b *dispatchBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
 	return executeSpawned()
@@ -34,11 +36,11 @@ func (b *cancelableDispatchBackend) CancelTask(_ context.Context, params *Cancel
 
 func newDispatchWorker(backend Backend) *Worker {
 	return &Worker{
-		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 4),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}, executionID: "exec-1"}},
-		backend:     backend,
+		ctx:      context.Background(),
+		config:   Config{},
+		sendChan: make(chan []byte, 4),
+		tasks:    registryWith(map[string]activeTask{"task-1": {cancel: func() {}, executionID: "exec-1"}}),
+		backend:  backend,
 	}
 }
 
@@ -60,11 +62,9 @@ func TestExecuteTaskDispatchedSuppressesTerminalMessage(t *testing.T) {
 		msg := readWebSocketMessage(t, w.sendChan)
 		t.Fatalf("expected no terminal message after dispatch, got %q", msg.Type)
 	}
-	w.tasksMutex.Lock()
-	task, ok := w.activeTasks["task-1"]
-	w.tasksMutex.Unlock()
+	task, ok := w.tasks.Get("task-1")
 	if !ok {
-		t.Fatal("spawned task should remain in activeTasks")
+		t.Fatal("spawned task should remain tracked")
 	}
 	if !task.spawned {
 		t.Error("spawned task entry should be marked spawned")
@@ -102,10 +102,10 @@ func spawnedActiveTask(executionID string) activeTask {
 func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 	backend := &cancelableDispatchBackend{cancelCalled: make(chan *CancelParams, 1)}
 	w := &Worker{
-		ctx:         context.Background(),
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
-		backend:     backend,
+		ctx:      context.Background(),
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": spawnedActiveTask("exec-1")}),
+		backend:  backend,
 	}
 
 	w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "task-1"})
@@ -119,10 +119,7 @@ func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 		t.Fatal("CancelTask was not invoked for a spawned task")
 	}
 
-	w.tasksMutex.Lock()
-	_, ok := w.activeTasks["task-1"]
-	w.tasksMutex.Unlock()
-	if ok {
+	if _, ok := w.tasks.Get("task-1"); ok {
 		t.Error("spawned task should be removed after cancellation is routed")
 	}
 }
@@ -134,11 +131,11 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 	w := &Worker{
 		ctx:      context.Background(),
 		sendChan: make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": {
+		tasks: registryWith(map[string]activeTask{"task-1": {
 			ctx:         taskCtx,
 			cancel:      taskCancel,
 			executionID: "exec-1",
-		}},
+		}}),
 		backend: backend,
 	}
 
@@ -157,11 +154,9 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 	}
 
 	// The entry stays until executeTask's deferred cleanup removes it.
-	w.tasksMutex.Lock()
-	task, ok := w.activeTasks["task-1"]
-	w.tasksMutex.Unlock()
+	task, ok := w.tasks.Get("task-1")
 	if !ok {
-		t.Fatal("running task should remain in activeTasks until executeTask returns")
+		t.Fatal("running task should remain tracked until executeTask returns")
 	}
 	if task.cancellationSource != taskCancellationSourceUser {
 		t.Fatalf("cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
@@ -170,10 +165,10 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 
 func TestHandleTaskCancellationSpawnedNoopCancelEmitsNoMessage(t *testing.T) {
 	w := &Worker{
-		ctx:         context.Background(),
-		sendChan:    make(chan []byte, 1),
-		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
-		backend:     &dispatchBackend{},
+		ctx:      context.Background(),
+		sendChan: make(chan []byte, 1),
+		tasks:    registryWith(map[string]activeTask{"task-1": spawnedActiveTask("exec-1")}),
+		backend:  &dispatchBackend{},
 	}
 
 	// Must not panic and must not emit any task status message when the

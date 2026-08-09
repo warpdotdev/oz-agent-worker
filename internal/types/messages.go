@@ -16,7 +16,18 @@ const (
 	MessageTypeTaskRejected     MessageType = "task_rejected"
 	MessageTypeTaskCancellation MessageType = "task_cancellation"
 	MessageTypeHeartbeat        MessageType = "heartbeat"
+	// MessageTypeDebugArchiveLogsRequested is sent from server to worker to ask
+	// the process that executed an assignment for a bounded log snapshot.
+	MessageTypeDebugArchiveLogsRequested MessageType = "debug_archive_logs_requested"
+	// MessageTypeDebugArchiveLogsUploaded is the owning worker's acknowledgement
+	// of a debug-archive log request.
+	MessageTypeDebugArchiveLogsUploaded MessageType = "debug_archive_logs_uploaded"
 )
+
+// WorkerVersionHeader carries the worker's build-time version on every
+// authenticated WebSocket dial so warp-server can snapshot the exact build
+// that claims an execution.
+const WorkerVersionHeader = "X-Warp-Worker-Version"
 
 // WebSocketMessage is the base structure for all WebSocket messages
 type WebSocketMessage struct {
@@ -99,6 +110,114 @@ type TaskRejectedMessage struct {
 // TaskCancellationMessage is sent from server to worker to cancel an active task.
 type TaskCancellationMessage struct {
 	TaskID string `json:"task_id"`
+}
+
+// DebugArchiveProtocolVersion is the only worker-log protocol version this
+// worker implements. A request carrying any other version is refused with
+// DebugArchiveReasonUnsupportedProtocolVersion.
+const DebugArchiveProtocolVersion = 1
+
+// DebugArchiveFormatNDJSON is the only snapshot encoding this worker produces.
+const DebugArchiveFormatNDJSON = "application/x-ndjson"
+
+// Debug-archive acknowledgement outcomes.
+const (
+	DebugArchiveOutcomeUploaded    = "uploaded"
+	DebugArchiveOutcomeUnavailable = "unavailable"
+	DebugArchiveOutcomeFailed      = "failed"
+)
+
+// Debug-archive capture statuses, reported only alongside an uploaded outcome.
+const (
+	DebugArchiveCaptureComplete = "complete"
+	DebugArchiveCapturePartial  = "partial"
+)
+
+// Debug-archive reason codes. These are the complete, stable set warp-server
+// keys off for non-upload outcomes.
+const (
+	DebugArchiveReasonUnsupportedProtocolVersion    = "unsupported_protocol_version"
+	DebugArchiveReasonUnsupportedContentTransformer = "unsupported_content_transformer"
+	DebugArchiveReasonInvalidRequest                = "invalid_request"
+	DebugArchiveReasonRequestExpired                = "request_expired"
+	DebugArchiveReasonBackendNotSupported           = "backend_not_supported"
+	DebugArchiveReasonResourceNotReady              = "resource_not_ready"
+	DebugArchiveReasonResourceNotFound              = "resource_not_found"
+	DebugArchiveReasonCleanupGraceExpired           = "cleanup_grace_expired"
+	DebugArchiveReasonCaptureUnavailable            = "capture_unavailable"
+	DebugArchiveReasonSnapshotFailed                = "snapshot_failed"
+	DebugArchiveReasonUploadRejected                = "upload_rejected"
+	DebugArchiveReasonUploadExpired                 = "upload_expired"
+	DebugArchiveReasonUploadFailed                  = "upload_failed"
+	DebugArchiveReasonWorkerShuttingDown            = "worker_shutting_down"
+	DebugArchiveReasonRequestCapacityExhausted      = "request_capacity_exhausted"
+)
+
+// Debug-archive warning codes. A partial capture reports these so warp-server
+// can mark a source partial without parsing provider text.
+const (
+	DebugArchiveWarningContainerLogsUnavailable   = "container_logs_unavailable"
+	DebugArchiveWarningPreviousLogsUnavailable    = "previous_logs_unavailable"
+	DebugArchiveWarningOutputDropped              = "output_dropped"
+	DebugArchiveWarningProviderSnapshotIncomplete = "provider_snapshot_incomplete"
+)
+
+// ContentTransformerDescriptor names the versioned transform applied to log
+// message data while the snapshot is encoded. V1 defines only the byte
+// preserving "noop" transformer.
+type ContentTransformerDescriptor struct {
+	Kind    string `json:"kind"`
+	Version int    `json:"version"`
+}
+
+// UploadTarget is the provider-neutral destination warp-server signs for one
+// immutable snapshot object. Its URL, headers, and multipart fields are
+// credential-bearing and must never be logged or echoed in an acknowledgement.
+type UploadTarget struct {
+	URL             string            `json:"url"`
+	Method          string            `json:"method"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	MultipartFields map[string]string `json:"multipart_fields,omitempty"`
+}
+
+// DebugArchiveLogsRequestedMessage is the server's request for a bounded log
+// snapshot of one exact execution. Unknown fields are ignored so a newer
+// server can add optional data without breaking this worker.
+type DebugArchiveLogsRequestedMessage struct {
+	ProtocolVersion    int                          `json:"protocol_version"`
+	RequestID          string                       `json:"request_id"`
+	ArchiveID          string                       `json:"archive_id"`
+	CollectionID       string                       `json:"collection_id"`
+	RunID              string                       `json:"run_id"`
+	ExecutionID        string                       `json:"execution_id"`
+	RequestedFormat    string                       `json:"requested_format"`
+	ExpiresAt          time.Time                    `json:"expires_at"`
+	MaxBytes           int64                        `json:"max_bytes"`
+	ContentTransformer ContentTransformerDescriptor `json:"content_transformer"`
+	UploadTarget       UploadTarget                 `json:"upload_target"`
+}
+
+// DebugArchiveLogsUploadedMessage is the owning worker's acknowledgement. Byte,
+// checksum, and capture fields are present only for an uploaded outcome; the
+// reason code and sanitized message describe every other outcome.
+type DebugArchiveLogsUploadedMessage struct {
+	ProtocolVersion           int      `json:"protocol_version"`
+	RequestID                 string   `json:"request_id"`
+	ArchiveID                 string   `json:"archive_id"`
+	CollectionID              string   `json:"collection_id"`
+	RunID                     string   `json:"run_id"`
+	ExecutionID               string   `json:"execution_id"`
+	Outcome                   string   `json:"outcome"`
+	BackendKind               string   `json:"backend_kind,omitempty"`
+	Bytes                     int64    `json:"bytes,omitempty"`
+	CRC32C                    string   `json:"crc32c,omitempty"`
+	SHA256                    string   `json:"sha256,omitempty"`
+	Truncated                 bool     `json:"truncated"`
+	ContentTransformerVersion int      `json:"content_transformer_version,omitempty"`
+	CaptureStatus             string   `json:"capture_status,omitempty"`
+	WarningCodes              []string `json:"warning_codes"`
+	ReasonCode                string   `json:"reason_code"`
+	Message                   string   `json:"message"`
 }
 
 // TaskState is the serialized terminal task state accepted by warp-server.

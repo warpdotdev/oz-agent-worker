@@ -8,9 +8,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
+	"github.com/warpdotdev/oz-agent-worker/internal/debuglog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
@@ -40,6 +42,14 @@ type Config struct {
 	ServerRootURL string
 	LogLevel      string
 	BackendType   string // "docker", "direct", or "kubernetes"
+	// Version is the worker's build identifier, reported to warp-server on
+	// every authenticated WebSocket dial so the server can snapshot the exact
+	// build that claims an execution.
+	Version string
+	// DebugLogCapture bounds the disk and concurrency debug-archive log
+	// collection may use. Retention comes from the execution's existing
+	// idle-on-complete cleanup grace, not from this configuration.
+	DebugLogCapture debuglog.Config
 	// MaxConcurrentTasks caps how many tasks may execute locally at once
 	// (0 means unlimited). A task's slot is released when the backend's
 	// ExecuteTask returns, so for backends that spawn tasks fire-and-forget
@@ -68,13 +78,17 @@ type Worker struct {
 	reconnectDelay time.Duration
 	lastHeartbeat  time.Time
 	sendChan       chan []byte
-	activeTasks    map[string]activeTask
-	tasksMutex     sync.Mutex
+	tasks          *TaskRegistry
 	backend        Backend
 	taskSemaphore  *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
+	// debugLogStore and debugLogs are nil when debug-log capture failed to
+	// initialize. That is non-fatal: ordinary task execution never depends on
+	// archive availability.
+	debugLogStore *debuglog.Store
+	debugLogs     *debuglog.Coordinator
 }
 type taskCancellationSource string
 
@@ -140,17 +154,48 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
 	}
 
-	return &Worker{
+	w := &Worker{
 		config:            config,
 		ctx:               workerCtx,
 		cancel:            cancel,
 		reconnectDelay:    InitialReconnectDelay,
 		sendChan:          make(chan []byte, 256),
-		activeTasks:       make(map[string]activeTask),
+		tasks:             newTaskRegistry(),
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
-	}, nil
+	}
+
+	// Losing debug-log capture must never cost the operator task execution, so
+	// an invalid bound or an unwritable capture root degrades to "no archive
+	// capture" and the worker carries on.
+	store, err := debuglog.NewStore(config.DebugLogCapture)
+	if err != nil {
+		log.Errorf(ctx, "Debug archive log capture is disabled: %v", err)
+		return w, nil
+	}
+	w.debugLogStore = store
+	w.debugLogs = debuglog.NewCoordinator(debuglog.CoordinatorOptions{
+		Ownership: w.tasks,
+		Source:    backendSnapshotSource{backend: backend},
+		Sender:    w,
+		Store:     store,
+	})
+	return w, nil
+}
+
+// backendSnapshotSource adapts the worker's backend to the coordinator's
+// snapshot contract.
+type backendSnapshotSource struct {
+	backend Backend
+}
+
+func (s backendSnapshotSource) SnapshotLogs(ctx context.Context, runID, executionID string, sink debuglog.Sink) error {
+	return s.backend.SnapshotTaskLogs(ctx, &SnapshotParams{
+		TaskID:      runID,
+		ExecutionID: executionID,
+		Sink:        sink,
+	})
 }
 
 func (w *Worker) Start() error {
@@ -195,6 +240,16 @@ func (w *Worker) connect() error {
 
 	headers := make(map[string][]string)
 	headers["Authorization"] = []string{fmt.Sprintf("Bearer %s", w.config.APIKey)}
+	// The version travels as connection metadata rather than a later message so
+	// it reaches the server before this connection is eligible for a task, and
+	// a reconnect re-reports it for future assignments.
+	if version, ok := workerVersionHeaderValue(w.config.Version); ok {
+		headers[types.WorkerVersionHeader] = []string{version}
+	} else if w.config.Version != "" {
+		// The value itself is never logged: an invalid build identifier is
+		// still attacker-influenced input.
+		log.Warnf(w.ctx, "Omitting invalid worker version metadata from the connection")
+	}
 
 	log.Infof(w.ctx, "Connecting to %s", u.String())
 
@@ -346,7 +401,6 @@ func (w *Worker) handleMessage(message []byte) {
 		return
 	}
 
-	// Currently there is only one message type, but we anticipate needing more in the future.
 	switch msg.Type {
 	case types.MessageTypeTaskAssignment:
 		var assignment types.TaskAssignmentMessage
@@ -364,27 +418,80 @@ func (w *Worker) handleMessage(message []byte) {
 		}
 		w.handleTaskCancellation(&cancellation)
 
+	case types.MessageTypeDebugArchiveLogsRequested:
+		var request types.DebugArchiveLogsRequestedMessage
+		if err := json.Unmarshal(msg.Data, &request); err != nil {
+			// A request whose envelope will not parse cannot be attributed to
+			// an execution, so this process cannot know whether it owns it and
+			// must not answer.
+			log.Errorf(w.ctx, "Failed to unmarshal debug archive log request: %v", err)
+			return
+		}
+		if w.debugLogs == nil {
+			return
+		}
+		// Handing off to the coordinator keeps provider reads and uploads off
+		// this loop, so heartbeats, cancellations, and later assignments are
+		// still processed while a snapshot is in flight.
+		w.debugLogs.Handle(w.ctx, &request)
+
 	default:
 		log.Warnf(w.ctx, "Unknown message type: %s", msg.Type)
 	}
 }
 
-func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
-	w.tasksMutex.Lock()
-	task, ok := w.activeTasks[cancellation.TaskID]
-	if ok {
-		if task.cancellationSource == "" {
-			task.cancellationSource = taskCancellationSourceUser
-			w.activeTasks[cancellation.TaskID] = task
-		}
-		if task.spawned {
-			// executeTask has already returned for a spawned task, so no
-			// deferred cleanup will remove the entry; drop it now that the
-			// cancellation is being routed to the backend.
-			delete(w.activeTasks, cancellation.TaskID)
+// maxWorkerVersionBytes bounds the build identifier the worker reports.
+const maxWorkerVersionBytes = 128
+
+// workerVersionHeaderValue reports whether a build identifier is safe to send
+// as connection metadata. It is an opaque, non-secret display value, so the
+// only requirements are that it fits the bound, is valid UTF-8, and carries no
+// control characters that could break header framing. An empty or invalid
+// value is simply omitted: the server records provenance as not reported and
+// the connection still executes tasks.
+func workerVersionHeaderValue(version string) (string, bool) {
+	if version == "" || len(version) > maxWorkerVersionBytes || !utf8.ValidString(version) {
+		return "", false
+	}
+	for _, r := range version {
+		if r < 0x20 || r == 0x7f {
+			return "", false
 		}
 	}
-	w.tasksMutex.Unlock()
+	return version, true
+}
+
+// SendDebugArchiveAck enqueues a debug-archive acknowledgement through the
+// worker's single WebSocket writer.
+func (w *Worker) SendDebugArchiveAck(ack *types.DebugArchiveLogsUploadedMessage) error {
+	data, err := json.Marshal(ack)
+	if err != nil {
+		return fmt.Errorf("failed to marshal debug archive acknowledgement: %w", err)
+	}
+
+	msgBytes, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeDebugArchiveLogsUploaded,
+		Data: data,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal websocket message: %w", err)
+	}
+
+	return w.sendMessage(msgBytes)
+}
+
+func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
+	task, ok := w.tasks.Update(cancellation.TaskID, func(task *activeTask) {
+		if task.cancellationSource == "" {
+			task.cancellationSource = taskCancellationSourceUser
+		}
+	})
+	if ok && task.spawned {
+		// executeTask has already returned for a spawned task, so no deferred
+		// cleanup will remove the entry; drop it now that the cancellation is
+		// being routed to the backend.
+		w.tasks.Delete(cancellation.TaskID)
+	}
 
 	if !ok {
 		log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
@@ -470,14 +577,39 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	}
 	taskCtx, taskCancel := context.WithCancel(executionCtx)
 
-	w.tasksMutex.Lock()
-	w.activeTasks[assignment.TaskID] = activeTask{
+	w.tasks.StartTask(assignment.TaskID, activeTask{
 		ctx:         taskCtx,
 		cancel:      taskCancel,
 		executionID: assignment.ExecutionID,
-	}
-	w.tasksMutex.Unlock()
+	}, w.backendKind(), w.newTaskLogCapture())
 	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+}
+
+// backendKind is the resolved backend name reported on debug-archive records
+// and acknowledgements. It normalizes the empty default to docker so ownership
+// lookups and NDJSON records always name a real backend.
+func (w *Worker) backendKind() string {
+	if w.config.BackendType == "" {
+		return debuglog.BackendDocker
+	}
+	return w.config.BackendType
+}
+
+// newTaskLogCapture allocates a bounded output capture for a direct execution.
+// Every other backend reads provider-native logs on demand instead of keeping
+// a second copy, and a capture that cannot be allocated is recorded and
+// skipped rather than failing the assignment.
+func (w *Worker) newTaskLogCapture() *debuglog.TaskLogCapture {
+	if w.debugLogStore == nil || w.backendKind() != debuglog.BackendDirect {
+		return nil
+	}
+	capture, err := w.debugLogStore.NewTaskLogCapture(nil)
+	if err != nil {
+		log.Warnf(w.ctx, "Debug archive output capture is unavailable for this task: %v", err)
+		return nil
+	}
+	metrics.SetDebugArchiveCaptureBytes(w.debugLogStore.ReservedBytes())
+	return capture
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -614,13 +746,11 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	defer func() {
 		taskCancel()
 		span.End()
-		w.tasksMutex.Lock()
-		// Spawned tasks stay in activeTasks so a later cancellation can be
-		// routed to the backend's CancelTask; everything else is done.
-		if task, tracked := w.activeTasks[assignment.TaskID]; !tracked || !task.spawned {
-			delete(w.activeTasks, assignment.TaskID)
+		// Spawned tasks stay tracked so a later cancellation can be routed to
+		// the backend's CancelTask; everything else is done.
+		if task, tracked := w.tasks.Get(assignment.TaskID); !tracked || !task.spawned {
+			w.tasks.Delete(assignment.TaskID)
 		}
-		w.tasksMutex.Unlock()
 
 		if w.taskSemaphore != nil {
 			w.taskSemaphore.Release(1)
@@ -635,12 +765,24 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	metrics.AddTaskEvent(ctx, "task.started")
 
 	params := w.prepareTaskParams(assignment)
+	if owner, owned := w.tasks.LookupExecution(assignment.TaskID, assignment.ExecutionID); owned {
+		params.LogCapture = owner.Capture
+	}
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
 		attribute.String("docker.image", params.DockerImage),
 	)
 
 	executeResult := w.backend.ExecuteTask(ctx, params)
+
+	// Ownership moves to cleanup grace before any terminal lifecycle message is
+	// enqueued. A server that reacts to task_failed by requesting logs then
+	// always finds the grace entry instead of racing registry deletion and
+	// backend cleanup, which is the whole point of the ANY_FAILURE path.
+	if executeResult.Outcome != ExecuteOutcomeSpawned {
+		w.beginCleanupGrace(assignment)
+	}
+
 	if executeResult.Error != nil {
 		err := executeResult.Error
 		if ctx.Err() == context.Canceled && w.cancellationSource(taskID) == taskCancellationSourceUser {
@@ -687,12 +829,11 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		// so that cancellation can be routed to the backend's CancelTask
 		// implementation later.
 		result = metrics.TaskResultDispatched
-		w.tasksMutex.Lock()
-		if task, tracked := w.activeTasks[taskID]; tracked && task.cancellationSource == "" {
-			task.spawned = true
-			w.activeTasks[taskID] = task
-		}
-		w.tasksMutex.Unlock()
+		w.tasks.Update(taskID, func(task *activeTask) {
+			if task.cancellationSource == "" {
+				task.spawned = true
+			}
+		})
 		metrics.AddTaskEvent(ctx, "task.dispatched")
 		span.SetStatus(codes.Ok, "task dispatched to remote runtime")
 		log.Infof(ctx, "Task %s dispatched", taskID)
@@ -708,14 +849,56 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 }
 
 func (w *Worker) cancellationSource(taskID string) taskCancellationSource {
-	w.tasksMutex.Lock()
-	defer w.tasksMutex.Unlock()
-
-	task, ok := w.activeTasks[taskID]
+	task, ok := w.tasks.Get(taskID)
 	if !ok {
 		return ""
 	}
 	return task.cancellationSource
+}
+
+// beginCleanupGrace retains the execution's backend resources and output
+// capture for the same window the agent itself stays idle, then releases them.
+// Reusing the resolved idle-on-complete duration keeps one cleanup clock:
+// operators size retention with the setting they already tune, and an archive
+// request never extends it.
+func (w *Worker) beginCleanupGrace(assignment *types.TaskAssignmentMessage) {
+	grace := common.ResolveCleanupGrace(assignment.Task, w.config.IdleOnComplete)
+	runID := assignment.TaskID
+	executionID := assignment.ExecutionID
+
+	w.tasks.MoveToCleanupGrace(runID, executionID, grace, func() {
+		w.expireCleanupGrace(runID, executionID)
+	})
+}
+
+// expireCleanupGrace performs the backend's normal resource cleanup and frees
+// the execution's capture. It is idempotent: the registry hands the entry over
+// exactly once, so a racing shutdown sweep finds nothing left to do.
+func (w *Worker) expireCleanupGrace(runID, executionID string) {
+	entry, ok := w.tasks.ReleaseCleanupGrace(runID, executionID)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), BackendShutdownTimeout)
+	defer cancel()
+
+	result := "succeeded"
+	if err := w.backend.CleanupTaskResources(ctx, &CancelParams{TaskID: runID, ExecutionID: executionID}); err != nil {
+		result = "failed"
+		log.Warnf(w.ctx, "Backend cleanup failed after cleanup grace for task %s: %v", runID, err)
+	}
+	metrics.RecordCleanupGraceResult(entry.backendKind, result)
+
+	if entry.capture != nil {
+		entry.capture.Close()
+	}
+	if w.debugLogStore != nil {
+		metrics.SetDebugArchiveCaptureBytes(w.debugLogStore.ReservedBytes())
+	}
+	if w.debugLogs != nil {
+		w.debugLogs.ForgetExecution(runID, executionID)
+	}
 }
 func (w *Worker) sendTaskClaimed(taskID string) error {
 	claimed := types.TaskClaimedMessage{
@@ -852,21 +1035,100 @@ func (w *Worker) sendMessage(message []byte) error {
 	}
 }
 
+// releaseCleanupGraceEntries performs the backend cleanup each cleanup-grace
+// entry was waiting for and deletes the bytes held for log retrieval.
+//
+// These executions have already reported terminal state; only their log source
+// is being retained. Ownership is process-local, so a replacement worker cannot
+// inherit the pending timer — leaving the resources behind would strand them
+// until an unrelated backstop (the Kubernetes Job TTL) eventually collected
+// them, far past the operator's chosen cleanup grace. Running the cleanup early
+// here is the same work the expiry timer would have done. Active executions are
+// untouched: they are not in cleanup grace, so each backend's own shutdown
+// contract still decides whether their task units may outlive this process.
+func (w *Worker) releaseCleanupGraceEntries() {
+	pending := w.tasks.PendingCleanups()
+	if len(pending) == 0 {
+		return
+	}
+
+	log.Infof(w.ctx, "Releasing %d cleanup-grace executions during worker shutdown", len(pending))
+
+	// Each resource gets its own budget and runs concurrently. Sharing one
+	// budget across the sweep let a single slow backend call consume it and
+	// starve every entry behind it, which on a busy worker is exactly when
+	// there is the most to release. Per-resource budgets keep the whole sweep
+	// bounded by one timeout regardless of how many entries there are.
+	var wg sync.WaitGroup
+	for key, entry := range pending {
+		wg.Add(1)
+		go func(key executionKey, entry *ownedExecution) {
+			defer wg.Done()
+			w.releaseCleanupGraceEntry(key, entry)
+		}(key, entry)
+	}
+	wg.Wait()
+
+	if w.debugLogStore != nil {
+		metrics.SetDebugArchiveCaptureBytes(w.debugLogStore.ReservedBytes())
+	}
+}
+
+// shutdownCleanupAttempts bounds how many times shutdown retries one backend
+// resource. A transient API error should not cost the resource its deletion,
+// but shutdown cannot retry indefinitely either.
+const shutdownCleanupAttempts = 3
+
+// releaseCleanupGraceEntry performs one execution's backend cleanup under its
+// own budget, retrying a transient failure, and then frees its capture.
+func (w *Worker) releaseCleanupGraceEntry(key executionKey, entry *ownedExecution) {
+	// The capture is local disk this process owns. Releasing it unconditionally
+	// is safe: a replacement worker's startup sweep removes any file left
+	// behind, so it can never accumulate the way a provider resource can.
+	defer func() {
+		if entry.capture != nil {
+			entry.capture.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+	defer cancel()
+
+	params := &CancelParams{TaskID: key.runID, ExecutionID: key.executionID}
+	var err error
+	for attempt := 1; attempt <= shutdownCleanupAttempts; attempt++ {
+		if err = w.backend.CleanupTaskResources(ctx, params); err == nil {
+			metrics.RecordCleanupGraceResult(entry.backendKind, "succeeded")
+			return
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	// The backend keeps the resource registered when deletion is unconfirmed,
+	// so its own shutdown still gets a final attempt. Naming what was left
+	// behind gives an operator something to act on if that attempt also fails.
+	metrics.RecordCleanupGraceResult(entry.backendKind, "failed")
+	log.Warnf(w.ctx, "Backend cleanup failed during shutdown for task %s; the resource remains registered for the backend's own shutdown: %v", key.runID, err)
+}
+
 func (w *Worker) Shutdown() {
 	log.Infof(w.ctx, "Shutting down worker...")
 	preserveActiveTasks := w.backend.PreservesTasksOnShutdown()
 
-	w.tasksMutex.Lock()
-	activeTaskCount := len(w.activeTasks)
+	active := w.tasks.Snapshot()
+	activeTaskCount := len(active)
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
 		log.Infof(w.ctx, "Cancelling %d active tasks", activeTaskCount)
-		for taskID, task := range w.activeTasks {
-			if task.cancellationSource == "" {
-				task.cancellationSource = taskCancellationSourceShutdown
-				w.activeTasks[taskID] = task
-			}
+		for taskID, task := range active {
+			w.tasks.Update(taskID, func(tracked *activeTask) {
+				if tracked.cancellationSource == "" {
+					tracked.cancellationSource = taskCancellationSourceShutdown
+				}
+			})
 			log.Debugf(w.ctx, "Cancelling task: %s", taskID)
 			metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
 				attribute.String("source", "signal"),
@@ -875,13 +1137,20 @@ func (w *Worker) Shutdown() {
 			task.cancel()
 		}
 	}
-	w.tasksMutex.Unlock()
 
 	if activeTaskCount > 0 && !preserveActiveTasks {
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	w.cancel()
+
+	// Cancelling the worker context aborts in-flight archive requests, so
+	// waiting for them adds no delay beyond the bounded backend shutdown below.
+	if w.debugLogs != nil {
+		w.debugLogs.Wait()
+	}
+	w.releaseCleanupGraceEntries()
+
 	backendShutdownCtx, backendShutdownCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
 	defer backendShutdownCancel()
 	w.backend.Shutdown(backendShutdownCtx)

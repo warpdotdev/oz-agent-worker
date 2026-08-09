@@ -98,6 +98,10 @@ spec:
             - name: config
               mountPath: /etc/oz-agent-worker
               readOnly: true
+            {{- if .Values.debugLogCapture.enabled }}
+            - name: debug-log-capture
+              mountPath: {{ .Values.debugLogCapture.directory | quote }}
+            {{- end }}
           {{- with .Values.worker.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
@@ -114,6 +118,14 @@ spec:
         - name: config
           configMap:
             name: {{ include "oz-agent-worker.fullname" . }}-config
+        {{- if .Values.debugLogCapture.enabled }}
+        # Scratch space for debug-archive log capture. It is explicitly
+        # ephemeral: nothing here survives worker pod replacement, and it does
+        # not change the execution cleanup-grace contract.
+        - name: debug-log-capture
+          emptyDir:
+            sizeLimit: {{ .Values.debugLogCapture.sizeLimit | quote }}
+        {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

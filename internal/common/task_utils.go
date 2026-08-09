@@ -4,9 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
+
+// DefaultIdleOnComplete mirrors the oz CLI's default --idle-on-complete value,
+// used when neither the task nor the worker sets one.
+const DefaultIdleOnComplete = 45 * time.Minute
 
 // TaskAugmentOptions contains settings translated into oz CLI flags for every task.
 // Add new CLI overrides here rather than as extra parameters.
@@ -146,6 +151,28 @@ func shareAccessLevelForEmission(access types.AccessLevel) string {
 	default:
 		return ""
 	}
+}
+
+// ResolveCleanupGrace returns how long the agent stays alive after its
+// conversation finishes, using the same precedence as the emitted
+// --idle-on-complete flag: task idle_timeout_minutes, then the worker's
+// idle_on_complete, then the oz CLI default.
+//
+// The worker reuses this window as its post-terminal ownership and
+// log-retrieval deadline, so a debug-archive request has one cleanup clock to
+// reason about instead of a second archive-specific retention setting. An
+// unparseable worker override falls back to the default rather than dropping
+// retention to zero.
+func ResolveCleanupGrace(task *types.Task, workerIdleOnComplete string) time.Duration {
+	value, ok := resolveIdleOnComplete(task, TaskAugmentOptions{IdleOnComplete: workerIdleOnComplete})
+	if !ok {
+		return DefaultIdleOnComplete
+	}
+	grace, err := time.ParseDuration(value)
+	if err != nil || grace < 0 {
+		return DefaultIdleOnComplete
+	}
+	return grace
 }
 
 func resolveIdleOnComplete(task *types.Task, opts TaskAugmentOptions) (string, bool) {

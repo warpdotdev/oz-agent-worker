@@ -91,9 +91,15 @@ kubernetesBackend:
   # How long finished task Jobs that the worker leaves in place are retained before
   # the Kubernetes Job TTL controller deletes them (and their pods). This covers
   # failed task Jobs, which are kept for post-mortem debugging, and Jobs orphaned by
-  # worker disruption. Successful task Jobs are deleted immediately by the worker, so
-  # this does not keep them around. Defaults to 24h (86400s). When worker.cleanup=false
-  # the worker sets no TTL, so these Jobs remain indefinitely.
+  # worker disruption.
+  #
+  # A successful task Job is deleted by the worker at its execution's cleanup-grace
+  # deadline (task idle_timeout_minutes, then worker.idleOnComplete, then the Oz
+  # default) rather than at task completion, so its logs remain readable for a debug
+  # archive. Keep this TTL at least as long as the effective grace: if the controller
+  # deletes the pods first, a debug archive collected for that run is partial.
+  # Defaults to 24h (86400s). When worker.cleanup=false the worker sets no TTL, so
+  # these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
@@ -115,6 +121,30 @@ kubernetesBackend:
   #       cpu: 100m
   #       memory: 64Mi
   preflightResources: {}
+
+# Bounds for debug-archive log capture. The worker uses this space for
+# direct-execution output captures and for the request-scoped snapshot it
+# uploads; Docker and Kubernetes executions read provider logs on demand and
+# keep nothing here.
+#
+# There is deliberately no retention duration: how long an execution's logs stay
+# retrievable is the existing idle-on-complete cleanup grace (task
+# `idle_timeout_minutes`, then `worker.idleOnComplete`, then the Oz default).
+debugLogCapture:
+  # Mounts a dedicated ephemeral volume for the capture root. Disable only if
+  # the container filesystem already provides suitable scratch space.
+  enabled: true
+  # Size of the ephemeral volume. Keep it at or above maxTotalBytes so the
+  # worker's own accounting, not the volume, is the binding limit.
+  sizeLimit: 1Gi
+  # Mount path for the capture volume, used as the worker's capture root.
+  directory: /var/lib/oz/debug-logs
+  # Process-local disk budget shared by captures and request snapshots.
+  maxTotalBytes: 1073741824
+  # Per-execution retention bound. May not exceed the protocol's 64 MiB ceiling.
+  maxExecutionBytes: 67108864
+  # Concurrent snapshot/upload handlers per worker process.
+  maxConcurrentUploads: 2
 
 # Metrics export uses the OpenTelemetry autoexport package, so the operator
 # selects the exporter via standard OpenTelemetry environment variables. When
