@@ -91,7 +91,11 @@ commandBackend:
   # Optional cancel command.
   cancelCommand: ""
   dispatchTimeout: "60s"
-  # Environment variables for dispatch and cancel commands.
+  # Environment variables for dispatch and cancel commands. Literal `value`
+  # fields are rendered into the chart ConfigMap and must not contain
+  # credentials. Load secrets into the worker Pod with
+  # worker.extraEnv[].valueFrom.secretKeyRef (or a read-only Secret volume),
+  # then omit `value` here to inherit them.
   environment: []
 
 kubernetesBackend:
