@@ -117,6 +117,10 @@ The dispatch contract:
 Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
 The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
 
+To host the worker in Kubernetes, see [Command backend with Helm](#command-backend-with-helm).
+
+Reference scripts are available in [`examples/command-backend`](./examples/command-backend).
+
 ### Kubernetes
 
 The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
@@ -186,6 +190,44 @@ pod_template:
               key: secret-key
 ```
 
+#### Command backend with Helm
+
+The worker can run in Kubernetes while dispatching tasks through the command backend instead of creating task Jobs. Opt in with `backend.type=command`. `commandBackend.dispatchCommand` is required; `cancelCommand`, `dispatchTimeout`, and `environment` are optional.
+
+Add scripts through an existing ConfigMap and credentials through a Secret. The example below uses the reference [`dispatch.py` and `cancel.py` scripts](./examples/command-backend). These scripts require Python, which is not included in the standard worker image, so replace the image with one that includes Python to run the example. Use an image with the appropriate tools for your own scripts.
+
+Create the script ConfigMap:
+
+```bash
+kubectl create configmap oz-dispatch \
+  --from-file=dispatch.py=examples/command-backend/dispatch.py \
+  --from-file=cancel.py=examples/command-backend/cancel.py
+```
+
+Then configure the chart and mounted scripts:
+
+```yaml
+backend:
+  type: command
+commandBackend:
+  dispatchCommand: "python3 /opt/oz/dispatch.py"
+  cancelCommand: "python3 /opt/oz/cancel.py"
+image:
+  repository: warpdotdev/oz-agent-worker
+  tag: v2026-08-04-15-14-28
+worker:
+  workerId: my-worker
+  extraVolumes:
+    - name: dispatch-scripts
+      configMap:
+        name: oz-dispatch
+  extraVolumeMounts:
+    - name: dispatch-scripts
+      mountPath: /opt/oz
+      readOnly: true
+```
+
+The standard image above is the base only. Build a custom image from it that includes the language runtime for your scripts, then set `image.repository` / `image.tag` to that image. For example, to run Python scripts, add Python to the image.
 
 ### Helm Chart
 

@@ -35,6 +35,11 @@ worker:
   idleOnComplete: ""
   extraArgs: []
   extraEnv: []
+  # Additional volumes and mounts on the long-lived worker pod. Use these to
+  # attach ConfigMaps or Secrets containing dispatch scripts, SSH keys, or
+  # other required files. The chart does not create those resources.
+  extraVolumes: []
+  extraVolumeMounts: []
   deploymentAnnotations: {}
   podAnnotations: {}
   podLabels: {}
@@ -70,6 +75,24 @@ worker:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# Execution backend for tasks claimed by this worker.
+# - kubernetes (default): create one Kubernetes Job per task.
+# - command: invoke a customer-provided dispatch command using HTTPS, gRPC,
+#   SSH, or similar.
+backend:
+  type: kubernetes
+# Used only when backend.type=command. Provide scripts/tools via image overrides and/or
+# worker.extraVolumes / worker.extraVolumeMounts.
+commandBackend:
+  # Required when backend.type=command. Shell command run via /bin/sh -c;
+  # receives the task DispatchPayload as JSON on stdin.
+  dispatchCommand: ""
+  # Optional cancel command.
+  cancelCommand: ""
+  dispatchTimeout: "60s"
+  # Environment variables for dispatch and cancel commands.
+  environment: []
 
 kubernetesBackend:
   namespace: ""
