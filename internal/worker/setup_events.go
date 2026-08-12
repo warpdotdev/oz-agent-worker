@@ -74,6 +74,28 @@ func newSetupEventReporter(serverRootURL string, assignment *types.TaskAssignmen
 	}
 }
 
+// startPhase begins timing one setup phase and returns a completion func that
+// reports the phase result. See startPhaseIf for the reporting rules.
+func (r *setupEventReporter) startPhase(ctx context.Context, eventName string) func(isError bool) {
+	return r.startPhaseIf(ctx, eventName, true)
+}
+
+// startPhaseIf begins timing one setup phase and returns a completion func
+// that reports the phase with the elapsed wall-clock time. The func skips the
+// report when shouldReport is false, and when the context was cancelled: a
+// cancelled phase is neither a success nor a failure, so recording it would
+// skew both the duration and the failure-rate metrics. Both funcs are safe to
+// call on a nil reporter.
+func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string, shouldReport bool) func(isError bool) {
+	start := time.Now()
+	return func(isError bool) {
+		if r == nil || !shouldReport || ctx.Err() != nil {
+			return
+		}
+		r.reportPhase(ctx, eventName, start, time.Now(), isError)
+	}
+}
+
 // reportPhase asynchronously reports one completed setup phase. It is safe to
 // call on a nil reporter and never blocks task execution.
 func (r *setupEventReporter) reportPhase(ctx context.Context, eventName string, start, finish time.Time, isError bool) {

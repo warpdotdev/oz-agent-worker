@@ -8,12 +8,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-const (
-	kubernetesTaskContainerName  = "task"
-	kubernetesSetupContainerName = "setup"
-	kubernetesSidecarInitPrefix  = "copy-sidecar-"
-)
-
 // kubernetesSetupPhaseTracker derives task setup phase durations from pod
 // status snapshots and reports each phase once. The kubelet performs the
 // image pulls and container starts for this backend, so the worker cannot

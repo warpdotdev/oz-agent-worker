@@ -45,6 +45,14 @@ const (
 	kubernetesExecutionIDLabel       = "oz-execution-id"
 	kubernetesExecutionHashLabel     = "oz-execution-hash"
 
+	// Task pod container names. kubernetesSetupPhaseTracker keys its phase
+	// reporting on these, so both the pod-spec construction below and the
+	// tracker must use these constants: a rename in one place would silently
+	// break phase reporting in the other.
+	kubernetesTaskContainerName  = "task"
+	kubernetesSetupContainerName = "setup"
+	kubernetesSidecarInitPrefix  = "copy-sidecar-"
+
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
 	maxLogBytes = 1 << 20 // 1 MiB
@@ -208,7 +216,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			},
 		})
 		initContainers = append(initContainers, corev1.Container{
-			Name:            fmt.Sprintf("copy-sidecar-%d", i),
+			Name:            fmt.Sprintf("%s%d", kubernetesSidecarInitPrefix, i),
 			Image:           sidecar.Image,
 			ImagePullPolicy: pullPolicy,
 			Command: []string{
@@ -240,7 +248,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	if b.config.SetupCommand != "" {
 		setupEnv := envStringsToKubernetesEnv(mainEnv)
 		initContainers = append(initContainers, corev1.Container{
-			Name:            "setup",
+			Name:            kubernetesSetupContainerName,
 			Image:           params.DockerImage,
 			ImagePullPolicy: pullPolicy,
 			Command:         []string{"/bin/sh", "-c", b.config.SetupCommand},
@@ -252,7 +260,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	mainEnvVars := envStringsToKubernetesEnv(mainEnv)
 	mainContainer := corev1.Container{
-		Name:            "task",
+		Name:            kubernetesTaskContainerName,
 		Image:           params.DockerImage,
 		ImagePullPolicy: pullPolicy,
 		Command: []string{
@@ -306,12 +314,12 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
-	jobCreateStart := time.Now()
+	doneJobCreate := params.SetupEvents.startPhase(ctx, SetupEventJobCreate)
 	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		params.SetupEvents.reportPhase(ctx, SetupEventJobCreate, jobCreateStart, time.Now(), true)
+		doneJobCreate(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err)))
 	}
-	params.SetupEvents.reportPhase(ctx, SetupEventJobCreate, jobCreateStart, time.Now(), false)
+	doneJobCreate(false)
 
 	// Derive the remaining setup phases (scheduling, sidecar prep, setup
 	// command, task container start) from pod status snapshots delivered by
@@ -562,7 +570,7 @@ func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, 
 
 	taskIdx := -1
 	for i, c := range podSpec.Containers {
-		if c.Name == "task" {
+		if c.Name == kubernetesTaskContainerName {
 			taskIdx = i
 			break
 		}

@@ -161,8 +161,77 @@ func TestSetupEventReporterSend(t *testing.T) {
 	})
 }
 
+func TestSetupEventReporterStartPhase(t *testing.T) {
+	newReporter := func(t *testing.T) (*setupEventReporter, *capturedSetupEvents) {
+		t.Helper()
+		captured := &capturedSetupEvents{events: make(map[string]clientEventRequest)}
+		server := httptest.NewServer(captured.handler())
+		t.Cleanup(server.Close)
+		reporter := newSetupEventReporter(server.URL, &types.TaskAssignmentMessage{
+			TaskID:  "task-123",
+			EnvVars: map[string]string{warpAPIKeyEnv: "api-key"},
+		})
+		return reporter, captured
+	}
+
+	t.Run("reports a completed phase", func(t *testing.T) {
+		reporter, captured := newReporter(t)
+		done := reporter.startPhase(context.Background(), SetupEventImagePull)
+		done(false)
+		captured.waitForEvents(t, 1)
+		event, ok := captured.get(SetupEventImagePull)
+		if !ok {
+			t.Fatal("missing image pull event")
+		}
+		if event.Payload.IsError {
+			t.Error("is_error = true, want false")
+		}
+	})
+
+	t.Run("reports a failed phase", func(t *testing.T) {
+		reporter, captured := newReporter(t)
+		reporter.startPhase(context.Background(), SetupEventContainerStart)(true)
+		captured.waitForEvents(t, 1)
+		event, ok := captured.get(SetupEventContainerStart)
+		if !ok {
+			t.Fatal("missing container start event")
+		}
+		if !event.Payload.IsError {
+			t.Error("is_error = false, want true")
+		}
+	})
+
+	t.Run("skips a phase interrupted by cancellation", func(t *testing.T) {
+		reporter, captured := newReporter(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := reporter.startPhase(ctx, SetupEventImagePull)
+		// The task was cancelled while the phase ran: the phase must not be
+		// recorded as a failure (or as a truncated success).
+		cancel()
+		done(true)
+		time.Sleep(50 * time.Millisecond)
+		if captured.count() != 0 {
+			t.Errorf("event count after cancelled phase = %d, want 0", captured.count())
+		}
+	})
+
+	t.Run("skips a phase when shouldReport is false", func(t *testing.T) {
+		reporter, captured := newReporter(t)
+		// Mirrors the Docker backend skipping sidecar prep for tasks without
+		// sidecars.
+		done := reporter.startPhaseIf(context.Background(), SetupEventSidecarPrep, false)
+		done(false)
+		time.Sleep(50 * time.Millisecond)
+		if captured.count() != 0 {
+			t.Errorf("event count for skipped phase = %d, want 0", captured.count())
+		}
+	})
+}
+
 func TestSetupEventReporterNilSafe(t *testing.T) {
 	var reporter *setupEventReporter
 	// Must not panic.
 	reporter.reportPhase(context.Background(), SetupEventImagePull, time.Now(), time.Now(), false)
+	reporter.startPhase(context.Background(), SetupEventImagePull)(false)
+	reporter.startPhaseIf(context.Background(), SetupEventSidecarPrep, true)(true)
 }

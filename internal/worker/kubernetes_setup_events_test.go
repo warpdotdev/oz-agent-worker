@@ -92,10 +92,10 @@ func TestKubernetesSetupPhaseTrackerReportsPhasesOnce(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(base)},
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
-				{Name: "copy-sidecar-0"},
-				{Name: "setup"},
+				{Name: kubernetesSidecarInitPrefix + "0"},
+				{Name: kubernetesSetupContainerName},
 			},
-			Containers: []corev1.Container{{Name: "task"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName}},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -106,12 +106,12 @@ func TestKubernetesSetupPhaseTrackerReportsPhasesOnce(t *testing.T) {
 				},
 			},
 			InitContainerStatuses: []corev1.ContainerStatus{
-				terminatedInitStatus("copy-sidecar-0", base.Add(6*time.Second), base.Add(18*time.Second), 0),
-				terminatedInitStatus("setup", base.Add(18*time.Second), base.Add(25*time.Second), 0),
+				terminatedInitStatus(kubernetesSidecarInitPrefix+"0", base.Add(6*time.Second), base.Add(18*time.Second), 0),
+				terminatedInitStatus(kubernetesSetupContainerName, base.Add(18*time.Second), base.Add(25*time.Second), 0),
 			},
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name: "task",
+					Name: kubernetesTaskContainerName,
 					State: corev1.ContainerState{
 						Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(base.Add(30 * time.Second))},
 					},
@@ -159,7 +159,7 @@ func TestKubernetesSetupPhaseTrackerImageVolumesMode(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(base)},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "task"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName}},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -171,7 +171,7 @@ func TestKubernetesSetupPhaseTrackerImageVolumesMode(t *testing.T) {
 			},
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name: "task",
+					Name: kubernetesTaskContainerName,
 					State: corev1.ContainerState{
 						Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(base.Add(20 * time.Second))},
 					},
@@ -205,14 +205,14 @@ func TestKubernetesSetupPhaseTrackerReportsSidecarFailure(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(base)},
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
-				{Name: "copy-sidecar-0"},
-				{Name: "copy-sidecar-1"},
+				{Name: kubernetesSidecarInitPrefix + "0"},
+				{Name: kubernetesSidecarInitPrefix + "1"},
 			},
-			Containers: []corev1.Container{{Name: "task"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName}},
 		},
 		Status: corev1.PodStatus{
 			InitContainerStatuses: []corev1.ContainerStatus{
-				terminatedInitStatus("copy-sidecar-0", base.Add(time.Second), base.Add(4*time.Second), 1),
+				terminatedInitStatus(kubernetesSidecarInitPrefix+"0", base.Add(time.Second), base.Add(4*time.Second), 1),
 			},
 		},
 	}
@@ -240,14 +240,14 @@ func TestKubernetesSetupPhaseTrackerWaitsForAllSidecars(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(base)},
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
-				{Name: "copy-sidecar-0"},
-				{Name: "copy-sidecar-1"},
+				{Name: kubernetesSidecarInitPrefix + "0"},
+				{Name: kubernetesSidecarInitPrefix + "1"},
 			},
-			Containers: []corev1.Container{{Name: "task"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName}},
 		},
 		Status: corev1.PodStatus{
 			InitContainerStatuses: []corev1.ContainerStatus{
-				terminatedInitStatus("copy-sidecar-0", base.Add(time.Second), base.Add(4*time.Second), 0),
+				terminatedInitStatus(kubernetesSidecarInitPrefix+"0", base.Add(time.Second), base.Add(4*time.Second), 0),
 			},
 		},
 	}
@@ -259,7 +259,7 @@ func TestKubernetesSetupPhaseTrackerWaitsForAllSidecars(t *testing.T) {
 	}
 
 	pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses,
-		terminatedInitStatus("copy-sidecar-1", base.Add(4*time.Second), base.Add(9*time.Second), 0))
+		terminatedInitStatus(kubernetesSidecarInitPrefix+"1", base.Add(4*time.Second), base.Add(9*time.Second), 0))
 	tracker.observePod(context.Background(), pod)
 	captured.waitForEvents(t, 1)
 
