@@ -97,6 +97,11 @@ kubernetesBackend:
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
+  # How long a task pod may keep failing to mount a volume (FailedMount) before
+  # the task is failed. The kubelet retries mounts on its own, so transient
+  # cluster conditions should not fail a task immediately. Set to "0s" to never
+  # fail a task on mount failures.
+  volumeMountTimeout: "2m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).

@@ -76,6 +76,7 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 				ActiveDeadlineSeconds: int64Ptr(900),
 				WorkspaceSizeLimit:    "8Gi",
 				UnschedulableTimeout:  stringPtr("2m"),
+				VolumeMountTimeout:    stringPtr("90s"),
 				PodTemplate: rawYAMLNodeFromString(t, `
 serviceAccountName: task-runner
 imagePullSecrets:
@@ -124,6 +125,9 @@ containers:
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 2*time.Minute {
 		t.Fatalf("UnschedulableTimeout = %v, want 2m", wc.Kubernetes.UnschedulableTimeout)
+	}
+	if wc.Kubernetes.VolumeMountTimeout == nil || *wc.Kubernetes.VolumeMountTimeout != 90*time.Second {
+		t.Fatalf("VolumeMountTimeout = %v, want 90s", wc.Kubernetes.VolumeMountTimeout)
 	}
 	if wc.Kubernetes.PodTemplate == nil {
 		t.Fatal("expected PodTemplate to be set")
@@ -262,6 +266,24 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 0 {
 		t.Fatalf("UnschedulableTimeout = %v, want 0", wc.Kubernetes.UnschedulableTimeout)
+	}
+}
+
+func TestMergeConfigKubernetesInvalidVolumeMountTimeout(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "worker-123",
+		Backend: config.BackendConfig{
+			Kubernetes: &config.KubernetesConfig{
+				VolumeMountTimeout: stringPtr("nope"),
+			},
+		},
+	}
+
+	if _, err := mergeConfig(fileConfig); err == nil {
+		t.Fatal("expected error for invalid volume_mount_timeout")
 	}
 }
 

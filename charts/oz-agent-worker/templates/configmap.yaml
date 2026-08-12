@@ -22,6 +22,7 @@ data:
         image_pull_policy: {{ .Values.kubernetesBackend.imagePullPolicy | quote }}
         use_image_volumes: {{ .Values.kubernetesBackend.useImageVolumes }}
         unschedulable_timeout: {{ .Values.kubernetesBackend.unschedulableTimeout | quote }}
+        volume_mount_timeout: {{ .Values.kubernetesBackend.volumeMountTimeout | quote }}
         {{- if .Values.kubernetesBackend.preflightImage }}
         preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}
         {{- end }}

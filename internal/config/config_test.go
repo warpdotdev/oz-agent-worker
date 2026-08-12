@@ -313,6 +313,7 @@ backend:
     active_deadline_seconds: 1800
     workspace_size_limit: "10Gi"
     unschedulable_timeout: "2m"
+    volume_mount_timeout: "90s"
     pod_template:
       serviceAccountName: "oz-agent-worker"
       imagePullSecrets:
@@ -358,6 +359,9 @@ backend:
 	}
 	if cfg.Backend.Kubernetes.UnschedulableTimeout == nil || *cfg.Backend.Kubernetes.UnschedulableTimeout != "2m" {
 		t.Fatalf("unschedulable_timeout = %v, want 2m", cfg.Backend.Kubernetes.UnschedulableTimeout)
+	}
+	if cfg.Backend.Kubernetes.VolumeMountTimeout == nil || *cfg.Backend.Kubernetes.VolumeMountTimeout != "90s" {
+		t.Fatalf("volume_mount_timeout = %v, want 90s", cfg.Backend.Kubernetes.VolumeMountTimeout)
 	}
 	if cfg.Backend.Kubernetes.PodTemplate == nil {
 		t.Fatal("expected pod_template to be non-nil")

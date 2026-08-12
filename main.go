@@ -202,6 +202,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ttlSecondsAfterFinish *int32
 			workspaceSizeLimit    *resource.Quantity
 			unschedulableTimeout  *time.Duration
+			volumeMountTimeout    *time.Duration
 			podTemplate           *corev1.PodSpec
 			preflightResources    *corev1.ResourceRequirements
 		)
@@ -235,6 +236,13 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.unschedulable_timeout %q: %w", *kc.UnschedulableTimeout, err)
 				}
 				unschedulableTimeout = &duration
+			}
+			if kc.VolumeMountTimeout != nil {
+				duration, err := time.ParseDuration(*kc.VolumeMountTimeout)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.volume_mount_timeout %q: %w", *kc.VolumeMountTimeout, err)
+				}
+				volumeMountTimeout = &duration
 			}
 			if kc.PodTemplate != nil {
 				yamlBytes, err := yaml.Marshal(kc.PodTemplate.Node)
@@ -279,6 +287,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			TTLSecondsAfterFinish: ttlSecondsAfterFinish,
 			WorkspaceSizeLimit:    workspaceSizeLimit,
 			UnschedulableTimeout:  unschedulableTimeout,
+			VolumeMountTimeout:    volumeMountTimeout,
 			TaskEnv:               copyStringMap(cliEnv),
 			PodTemplate:           podTemplate,
 			PreflightResources:    preflightResources,

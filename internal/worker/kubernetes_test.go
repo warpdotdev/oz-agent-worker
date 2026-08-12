@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -164,7 +165,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "unschedulable") {
 			t.Fatalf("expected unschedulable error, got %v", err)
 		}
@@ -188,7 +189,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err != nil {
 			t.Fatalf("expected no error before timeout, got %v", err)
 		}
@@ -212,11 +213,230 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err != nil {
 			t.Fatalf("expected no error when timeout is disabled, got %v", err)
 		}
 	})
+}
+
+func TestInspectPodFailureRespectsVolumeMountTimeout(t *testing.T) {
+	ctx := context.Background()
+	// The transient kubelet condition from a real self-hosted worker failure:
+	// the mount is retried by Kubernetes and normally succeeds.
+	mountEvent := corev1.Event{
+		Type:    corev1.EventTypeWarning,
+		Reason:  "FailedMount",
+		Message: `MountVolume.SetUp failed for volume "istiod-ca-cert" : failed to sync configmap cache: timed out waiting for the condition`,
+	}
+	newBackend := func(timeout *time.Duration) *KubernetesBackend {
+		fakeClient := fake.NewSimpleClientset()
+		fakeClient.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &corev1.EventList{Items: []corev1.Event{mountEvent}}, nil
+		})
+		return &KubernetesBackend{
+			config: KubernetesBackendConfig{
+				Namespace:          "agents",
+				VolumeMountTimeout: timeout,
+			},
+			clientset: fakeClient,
+		}
+	}
+	pendingPod := func(age time.Duration) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "task-pod",
+				Namespace:         "agents",
+				UID:               "task-pod-uid",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+	}
+
+	t.Run("does not fail before the timeout", func(t *testing.T) {
+		backend := newBackend(durationPtr(2 * time.Minute))
+		if err := backend.inspectPodFailure(ctx, pendingPod(10*time.Second), graceTransientMountFailures); err != nil {
+			t.Fatalf("expected transient mount failure to be tolerated, got %v", err)
+		}
+	})
+
+	t.Run("fails after the timeout", func(t *testing.T) {
+		backend := newBackend(durationPtr(2 * time.Minute))
+		err := backend.inspectPodFailure(ctx, pendingPod(3*time.Minute), graceTransientMountFailures)
+		if err == nil || !strings.Contains(err.Error(), "failed to mount a volume") {
+			t.Fatalf("expected persistent mount failure, got %v", err)
+		}
+	})
+
+	t.Run("does not fail when the timeout is disabled", func(t *testing.T) {
+		backend := newBackend(durationPtr(0))
+		if err := backend.inspectPodFailure(ctx, pendingPod(time.Hour), graceTransientMountFailures); err != nil {
+			t.Fatalf("expected no error when the timeout is disabled, got %v", err)
+		}
+	})
+
+	t.Run("fails immediately when the grace window does not apply", func(t *testing.T) {
+		// Callers that cannot wait - the startup preflight and terminally
+		// failed Jobs - still surface the event right away.
+		backend := newBackend(durationPtr(2 * time.Minute))
+		err := backend.inspectPodFailure(ctx, pendingPod(time.Second), failFastOnMountFailures)
+		if err == nil || !strings.Contains(err.Error(), "failed to mount a volume") {
+			t.Fatalf("expected immediate mount failure, got %v", err)
+		}
+	})
+}
+
+func TestWatchStreamDetachesAndReconnectsAfterFailedReopen(t *testing.T) {
+	ctx := context.Background()
+	var (
+		attempts int
+		watchers []*watch.FakeWatcher
+	)
+	open := func(context.Context) (watch.Interface, error) {
+		attempts++
+		if attempts == 2 {
+			return nil, fmt.Errorf(`Get "https://100.100.0.1:443/apis/batch/v1/namespaces/warp-oz/jobs?watch=true": dial tcp 100.100.0.1:443: connect: connection refused`)
+		}
+		watcher := watch.NewFake()
+		watchers = append(watchers, watcher)
+		return watcher, nil
+	}
+
+	stream, err := newWatchStream(ctx, "Job task-job", open)
+	if err != nil {
+		t.Fatalf("unexpected error establishing watch: %v", err)
+	}
+	t.Cleanup(func() {
+		stream.stop()
+		for _, watcher := range watchers {
+			watcher.Stop()
+		}
+	})
+	if stream.resultChan() == nil {
+		t.Fatal("expected an attached watch after the initial open")
+	}
+
+	// A failed reopen must detach the stream rather than surface an error: a
+	// nil channel is never ready in the caller's select, so the safety poll
+	// carries the task until the watch is back.
+	stream.reopen(ctx)
+	if stream.resultChan() != nil {
+		t.Fatal("expected the stream to detach after a failed reopen")
+	}
+	if stream.backoff != watchReopenInitialBackoff {
+		t.Fatalf("backoff = %s, want %s", stream.backoff, watchReopenInitialBackoff)
+	}
+
+	// Retries are rate-limited by the backoff.
+	stream.retry(ctx)
+	if attempts != 2 {
+		t.Fatalf("open attempts = %d, want 2 (retry should wait out the backoff)", attempts)
+	}
+
+	stream.retryAt = time.Now().Add(-time.Millisecond)
+	stream.retry(ctx)
+	if stream.resultChan() == nil {
+		t.Fatal("expected the stream to reconnect once the backoff elapsed")
+	}
+	if attempts != 3 {
+		t.Fatalf("open attempts = %d, want 3", attempts)
+	}
+	if stream.backoff != 0 {
+		t.Fatalf("backoff = %s, want it reset after a successful reopen", stream.backoff)
+	}
+}
+
+func TestNextWatchReopenBackoffIsBounded(t *testing.T) {
+	if got := nextWatchReopenBackoff(0); got != watchReopenInitialBackoff {
+		t.Fatalf("first backoff = %s, want %s", got, watchReopenInitialBackoff)
+	}
+	backoff := watchReopenInitialBackoff
+	for i := 0; i < 20; i++ {
+		backoff = nextWatchReopenBackoff(backoff)
+		if backoff > watchReopenMaxBackoff {
+			t.Fatalf("backoff = %s, want it capped at %s", backoff, watchReopenMaxBackoff)
+		}
+	}
+	if backoff != watchReopenMaxBackoff {
+		t.Fatalf("backoff = %s, want it to reach the %s cap", backoff, watchReopenMaxBackoff)
+	}
+}
+
+// Regression test for tasks failed by a brief API server outage: the pod watch
+// closes and cannot be re-established, which used to fail the whole task. The
+// task must keep running on the remaining watch and the safety poll.
+func TestExecuteTaskSurvivesFailedPodRewatch(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	podWatchAttempts := 0
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		podWatchAttempts++
+		if podWatchAttempts > 1 {
+			return true, nil, fmt.Errorf(`Get "https://100.100.0.1:443/api/v1/namespaces/warp-oz/pods?watch=true": dial tcp 100.100.0.1:443: connect: connection refused`)
+		}
+		// Drop the pod watch as soon as the task loop starts consuming it.
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			podWatch.Stop()
+		}()
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected a failed pod re-watch to be tolerated, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
+	}
+	if podWatchAttempts < 2 {
+		t.Fatalf("pod watch attempts = %d, want the closed watch to be reopened", podWatchAttempts)
+	}
 }
 
 func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
@@ -248,7 +468,7 @@ func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, graceTransientMountFailures)
 	if err == nil {
 		t.Fatal("expected container termination error")
 	}
@@ -301,7 +521,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err != nil {
 			t.Fatalf("expected no failure for terminated restartable sidecar, got %v", err)
 		}
@@ -321,7 +541,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "init container copy-sidecar-0") {
 			t.Fatalf("expected init container failure, got %v", err)
 		}
@@ -350,7 +570,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "container task") || !strings.Contains(err.Error(), "exited with code 2") {
 			t.Fatalf("expected task container failure attribution, got %v", err)
 		}
@@ -371,7 +591,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, graceTransientMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "ImagePullBackOff") {
 			t.Fatalf("expected image pull failure, got %v", err)
 		}

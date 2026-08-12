@@ -80,6 +80,7 @@ type KubernetesConfig struct {
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
 	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
+	VolumeMountTimeout    *string           `yaml:"volume_mount_timeout"`
 	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
 	// Docker image. When set, the worker overrides the server-provided sidecar image for
 	// that harness (or injects a new sidecar entry if the server did not send one),
