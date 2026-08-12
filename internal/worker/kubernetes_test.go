@@ -239,7 +239,7 @@ func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
 			Phase: corev1.PodFailed,
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name: "task",
+					Name: kubernetesTaskContainerName,
 					State: corev1.ContainerState{
 						Terminated: &corev1.ContainerStateTerminated{
 							ExitCode: 143,
@@ -281,7 +281,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 	}
 	podSpec := corev1.PodSpec{
 		InitContainers: []corev1.Container{
-			{Name: "copy-sidecar-0"},
+			{Name: kubernetesSidecarInitPrefix + "0"},
 			{Name: "zookeeper", RestartPolicy: &sidecarPolicy},
 		},
 	}
@@ -314,7 +314,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 			Status: corev1.PodStatus{
 				InitContainerStatuses: []corev1.ContainerStatus{
 					{
-						Name: "copy-sidecar-0",
+						Name: kubernetesSidecarInitPrefix + "0",
 						State: corev1.ContainerState{
 							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
 						},
@@ -343,7 +343,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 				},
 				ContainerStatuses: []corev1.ContainerStatus{
 					{
-						Name: "task",
+						Name: kubernetesTaskContainerName,
 						State: corev1.ContainerState{
 							Terminated: &corev1.ContainerStateTerminated{ExitCode: 2},
 						},
@@ -448,7 +448,7 @@ func TestExecuteTaskSucceedsWhenSidecarExitsBeforeJobComplete(t *testing.T) {
 					},
 					ContainerStatuses: []corev1.ContainerStatus{
 						{
-							Name: "task",
+							Name: kubernetesTaskContainerName,
 							State: corev1.ContainerState{
 								Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
 							},
@@ -622,7 +622,7 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 			},
 		},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "task", Image: "ubuntu:22.04"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName, Image: "ubuntu:22.04"}},
 		},
 	}
 	if _, err := fakeClient.CoreV1().Pods("agents").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
@@ -713,7 +713,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 				},
 				Containers: []corev1.Container{
 					{
-						Name:            "task",
+						Name:            kubernetesTaskContainerName,
 						ImagePullPolicy: corev1.PullAlways,
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -733,7 +733,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 	}
 
 	mainContainer := corev1.Container{
-		Name:            "task",
+		Name:            kubernetesTaskContainerName,
 		Image:           "ubuntu:22.04",
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Command:         []string{"/bin/sh", "-c", "run-task"},
@@ -764,7 +764,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 
 	var taskContainer *corev1.Container
 	for i := range podSpec.Containers {
-		if podSpec.Containers[i].Name == "task" {
+		if podSpec.Containers[i].Name == kubernetesTaskContainerName {
 			taskContainer = &podSpec.Containers[i]
 			break
 		}
@@ -880,7 +880,7 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 			PodTemplate: &corev1.PodSpec{
 				Containers: []corev1.Container{
 					{
-						Name: "task",
+						Name: kubernetesTaskContainerName,
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
 								corev1.ResourceCPU:    resource.MustParse("500m"),
@@ -894,14 +894,14 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 		},
 	}
 
-	mainContainer := corev1.Container{Name: "task", Image: "ubuntu:22.04"}
+	mainContainer := corev1.Container{Name: kubernetesTaskContainerName, Image: "ubuntu:22.04"}
 	applyInstanceShapeToContainer(&mainContainer, &types.InstanceShape{Vcpus: 4, MemoryGb: 16})
 
 	podSpec := backend.buildTaskPodSpec(nil, nil, mainContainer)
 
 	var tc *corev1.Container
 	for i := range podSpec.Containers {
-		if podSpec.Containers[i].Name == "task" {
+		if podSpec.Containers[i].Name == kubernetesTaskContainerName {
 			tc = &podSpec.Containers[i]
 			break
 		}
@@ -1047,7 +1047,7 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
 		t.Fatalf("expected only setup init container, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
-	if createdJob.Spec.Template.Spec.InitContainers[0].Name != "setup" {
+	if createdJob.Spec.Template.Spec.InitContainers[0].Name != kubernetesSetupContainerName {
 		t.Fatalf("expected setup init container, got %q", createdJob.Spec.Template.Spec.InitContainers[0].Name)
 	}
 	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
@@ -1207,7 +1207,7 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 		t.Fatalf("expected copy init container plus setup, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
 	copyInit := createdJob.Spec.Template.Spec.InitContainers[0]
-	if copyInit.Name != "copy-sidecar-0" {
+	if copyInit.Name != kubernetesSidecarInitPrefix+"0" {
 		t.Fatalf("expected copy-sidecar init container, got %q", copyInit.Name)
 	}
 	if copyInit.Image != "registry.internal/agent:1.0" {

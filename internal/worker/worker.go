@@ -575,6 +575,18 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		}
 	}
 
+	setupEvents := newSetupEventReporter(w.config.ServerRootURL, assignment)
+	if setupEvents == nil {
+		// Warn once per task: a fleet-wide config or credential change that
+		// disables setup event reporting must be visible in the worker logs,
+		// not silently drop the setup metrics.
+		reason := "the worker has no server root URL configured"
+		if w.config.ServerRootURL != "" {
+			reason = warpAPIKeyEnv + " is not present in the task assignment env vars"
+		}
+		log.Warnf(w.ctx, "Setup event reporting is disabled for task %s: %s", assignment.TaskID, reason)
+	}
+
 	return &TaskParams{
 		TaskID:        assignment.TaskID,
 		ExecutionID:   assignment.ExecutionID,
@@ -584,6 +596,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage:   dockerImage,
 		Sidecars:      sidecars,
 		InstanceShape: assignment.InstanceShape,
+		SetupEvents:   setupEvents,
 	}
 }
 
