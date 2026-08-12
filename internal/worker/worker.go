@@ -584,6 +584,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage:   dockerImage,
 		Sidecars:      sidecars,
 		InstanceShape: assignment.InstanceShape,
+		SetupEvents:   newSetupEventReporter(w.config.ServerRootURL, assignment),
 	}
 }
 

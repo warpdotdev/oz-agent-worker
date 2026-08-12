@@ -103,15 +103,21 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
+	pullStart := time.Now()
 	if err := b.pullImage(ctx, imageName, authStr); err != nil {
+		params.SetupEvents.reportPhase(ctx, SetupEventImagePull, pullStart, time.Now(), true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
+	params.SetupEvents.reportPhase(ctx, SetupEventImagePull, pullStart, time.Now(), false)
 
 	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
+	sidecarPrepStart := time.Now()
 	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
 	if err != nil {
+		params.SetupEvents.reportPhase(ctx, SetupEventSidecarPrep, sidecarPrepStart, time.Now(), true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
+	params.SetupEvents.reportPhase(ctx, SetupEventSidecarPrep, sidecarPrepStart, time.Now(), false)
 
 	// Start with common env vars, then append backend-specific config env vars.
 	envVars := make([]string, len(params.EnvVars))
@@ -141,11 +147,13 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		Resources: dockerResourcesForShape(params.InstanceShape),
 	}
 
+	containerStartBegin := time.Now()
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
 	if err != nil {
+		params.SetupEvents.reportPhase(ctx, SetupEventContainerStart, containerStartBegin, time.Now(), true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err)))
 	}
 
@@ -163,8 +171,10 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	}()
 
 	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+		params.SetupEvents.reportPhase(ctx, SetupEventContainerStart, containerStartBegin, time.Now(), true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
 	}
+	params.SetupEvents.reportPhase(ctx, SetupEventContainerStart, containerStartBegin, time.Now(), false)
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
 
