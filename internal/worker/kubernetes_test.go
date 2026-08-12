@@ -223,16 +223,24 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 func TestInspectPodFailureRespectsVolumeMountTimeout(t *testing.T) {
 	ctx := context.Background()
 	// The transient kubelet condition from a real self-hosted worker failure:
-	// the mount is retried by Kubernetes and normally succeeds.
-	mountEvent := corev1.Event{
-		Type:    corev1.EventTypeWarning,
-		Reason:  "FailedMount",
-		Message: `MountVolume.SetUp failed for volume "istiod-ca-cert" : failed to sync configmap cache: timed out waiting for the condition`,
+	// the mount is retried by Kubernetes and normally succeeds. firstSeen and
+	// lastSeen are ages, so the window is exercised through the event's own
+	// clock rather than the pod's.
+	mountEvent := func(firstSeen, lastSeen time.Duration) corev1.Event {
+		return corev1.Event{
+			ObjectMeta:     metav1.ObjectMeta{Name: "task-pod.failedmount", Namespace: "agents"},
+			Type:           corev1.EventTypeWarning,
+			Reason:         "FailedMount",
+			Message:        `MountVolume.SetUp failed for volume "istiod-ca-cert" : failed to sync configmap cache: timed out waiting for the condition`,
+			FirstTimestamp: metav1.NewTime(time.Now().Add(-firstSeen)),
+			LastTimestamp:  metav1.NewTime(time.Now().Add(-lastSeen)),
+			Count:          3,
+		}
 	}
-	newBackend := func(timeout *time.Duration) *KubernetesBackend {
+	newBackend := func(timeout *time.Duration, events ...corev1.Event) *KubernetesBackend {
 		fakeClient := fake.NewSimpleClientset()
 		fakeClient.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
-			return true, &corev1.EventList{Items: []corev1.Event{mountEvent}}, nil
+			return true, &corev1.EventList{Items: events}, nil
 		})
 		return &KubernetesBackend{
 			config: KubernetesBackendConfig{
@@ -254,23 +262,35 @@ func TestInspectPodFailureRespectsVolumeMountTimeout(t *testing.T) {
 		}
 	}
 
-	t.Run("does not fail before the timeout", func(t *testing.T) {
-		backend := newBackend(durationPtr(2 * time.Minute))
-		if err := backend.inspectPodFailure(ctx, pendingPod(10*time.Second), graceTransientMountFailures); err != nil {
+	t.Run("does not fail a mount failure that just started", func(t *testing.T) {
+		// The pod is far older than the timeout because scheduling and image
+		// pulls precede the first mount attempt. Aging the failure from the pod
+		// would spend the whole grace window before the kubelet ever tried.
+		backend := newBackend(durationPtr(2*time.Minute), mountEvent(5*time.Second, 0))
+		if err := backend.inspectPodFailure(ctx, pendingPod(10*time.Minute), graceTransientMountFailures); err != nil {
 			t.Fatalf("expected transient mount failure to be tolerated, got %v", err)
 		}
 	})
 
-	t.Run("fails after the timeout", func(t *testing.T) {
-		backend := newBackend(durationPtr(2 * time.Minute))
-		err := backend.inspectPodFailure(ctx, pendingPod(3*time.Minute), graceTransientMountFailures)
+	t.Run("fails once the failure has persisted", func(t *testing.T) {
+		backend := newBackend(durationPtr(2*time.Minute), mountEvent(3*time.Minute, time.Second))
+		err := backend.inspectPodFailure(ctx, pendingPod(4*time.Minute), graceTransientMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "failed to mount a volume") {
 			t.Fatalf("expected persistent mount failure, got %v", err)
 		}
 	})
 
+	t.Run("does not fail on a mount failure the kubelet stopped reporting", func(t *testing.T) {
+		// The mount failed early and was resolved; the event lingers. A pod
+		// still pending for an unrelated reason must not be failed with it.
+		backend := newBackend(durationPtr(2*time.Minute), mountEvent(10*time.Minute, 9*time.Minute))
+		if err := backend.inspectPodFailure(ctx, pendingPod(15*time.Minute), graceTransientMountFailures); err != nil {
+			t.Fatalf("expected a stale mount failure to be ignored, got %v", err)
+		}
+	})
+
 	t.Run("does not fail when the timeout is disabled", func(t *testing.T) {
-		backend := newBackend(durationPtr(0))
+		backend := newBackend(durationPtr(0), mountEvent(time.Hour, 0))
 		if err := backend.inspectPodFailure(ctx, pendingPod(time.Hour), graceTransientMountFailures); err != nil {
 			t.Fatalf("expected no error when the timeout is disabled, got %v", err)
 		}
@@ -279,7 +299,7 @@ func TestInspectPodFailureRespectsVolumeMountTimeout(t *testing.T) {
 	t.Run("fails immediately when the grace window does not apply", func(t *testing.T) {
 		// Callers that cannot wait - the startup preflight and terminally
 		// failed Jobs - still surface the event right away.
-		backend := newBackend(durationPtr(2 * time.Minute))
+		backend := newBackend(durationPtr(2*time.Minute), mountEvent(time.Second, 0))
 		err := backend.inspectPodFailure(ctx, pendingPod(time.Second), failFastOnMountFailures)
 		if err == nil || !strings.Contains(err.Error(), "failed to mount a volume") {
 			t.Fatalf("expected immediate mount failure, got %v", err)
@@ -317,6 +337,9 @@ func TestWatchStreamDetachesAndReconnectsAfterFailedReopen(t *testing.T) {
 		t.Fatal("expected an attached watch after the initial open")
 	}
 
+	// Pretend the watch has been up for a while so the reopen below is due.
+	stream.lastAttempt = time.Now().Add(-watchReopenInterval)
+
 	// A failed reopen must detach the stream rather than surface an error: a
 	// nil channel is never ready in the caller's select, so the safety poll
 	// carries the task until the watch is back.
@@ -335,6 +358,7 @@ func TestWatchStreamDetachesAndReconnectsAfterFailedReopen(t *testing.T) {
 	}
 
 	stream.retryAt = time.Now().Add(-time.Millisecond)
+	stream.lastAttempt = time.Now().Add(-watchReopenInterval)
 	stream.retry(ctx)
 	if stream.resultChan() == nil {
 		t.Fatal("expected the stream to reconnect once the backoff elapsed")
@@ -344,6 +368,51 @@ func TestWatchStreamDetachesAndReconnectsAfterFailedReopen(t *testing.T) {
 	}
 	if stream.backoff != 0 {
 		t.Fatalf("backoff = %s, want it reset after a successful reopen", stream.backoff)
+	}
+}
+
+// A watch that is re-established successfully and then closes immediately must
+// not spin the task loop against an API server that is already struggling.
+func TestWatchStreamRateLimitsReopenAttempts(t *testing.T) {
+	ctx := context.Background()
+	var (
+		attempts int
+		watchers []*watch.FakeWatcher
+	)
+	open := func(context.Context) (watch.Interface, error) {
+		attempts++
+		// Every watch is dead on arrival, exactly like an API server that
+		// accepts the watch and drops it.
+		watcher := watch.NewFake()
+		watchers = append(watchers, watcher)
+		go watcher.Stop()
+		return watcher, nil
+	}
+
+	stream, err := newWatchStream(ctx, "Job task-job", open)
+	if err != nil {
+		t.Fatalf("unexpected error establishing watch: %v", err)
+	}
+	t.Cleanup(func() {
+		stream.stop()
+		for _, watcher := range watchers {
+			watcher.Stop()
+		}
+	})
+
+	// Drive the reopen path the way a closed channel does, as fast as the loop
+	// would. Only the first attempt is due; the rest must be turned away.
+	for i := 0; i < 1000; i++ {
+		stream.reopen(ctx)
+	}
+	if attempts != 1 {
+		t.Fatalf("open attempts = %d, want 1: reopen must be rate-limited whatever the outcome", attempts)
+	}
+	if stream.resultChan() != nil {
+		t.Fatal("expected the stream to stay detached until the next attempt is due")
+	}
+	if wait := time.Until(stream.retryAt); wait <= 0 || wait > watchReopenInterval {
+		t.Fatalf("retryAt is %s away, want a positive wait of at most %s", wait, watchReopenInterval)
 	}
 }
 
@@ -360,6 +429,122 @@ func TestNextWatchReopenBackoffIsBounded(t *testing.T) {
 	}
 	if backoff != watchReopenMaxBackoff {
 		t.Fatalf("backoff = %s, want it to reach the %s cap", backoff, watchReopenMaxBackoff)
+	}
+}
+
+// The design rests on the safety poll carrying the task while the watches are
+// down, so this exercises that path on its own: both watches are dropped and
+// never come back, the first poll fails the way the API server did during the
+// incident, and the task still completes off the following poll.
+func TestExecuteTaskCompletesThroughSafetyPollWhileWatchesAreDown(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	unreachable := fmt.Errorf(`dial tcp 100.100.0.1:443: connect: connection refused`)
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+
+	// Both watches are established once and then dropped; every reconnect
+	// fails, so the task loop is left with the poll alone.
+	dropWatchOnce := func(watcher *watch.FakeWatcher) func(k8stesting.Action) (bool, watch.Interface, error) {
+		attempts := 0
+		return func(k8stesting.Action) (bool, watch.Interface, error) {
+			attempts++
+			if attempts > 1 {
+				return true, nil, unreachable
+			}
+			go func() {
+				time.Sleep(5 * time.Millisecond)
+				watcher.Stop()
+			}()
+			return true, watcher, nil
+		}
+	}
+	fakeClient.PrependWatchReactor("jobs", dropWatchOnce(jobWatch))
+	fakeClient.PrependWatchReactor("pods", dropWatchOnce(podWatch))
+
+	jobGets := 0
+	fakeClient.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		jobGets++
+		if jobGets == 1 {
+			// The same blip that killed the watch also hits the first poll.
+			return true, nil, unreachable
+		}
+		if createdJob == nil {
+			t.Fatal("expected the task job to be created before polling")
+		}
+		completedJob := createdJob.DeepCopy()
+		completedJob.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+		}
+		return true, completedJob, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset:      fakeClient,
+		safetyInterval: 20 * time.Millisecond,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected the safety poll to carry the task, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
+	}
+	if jobGets < 2 {
+		t.Fatalf("job polls = %d, want the first failed poll to be tolerated and retried", jobGets)
+	}
+}
+
+func TestSafetyPollFailuresAreOnlyTerminalOncePersistent(t *testing.T) {
+	var tracker pollFailureTracker
+
+	if elapsed, tolerated := tracker.record(); !tolerated || elapsed > time.Second {
+		t.Fatalf("first failure: elapsed = %s, tolerated = %v; want a tolerated failure", elapsed, tolerated)
+	}
+	if _, tolerated := tracker.record(); !tolerated {
+		t.Fatal("expected consecutive failures inside the window to stay tolerated")
+	}
+
+	// Once the failures have run past the tolerance window they are terminal.
+	tracker.since = time.Now().Add(-safetyPollFailureTolerance - time.Second)
+	elapsed, tolerated := tracker.record()
+	if tolerated {
+		t.Fatalf("expected failures lasting %s to be terminal", elapsed)
+	}
+	if elapsed < safetyPollFailureTolerance {
+		t.Fatalf("elapsed = %s, want at least %s", elapsed, safetyPollFailureTolerance)
+	}
+
+	// A poll that succeeds clears the streak.
+	tracker.reset()
+	if _, tolerated := tracker.record(); !tolerated {
+		t.Fatal("expected the streak to restart after a successful poll")
 	}
 }
 
@@ -388,7 +573,9 @@ func TestExecuteTaskSurvivesFailedPodRewatch(t *testing.T) {
 	})
 	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
 		go func() {
-			time.Sleep(60 * time.Millisecond)
+			// Complete after the reopen ticker has had a chance to retry the
+			// dropped pod watch and fail.
+			time.Sleep(1200 * time.Millisecond)
 			if createdJob == nil {
 				return
 			}

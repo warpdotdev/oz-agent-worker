@@ -29,10 +29,14 @@ const (
 	defaultWorkspaceMountPath        = "/workspace"
 	defaultSetupEnvironmentFile      = "/workspace/.oz-env"
 	watchSafetyInterval              = 30 * time.Second
+	watchReopenInterval              = 1 * time.Second
 	watchReopenInitialBackoff        = 1 * time.Second
 	watchReopenMaxBackoff            = watchSafetyInterval
+	watchOpenTimeout                 = 10 * time.Second
+	safetyPollFailureTolerance       = 3 * time.Minute
 	defaultUnschedulableFailureDelay = 30 * time.Second
 	defaultVolumeMountFailureDelay   = 2 * time.Minute
+	volumeMountEventActiveWindow     = 1 * time.Minute
 	startupPreflightPollInterval     = 500 * time.Millisecond
 	startupPreflightTimeout          = 15 * time.Second
 	kubernetesBackendTypeName        = "kubernetes"
@@ -108,6 +112,18 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 type KubernetesBackend struct {
 	config    KubernetesBackendConfig
 	clientset kubernetes.Interface
+	// safetyInterval overrides how often ExecuteTask runs its safety poll.
+	// Zero means watchSafetyInterval; tests shorten it so they can observe the
+	// poll without waiting on the production cadence.
+	safetyInterval time.Duration
+}
+
+// safetyPollInterval returns the effective safety-poll cadence.
+func (b *KubernetesBackend) safetyPollInterval() time.Duration {
+	if b.safetyInterval > 0 {
+		return b.safetyInterval
+	}
+	return watchSafetyInterval
 }
 
 func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
@@ -359,14 +375,25 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 	defer podStream.stop()
 
-	safetyTicker := time.NewTicker(watchSafetyInterval)
+	safetyTicker := time.NewTicker(b.safetyPollInterval())
 	defer safetyTicker.Stop()
+
+	// Reconnecting a detached watch is driven by its own timer so a brief
+	// outage costs about a second rather than a full safety-poll interval.
+	reopenTicker := time.NewTicker(watchReopenInterval)
+	defer reopenTicker.Stop()
+
+	var pollFailures pollFailureTracker
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Infof(ctx, "Stopping local watch for Kubernetes Job %s after task context cancellation", jobName)
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+
+		case <-reopenTicker.C:
+			jobStream.retry(ctx)
+			podStream.retry(ctx)
 
 		case event, ok := <-jobStream.resultChan():
 			if !ok {
@@ -411,18 +438,25 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 
 		case <-safetyTicker.C:
-			// Reconnect any watch that could not be reopened earlier. Until it is
-			// back, the poll below is what keeps the task observable.
-			jobStream.retry(ctx)
-			podStream.retry(ctx)
-
-			// Safety-net poll: catch anything the watches may have missed.
+			// Safety-net poll: catch anything the watches may have missed, and
+			// carry the task outright while a watch is detached. The API server
+			// being briefly unreachable is the very condition this has to survive,
+			// so a failed call is only terminal once it keeps failing.
 			jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
-				if apierrors.IsNotFound(err) && ctx.Err() != nil {
-					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+				if apierrors.IsNotFound(err) {
+					// The Job is gone rather than unreachable; waiting cannot help.
+					if ctx.Err() != nil {
+						return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+					}
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err)))
 				}
-				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err)))
+				elapsed, tolerated := pollFailures.record()
+				if tolerated {
+					log.Warnf(ctx, "Safety poll failed to get Job %s: %v; retrying (the task fails after %s of consecutive failures)", jobName, err, safetyPollFailureTolerance)
+					continue
+				}
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s for %s: %w", jobName, elapsed.Round(time.Second), err)))
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
 				return result.outcome()
@@ -430,8 +464,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 			pods, err := b.listTaskPods(ctx, executionID)
 			if err != nil {
-				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)))
+				elapsed, tolerated := pollFailures.record()
+				if tolerated {
+					log.Warnf(ctx, "Safety poll failed to list task pods for Job %s: %v; retrying (the task fails after %s of consecutive failures)", jobName, err, safetyPollFailureTolerance)
+					continue
+				}
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s for %s: %w", jobName, elapsed.Round(time.Second), err)))
 			}
+			pollFailures.reset()
+
 			if failure := b.detectPodFailure(ctx, pods, graceTransientMountFailures); failure != nil {
 				return executeError(failure)
 			}
@@ -516,32 +557,48 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 	return nil
 }
 
-// watchStream keeps a Kubernetes watch open for the lifetime of a task.
+// watchStream keeps a Kubernetes watch open for the lifetime of a task, and
+// owns the policy for re-establishing it.
 //
 // A watch is an optimization, not a correctness requirement: ExecuteTask's
-// safety poll independently observes Job and pod state every
-// watchSafetyInterval. Failing to re-establish a watch - for example because
-// the API server is briefly unreachable - therefore must not fail the task.
-// Instead the stream detaches (resultChan reports a nil channel, which never
-// becomes ready in a select, so the safety poll carries the task) and
-// reconnects on a later tick with bounded backoff.
+// safety poll independently observes Job and pod state. Failing to
+// re-establish a watch - for example because the API server is briefly
+// unreachable - therefore must not fail the task. Instead the stream detaches
+// (resultChan reports a nil channel, which never becomes ready in a select, so
+// the safety poll carries the task) and reconnects from ExecuteTask's reopen
+// ticker.
+//
+// Reconnects are rate-limited to one attempt per watchReopenInterval whatever
+// the outcome, because a watch that is re-established successfully and then
+// closes immediately would otherwise spin the task loop against an API server
+// that is already struggling. Attempts that fail additionally back off
+// exponentially up to watchReopenMaxBackoff.
 type watchStream struct {
 	// name describes the watched resource in log messages, e.g. "Job oz-task-1".
 	name    string
 	open    func(context.Context) (watch.Interface, error)
 	watcher watch.Interface
-	backoff time.Duration
-	retryAt time.Time
+	// cancel stops the context backing the current watch. client-go ends a
+	// watch when its context is cancelled, so this must outlive the open call
+	// and is only invoked when the watch is discarded.
+	cancel      context.CancelFunc
+	backoff     time.Duration
+	lastAttempt time.Time
+	retryAt     time.Time
 }
 
 // newWatchStream establishes the initial watch. Unlike a later reconnect, this
 // failure is reported to the caller: it happens before the task loop starts.
 func newWatchStream(ctx context.Context, name string, open func(context.Context) (watch.Interface, error)) (*watchStream, error) {
-	watcher, err := open(ctx)
+	stream := &watchStream{name: name, open: open}
+	watcher, cancel, err := stream.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &watchStream{name: name, open: open, watcher: watcher}, nil
+	stream.watcher = watcher
+	stream.cancel = cancel
+	stream.lastAttempt = time.Now()
+	return stream, nil
 }
 
 // resultChan returns the current watch's event channel, or nil while the
@@ -554,18 +611,28 @@ func (w *watchStream) resultChan() <-chan watch.Event {
 	return w.watcher.ResultChan()
 }
 
-// reopen re-establishes the watch. A failure detaches the stream and schedules
-// a retry instead of failing the task.
+// reopen discards the current watch and re-establishes it. An attempt that is
+// not due yet, or that fails, leaves the stream detached and schedules a retry
+// instead of failing the task.
 func (w *watchStream) reopen(ctx context.Context) {
 	w.stop()
-	watcher, err := w.open(ctx)
+
+	if elapsed := time.Since(w.lastAttempt); elapsed < watchReopenInterval {
+		w.retryAt = w.lastAttempt.Add(watchReopenInterval)
+		log.Debugf(ctx, "Skipping reconnect of %s: last attempt was %s ago, retrying in %s", w.name, elapsed.Round(time.Millisecond), time.Until(w.retryAt).Round(time.Millisecond))
+		return
+	}
+	w.lastAttempt = time.Now()
+
+	watcher, cancel, err := w.dial(ctx)
 	if err != nil {
 		w.backoff = nextWatchReopenBackoff(w.backoff)
 		w.retryAt = time.Now().Add(w.backoff)
-		log.Warnf(ctx, "Failed to re-watch %s: %v; relying on the safety poll and retrying no sooner than %s from now", w.name, err, w.backoff)
+		log.Warnf(ctx, "Failed to re-watch %s: %v; relying on the safety poll and retrying in %s", w.name, err, w.backoff)
 		return
 	}
 	w.watcher = watcher
+	w.cancel = cancel
 	w.backoff = 0
 	w.retryAt = time.Time{}
 }
@@ -578,10 +645,32 @@ func (w *watchStream) retry(ctx context.Context) {
 	w.reopen(ctx)
 }
 
+// dial opens the watch, bounding how long the call may block the task loop.
+// The watch's context has to outlive the call, so the bound is enforced with a
+// watchdog that cancels only while the call is in flight: against an API
+// server that blackholes connections, giving up quickly is strictly better
+// than stalling the loop on the dialer, because the safety poll is the
+// fallback either way.
+func (w *watchStream) dial(ctx context.Context) (watch.Interface, context.CancelFunc, error) {
+	watchCtx, cancel := context.WithCancel(ctx)
+	watchdog := time.AfterFunc(watchOpenTimeout, cancel)
+	watcher, err := w.open(watchCtx)
+	watchdog.Stop()
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return watcher, cancel, nil
+}
+
 func (w *watchStream) stop() {
 	if w.watcher != nil {
 		w.watcher.Stop()
 		w.watcher = nil
+	}
+	if w.cancel != nil {
+		w.cancel()
+		w.cancel = nil
 	}
 }
 
@@ -593,6 +682,30 @@ func nextWatchReopenBackoff(current time.Duration) time.Duration {
 		return doubled
 	}
 	return watchReopenMaxBackoff
+}
+
+// pollFailureTracker tolerates transient safety-poll failures. The poll is
+// what carries a task while a watch is detached, so it must survive the same
+// brief API server outages the watch does: a single failed call is not
+// terminal, but failures that persist past safetyPollFailureTolerance are.
+type pollFailureTracker struct {
+	since time.Time
+}
+
+// record notes a failed poll and reports how long consecutive failures have
+// lasted and whether they are still within the tolerance window.
+func (t *pollFailureTracker) record() (time.Duration, bool) {
+	now := time.Now()
+	if t.since.IsZero() {
+		t.since = now
+	}
+	elapsed := now.Sub(t.since)
+	return elapsed, elapsed < safetyPollFailureTolerance
+}
+
+// reset clears the failure streak after a poll that fully succeeded.
+func (t *pollFailureTracker) reset() {
+	t.since = time.Time{}
 }
 
 func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch.Interface, error) {
@@ -1094,13 +1207,14 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 			log.Warnf(ctx, "Failed to list events for pod %s: %v", pod.Name, err)
 			return nil
 		}
-		for _, event := range events.Items {
-			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
-				if mountGrace == failFastOnMountFailures || b.shouldFailVolumeMount(pod) {
-					return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, b.podEventFailureError(pod, "failed to mount a volume", event))
-				}
-				log.Debugf(ctx, "Pod %s has not mounted a volume yet; waiting for the kubelet to retry. Kubernetes event message: %s", pod.Name, event.Message)
+		if mountFailures := volumeMountFailureEvents(events.Items); len(mountFailures) > 0 {
+			// Report the most recent occurrence: it is the one describing the
+			// condition the pod is still stuck on.
+			latest := mountFailures[len(mountFailures)-1]
+			if mountGrace == failFastOnMountFailures || b.shouldFailVolumeMount(mountFailures) {
+				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, b.podEventFailureError(pod, "failed to mount a volume", latest))
 			}
+			log.Debugf(ctx, "Pod %s has not mounted a volume yet; waiting for the kubelet to retry. Kubernetes event message: %s", pod.Name, latest.Message)
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
@@ -1555,17 +1669,94 @@ func (b *KubernetesBackend) shouldFailUnschedulablePod(pod *corev1.Pod) bool {
 	return time.Since(pod.CreationTimestamp.Time) >= *b.config.UnschedulableTimeout
 }
 
-// shouldFailVolumeMount reports whether a pod that cannot mount a volume has
-// been failing for long enough to be treated as terminal. The kubelet retries
-// mounts on its own and transient cluster conditions (for example a configmap
-// cache that has not synced yet) clear within seconds, so FailedMount gets the
-// same bounded grace window that unschedulable pods get instead of failing the
-// task on the first event.
-func (b *KubernetesBackend) shouldFailVolumeMount(pod *corev1.Pod) bool {
+// volumeMountFailureEvents returns the pod events reporting a failed volume
+// mount, oldest reported occurrence first.
+func volumeMountFailureEvents(events []corev1.Event) []corev1.Event {
+	var failures []corev1.Event
+	for i := range events {
+		if events[i].Reason == "FailedMount" || strings.Contains(events[i].Message, "MountVolume.SetUp failed") {
+			failures = append(failures, events[i])
+		}
+	}
+	sort.SliceStable(failures, func(i, j int) bool {
+		return eventLastSeen(&failures[i]).Before(eventLastSeen(&failures[j]))
+	})
+	return failures
+}
+
+// shouldFailVolumeMount reports whether a pod's volume mount failures have
+// persisted long enough, and recently enough, to be treated as terminal.
+//
+// The kubelet retries mounts on its own and transient cluster conditions (for
+// example a configmap cache that has not synced yet) clear within seconds, so
+// FailedMount gets a bounded grace window like unschedulable pods do. Unlike
+// an unschedulable pod, though, a mount failure cannot be aged from the pod:
+// the first mount attempt only happens once the pod is scheduled and its
+// images are available, so pod age both fails pods whose grace was spent
+// before the first attempt and fails pods on a mount failure the kubelet
+// resolved long ago. The window is therefore measured across the events
+// themselves: the failures must have started at least VolumeMountTimeout ago
+// and must still be current. A pod that has stopped reporting mount failures
+// is treated as recovered, and any real recurrence restarts the assessment
+// with a fresh event.
+func (b *KubernetesBackend) shouldFailVolumeMount(events []corev1.Event) bool {
 	if b.config.VolumeMountTimeout == nil || *b.config.VolumeMountTimeout <= 0 {
 		return false
 	}
-	return time.Since(pod.CreationTimestamp.Time) >= *b.config.VolumeMountTimeout
+
+	var firstSeen, lastSeen time.Time
+	for i := range events {
+		if first := eventFirstSeen(&events[i]); !first.IsZero() && (firstSeen.IsZero() || first.Before(firstSeen)) {
+			firstSeen = first
+		}
+		if last := eventLastSeen(&events[i]); last.After(lastSeen) {
+			lastSeen = last
+		}
+	}
+	if firstSeen.IsZero() && lastSeen.IsZero() {
+		// Nothing to age the failure by. Fall back to failing, as the worker
+		// did before the grace window existed, rather than waiting on a
+		// condition that can never be evaluated.
+		return true
+	}
+	if time.Since(lastSeen) > volumeMountEventActiveWindow {
+		// The kubelet has stopped reporting the failure. Its retry backoff is
+		// far shorter than this window, so silence means the mount is no
+		// longer the reason the pod is pending.
+		return false
+	}
+	return time.Since(firstSeen) >= *b.config.VolumeMountTimeout
+}
+
+// eventFirstSeen returns when an event was first reported, falling back across
+// the fields that different Kubernetes versions and event clients populate.
+func eventFirstSeen(event *corev1.Event) time.Time {
+	switch {
+	case !event.FirstTimestamp.IsZero():
+		return event.FirstTimestamp.Time
+	case !event.EventTime.IsZero():
+		return event.EventTime.Time
+	case !event.LastTimestamp.IsZero():
+		return event.LastTimestamp.Time
+	default:
+		return event.CreationTimestamp.Time
+	}
+}
+
+// eventLastSeen returns the most recent reported occurrence of an event.
+func eventLastSeen(event *corev1.Event) time.Time {
+	switch {
+	case event.Series != nil && !event.Series.LastObservedTime.IsZero():
+		return event.Series.LastObservedTime.Time
+	case !event.LastTimestamp.IsZero():
+		return event.LastTimestamp.Time
+	case !event.EventTime.IsZero():
+		return event.EventTime.Time
+	case !event.FirstTimestamp.IsZero():
+		return event.FirstTimestamp.Time
+	default:
+		return event.CreationTimestamp.Time
+	}
 }
 
 func isImmediateContainerFailure(reason string) bool {
