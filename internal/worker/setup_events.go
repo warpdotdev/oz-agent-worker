@@ -27,10 +27,18 @@ const (
 	// ingests them as setup metrics, labeled with the run's current timeline
 	// phase (oz_run_claimed while the container is still being prepared).
 	// SetupEventContainerStart spans container creation through a successful
-	// start call.
+	// start call on the Docker backend, and the span from the end of init
+	// (or scheduling) to the task container start on the Kubernetes backend.
 	SetupEventImagePull      = "setup_worker_image_pull"
 	SetupEventSidecarPrep    = "setup_worker_sidecar_prep"
 	SetupEventContainerStart = "setup_worker_container_start"
+
+	// Kubernetes-backend phases. SetupEventJobCreate is timed directly around
+	// the Job create call; the other phases are derived from pod status by
+	// kubernetesSetupPhaseTracker.
+	SetupEventJobCreate    = "setup_worker_job_create"
+	SetupEventPodSchedule  = "setup_worker_pod_schedule"
+	SetupEventSetupCommand = "setup_worker_setup_command"
 
 	setupEventRequestTimeout = 5 * time.Second
 )

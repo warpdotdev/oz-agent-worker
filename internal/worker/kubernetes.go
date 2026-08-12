@@ -306,9 +306,17 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
+	jobCreateStart := time.Now()
 	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
+		params.SetupEvents.reportPhase(ctx, SetupEventJobCreate, jobCreateStart, time.Now(), true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err)))
 	}
+	params.SetupEvents.reportPhase(ctx, SetupEventJobCreate, jobCreateStart, time.Now(), false)
+
+	// Derive the remaining setup phases (scheduling, sidecar prep, setup
+	// command, task container start) from pod status snapshots delivered by
+	// the pod watch and the safety poll below.
+	setupPhases := newKubernetesSetupPhaseTracker(params.SetupEvents)
 
 	defer func() {
 		if ctx.Err() != nil {
@@ -402,6 +410,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				continue
 			}
+			setupPhases.observePod(ctx, pod)
 			if failure := b.inspectPodFailure(ctx, pod); failure != nil {
 				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
 				if logs != "" {
@@ -426,6 +435,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			pods, err := b.listTaskPods(ctx, executionID)
 			if err != nil {
 				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)))
+			}
+			for i := range pods {
+				setupPhases.observePod(ctx, &pods[i])
 			}
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
 				return executeError(failure)
