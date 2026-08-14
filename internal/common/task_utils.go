@@ -53,17 +53,19 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 				args = append(args, "--mcp", string(b))
 			}
 		}
-	}
 
-	// Pass the computer use setting. An explicit value wins; if not set
-	// (including a nil snapshot), defaults to true.
-	if isComputerUseEnabled(task.AgentConfigSnapshot) {
-		args = append(args, "--computer-use")
-	} else {
-		args = append(args, "--no-computer-use")
-	}
+		// Pass the computer use setting. An explicit value wins; if not set,
+		// defaults to true.
+		computerUseEnabled := true
+		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
+			computerUseEnabled = *task.AgentConfigSnapshot.ComputerUseEnabled
+		}
+		if computerUseEnabled {
+			args = append(args, "--computer-use")
+		} else {
+			args = append(args, "--no-computer-use")
+		}
 
-	if task.AgentConfigSnapshot != nil {
 		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
 		// configured, pair it with --bedrock-role-region so the Warp client's
 		// STS AssumeRoleWithWebIdentity call targets the right regional endpoint.
@@ -128,16 +130,6 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
-}
-
-// isComputerUseEnabled reports whether computer use should be enabled, given
-// a possibly-nil agent config snapshot. An explicit value always wins; if not
-// set, defaults to true.
-func isComputerUseEnabled(snapshot *types.AmbientAgentConfig) bool {
-	if snapshot == nil || snapshot.ComputerUseEnabled == nil {
-		return true
-	}
-	return *snapshot.ComputerUseEnabled
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string

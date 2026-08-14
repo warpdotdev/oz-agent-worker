@@ -357,15 +357,6 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--computer-use", "--harness", "claude", "--idle-on-complete"},
 		},
-		{
-			// A nil snapshot still gets the default.
-			name: "adds --computer-use by default when AgentConfigSnapshot itself is nil",
-			task: &types.Task{
-				AgentConfigSnapshot: nil,
-			},
-			opts:     TaskAugmentOptions{},
-			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
-		},
 	}
 
 	for _, tt := range tests {
