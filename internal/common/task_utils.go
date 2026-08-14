@@ -54,10 +54,9 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		// Pass the computer use setting. An explicit value wins; when unset,
-		// computer use defaults to enabled for Oz-harness runs and disabled
-		// for third-party harnesses. Mirrors warp-server's IsComputerUseEnabled.
-		computerUseEnabled := task.AgentConfigSnapshot.Harness.IsOz()
+		// Pass the computer use setting. An explicit value wins; if not set,
+		// defaults to true.
+		computerUseEnabled := true
 		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
 			computerUseEnabled = *task.AgentConfigSnapshot.ComputerUseEnabled
 		}
