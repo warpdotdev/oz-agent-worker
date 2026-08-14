@@ -53,15 +53,17 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 				args = append(args, "--mcp", string(b))
 			}
 		}
+	}
 
-		// Pass the computer use setting. An explicit value wins; if not set,
-		// defaults to true.
-		if isComputerUseEnabled(task.AgentConfigSnapshot) {
-			args = append(args, "--computer-use")
-		} else {
-			args = append(args, "--no-computer-use")
-		}
+	// Pass the computer use setting. An explicit value wins; if not set
+	// (including a nil snapshot), defaults to true.
+	if isComputerUseEnabled(task.AgentConfigSnapshot) {
+		args = append(args, "--computer-use")
+	} else {
+		args = append(args, "--no-computer-use")
+	}
 
+	if task.AgentConfigSnapshot != nil {
 		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
 		// configured, pair it with --bedrock-role-region so the Warp client's
 		// STS AssumeRoleWithWebIdentity call targets the right regional endpoint.
@@ -105,9 +107,6 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		if task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs != nil && *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs > 0 {
 			args = append(args, "--snapshot-script-timeout", fmt.Sprintf("%ds", *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs))
 		}
-	} else {
-		// A nil snapshot still gets the computer-use default.
-		args = append(args, "--computer-use")
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
