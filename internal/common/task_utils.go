@@ -57,11 +57,7 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		// Pass the computer use setting. An explicit value wins; when unset,
 		// computer use defaults to enabled regardless of harness. Mirrors
 		// warp-server's IsComputerUseEnabled.
-		computerUseEnabled := true
-		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
-			computerUseEnabled = *task.AgentConfigSnapshot.ComputerUseEnabled
-		}
-		if computerUseEnabled {
+		if isComputerUseEnabled(task.AgentConfigSnapshot) {
 			args = append(args, "--computer-use")
 		} else {
 			args = append(args, "--no-computer-use")
@@ -110,6 +106,10 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 		if task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs != nil && *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs > 0 {
 			args = append(args, "--snapshot-script-timeout", fmt.Sprintf("%ds", *task.AgentConfigSnapshot.SnapshotScriptTimeoutSecs))
 		}
+	} else {
+		// A nil snapshot still gets the computer-use default: mirrors
+		// warp-server's IsComputerUseEnabled, which is nil-safe.
+		args = append(args, "--computer-use")
 	}
 
 	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
@@ -131,6 +131,16 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
+}
+
+// isComputerUseEnabled reports whether computer use should be enabled, given
+// a possibly-nil agent config snapshot. An explicit value always wins; a nil
+// snapshot or a nil field both default to true, regardless of harness.
+func isComputerUseEnabled(snapshot *types.AmbientAgentConfig) bool {
+	if snapshot == nil || snapshot.ComputerUseEnabled == nil {
+		return true
+	}
+	return *snapshot.ComputerUseEnabled
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string

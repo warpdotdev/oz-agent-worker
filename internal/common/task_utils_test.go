@@ -357,6 +357,19 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			opts:     TaskAugmentOptions{},
 			expected: []string{"agent", "run", "--computer-use", "--harness", "claude", "--idle-on-complete"},
 		},
+		{
+			// A nil AgentConfigSnapshot must still get the computer-use default
+			// (matches warp-server's nil-safe IsComputerUseEnabled); previously the
+			// resolution and emission both lived inside the non-nil snapshot guard,
+			// so this path silently emitted neither --computer-use nor
+			// --no-computer-use.
+			name: "adds --computer-use by default when AgentConfigSnapshot itself is nil",
+			task: &types.Task{
+				AgentConfigSnapshot: nil,
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
 	}
 
 	for _, tt := range tests {
