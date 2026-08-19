@@ -368,3 +368,170 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestAugmentArgsForTask_ComputerUseModel covers the emission gating for
+// --computer-use-model. The flag is newer than the agent CLI some pinned
+// workers run, and an unknown flag fails a run at startup, so it is emitted
+// only when the run actually configures a model: computer use on, Oz harness,
+// non-empty value. Every other case must produce the same args as before the
+// field existed.
+func TestAugmentArgsForTask_ComputerUseModel(t *testing.T) {
+	baseArgs := []string{"agent", "run"}
+
+	tests := []struct {
+		name     string
+		task     *types.Task
+		opts     TaskAugmentOptions
+		expected []string
+	}{
+		{
+			name: "emits --computer-use-model for an Oz run that pinned a model",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			name: "emits --computer-use-model when computer use is explicitly enabled",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseEnabled: boolPtr(true),
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			// An absent harness is the Oz harness, which is the common case for a
+			// factory-configured run; IsOz treats nil as Oz.
+			name: "emits --computer-use-model for an explicit oz harness",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{Type: strPtr("oz")},
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent", "run",
+				"--computer-use",
+				"--computer-use-model", "claude-4-5-haiku",
+				"--harness", "oz",
+				"--idle-on-complete",
+			},
+		},
+		{
+			// IsOz treats four shapes as Oz: a nil Harness, a Harness with a nil
+			// Type, a Type that is the empty string, and an explicit "oz". This case
+			// and the next pin the two middle forms, which a real snapshot can carry
+			// and which the other cases here do not reach. Were either to stop
+			// counting as Oz, the pin would silently vanish and the run would fall
+			// back to the automatic computer use model — the bug this emission fixes.
+			name: "emits --computer-use-model when the harness block carries no type",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			name: "emits --computer-use-model when the harness type is empty",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{Type: strPtr("")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			name: "emits --computer-use-model alongside the Oz --model",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ModelID:            strPtr("auto"),
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+				},
+			},
+			opts: TaskAugmentOptions{},
+			expected: []string{
+				"agent", "run",
+				"--model", "auto",
+				"--computer-use",
+				"--computer-use-model", "claude-4-5-haiku",
+				"--idle-on-complete",
+			},
+		},
+		{
+			name: "trims the pinned model before emitting it",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("  claude-4-5-haiku  "),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			// The byte-identical baseline: an unconfigured snapshot must produce
+			// exactly the args it produced before this field existed, which is what
+			// keeps older pinned agent CLIs working.
+			name: "omits --computer-use-model when no model is pinned",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
+		{
+			name: "omits --computer-use-model when the pinned model is whitespace",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("   "),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
+		},
+		{
+			// The subagent the model configures never runs, so emitting the flag
+			// would only risk an unknown-argument failure for no behavior change.
+			name: "omits --computer-use-model when computer use is disabled",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseEnabled: boolPtr(false),
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--no-computer-use", "--idle-on-complete"},
+		},
+		{
+			name: "omits --computer-use-model under a third-party harness",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{Type: strPtr("codex")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--harness", "codex", "--idle-on-complete"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := AugmentArgsForTask(tt.task, append([]string{}, baseArgs...), tt.opts)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, tt.expected)
+			}
+		})
+	}
+}
