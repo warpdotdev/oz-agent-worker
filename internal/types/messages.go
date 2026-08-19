@@ -160,6 +160,7 @@ type AmbientAgentConfig struct {
 	SkillSpec                 *string                    `json:"skill_spec,omitempty"`
 	MCPServers                map[string]json.RawMessage `json:"mcp_servers,omitempty"`
 	ComputerUseEnabled        *bool                      `json:"computer_use_enabled,omitempty"`
+	ComputerUseModelID        *string                    `json:"computer_use_model_id,omitempty"`
 	IdleTimeoutMinutes        *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness                   *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets        *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`

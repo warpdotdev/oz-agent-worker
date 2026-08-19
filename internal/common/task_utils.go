@@ -66,6 +66,13 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			args = append(args, "--no-computer-use")
 		}
 
+		// Pin the model for the computer use subagent, which is distinct from --model.
+		if computerUseEnabled && task.AgentConfigSnapshot.Harness.IsOz() && task.AgentConfigSnapshot.ComputerUseModelID != nil {
+			if computerUseModel := strings.TrimSpace(*task.AgentConfigSnapshot.ComputerUseModelID); computerUseModel != "" {
+				args = append(args, "--computer-use-model", computerUseModel)
+			}
+		}
+
 		// Forward the AWS Bedrock OIDC role ARN, if any. When a region is also
 		// configured, pair it with --bedrock-role-region so the Warp client's
 		// STS AssumeRoleWithWebIdentity call targets the right regional endpoint.
