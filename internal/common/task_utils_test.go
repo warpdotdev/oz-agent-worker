@@ -425,6 +425,34 @@ func TestAugmentArgsForTask_ComputerUseModel(t *testing.T) {
 			},
 		},
 		{
+			// IsOz treats four shapes as Oz: a nil Harness, a Harness with a nil
+			// Type, a Type that is the empty string, and an explicit "oz". This case
+			// and the next pin the two middle forms, which a real snapshot can carry
+			// and which the other cases here do not reach. Were either to stop
+			// counting as Oz, the pin would silently vanish and the run would fall
+			// back to the automatic computer use model — the bug this emission fixes.
+			name: "emits --computer-use-model when the harness block carries no type",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
+			name: "emits --computer-use-model when the harness type is empty",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					ComputerUseModelID: strPtr("claude-4-5-haiku"),
+					Harness:            &types.Harness{Type: strPtr("")},
+				},
+			},
+			opts:     TaskAugmentOptions{},
+			expected: []string{"agent", "run", "--computer-use", "--computer-use-model", "claude-4-5-haiku", "--idle-on-complete"},
+		},
+		{
 			name: "emits --computer-use-model alongside the Oz --model",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
