@@ -570,8 +570,9 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	return nil
 }
 
-// prepareSidecars pulls each sidecar image, creates a Docker volume from its filesystem,
-// and returns the list of bind mount strings to add to the container.
+// prepareSidecars resolves each sidecar image according to the configured image pull policy,
+// creates a Docker volume from its filesystem, and returns the list of bind mount strings to
+// add to the container.
 func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
 	var binds []string
 	seenMountPaths := make(map[string]bool)
