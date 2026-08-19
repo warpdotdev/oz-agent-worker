@@ -32,6 +32,23 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock \
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
 
+#### Docker backend configuration
+
+`backend.docker.image_pull_policy` controls how the Docker backend gets the task image and each Warp/additional sidecar image before it starts a container. The accepted values match the Kubernetes backend's `image_pull_policy`:
+
+- `Always` (the default for this backend when you omit the key): pull the image from the registry, then use the pulled image.
+- `IfNotPresent`: use the image if it is already stored locally. Pull the image only when it is not present locally.
+- `Never`: do not contact the registry. Use the image if it is already stored locally. If the image is not present locally, the task setup fails with a clear error.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    image_pull_policy: "IfNotPresent"
+```
+
+This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
+
 ### Image releases and pinning
 
 Production self-hosted workers should pin an immutable image version instead of relying on `latest`.
