@@ -49,8 +49,14 @@ type CommandConfig struct {
 
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
-	Volumes     []string   `yaml:"volumes"`
-	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+	Volumes []string `yaml:"volumes"`
+	// ImagePullPolicy controls how the Docker backend resolves the main task image and any
+	// Warp/additional sidecar images before use. Accepted values are the same as the
+	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
+	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
+	// backend's original unconditional-pull behavior for existing installations.
+	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,image_pull_policy"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.
@@ -68,7 +74,7 @@ type KubernetesConfig struct {
 	Namespace             string            `yaml:"namespace"`
 	Kubeconfig            string            `yaml:"kubeconfig"`
 	DefaultImage          string            `yaml:"default_image" validate:"omitempty,no_whitespace"`
-	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,image_pull_policy"`
 	UseImageVolumes       bool              `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SidecarImage          string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
@@ -119,6 +125,12 @@ type EnvEntry struct {
 	Value *string `yaml:"value"`
 }
 
+// imagePullPolicyValues are the accepted backend.docker.image_pull_policy and
+// backend.kubernetes.image_pull_policy values. Both backends validate against this same list
+// (via the image_pull_policy validator tag below) so their accepted values cannot diverge; each
+// backend still applies its own default when the field is omitted.
+var imagePullPolicyValues = []string{"Always", "IfNotPresent", "Never"}
+
 // configValidator is the package-level validator instance, initialized once.
 var configValidator = newConfigValidator()
 
@@ -128,6 +140,18 @@ func newConfigValidator() *validator.Validate {
 	// no_whitespace rejects strings that contain spaces or tabs.
 	_ = v.RegisterValidation("no_whitespace", func(fl validator.FieldLevel) bool {
 		return !strings.ContainsAny(fl.Field().String(), " \t")
+	})
+
+	// image_pull_policy rejects any value not in imagePullPolicyValues, shared by the Docker and
+	// Kubernetes backends' image_pull_policy fields.
+	_ = v.RegisterValidation("image_pull_policy", func(fl validator.FieldLevel) bool {
+		value := fl.Field().String()
+		for _, accepted := range imagePullPolicyValues {
+			if value == accepted {
+				return true
+			}
+		}
+		return false
 	})
 
 	// Struct-level validator for BackendConfig: at most one backend field may be non-nil.

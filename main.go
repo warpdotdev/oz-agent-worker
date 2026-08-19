@@ -362,15 +362,18 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 
 		// Merge volumes: config file + CLI (concatenated).
 		var volumes []string
+		var imagePullPolicy string
 		if fileConfig != nil && fileConfig.Backend.Docker != nil {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
+			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
 		wc.Docker = &worker.DockerBackendConfig{
-			NoCleanup: noCleanup,
-			Volumes:   volumes,
-			Env:       mergedEnv,
+			NoCleanup:       noCleanup,
+			Volumes:         volumes,
+			Env:             mergedEnv,
+			ImagePullPolicy: imagePullPolicy,
 		}
 	}
 
