@@ -18,6 +18,9 @@ import (
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
 
+// directBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
+const directBackendTypeName = "direct"
+
 // validateTaskIDForPath ensures task IDs are safe to use as a single path component.
 func validateTaskIDForPath(taskID string) error {
 	if taskID == "" || taskID == "." || taskID == ".." {
@@ -195,12 +198,12 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
-		setupEnv := append(envVars, withWarpAliases([]string{
-			fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
-			"OZ_WORKER_BACKEND=direct",
-			fmt.Sprintf("OZ_RUN_ID=%s", taskID),
-			fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", envFilePath),
-		})...)
+		setupEnv := append(envVars, concatEnvVars(
+			workspaceRootEnvVars(workspaceDir),
+			workerBackendEnvVars(directBackendTypeName),
+			runIDEnvVars(taskID),
+			environmentFileEnvVars(envFilePath),
+		)...)
 
 		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
 		if err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv); err != nil {
@@ -307,12 +310,12 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 	if b.config.TeardownCommand == "" {
 		return
 	}
-	teardownEnv := withWarpAliases([]string{
-		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
-		fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath),
-		"OZ_WORKER_BACKEND=direct",
-		fmt.Sprintf("OZ_RUN_ID=%s", taskID),
-	})
+	teardownEnv := concatEnvVars(
+		workspaceRootEnvVars(workspaceDir),
+		[]string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)},
+		workerBackendEnvVars(directBackendTypeName),
+		runIDEnvVars(taskID),
+	)
 	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
 		metrics.AddTaskEvent(ctx, "cleanup.failed",

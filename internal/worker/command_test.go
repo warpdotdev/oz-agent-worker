@@ -146,9 +146,9 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 	}
 }
 
-// Every well-known OZ_ variable the dispatch and cancel commands receive is also present
-// under its WARP_ alias, carrying the identical value.
-func TestCommandBackendMirrorsWellKnownVarsToWarpAliases(t *testing.T) {
+// Every well-known variable the dispatch and cancel commands receive is present under both
+// its OZ_ and its WARP_ name, carrying the identical value.
+func TestCommandBackendSetsWellKnownVarsUnderBothNames(t *testing.T) {
 	dispatchOut := filepath.Join(t.TempDir(), "dispatch_env.txt")
 	cancelOut := filepath.Join(t.TempDir(), "cancel_env.txt")
 	b := newTestCommandBackend(t, CommandBackendConfig{

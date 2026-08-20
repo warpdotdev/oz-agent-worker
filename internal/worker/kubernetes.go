@@ -168,12 +168,12 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
-	backendEnv := append(envSliceFromMap(b.config.TaskEnv), withWarpAliases([]string{
-		fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", defaultSetupEnvironmentFile),
-		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
-		"OZ_WORKER_BACKEND=" + kubernetesBackendTypeName,
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-	})...)
+	backendEnv := append(envSliceFromMap(b.config.TaskEnv), concatEnvVars(
+		environmentFileEnvVars(defaultSetupEnvironmentFile),
+		workspaceRootEnvVars(defaultWorkspaceMountPath),
+		workerBackendEnvVars(kubernetesBackendTypeName),
+		runIDEnvVars(params.TaskID),
+	)...)
 	mainEnv := mergeEnvVars(params.EnvVars, backendEnv)
 
 	volumes := []corev1.Volume{

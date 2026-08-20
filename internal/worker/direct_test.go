@@ -186,9 +186,9 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	}
 }
 
-// The operator's setup and teardown hooks see every well-known OZ_ variable under its
-// WARP_ alias too, carrying the identical value.
-func TestDirectBackendHooksReceiveWarpAliases(t *testing.T) {
+// The operator's setup and teardown hooks see every well-known variable under both its OZ_
+// and its WARP_ name, carrying the identical value.
+func TestDirectBackendHooksReceiveBothNames(t *testing.T) {
 	testDir := t.TempDir()
 	setupCapture := filepath.Join(testDir, "setup_env.txt")
 	teardownCapture := filepath.Join(testDir, "teardown_env.txt")

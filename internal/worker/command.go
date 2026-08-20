@@ -18,6 +18,9 @@ import (
 // promptly; it is not meant to stay alive for the task's lifetime.
 const defaultDispatchTimeout = 60 * time.Second
 
+// commandBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
+const commandBackendTypeName = "command"
+
 // CommandBackendConfig configures the command backend, which dispatches tasks to
 // an operator-owned runtime over any transport by invoking a shell command.
 type CommandBackendConfig struct {
@@ -75,13 +78,13 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	dctx, cancel := context.WithTimeout(ctx, b.config.DispatchTimeout)
 	defer cancel()
 
-	env := b.commandEnv(withWarpAliases([]string{
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
-		"OZ_WORKER_BACKEND=command",
-		fmt.Sprintf("OZ_SERVER_ROOT_URL=%s", b.config.ServerRootURL),
-		fmt.Sprintf("OZ_DOCKER_IMAGE=%s", params.DockerImage),
-	}))
+	env := b.commandEnv(concatEnvVars(
+		runIDEnvVars(params.TaskID),
+		executionIDEnvVars(params.ExecutionID),
+		workerBackendEnvVars(commandBackendTypeName),
+		serverRootURLEnvVars(b.config.ServerRootURL),
+		dockerImageEnvVars(params.DockerImage),
+	))
 
 	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
 	cmd.Stdin = bytes.NewReader(payloadJSON)
@@ -114,11 +117,11 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 		return nil
 	}
 
-	env := b.commandEnv(withWarpAliases([]string{
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
-		"OZ_WORKER_BACKEND=command",
-	}))
+	env := b.commandEnv(concatEnvVars(
+		runIDEnvVars(params.TaskID),
+		executionIDEnvVars(params.ExecutionID),
+		workerBackendEnvVars(commandBackendTypeName),
+	))
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", b.config.CancelCommand) // #nosec G204 -- cancel command is explicit operator configuration.
 	cmd.Env = env
