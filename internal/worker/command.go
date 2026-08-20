@@ -75,13 +75,13 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	dctx, cancel := context.WithTimeout(ctx, b.config.DispatchTimeout)
 	defer cancel()
 
-	env := b.commandEnv([]string{
+	env := b.commandEnv(withWarpAliases([]string{
 		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
 		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
 		"OZ_WORKER_BACKEND=command",
 		fmt.Sprintf("OZ_SERVER_ROOT_URL=%s", b.config.ServerRootURL),
 		fmt.Sprintf("OZ_DOCKER_IMAGE=%s", params.DockerImage),
-	})
+	}))
 
 	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
 	cmd.Stdin = bytes.NewReader(payloadJSON)
@@ -114,11 +114,11 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 		return nil
 	}
 
-	env := b.commandEnv([]string{
+	env := b.commandEnv(withWarpAliases([]string{
 		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
 		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
 		"OZ_WORKER_BACKEND=command",
-	})
+	}))
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", b.config.CancelCommand) // #nosec G204 -- cancel command is explicit operator configuration.
 	cmd.Env = env
@@ -142,14 +142,14 @@ func (b *CommandBackend) Shutdown(ctx context.Context) {
 }
 
 // commandEnv builds the subprocess environment: the host environment overlaid
-// with the operator-configured Env and then the well-known OZ_* vars. Task env
-// vars (which may include secrets) are deliberately excluded — they travel only
+// with the operator-configured Env and then the well-known OZ_*/WARP_* vars. Task
+// env vars (which may include secrets) are deliberately excluded — they travel only
 // in the JSON payload on stdin.
 //
-// Well-known OZ_* vars (OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, etc.)
-// are applied last so that operator-configured Env entries can never clobber
-// them. mergeEnvVars uses last-wins semantics within the override slice, so
-// position determines precedence.
+// Well-known vars (OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, etc., each with
+// its WARP_ alias) are applied last so that operator-configured Env entries can
+// never clobber them. mergeEnvVars uses last-wins semantics within the override
+// slice, so position determines precedence.
 func (b *CommandBackend) commandEnv(wellKnown []string) []string {
 	overlay := make([]string, 0, len(b.config.Env)+len(wellKnown))
 	for key, value := range b.config.Env {

@@ -146,6 +146,70 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 	}
 }
 
+// Every well-known OZ_ variable the dispatch and cancel commands receive is also present
+// under its WARP_ alias, carrying the identical value.
+func TestCommandBackendMirrorsWellKnownVarsToWarpAliases(t *testing.T) {
+	dispatchOut := filepath.Join(t.TempDir(), "dispatch_env.txt")
+	cancelOut := filepath.Join(t.TempDir(), "cancel_env.txt")
+	b := newTestCommandBackend(t, CommandBackendConfig{
+		DispatchCommand: "env > " + dispatchOut,
+		CancelCommand:   "env > " + cancelOut,
+		ServerRootURL:   "https://app.warp.dev",
+	})
+
+	if result := b.ExecuteTask(context.Background(), testTaskParams()); result.Error != nil {
+		t.Fatalf("ExecuteTask() error = %v", result.Error)
+	}
+	if err := b.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "exec-1"}); err != nil {
+		t.Fatalf("CancelTask() error = %v", err)
+	}
+
+	commands := []struct {
+		name    string
+		outFile string
+		want    map[string]string
+	}{
+		{
+			name:    "dispatch",
+			outFile: dispatchOut,
+			want: map[string]string{
+				"OZ_RUN_ID":          "task-1",
+				"OZ_EXECUTION_ID":    "exec-1",
+				"OZ_WORKER_BACKEND":  "command",
+				"OZ_SERVER_ROOT_URL": "https://app.warp.dev",
+				"OZ_DOCKER_IMAGE":    "ubuntu:22.04",
+			},
+		},
+		{
+			name:    "cancel",
+			outFile: cancelOut,
+			want: map[string]string{
+				"OZ_RUN_ID":         "task-1",
+				"OZ_EXECUTION_ID":   "exec-1",
+				"OZ_WORKER_BACKEND": "command",
+			},
+		},
+	}
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			data, err := os.ReadFile(command.outFile) // #nosec G304 -- test-controlled temp path.
+			if err != nil {
+				t.Fatalf("failed to read captured env: %v", err)
+			}
+			env := envMap(strings.Split(strings.TrimSpace(string(data)), "\n"))
+			for name, want := range command.want {
+				if env[name] != want {
+					t.Errorf("%s = %q, want %q", name, env[name], want)
+				}
+				alias := "WARP_" + strings.TrimPrefix(name, "OZ_")
+				if env[alias] != want {
+					t.Errorf("%s = %q, want it to mirror %s as %q", alias, env[alias], name, want)
+				}
+			}
+		})
+	}
+}
+
 func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T) {
 	outFile := filepath.Join(t.TempDir(), "env.txt")
 	b := newTestCommandBackend(t, CommandBackendConfig{
@@ -153,6 +217,7 @@ func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T)
 		// Operator attempts to override well-known vars — they must not take effect.
 		Env: map[string]string{
 			"OZ_RUN_ID":         "operator-injected",
+			"WARP_RUN_ID":       "operator-injected",
 			"OZ_EXECUTION_ID":   "operator-injected",
 			"OZ_WORKER_BACKEND": "operator-injected",
 		},
@@ -169,6 +234,9 @@ func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T)
 	env := string(data)
 	if !strings.Contains(env, "OZ_RUN_ID=task-1") {
 		t.Errorf("OZ_RUN_ID must be the actual task ID, not overridable by operator Env; got:\n%s", env)
+	}
+	if !strings.Contains(env, "WARP_RUN_ID=task-1") {
+		t.Errorf("the WARP_RUN_ID alias must be the actual task ID, not overridable by operator Env; got:\n%s", env)
 	}
 	if !strings.Contains(env, "OZ_EXECUTION_ID=exec-1") {
 		t.Errorf("OZ_EXECUTION_ID must be the actual execution ID, not overridable by operator Env; got:\n%s", env)

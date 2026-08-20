@@ -82,7 +82,7 @@ backend:
 }
 ```
 
-The non-secret identifiers `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND`, `OZ_SERVER_ROOT_URL`, and `OZ_DOCKER_IMAGE` are also set in the script's environment. Secrets appear only in the stdin payload.
+The non-secret identifiers `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND`, `OZ_SERVER_ROOT_URL`, and `OZ_DOCKER_IMAGE` are also set in the script's environment, each alongside a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, and so on). Secrets appear only in the stdin payload.
 
 Your runtime should launch the agent with `base_args` inside an environment built from `docker_image` + `sidecars`, injecting `env`. Because `base_args` already includes `--task-id` and `--server-root-url`, the agent reports its own progress and terminal state to Warp — the worker does not. Once the CLI exits, your runtime must report completion by running `oz harness-support --run-id <run_id> report-shutdown` (see the [command backend docs](../../README.md#command)). Keep the exit-code contract: exit `0` only when the task is durably accepted for execution.
 

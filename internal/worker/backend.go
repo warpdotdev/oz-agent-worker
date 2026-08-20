@@ -2,10 +2,38 @@ package worker
 
 import (
 	"context"
+	"strings"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
+
+const (
+	ozEnvVarPrefix   = "OZ_"
+	warpEnvVarPrefix = "WARP_"
+)
+
+// withWarpAliases returns envVars followed by a WARP_-prefixed alias of every
+// OZ_-prefixed entry, so a backend's well-known variables always reach the processes
+// it starts under both names. Entries are in KEY=VALUE form; one without an `=` has no
+// name to alias and is passed through untouched.
+//
+// Deriving the aliases here rather than writing them out per variable means an OZ_
+// variable added to a backend's environment is aliased without a second edit.
+func withWarpAliases(envVars []string) []string {
+	aliased := make([]string, 0, 2*len(envVars))
+	aliased = append(aliased, envVars...)
+	for _, entry := range envVars {
+		name, value, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		if suffix, ok := strings.CutPrefix(name, ozEnvVarPrefix); ok {
+			aliased = append(aliased, warpEnvVarPrefix+suffix+"="+value)
+		}
+	}
+	return aliased
+}
 
 // ExecuteOutcome describes how a backend handled a task in ExecuteTask.
 type ExecuteOutcome int
