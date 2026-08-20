@@ -49,8 +49,14 @@ type CommandConfig struct {
 
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
-	Volumes     []string   `yaml:"volumes"`
-	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+	Volumes []string `yaml:"volumes"`
+	// ImagePullPolicy controls how the Docker backend resolves the main task image and any
+	// Warp/additional sidecar images before use. Accepted values are the same as the
+	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
+	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
+	// backend's original unconditional-pull behavior for existing installations.
+	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.

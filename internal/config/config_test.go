@@ -56,6 +56,61 @@ backend:
 	}
 }
 
+func TestLoadValidDockerImagePullPolicy(t *testing.T) {
+	for _, policy := range []string{"Always", "IfNotPresent", "Never"} {
+		t.Run(policy, func(t *testing.T) {
+			path := writeTestConfig(t, `
+backend:
+  docker:
+    image_pull_policy: "`+policy+`"
+`)
+
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.Backend.Docker == nil {
+				t.Fatal("expected docker backend to be set")
+			}
+			if cfg.Backend.Docker.ImagePullPolicy != policy {
+				t.Errorf("image_pull_policy = %q, want %q", cfg.Backend.Docker.ImagePullPolicy, policy)
+			}
+		})
+	}
+}
+
+func TestLoadDockerImagePullPolicyOmitted(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  docker:
+    volumes: []
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Backend.Docker == nil {
+		t.Fatal("expected docker backend to be set")
+	}
+	if cfg.Backend.Docker.ImagePullPolicy != "" {
+		t.Errorf("image_pull_policy = %q, want empty (defaulting happens at the worker layer)", cfg.Backend.Docker.ImagePullPolicy)
+	}
+}
+
+func TestLoadInvalidDockerPullPolicy(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  docker:
+    image_pull_policy: "Sometimes"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid docker image_pull_policy")
+	}
+}
+
 func TestLoadKubernetesCodingCLISidecars(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "k8s-worker"

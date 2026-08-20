@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/moby/moby/api/pkg/authconfig"
@@ -22,11 +23,25 @@ import (
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
 
+// PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
+// backend.docker.image_pull_policy values. They mirror the Kubernetes backend's
+// image_pull_policy spelling so operators configure the same three values for either backend.
+const (
+	PullPolicyAlways       = "Always"
+	PullPolicyIfNotPresent = "IfNotPresent"
+	PullPolicyNever        = "Never"
+)
+
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
+	// ImagePullPolicy controls how the main task image and every Warp/additional sidecar image
+	// are resolved before use: PullPolicyAlways, PullPolicyIfNotPresent, or PullPolicyNever. An
+	// empty value defaults to PullPolicyAlways, preserving the backend's original
+	// unconditional-pull behavior for installations that don't set it.
+	ImagePullPolicy string
 }
 
 func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient *client.Client, containerID string) bool {
@@ -103,12 +118,9 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
-	doneImagePull := params.SetupEvents.startPhase(ctx, SetupEventImagePull)
-	if err := b.pullImage(ctx, imageName, authStr); err != nil {
-		doneImagePull(true)
+	if err := b.prepareImage(ctx, imageName, authStr, params.SetupEvents); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
-	doneImagePull(false)
 
 	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
 	// Report the phase only when the task has sidecars, matching the Kubernetes
@@ -257,10 +269,97 @@ func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
 
-// pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
-// Docker only downloads changed layers, so this is efficient even if the image exists locally.
-func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string) error {
+// normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,
+// defaulting an empty (omitted) value to PullPolicyAlways so existing installations keep
+// pulling unconditionally. Config loading already rejects any other unrecognized value before
+// it reaches here, so falling back to PullPolicyAlways for an unrecognized value is purely
+// defensive (e.g. for callers that bypass config loading, such as tests).
+func normalizeDockerPullPolicy(policy string) string {
+	switch policy {
+	case PullPolicyAlways, PullPolicyIfNotPresent, PullPolicyNever:
+		return policy
+	default:
+		return PullPolicyAlways
+	}
+}
+
+// prepareImage ensures imageName is available locally per the Docker backend's configured
+// image pull policy, validating the resolved image's platform before it is used to create a
+// container. It is the single entry point for image resolution shared by the main task image
+// and every Warp/additional sidecar image, so the two cannot drift in how they interpret the
+// policy. authStr is used for registry authentication only for the calls that actually pull.
+// setupEvents is non-nil for the main task image and nil for sidecars, whose image resolution
+// is already included in the sidecar-preparation phase.
+func (b *DockerBackend) prepareImage(ctx context.Context, imageName, authStr string, setupEvents *setupEventReporter) error {
+	switch normalizeDockerPullPolicy(b.config.ImagePullPolicy) {
+	case PullPolicyNever:
+		return b.useLocalImageOnly(ctx, imageName)
+	case PullPolicyIfNotPresent:
+		return b.pullIfNotPresent(ctx, imageName, authStr, setupEvents)
+	default: // PullPolicyAlways
+		return b.pullImage(ctx, imageName, authStr, setupEvents)
+	}
+}
+
+// pullIfNotPresent implements pull policy IfNotPresent: it reuses a local image when present,
+// validating its platform, and pulls (then validates) only when the image isn't present
+// locally. Any inspection failure other than "not found" is propagated as-is, so a transient
+// Engine error isn't misread as a missing image and silently converted into a pull.
+func (b *DockerBackend) pullIfNotPresent(ctx context.Context, imageName, authStr string, setupEvents *setupEventReporter) error {
+	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
+	switch {
+	case err == nil:
+		log.Infof(ctx, "Reusing local image (pull policy %s): %s", PullPolicyIfNotPresent, imageName)
+		return b.validateImagePlatform(inspect, imageName)
+	case cerrdefs.IsNotFound(err):
+		log.Infof(ctx, "Image %s not found locally (pull policy %s); pulling", imageName, PullPolicyIfNotPresent)
+		return b.pullImage(ctx, imageName, authStr, setupEvents)
+	default:
+		return fmt.Errorf("failed to inspect local image %s: %w", imageName, err)
+	}
+}
+
+// useLocalImageOnly implements pull policy Never: it never contacts the registry. It requires
+// imageName to already be present locally, validates its platform when found, and otherwise
+// returns a clear setup error naming the policy, distinguishing this configuration/setup
+// problem from a transient inspection failure (which is propagated as-is).
+func (b *DockerBackend) useLocalImageOnly(ctx context.Context, imageName string) error {
+	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
+	switch {
+	case err == nil:
+		log.Infof(ctx, "Using local image (pull policy %s): %s", PullPolicyNever, imageName)
+		return b.validateImagePlatform(inspect, imageName)
+	case cerrdefs.IsNotFound(err):
+		return fmt.Errorf("image %s not found locally and pull policy is %s", imageName, PullPolicyNever)
+	default:
+		return fmt.Errorf("failed to inspect local image %s: %w", imageName, err)
+	}
+}
+
+// validateImagePlatform verifies that a resolved image's platform matches this Docker daemon's
+// platform. Docker may resolve a pull to an image built for a different architecture than
+// requested (see https://github.com/moby/moby/pull/42325), so this check applies both to images
+// just pulled and to images already present locally that pull policy IfNotPresent/Never reuse.
+func (b *DockerBackend) validateImagePlatform(inspect client.ImageInspectResult, imageName string) error {
+	imagePlatform := fmt.Sprintf("%s/%s", inspect.Os, inspect.Architecture)
+	if imagePlatform != b.platform {
+		return fmt.Errorf(
+			"image %s is for platform %s, but this worker requires %s",
+			imageName, imagePlatform, b.platform,
+		)
+	}
+	return nil
+}
+
+// pullImage unconditionally pulls a Docker image (pull policy Always), then validates its
+// resolved platform. If authStr is non-empty, it is used for registry authentication. Docker
+// only downloads changed layers, so this is efficient even if the image exists locally.
+func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string, setupEvents *setupEventReporter) (err error) {
 	log.Infof(ctx, "Pulling image: %s", imageName)
+	doneImagePull := setupEvents.startPhase(ctx, SetupEventImagePull)
+	defer func() {
+		doneImagePull(err != nil)
+	}()
 	pullOptions := client.ImagePullOptions{
 		Platforms:    []ocispec.Platform{b.platformSpec},
 		RegistryAuth: authStr,
@@ -280,19 +379,12 @@ func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr
 		return fmt.Errorf("failed to read image pull output: %w", err)
 	}
 
-	// Verify the pulled image matches the host platform. Docker may pull an image for a different
-	// architecture than what is specified in client.ImagePullOptions.Platforms
-	// See: https://github.com/moby/moby/pull/42325
 	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
 	if err != nil {
 		return fmt.Errorf("failed to inspect pulled image %s: %w", imageName, err)
 	}
-	imagePlatform := fmt.Sprintf("%s/%s", inspect.Os, inspect.Architecture)
-	if imagePlatform != b.platform {
-		return fmt.Errorf(
-			"image %s is for platform %s, but this worker requires %s",
-			imageName, imagePlatform, b.platform,
-		)
+	if err := b.validateImagePlatform(inspect, imageName); err != nil {
+		return err
 	}
 
 	log.Infof(ctx, "Successfully pulled image: %s", imageName)
@@ -481,8 +573,9 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	return nil
 }
 
-// prepareSidecars pulls each sidecar image, creates a Docker volume from its filesystem,
-// and returns the list of bind mount strings to add to the container.
+// prepareSidecars resolves each sidecar image according to the configured image pull policy,
+// creates a Docker volume from its filesystem, and returns the list of bind mount strings to
+// add to the container.
 func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
 	var binds []string
 	seenMountPaths := make(map[string]bool)
@@ -501,9 +594,9 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 
 		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
 
-		// Additional sidecar images are public, so no auth is needed.
-		if err := b.pullImage(ctx, sidecar.Image, ""); err != nil {
-			return nil, fmt.Errorf("failed to pull additional sidecar image %s: %w", sidecar.Image, err)
+		// Additional sidecar images are public, so no auth is needed when a pull is required.
+		if err := b.prepareImage(ctx, sidecar.Image, "", nil); err != nil {
+			return nil, fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
 		}
 
 		digest, err := b.getImageDigest(ctx, sidecar.Image)

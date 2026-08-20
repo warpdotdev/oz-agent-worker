@@ -265,6 +265,62 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	}
 }
 
+func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				ImagePullPolicy: "Never",
+				Volumes:         []string{"/data:/data"},
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "Never" {
+		t.Errorf("ImagePullPolicy = %q, want %q", wc.Docker.ImagePullPolicy, "Never")
+	}
+	if len(wc.Docker.Volumes) != 1 || wc.Docker.Volumes[0] != "/data:/data" {
+		t.Errorf("Volumes = %v, want [/data:/data]", wc.Docker.Volumes)
+	}
+}
+
+func TestMergeConfigDockerImagePullPolicyOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "" {
+		t.Errorf("ImagePullPolicy = %q, want empty (defaulting happens at the worker layer)", wc.Docker.ImagePullPolicy)
+	}
+}
+
 func TestMergeConfigKubernetesCodingCLISidecars(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
