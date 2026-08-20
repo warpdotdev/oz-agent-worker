@@ -82,6 +82,18 @@ backend:
     oz_path: "/usr/local/bin/oz"
 ```
 
+The `setup_command` and `teardown_command` hooks run with these variables set, each under both
+its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
+
+- `OZ_RUN_ID` — the run being executed.
+- `OZ_WORKER_BACKEND` — always `direct` here.
+- `OZ_WORKSPACE_ROOT` — the per-task workspace directory, which is also the hook's working directory.
+- `OZ_ENVIRONMENT_FILE` — setup only. Write `KEY=VALUE` lines here to add variables to the agent's environment.
+
+The teardown hook additionally gets `GIT_CONFIG_GLOBAL`, pointing at the task's isolated git config.
+These names are worker-owned: the worker writes them last, so an entry with one of these names in
+the backend's `environment` is overwritten rather than honoured.
+
 ### Command
 
 The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
