@@ -20,6 +20,10 @@ const (
 //
 // Deriving the aliases here rather than writing them out per variable means an OZ_
 // variable added to a backend's environment is aliased without a second edit.
+//
+// Only ever pass a worker-authored set. It aliases whatever it is handed, so running it
+// over a slice that operator-configured or server-supplied task env has already been
+// merged into would mirror those too.
 func withWarpAliases(envVars []string) []string {
 	aliased := make([]string, 0, 2*len(envVars))
 	aliased = append(aliased, envVars...)

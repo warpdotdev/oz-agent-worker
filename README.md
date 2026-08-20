@@ -109,7 +109,7 @@ Config keys:
 The dispatch contract:
 
 - The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
-- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`. Each is also set under a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, `WARP_WORKER_BACKEND`, `WARP_SERVER_ROOT_URL`, `WARP_DOCKER_IMAGE`); read whichever name you prefer.
+- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`. Each is also set under a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, `WARP_WORKER_BACKEND`, `WARP_SERVER_ROOT_URL`, `WARP_DOCKER_IMAGE`); read whichever name you prefer. One exception to "just an alias": `WARP_SERVER_ROOT_URL` is also the Warp CLI's own server-root-URL override, so inside the dispatch and cancel subprocesses it points any `oz`/`warp` invocation at that server. The value is the same one the worker already uses, so this changes nothing in practice — but do not treat that one name as inert.
 - The JSON payload looks like:
 
   ```json

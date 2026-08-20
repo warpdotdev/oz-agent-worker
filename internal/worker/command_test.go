@@ -215,11 +215,14 @@ func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T)
 	b := newTestCommandBackend(t, CommandBackendConfig{
 		DispatchCommand: "env > " + outFile,
 		// Operator attempts to override well-known vars — they must not take effect.
+		// OZ_OPERATOR_THING is not a well-known var, so it is passed through as-is and
+		// must not be aliased: only what the worker injects gets a WARP_ twin.
 		Env: map[string]string{
 			"OZ_RUN_ID":         "operator-injected",
 			"WARP_RUN_ID":       "operator-injected",
 			"OZ_EXECUTION_ID":   "operator-injected",
 			"OZ_WORKER_BACKEND": "operator-injected",
+			"OZ_OPERATOR_THING": "operator-value",
 		},
 	})
 
@@ -243,6 +246,12 @@ func TestCommandBackendWellKnownVarsCannotBeClobberedByOperatorEnv(t *testing.T)
 	}
 	if !strings.Contains(env, "OZ_WORKER_BACKEND=command") {
 		t.Errorf("OZ_WORKER_BACKEND must be 'command', not overridable by operator Env; got:\n%s", env)
+	}
+	if !strings.Contains(env, "OZ_OPERATOR_THING=operator-value") {
+		t.Errorf("an operator's own OZ_-named var must still reach the subprocess; got:\n%s", env)
+	}
+	if strings.Contains(env, "WARP_OPERATOR_THING") {
+		t.Errorf("only worker-injected vars are aliased; an operator's OZ_-named var must not gain one; got:\n%s", env)
 	}
 }
 

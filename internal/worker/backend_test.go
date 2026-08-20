@@ -1,7 +1,7 @@
 package worker
 
 import (
-	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -42,13 +42,15 @@ func TestWithWarpAliases(t *testing.T) {
 		{
 			name:    "an empty environment stays empty",
 			envVars: nil,
-			want:    []string{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := withWarpAliases(tt.envVars); !reflect.DeepEqual(got, tt.want) {
+			// slices.Equal rather than reflect.DeepEqual: a nil and an empty result are
+			// indistinguishable to every caller, so pinning which one comes back would
+			// only break on a harmless refactor.
+			if got := withWarpAliases(tt.envVars); !slices.Equal(got, tt.want) {
 				t.Fatalf("withWarpAliases(%v) = %v, want %v", tt.envVars, got, tt.want)
 			}
 		})
