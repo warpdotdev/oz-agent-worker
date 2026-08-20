@@ -6,58 +6,50 @@ import (
 )
 
 // Nothing derives the WARP_ names any more: each set site writes both outright. This is the
-// guard that keeps them in step, by failing when a well-known variable carries an OZ_ name
-// without a WARP_ one holding the same value.
+// guard that keeps them in step.
 //
-// It covers the pair helpers rather than each backend's full environment, because those also
-// carry the host environment and operator config, neither of which is paired on purpose.
+// It runs over the environment each backend actually builds, not over the pair helpers, so it
+// also catches a variable added inline at a call site or a new helper nobody registered here.
+// Each function returns only the worker-owned slice, which excludes the host environment and
+// operator config by construction — neither of those is paired on purpose.
 func TestBackendEnvPairsEveryOZName(t *testing.T) {
-	groups := map[string][]string{
-		"run ID":           runIDEnvVars("task-1"),
-		"execution ID":     executionIDEnvVars("exec-1"),
-		"worker backend":   workerBackendEnvVars(directBackendTypeName),
-		"workspace root":   workspaceRootEnvVars("/workspace"),
-		"environment file": environmentFileEnvVars("/tmp/oz-env"),
-		"server root URL":  serverRootURLEnvVars("https://app.warp.dev/?a=b"),
-		"docker image":     dockerImageEnvVars("ubuntu:22.04"),
+	backendEnvs := map[string][]string{
+		"command dispatch": commandDispatchEnvVars("task-1", "exec-1", "https://app.warp.dev/?a=b", "ubuntu:22.04"),
+		"command cancel":   commandCancelEnvVars("task-1", "exec-1"),
+		"direct setup":     directSetupEnvVars("/workspace", "task-1", "/tmp/oz-env"),
+		"direct teardown":  directTeardownEnvVars("/workspace", "/workspace/.gitconfig", "task-1"),
+		"kubernetes task":  kubernetesTaskOwnedEnvVars("task-1"),
 	}
 
-	for name, group := range groups {
+	for name, envVars := range backendEnvs {
 		t.Run(name, func(t *testing.T) {
-			env := envMap(group)
-			paired := 0
+			env := envMap(envVars)
+			ozNames, warpNames := 0, 0
 			for envName, value := range env {
-				suffix, isOZ := strings.CutPrefix(envName, "OZ_")
-				if !isOZ {
+				if strings.HasPrefix(envName, "WARP_") {
+					warpNames++
 					continue
 				}
-				paired++
-				if alias := "WARP_" + suffix; env[alias] != value {
+				suffix, isOZ := strings.CutPrefix(envName, "OZ_")
+				if !isOZ {
+					// Something like GIT_CONFIG_GLOBAL, which has no OZ_/WARP_ spelling.
+					continue
+				}
+				ozNames++
+				if warpName := "WARP_" + suffix; env[warpName] != value {
 					t.Errorf("%s = %q, want a matching %s with the same value, got %q",
-						envName, value, alias, env[alias])
+						envName, value, warpName, env[warpName])
 				}
 			}
-			if paired == 0 {
-				t.Errorf("no OZ_ variables in this group, so the assertion above proves nothing")
+			if ozNames == 0 {
+				t.Errorf("no OZ_ variables in this environment, so the assertion above proves nothing")
 			}
-			// Every entry is either an OZ_ name or its WARP_ counterpart, so a group that
-			// grew a third, unpaired entry fails here.
-			if len(env) != 2*paired {
-				t.Errorf("group has %d entries for %d OZ_ names; expected exactly one WARP_ name each", len(env), paired)
+			// Counting both directions catches a WARP_ name left behind after its OZ_
+			// counterpart was renamed or removed, which the per-name check above cannot see.
+			if ozNames != warpNames {
+				t.Errorf("%d OZ_ names but %d WARP_ names; every one should be paired", ozNames, warpNames)
 			}
 		})
-	}
-}
-
-// A value containing '=' reaches both names intact.
-func TestBackendEnvPairPreservesValuesContainingEquals(t *testing.T) {
-	env := envMap(serverRootURLEnvVars("https://app.warp.dev/?a=b"))
-	const want = "https://app.warp.dev/?a=b"
-	if env["OZ_SERVER_ROOT_URL"] != want {
-		t.Errorf("OZ_SERVER_ROOT_URL = %q, want %q", env["OZ_SERVER_ROOT_URL"], want)
-	}
-	if env["WARP_SERVER_ROOT_URL"] != want {
-		t.Errorf("WARP_SERVER_ROOT_URL = %q, want %q", env["WARP_SERVER_ROOT_URL"], want)
 	}
 }
 

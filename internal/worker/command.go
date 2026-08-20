@@ -21,6 +21,28 @@ const defaultDispatchTimeout = 60 * time.Second
 // commandBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
 const commandBackendTypeName = "command"
 
+// commandDispatchEnvVars and commandCancelEnvVars return exactly the worker-owned variables
+// this backend injects into the dispatch and cancel subprocesses — no host environment and no
+// operator config. TestBackendEnvPairsEveryOZName runs its pairing assertion over these, so a
+// variable added here under only one of its two names fails the build.
+func commandDispatchEnvVars(taskID, executionID, serverRootURL, dockerImage string) []string {
+	return concatEnvVars(
+		runIDEnvVars(taskID),
+		executionIDEnvVars(executionID),
+		workerBackendEnvVars(commandBackendTypeName),
+		serverRootURLEnvVars(serverRootURL),
+		dockerImageEnvVars(dockerImage),
+	)
+}
+
+func commandCancelEnvVars(taskID, executionID string) []string {
+	return concatEnvVars(
+		runIDEnvVars(taskID),
+		executionIDEnvVars(executionID),
+		workerBackendEnvVars(commandBackendTypeName),
+	)
+}
+
 // CommandBackendConfig configures the command backend, which dispatches tasks to
 // an operator-owned runtime over any transport by invoking a shell command.
 type CommandBackendConfig struct {
@@ -78,13 +100,7 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	dctx, cancel := context.WithTimeout(ctx, b.config.DispatchTimeout)
 	defer cancel()
 
-	env := b.commandEnv(concatEnvVars(
-		runIDEnvVars(params.TaskID),
-		executionIDEnvVars(params.ExecutionID),
-		workerBackendEnvVars(commandBackendTypeName),
-		serverRootURLEnvVars(b.config.ServerRootURL),
-		dockerImageEnvVars(params.DockerImage),
-	))
+	env := b.commandEnv(commandDispatchEnvVars(params.TaskID, params.ExecutionID, b.config.ServerRootURL, params.DockerImage))
 
 	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
 	cmd.Stdin = bytes.NewReader(payloadJSON)
@@ -117,11 +133,7 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 		return nil
 	}
 
-	env := b.commandEnv(concatEnvVars(
-		runIDEnvVars(params.TaskID),
-		executionIDEnvVars(params.ExecutionID),
-		workerBackendEnvVars(commandBackendTypeName),
-	))
+	env := b.commandEnv(commandCancelEnvVars(params.TaskID, params.ExecutionID))
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", b.config.CancelCommand) // #nosec G204 -- cancel command is explicit operator configuration.
 	cmd.Env = env
