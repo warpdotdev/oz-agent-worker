@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moby/moby/api/types/common"
 	"github.com/moby/moby/api/types/image"
@@ -65,6 +67,9 @@ type fakeDockerEngine struct {
 
 	// pullResponse answers every ImagePull call; nil means no pull is expected.
 	pullResponse func(req *http.Request) *http.Response
+	// containerCreateResponse lets ExecuteTask tests stop after image preparation without
+	// exercising the rest of the container lifecycle.
+	containerCreateResponse func(req *http.Request) *http.Response
 
 	// volumeFound controls the VolumeInspect response used by sidecar tests, so they can reuse
 	// an existing volume and avoid exercising the (unrelated, unchanged) volume-copy machinery.
@@ -96,6 +101,12 @@ func (e *fakeDockerEngine) RoundTrip(req *http.Request) (*http.Response, error) 
 			e.t.Fatalf("unexpected ImagePull call: no response scripted")
 		}
 		return e.pullResponse(req), nil
+	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/containers/create"):
+		e.calls = append(e.calls, "container_create")
+		if e.containerCreateResponse == nil {
+			e.t.Fatalf("unexpected ContainerCreate call: no response scripted")
+		}
+		return e.containerCreateResponse(req), nil
 	case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/volumes/"):
 		e.calls = append(e.calls, "volume_inspect")
 		if e.volumeFound {
@@ -140,7 +151,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyAlways)
-		if err := backend.prepareImage(context.Background(), imageName, ""); err != nil {
+		if err := backend.prepareImage(context.Background(), imageName, "", nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		wantCalls := []string{"pull", "inspect"}
@@ -158,7 +169,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, "")
-		if err := backend.prepareImage(context.Background(), imageName, ""); err != nil {
+		if err := backend.prepareImage(context.Background(), imageName, "", nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		wantCalls := []string{"pull", "inspect"}
@@ -175,7 +186,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyIfNotPresent)
-		if err := backend.prepareImage(context.Background(), imageName, ""); err != nil {
+		if err := backend.prepareImage(context.Background(), imageName, "", nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		wantCalls := []string{"inspect"}
@@ -196,7 +207,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			pullResponse: pullOK,
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyIfNotPresent)
-		if err := backend.prepareImage(context.Background(), imageName, ""); err != nil {
+		if err := backend.prepareImage(context.Background(), imageName, "", nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		wantCalls := []string{"inspect", "pull", "inspect"}
@@ -215,7 +226,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyIfNotPresent)
-		err := backend.prepareImage(context.Background(), imageName, "")
+		err := backend.prepareImage(context.Background(), imageName, "", nil)
 		if err == nil {
 			t.Fatal("expected an error")
 		}
@@ -233,7 +244,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyNever)
-		if err := backend.prepareImage(context.Background(), imageName, ""); err != nil {
+		if err := backend.prepareImage(context.Background(), imageName, "", nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		wantCalls := []string{"inspect"}
@@ -252,7 +263,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyNever)
-		err := backend.prepareImage(context.Background(), imageName, "")
+		err := backend.prepareImage(context.Background(), imageName, "", nil)
 		if err == nil || !strings.Contains(err.Error(), "pull policy is Never") {
 			t.Fatalf("error = %v, want a message naming pull policy Never", err)
 		}
@@ -271,7 +282,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyAlways)
-		err := backend.prepareImage(context.Background(), imageName, "")
+		err := backend.prepareImage(context.Background(), imageName, "", nil)
 		if err == nil || !strings.Contains(err.Error(), "is for platform linux/arm64") {
 			t.Fatalf("error = %v, want a platform mismatch error", err)
 		}
@@ -285,7 +296,7 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyIfNotPresent)
-		err := backend.prepareImage(context.Background(), imageName, "")
+		err := backend.prepareImage(context.Background(), imageName, "", nil)
 		if err == nil || !strings.Contains(err.Error(), "is for platform linux/arm64") {
 			t.Fatalf("error = %v, want a platform mismatch error", err)
 		}
@@ -299,13 +310,206 @@ func TestPrepareImagePullPolicy(t *testing.T) {
 			},
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyAlways)
-		err := backend.prepareImage(context.Background(), imageName, "")
+		err := backend.prepareImage(context.Background(), imageName, "", nil)
 		if err == nil || !strings.Contains(err.Error(), "failed to pull image") {
 			t.Fatalf("error = %v, want a pull failure error", err)
 		}
 	})
 }
 
+func TestExecuteTaskReportsImagePullOnlyWhenPullRuns(t *testing.T) {
+	const imageName = "example.com/task-image:v1"
+
+	pullOK := func(req *http.Request) *http.Response {
+		return mockEngineResponse(req, http.StatusOK, "text/plain", "pulling image...\n")
+	}
+	containerCreateFailure := func(req *http.Request) *http.Response {
+		return mockEngineErrorResponse(t, req, http.StatusInternalServerError, "stop after image preparation")
+	}
+	newReporter := func(t *testing.T) (*setupEventReporter, *capturedSetupEvents) {
+		t.Helper()
+		captured := &capturedSetupEvents{events: make(map[string]clientEventRequest)}
+		server := httptest.NewServer(captured.handler())
+		t.Cleanup(server.Close)
+		reporter := newSetupEventReporter(server.URL, &types.TaskAssignmentMessage{
+			TaskID:  "task-123",
+			EnvVars: map[string]string{warpAPIKeyEnv: "api-key"},
+		})
+		return reporter, captured
+	}
+	execute := func(t *testing.T, engine *fakeDockerEngine, policy string) (*capturedSetupEvents, ExecuteResult) {
+		t.Helper()
+		reporter, captured := newReporter(t)
+		backend := newTestDockerBackend(t, engine, policy)
+		result := backend.ExecuteTask(context.Background(), &TaskParams{
+			TaskID:      "task-123",
+			DockerImage: imageName,
+			SetupEvents: reporter,
+		})
+		return captured, result
+	}
+	assertNoPullEvent := func(t *testing.T, captured *capturedSetupEvents) {
+		t.Helper()
+		time.Sleep(50 * time.Millisecond)
+		if _, ok := captured.get(SetupEventImagePull); ok {
+			t.Fatal("unexpected image pull setup event when ImagePull was not called")
+		}
+	}
+
+	t.Run("Always reports a successful pull", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t:                       t,
+			pullResponse:            pullOK,
+			containerCreateResponse: containerCreateFailure,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockImageInspectResponse(t, req, "linux", "amd64", "")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyAlways)
+		if result.Error == nil {
+			t.Fatal("expected the scripted container-create failure")
+		}
+		captured.waitForEvents(t, 2)
+		event, ok := captured.get(SetupEventImagePull)
+		if !ok {
+			t.Fatal("missing image pull setup event")
+		}
+		if event.Payload.IsError {
+			t.Fatal("image pull setup event is_error = true, want false")
+		}
+	})
+
+	t.Run("IfNotPresent reports a pull when the image is missing", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t:                       t,
+			pullResponse:            pullOK,
+			containerCreateResponse: containerCreateFailure,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockEngineErrorResponse(t, req, http.StatusNotFound, "no such image")
+				},
+				func(req *http.Request) *http.Response {
+					return mockImageInspectResponse(t, req, "linux", "amd64", "")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyIfNotPresent)
+		if result.Error == nil {
+			t.Fatal("expected the scripted container-create failure")
+		}
+		captured.waitForEvents(t, 2)
+		if _, ok := captured.get(SetupEventImagePull); !ok {
+			t.Fatal("missing image pull setup event")
+		}
+	})
+
+	t.Run("IfNotPresent does not report a pull when reusing a local image", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t:                       t,
+			containerCreateResponse: containerCreateFailure,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockImageInspectResponse(t, req, "linux", "amd64", "")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyIfNotPresent)
+		if result.Error == nil {
+			t.Fatal("expected the scripted container-create failure")
+		}
+		captured.waitForEvents(t, 1)
+		assertNoPullEvent(t, captured)
+	})
+
+	t.Run("Never does not report a pull when using a local image", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t:                       t,
+			containerCreateResponse: containerCreateFailure,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockImageInspectResponse(t, req, "linux", "amd64", "")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyNever)
+		if result.Error == nil {
+			t.Fatal("expected the scripted container-create failure")
+		}
+		captured.waitForEvents(t, 1)
+		assertNoPullEvent(t, captured)
+	})
+
+	t.Run("inspection failure before a pull does not report a pull", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t: t,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockEngineErrorResponse(t, req, http.StatusInternalServerError, "engine unavailable")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyIfNotPresent)
+		if result.Error == nil {
+			t.Fatal("expected image inspection to fail")
+		}
+		assertNoPullEvent(t, captured)
+	})
+
+	t.Run("Never missing-image failure does not report a pull", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t: t,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockEngineErrorResponse(t, req, http.StatusNotFound, "no such image")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyNever)
+		if result.Error == nil {
+			t.Fatal("expected the missing local image to fail")
+		}
+		assertNoPullEvent(t, captured)
+	})
+
+	t.Run("local platform mismatch does not report a pull", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t: t,
+			inspectResponses: []func(req *http.Request) *http.Response{
+				func(req *http.Request) *http.Response {
+					return mockImageInspectResponse(t, req, "linux", "arm64", "")
+				},
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyIfNotPresent)
+		if result.Error == nil {
+			t.Fatal("expected the local platform mismatch to fail")
+		}
+		assertNoPullEvent(t, captured)
+	})
+
+	t.Run("pull failure reports a failed pull", func(t *testing.T) {
+		engine := &fakeDockerEngine{
+			t: t,
+			pullResponse: func(req *http.Request) *http.Response {
+				return mockEngineErrorResponse(t, req, http.StatusInternalServerError, "registry unavailable")
+			},
+		}
+		captured, result := execute(t, engine, PullPolicyAlways)
+		if result.Error == nil {
+			t.Fatal("expected image pull to fail")
+		}
+		captured.waitForEvents(t, 1)
+		event, ok := captured.get(SetupEventImagePull)
+		if !ok {
+			t.Fatal("missing failed image pull setup event")
+		}
+		if !event.Payload.IsError {
+			t.Fatal("image pull setup event is_error = false, want true")
+		}
+	})
+}
 func TestPrepareSidecarsAppliesImagePullPolicy(t *testing.T) {
 	const sidecarImage = "example.com/sidecar-image:v1"
 	sidecars := []types.SidecarMount{{Image: sidecarImage, MountPath: "/mnt/sidecar"}}
