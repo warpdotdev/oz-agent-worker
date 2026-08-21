@@ -1082,6 +1082,16 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	if envMap["OZ_RUN_ID"] != "task-1" {
 		t.Fatalf("OZ_RUN_ID = %q, want %q", envMap["OZ_RUN_ID"], "task-1")
 	}
+	// Every well-known OZ_ variable on the Job's task container carries a WARP_ alias with
+	// the same value; the setup init container inherits this env, so it is covered too.
+	for _, name := range []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT", "OZ_ENVIRONMENT_FILE"} {
+		if envMap[name] == "" {
+			t.Fatalf("%s is unset, so its alias proves nothing", name)
+		}
+		if alias := "WARP_" + strings.TrimPrefix(name, "OZ_"); envMap[alias] != envMap[name] {
+			t.Fatalf("%s = %q, want it to mirror %s = %q", alias, envMap[alias], name, envMap[name])
+		}
+	}
 	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
 		t.Fatal("expected OZ_EXECUTION_ID to be omitted from task container env")
 	}

@@ -2,10 +2,80 @@ package worker
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
+
+// runIDEnvVars, workerBackendEnvVars and the helpers beside them return a backend's
+// well-known variables under both their OZ_ and WARP_ names.
+//
+// Nothing derives one name from the other: each pair is written out, from a single value,
+// so retiring the OZ_ half later is a line deletion rather than an unwinding of aliasing
+// machinery. TestBackendEnvPairsEveryOZName is what keeps a newly added variable from
+// arriving under only one name.
+func runIDEnvVars(taskID string) []string {
+	return []string{
+		fmt.Sprintf("OZ_RUN_ID=%s", taskID),
+		fmt.Sprintf("WARP_RUN_ID=%s", taskID),
+	}
+}
+
+func executionIDEnvVars(executionID string) []string {
+	return []string{
+		fmt.Sprintf("OZ_EXECUTION_ID=%s", executionID),
+		fmt.Sprintf("WARP_EXECUTION_ID=%s", executionID),
+	}
+}
+
+func workerBackendEnvVars(backend string) []string {
+	return []string{
+		fmt.Sprintf("OZ_WORKER_BACKEND=%s", backend),
+		fmt.Sprintf("WARP_WORKER_BACKEND=%s", backend),
+	}
+}
+
+func workspaceRootEnvVars(workspaceRoot string) []string {
+	return []string{
+		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceRoot),
+		fmt.Sprintf("WARP_WORKSPACE_ROOT=%s", workspaceRoot),
+	}
+}
+
+func environmentFileEnvVars(environmentFile string) []string {
+	return []string{
+		fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", environmentFile),
+		fmt.Sprintf("WARP_ENVIRONMENT_FILE=%s", environmentFile),
+	}
+}
+
+func serverRootURLEnvVars(serverRootURL string) []string {
+	return []string{
+		fmt.Sprintf("OZ_SERVER_ROOT_URL=%s", serverRootURL),
+		fmt.Sprintf("WARP_SERVER_ROOT_URL=%s", serverRootURL),
+	}
+}
+
+func dockerImageEnvVars(dockerImage string) []string {
+	return []string{
+		fmt.Sprintf("OZ_DOCKER_IMAGE=%s", dockerImage),
+		fmt.Sprintf("WARP_DOCKER_IMAGE=%s", dockerImage),
+	}
+}
+
+// concatEnvVars flattens the per-variable pairs above into one KEY=VALUE slice.
+func concatEnvVars(groups ...[]string) []string {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	envVars := make([]string, 0, total)
+	for _, group := range groups {
+		envVars = append(envVars, group...)
+	}
+	return envVars
+}
 
 // ExecuteOutcome describes how a backend handled a task in ExecuteTask.
 type ExecuteOutcome int

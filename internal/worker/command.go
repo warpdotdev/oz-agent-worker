@@ -18,6 +18,31 @@ import (
 // promptly; it is not meant to stay alive for the task's lifetime.
 const defaultDispatchTimeout = 60 * time.Second
 
+// commandBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
+const commandBackendTypeName = "command"
+
+// commandDispatchEnvVars and commandCancelEnvVars return exactly the worker-owned variables
+// this backend injects into the dispatch and cancel subprocesses — no host environment and no
+// operator config. TestBackendEnvPairsEveryOZName runs its pairing assertion over these, so a
+// variable added here under only one of its two names fails the build.
+func commandDispatchEnvVars(taskID, executionID, serverRootURL, dockerImage string) []string {
+	return concatEnvVars(
+		runIDEnvVars(taskID),
+		executionIDEnvVars(executionID),
+		workerBackendEnvVars(commandBackendTypeName),
+		serverRootURLEnvVars(serverRootURL),
+		dockerImageEnvVars(dockerImage),
+	)
+}
+
+func commandCancelEnvVars(taskID, executionID string) []string {
+	return concatEnvVars(
+		runIDEnvVars(taskID),
+		executionIDEnvVars(executionID),
+		workerBackendEnvVars(commandBackendTypeName),
+	)
+}
+
 // CommandBackendConfig configures the command backend, which dispatches tasks to
 // an operator-owned runtime over any transport by invoking a shell command.
 type CommandBackendConfig struct {
@@ -75,13 +100,7 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	dctx, cancel := context.WithTimeout(ctx, b.config.DispatchTimeout)
 	defer cancel()
 
-	env := b.commandEnv([]string{
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
-		"OZ_WORKER_BACKEND=command",
-		fmt.Sprintf("OZ_SERVER_ROOT_URL=%s", b.config.ServerRootURL),
-		fmt.Sprintf("OZ_DOCKER_IMAGE=%s", params.DockerImage),
-	})
+	env := b.commandEnv(commandDispatchEnvVars(params.TaskID, params.ExecutionID, b.config.ServerRootURL, params.DockerImage))
 
 	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
 	cmd.Stdin = bytes.NewReader(payloadJSON)
@@ -114,11 +133,7 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 		return nil
 	}
 
-	env := b.commandEnv([]string{
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-		fmt.Sprintf("OZ_EXECUTION_ID=%s", params.ExecutionID),
-		"OZ_WORKER_BACKEND=command",
-	})
+	env := b.commandEnv(commandCancelEnvVars(params.TaskID, params.ExecutionID))
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", b.config.CancelCommand) // #nosec G204 -- cancel command is explicit operator configuration.
 	cmd.Env = env
@@ -142,14 +157,14 @@ func (b *CommandBackend) Shutdown(ctx context.Context) {
 }
 
 // commandEnv builds the subprocess environment: the host environment overlaid
-// with the operator-configured Env and then the well-known OZ_* vars. Task env
-// vars (which may include secrets) are deliberately excluded — they travel only
+// with the operator-configured Env and then the well-known OZ_*/WARP_* vars. Task
+// env vars (which may include secrets) are deliberately excluded — they travel only
 // in the JSON payload on stdin.
 //
-// Well-known OZ_* vars (OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, etc.)
-// are applied last so that operator-configured Env entries can never clobber
-// them. mergeEnvVars uses last-wins semantics within the override slice, so
-// position determines precedence.
+// Well-known vars (OZ_RUN_ID, OZ_EXECUTION_ID, OZ_WORKER_BACKEND, etc., each with
+// its WARP_ alias) are applied last so that operator-configured Env entries can
+// never clobber them. mergeEnvVars uses last-wins semantics within the override
+// slice, so position determines precedence.
 func (b *CommandBackend) commandEnv(wellKnown []string) []string {
 	overlay := make([]string, 0, len(b.config.Env)+len(wellKnown))
 	for key, value := range b.config.Env {

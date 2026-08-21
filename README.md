@@ -82,6 +82,18 @@ backend:
     oz_path: "/usr/local/bin/oz"
 ```
 
+The `setup_command` and `teardown_command` hooks run with these variables set, each under both
+its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
+
+- `OZ_RUN_ID` — the run being executed.
+- `OZ_WORKER_BACKEND` — always `direct` here.
+- `OZ_WORKSPACE_ROOT` — the per-task workspace directory, which is also the hook's working directory.
+- `OZ_ENVIRONMENT_FILE` — setup only. Write `KEY=VALUE` lines here to add variables to the agent's environment.
+
+The teardown hook additionally gets `GIT_CONFIG_GLOBAL`, pointing at the task's isolated git config.
+These names are worker-owned: the worker writes them last, so an entry with one of these names in
+the backend's `environment` is overwritten rather than honoured.
+
 ### Command
 
 The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
@@ -109,7 +121,7 @@ Config keys:
 The dispatch contract:
 
 - The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
-- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`.
+- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`. Each is also set under a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, `WARP_WORKER_BACKEND`, `WARP_SERVER_ROOT_URL`, `WARP_DOCKER_IMAGE`); read whichever name you prefer. One exception to "just an alias": `WARP_SERVER_ROOT_URL` is also the Warp CLI's own server-root-URL override, so inside the dispatch and cancel subprocesses it points any `oz`/`warp` invocation at that server. The value is the same one the worker already uses, so this changes nothing in practice — but do not treat that one name as inert.
 - The JSON payload looks like:
 
   ```json
@@ -129,7 +141,7 @@ The dispatch contract:
 
   `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
 - Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
-- The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment.
+- The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment, each with its `WARP_`-prefixed alias.
 
 Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
 The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
@@ -169,6 +181,7 @@ Notes:
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
+- the worker owns a set of names in the task container's environment and writes them last, so an entry with one of these names in `task_env` or `pod_template` is overwritten rather than honoured: `OZ_RUN_ID`, `OZ_WORKER_BACKEND`, `OZ_WORKSPACE_ROOT`, `OZ_ENVIRONMENT_FILE`, and the `WARP_`-prefixed name of each (`WARP_RUN_ID` and so on). Pick different names for operator-supplied variables. Warp reserves the `WARP_` names against managed secrets too, but a worker's own config is yours, so nothing stops you setting them — they just will not survive
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
 - `coding_cli_sidecars` maps a harness config name (e.g. `claude`, `codex`) to a custom Docker image that will be mounted as the coding CLI sidecar for runs using that harness. When set, the worker replaces the server-provided sidecar image (or injects a new entry if the server did not send one) at the standard mount path `/mnt/{harness}-cli-sidecar`. Use this when your cluster uses a custom or internal Claude Code binary wrapper instead of the Warp-provided image. Example:
 

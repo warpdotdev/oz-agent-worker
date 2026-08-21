@@ -58,6 +58,19 @@ const (
 	maxLogBytes = 1 << 20 // 1 MiB
 )
 
+// kubernetesTaskOwnedEnvVars returns exactly the worker-owned variables this backend puts on
+// the task container — no operator TaskEnv and no server-supplied task env.
+// TestBackendEnvPairsEveryOZName runs its pairing assertion over these, so a variable added
+// here under only one of its two names fails the build.
+func kubernetesTaskOwnedEnvVars(taskID string) []string {
+	return concatEnvVars(
+		environmentFileEnvVars(defaultSetupEnvironmentFile),
+		workspaceRootEnvVars(defaultWorkspaceMountPath),
+		workerBackendEnvVars(kubernetesBackendTypeName),
+		runIDEnvVars(taskID),
+	)
+}
+
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
 	WorkerID              string
@@ -168,13 +181,8 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
-	baseEnv := envSliceFromMap(b.config.TaskEnv)
-	mainEnv := mergeEnvVars(params.EnvVars, append(baseEnv,
-		fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", defaultSetupEnvironmentFile),
-		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
-		"OZ_WORKER_BACKEND="+kubernetesBackendTypeName,
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-	))
+	backendEnv := append(envSliceFromMap(b.config.TaskEnv), kubernetesTaskOwnedEnvVars(params.TaskID)...)
+	mainEnv := mergeEnvVars(params.EnvVars, backendEnv)
 
 	volumes := []corev1.Volume{
 		workspaceVolume(b.config.WorkspaceSizeLimit),

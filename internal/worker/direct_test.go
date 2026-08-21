@@ -186,6 +186,70 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	}
 }
 
+// The operator's setup and teardown hooks see every well-known variable under both its OZ_
+// and its WARP_ name, carrying the identical value.
+func TestDirectBackendHooksReceiveBothNames(t *testing.T) {
+	testDir := t.TempDir()
+	setupCapture := filepath.Join(testDir, "setup_env.txt")
+	teardownCapture := filepath.Join(testDir, "teardown_env.txt")
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot:   filepath.Join(testDir, "workspaces"),
+		OzPath:          ozPath,
+		SetupCommand:    "env > " + setupCapture,
+		TeardownCommand: "env > " + teardownCapture,
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-run-id"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
+	}
+
+	hooks := []struct {
+		name        string
+		capturePath string
+		ozVars      []string
+	}{
+		{
+			name:        "setup",
+			capturePath: setupCapture,
+			ozVars:      []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT", "OZ_ENVIRONMENT_FILE"},
+		},
+		{
+			name:        "teardown",
+			capturePath: teardownCapture,
+			ozVars:      []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT"},
+		},
+	}
+	for _, hook := range hooks {
+		t.Run(hook.name, func(t *testing.T) {
+			data, err := os.ReadFile(hook.capturePath) // #nosec G304 -- test-controlled temp path.
+			if err != nil {
+				t.Fatalf("failed to read captured env: %v", err)
+			}
+			env := envMap(strings.Split(strings.TrimSpace(string(data)), "\n"))
+			if env["OZ_RUN_ID"] != "task-run-id" {
+				t.Errorf("OZ_RUN_ID = %q, want %q", env["OZ_RUN_ID"], "task-run-id")
+			}
+			for _, name := range hook.ozVars {
+				if env[name] == "" {
+					t.Errorf("%s is unset, so its alias proves nothing", name)
+					continue
+				}
+				alias := "WARP_" + strings.TrimPrefix(name, "OZ_")
+				if env[alias] != env[name] {
+					t.Errorf("%s = %q, want it to mirror %s = %q", alias, env[alias], name, env[name])
+				}
+			}
+		})
+	}
+}
+
 func TestDirectBackendSetupEnvFileCannotOverrideGitConfigGlobal(t *testing.T) {
 	testDir := t.TempDir()
 	mainCfgCapture := filepath.Join(testDir, "main_git_config_global.txt")
