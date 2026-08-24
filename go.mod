@@ -1,6 +1,6 @@
 module github.com/warpdotdev/oz-agent-worker
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/alecthomas/kong v1.13.0

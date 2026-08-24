@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 # VERSION is stamped into the binary via -ldflags="-X main.Version=...".
 # CI passes the release tag (or commit SHA) here so the value reported by
