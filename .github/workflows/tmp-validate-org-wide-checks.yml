@@ -6,4 +6,4 @@ on:
 
 jobs:
   call-org-wide-checks:
-    uses: warpdotdev/warp-github-actions/.github/workflows/org-wide-checks.yml@fix/org-wide-checks-diff-scoped-secrets
+    uses: warpdotdev/warp-github-actions/.github/workflows/org-wide-checks.yml@8700e41085562d1dd6300b0caefce9c6148434d1
