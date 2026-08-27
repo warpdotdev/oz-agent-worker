@@ -1,0 +1,9 @@
+name: TMP Validate org-wide-checks (consumer repo)
+on:
+  pull_request:
+    branches:
+      - test/validate-org-wide-checks-consumer
+
+jobs:
+  call-org-wide-checks:
+    uses: warpdotdev/warp-github-actions/.github/workflows/org-wide-checks.yml@abd54bc10f055709e8dd73c620590c846e1ac4fc
