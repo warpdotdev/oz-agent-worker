@@ -1,9 +1,289 @@
-name: TMP Validate org-wide-checks (consumer repo)
+# Baseline validation for every warpdotdev repo, applied by the
+# `Baseline PR CI` org ruleset. Assumes no toolchain or manifest; repos with
+# real test suites layer their own CI on top.
+#
+# Invariants to preserve when editing:
+#   - Diff-scoped, never whole-repo: a whole-history secret scan would block
+#     every PR in any repo that ever committed a secret. The secret scan is
+#     additionally scoped to added lines only, not whole changed files: a
+#     file that already contains a secret must not fail a PR that doesn't
+#     touch that line.
+#   - No secrets, no third-party actions, so it runs on fork PRs. This rules
+#     out gitleaks-action (needs an org licence key); the gitleaks CLI is MIT.
+#   - Job is `org-wide-checks`, not `CI`, so required_status_checks can tell
+#     it apart from a repo's own CI job.
+#   - Never widen a gitleaks allowlist entry beyond what it documents; see
+#     the "Write gitleaks config" step's own header for the reasoning. The
+#     config is written out by that step, not checked out as a file in this
+#     repo, because this workflow runs inside each *consumer* repo (via the
+#     org ruleset) and actions/checkout there checks out the consumer's
+#     code, not this repo's.
+name: TMP Validate org-wide-checks (consumer repo, native copy)
 on:
   pull_request:
     branches:
       - test/validate-org-wide-checks-consumer
+  workflow_call:
+    inputs:
+      base_sha:
+        description: >-
+          Base commit SHA to diff against. Required when this workflow is
+          invoked outside a pull_request context (HEAD is not the
+          auto-generated base+head merge commit); ignored otherwise.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: org-wide-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  MAX_FILE_MB: "5"
 
 jobs:
-  call-org-wide-checks:
-    uses: warpdotdev/warp-github-actions/.github/workflows/org-wide-checks.yml@8700e41085562d1dd6300b0caefce9c6148434d1
+  org-wide-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No fetch-depth: 0 (full history). For a pull_request event,
+      # actions/checkout defaults to the synthetic refs/pull/<n>/merge
+      # commit, whose two parents are the base tip and the PR head;
+      # fetch-depth 2 brings both down with the checkout itself, no extra
+      # fetch needed. The diff step below uses those parents directly rather
+      # than a merge-base walk, whose required history depth scales with how
+      # long the PR's branch has diverged from base. warp-server's
+      # check-graphql-schema-change.yml switched to this same parent-diff
+      # form on its `develop` branch (not yet in `main`) to fix the same
+      # class of problem: PR warpdotdev/warp-server#14086 found that
+      # resolving the base branch by name broke on Graphite stacked PRs,
+      # whose graphite-base/* branches get deleted from the remote mid-run.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Resolve changed files
+        id: diff
+        env:
+          # Route the input through env rather than interpolating
+          # ${{ inputs.base_sha }} directly into the script: a caller-
+          # controlled value spliced straight into a double-quoted shell
+          # string can inject arbitrary commands. The regex check below
+          # additionally rejects anything that isn't a full commit SHA.
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if git rev-parse -q --verify HEAD^2 >/dev/null; then
+            # HEAD is the base+head merge commit; ^1 is the base tip.
+            base="$(git rev-parse HEAD^1)"
+          elif [ -n "$INPUT_BASE_SHA" ]; then
+            if ! [[ "$INPUT_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::base_sha must be a full 40-character hex commit SHA." >&2
+              exit 1
+            fi
+            git fetch --depth=1 --no-tags origin "$INPUT_BASE_SHA"
+            base="$(git rev-parse "$INPUT_BASE_SHA")"
+          else
+            # HEAD isn't a merge commit (not a pull_request event) and no
+            # base_sha was supplied, so there's no PR-scoped range to diff.
+            # Fail rather than silently falling back to HEAD^/HEAD and
+            # scanning zero or the wrong files: a required secret gate that
+            # quietly passes having scanned nothing is worse than one that
+            # fails loudly.
+            echo "::error::Cannot resolve a diff range: HEAD is not a pull_request merge commit and no base_sha input was supplied. workflow_call callers outside a pull_request context must pass base_sha." >&2
+            exit 1
+          fi
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          echo "head=$head" >>"$GITHUB_OUTPUT"
+          git diff --name-only --diff-filter=ACMR "$base" "$head" >changed.txt || : >changed.txt
+          echo "Changed files: $(wc -l <changed.txt)"
+          sed 's/^/  /' changed.txt
+
+      # This workflow is injected into consumer repos as a required check;
+      # actions/checkout above checks out the *consumer's* code, so a
+      # .gitleaks.toml file living in this repo would never reach the
+      # runner anywhere but here. Materialize the config from this step
+      # instead, so it is version-pinned with the workflow (whatever ref a
+      # consumer's ruleset points at) rather than fetched from a separate,
+      # independently-movable location.
+      #
+      # Extends gitleaks' maintained default rules. Every allowlist entry
+      # below documents exactly why the pattern it exempts is not a live
+      # secret, and is scoped as narrowly as the shape of the false
+      # positive allows - an entry without both a stated rationale and a
+      # tight scope becomes a place a real secret can hide. Do not widen an
+      # entry (broader paths, dropping a regexes condition, matching a
+      # value shape instead of a known identifier) without re-justifying it
+      # here; handle a newly reported false positive with a new, separately
+      # scoped entry instead.
+      - name: Write gitleaks config
+        run: |
+          cat > .gitleaks.toml <<'GITLEAKS_TOML_EOF'
+          [extend]
+          useDefault = true
+
+          [[allowlists]]
+          description = """
+          Firebase *web* API keys (config key: firebase_web_api_key) are public
+          identifiers by Google's own design, not authentication secrets - they only
+          identify a Firebase project to client SDKs, and warp-server already ships
+          them unredacted to end users via client/*.env. Scoped two ways: to the
+          gcp-api-key rule only, and to lines containing the firebase_web_api_key key
+          in warp-server's config files, so an unrelated AIza... value - a real GCP
+          API key assigned to any other config key, in any other file - is still
+          caught.
+          """
+          targetRules = ["gcp-api-key"]
+          condition = "AND"
+          regexTarget = "line"
+          regexes = ['''firebase_web_api_key''']
+          paths = ['''(^|/)config/(local|staging|prod)\.yaml$''']
+
+          [[allowlists]]
+          description = """
+          hashicorp-tf-password fires on any `*_password = "..."` assignment in a
+          .tf/.hcl file. warp-terraform's cloud_run_jobs.tf assigns the known GCP
+          Secret Manager secret id "postgres-password" to POSTGRES_PASSWORD; the
+          literal credential is resolved from Secret Manager at deploy time and is
+          never stored here. Pinned to that exact assignment, not a value shape: any
+          other quoted string assigned to POSTGRES_PASSWORD, or to any other
+          *_PASSWORD key in this same file, still fails this rule.
+          """
+          targetRules = ["hashicorp-tf-password"]
+          condition = "AND"
+          regexTarget = "line"
+          regexes = ['''POSTGRES_PASSWORD\s*=\s*"postgres-password"''']
+          paths = ['''(^|/)modules/talent_platform_v3/cloud_run_jobs\.tf$''']
+
+          [[allowlists]]
+          description = """
+          warp-server's config/{local,staging,prod}.yaml hold several Slack
+          workflow/trigger webhook URLs that are live, deployed credentials (staging
+          and prod notifications are both enabled) - unlike the two exemptions above,
+          these are not safe to allowlist by value shape, since the rule's entire job
+          is to catch exactly this URL shape. Exempt only the specific config keys
+          that are already known to hold one of these deployed URLs, not the
+          containing files or the URL pattern generally: a new webhook added under
+          any other key, in any file, still fails this rule so it gets the same
+          review a first-time credential should get.
+          """
+          targetRules = ["slack-webhook-url"]
+          condition = "AND"
+          regexTarget = "line"
+          regexes = [
+            '''\b(?:credit_depletion_slack_webhook_url|monthly_spend_limit_slack_webhook_url|workspace_spend_limit_slack_webhook_url|high_usage_threshold_slack_webhook_url|new_subscription_webhook_url|upgraded_to_higher_plan_webhook_url|team_expanded_webhook_url|team_deleted_webhook_url|overage_invoice_paid_webhook_url|addon_credits_purchased_webhook_url|addon_credits_refunded_webhook_url|addon_credits_failed_refund_webhook_url)\s*:''',
+          ]
+          paths = ['''(^|/)config/(local|staging|prod)\.yaml$''']
+          GITLEAKS_TOML_EOF
+
+      - name: Secret scan (changed files only)
+        run: |
+          set -euo pipefail
+          [ -s changed.txt ] || { echo "No changed files; nothing to scan."; exit 0; }
+          base="${{ steps.diff.outputs.base }}"
+          head="${{ steps.diff.outputs.head }}"
+          curl -fsSL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          # Stage only the *added* lines of each changed file, not its whole
+          # content: a file that already contains a secret must not fail a
+          # PR that doesn't touch that line. --unified=0 drops context lines
+          # too, so an unrelated unchanged line near a real edit can't
+          # trigger this either. awk (not grep) does the extraction: grep
+          # exits 1 on no match, which under pipefail would fail this step
+          # for a deletion-only file even though there's nothing wrong; awk
+          # exits 0 regardless of match count but still lets a genuine git
+          # diff failure surface, since it's the rightmost *failing*
+          # command that sets a pipefail exit status. The header is matched
+          # exactly ("+++ b/<path>"), not by prefix, so added content that
+          # happens to start with "++ " isn't mistaken for it.
+          rm -rf .scan && mkdir -p .scan
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            mkdir -p ".scan/$(dirname "$f")"
+            git diff --unified=0 "$base" "$head" -- "$f" \
+              | awk -v hdr="+++ b/$f" '$0 == hdr { next } /^\+/ { print substr($0, 2) }' > ".scan/$f"
+          done <changed.txt
+          # --no-git: .scan is a plain directory, not a work tree.
+          ./gitleaks detect --no-git --source .scan --config .gitleaks.toml \
+            --redact --exit-code 1 --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload secret-scan report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Merge conflict markers
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            grep -Iq . "$f" 2>/dev/null || continue   # skip binaries
+            # Not '=======': collides with setext headings; real conflicts
+            # always have the <<<<<<< / >>>>>>> pair.
+            if grep -nE '^(<{7}|>{7})( |$)' "$f" >/tmp/hits 2>/dev/null; then
+              echo "::error file=$f::unresolved merge conflict marker"
+              sed 's/^/    /' /tmp/hits
+              bad=1
+            fi
+          done <changed.txt
+          exit $bad
+
+      - name: Oversized files
+        run: |
+          set -euo pipefail
+          bad=0
+          limit=$(( MAX_FILE_MB * 1024 * 1024 ))
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            sz=$(wc -c <"$f")
+            if [ "$sz" -gt "$limit" ]; then
+              echo "::error file=$f::$(( sz / 1024 / 1024 ))MB exceeds ${MAX_FILE_MB}MB - use Git LFS"
+              bad=1
+            fi
+          done <changed.txt
+          exit $bad
+
+      - name: YAML / JSON syntax
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
+          python3 - <<'PY'
+          import json, pathlib, sys
+          import yaml
+          bad = []
+          for path in pathlib.Path("changed.txt").read_text().splitlines():
+              p = pathlib.Path(path)
+              if not p.is_file():
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              try:
+                  if p.suffix in (".yml", ".yaml"):
+                      list(yaml.safe_load_all(text))
+                  elif p.suffix == ".json":
+                      json.loads(text)
+                  else:
+                      continue
+              except Exception as e:
+                  if "{{" in text and "templates/" in path:
+                      continue  # Helm template; not parseable by design
+                  msg = str(e).splitlines()[0]
+                  bad.append((path, msg))
+                  print(f"::error file={path}::{type(e).__name__}: {msg}")
+          print(f"Validated syntax across changed YAML/JSON files; {len(bad)} invalid.")
+          sys.exit(1 if bad else 0)
+          PY
