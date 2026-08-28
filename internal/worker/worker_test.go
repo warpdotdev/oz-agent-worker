@@ -622,61 +622,98 @@ func TestDefaultImageForTask(t *testing.T) {
 }
 
 func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
-	newWorker := func(sidecarImage string) *Worker {
-		ctx := context.Background()
-		var k8sConfig *KubernetesBackendConfig
-		if sidecarImage != "" {
-			k8sConfig = &KubernetesBackendConfig{SidecarImage: sidecarImage}
-		} else {
-			k8sConfig = &KubernetesBackendConfig{}
-		}
+	const (
+		serverImage   = "docker.io/warpdotdev/warp-agent:latest"
+		overrideImage = "my-registry.io/warpdotdev/warp-agent:latest"
+	)
+
+	newK8sWorker := func(sidecarImage string) *Worker {
 		return &Worker{
-			ctx: ctx,
+			ctx: context.Background(),
 			config: Config{
-				Kubernetes: k8sConfig,
+				Kubernetes: &KubernetesBackendConfig{SidecarImage: sidecarImage},
 			},
 		}
 	}
+	newDockerWorker := func(sidecarImage string) *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				Docker: &DockerBackendConfig{SidecarImage: sidecarImage},
+			},
+		}
+	}
+	assignment := func(sidecarImage string, extra ...types.SidecarMount) *types.TaskAssignmentMessage {
+		return &types.TaskAssignmentMessage{
+			TaskID:             "task-1",
+			Task:               &types.Task{ID: "task-1"},
+			SidecarImage:       sidecarImage,
+			AdditionalSidecars: extra,
+		}
+	}
 
-	t.Run("config sidecar_image overrides server-provided image", func(t *testing.T) {
-		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
+	assertAgentSidecar := func(t *testing.T, params *TaskParams, wantImage string) {
+		t.Helper()
 		if len(params.Sidecars) == 0 {
 			t.Fatal("expected at least one sidecar")
 		}
-		if params.Sidecars[0].Image != "my-registry.io/warpdotdev/warp-agent:latest" {
-			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "my-registry.io/warpdotdev/warp-agent:latest")
+		if params.Sidecars[0].Image != wantImage {
+			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, wantImage)
 		}
+		if params.Sidecars[0].MountPath != "/agent" {
+			t.Errorf("sidecar mount path = %q, want /agent", params.Sidecars[0].MountPath)
+		}
+	}
+
+	t.Run("kubernetes config sidecar_image overrides server-provided image", func(t *testing.T) {
+		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, overrideImage)
 	})
 
-	t.Run("server-provided image used when config sidecar_image empty", func(t *testing.T) {
-		w := newWorker("")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
-		if len(params.Sidecars) == 0 {
-			t.Fatal("expected at least one sidecar")
-		}
-		if params.Sidecars[0].Image != "docker.io/warpdotdev/warp-agent:latest" {
-			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "docker.io/warpdotdev/warp-agent:latest")
-		}
+	t.Run("docker config sidecar_image overrides server-provided image", func(t *testing.T) {
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, overrideImage)
 	})
 
-	t.Run("no sidecar when server provides empty sidecar image", func(t *testing.T) {
-		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "",
-		})
+	t.Run("server-provided image used when kubernetes config sidecar_image empty", func(t *testing.T) {
+		params := newK8sWorker("").prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("server-provided image used when docker config sidecar_image empty", func(t *testing.T) {
+		params := newDockerWorker("").prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("server-provided image used when docker config is nil", func(t *testing.T) {
+		w := &Worker{ctx: context.Background(), config: Config{}}
+		params := w.prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("no sidecar when server provides empty sidecar image with kubernetes override", func(t *testing.T) {
+		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(""))
 		if len(params.Sidecars) != 0 {
 			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
+		}
+	})
+
+	t.Run("no sidecar when server provides empty sidecar image with docker override", func(t *testing.T) {
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(""))
+		if len(params.Sidecars) != 0 {
+			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
+		}
+	})
+
+	t.Run("docker override does not rewrite additional sidecars", func(t *testing.T) {
+		extra := types.SidecarMount{Image: "docker.io/warpdotdev/extra:latest", MountPath: "/mnt/extra"}
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage, extra))
+		if len(params.Sidecars) != 2 {
+			t.Fatalf("sidecar count = %d, want 2: %+v", len(params.Sidecars), params.Sidecars)
+		}
+		assertAgentSidecar(t, params, overrideImage)
+		if params.Sidecars[1] != extra {
+			t.Errorf("additional sidecar = %+v, want %+v", params.Sidecars[1], extra)
 		}
 	})
 }

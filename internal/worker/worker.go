@@ -533,9 +533,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	var sidecars []types.SidecarMount
 	if assignment.SidecarImage != "" {
 		sidecarImage := assignment.SidecarImage
-		if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
-			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, w.config.Kubernetes.SidecarImage)
-			sidecarImage = w.config.Kubernetes.SidecarImage
+		if override := w.configuredWarpAgentSidecarImage(); override != "" {
+			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, override)
+			sidecarImage = override
 		}
 		sidecars = append(sidecars, types.SidecarMount{
 			Image:     sidecarImage,
@@ -598,6 +598,19 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		InstanceShape: assignment.InstanceShape,
 		SetupEvents:   setupEvents,
 	}
+}
+
+// configuredWarpAgentSidecarImage returns the operator-configured warp-agent sidecar
+// image, or empty if neither backend set one. Only one backend config is populated
+// at runtime.
+func (w *Worker) configuredWarpAgentSidecarImage() string {
+	if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
+		return w.config.Kubernetes.SidecarImage
+	}
+	if w.config.Docker != nil && w.config.Docker.SidecarImage != "" {
+		return w.config.Docker.SidecarImage
+	}
+	return ""
 }
 
 // defaultImageForTask returns the Docker image to use for a task, applying the

@@ -56,6 +56,7 @@ type DockerConfig struct {
 	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
 	// backend's original unconditional-pull behavior for existing installations.
 	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	SidecarImage    string     `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
 	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 

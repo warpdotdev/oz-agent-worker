@@ -49,6 +49,15 @@ backend:
 
 This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
 
+`backend.docker.sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when the worker host cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    sidecar_image: "my-registry.io/warpdotdev/warp-agent:latest"
+```
+
 ### Image releases and pinning
 
 Production self-hosted workers should pin an immutable image version instead of relying on `latest`.
