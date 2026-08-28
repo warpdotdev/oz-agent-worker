@@ -298,6 +298,58 @@ func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
 	}
 }
 
+func TestMergeConfigDockerSidecarImageFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				SidecarImage: "my-registry.io/warpdotdev/warp-agent:latest",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "my-registry.io/warpdotdev/warp-agent:latest" {
+		t.Errorf("SidecarImage = %q, want %q", wc.Docker.SidecarImage, "my-registry.io/warpdotdev/warp-agent:latest")
+	}
+}
+
+func TestMergeConfigDockerSidecarImageOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "" {
+		t.Errorf("SidecarImage = %q, want empty", wc.Docker.SidecarImage)
+	}
+}
+
 func TestMergeConfigDockerImagePullPolicyOmitted(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
