@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/pkg/authconfig"
 	"github.com/moby/moby/api/types/common"
 	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/client"
@@ -567,4 +569,53 @@ func TestPrepareSidecarsAppliesImagePullPolicy(t *testing.T) {
 			t.Fatalf("engine calls = %v, want %v (must fail before any pull or volume lookup)", engine.calls, wantCalls)
 		}
 	})
+}
+
+func TestPrepareSidecarsAgentImageUsesRegistryAuth(t *testing.T) {
+	const (
+		agentImage = "my-registry.io/warpdotdev/warp-agent:latest"
+		extraImage = "example.com/extra-sidecar:v1"
+		username   = "mirror-user"
+		password   = "mirror-pass"
+	)
+	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	t.Setenv("DOCKER_AUTH_CONFIG", fmt.Sprintf(`{"auths":{"my-registry.io":{"auth":%q}}}`, auth))
+
+	var pullAuths []string
+	engine := &fakeDockerEngine{
+		t:           t,
+		volumeFound: true,
+		inspectResponses: []func(req *http.Request) *http.Response{
+			func(req *http.Request) *http.Response {
+				return mockImageInspectResponse(t, req, "linux", "amd64", "sha256:deadbeefcafebabe0000")
+			},
+		},
+		pullResponse: func(req *http.Request) *http.Response {
+			pullAuths = append(pullAuths, req.Header.Get("X-Registry-Auth"))
+			return mockEngineResponse(req, http.StatusOK, "text/plain", "pulling image...\n")
+		},
+	}
+	backend := newTestDockerBackend(t, engine, PullPolicyAlways)
+
+	_, err := backend.prepareSidecars(context.Background(), backend.dockerClient, []types.SidecarMount{
+		{Image: agentImage, MountPath: "/agent"},
+		{Image: extraImage, MountPath: "/mnt/extra"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pullAuths) != 2 {
+		t.Fatalf("pull count = %d, want 2", len(pullAuths))
+	}
+
+	decoded, decodeErr := authconfig.Decode(pullAuths[0])
+	if decodeErr != nil {
+		t.Fatalf("failed to decode /agent X-Registry-Auth: %v", decodeErr)
+	}
+	if decoded.Username != username {
+		t.Fatalf("/agent pull username = %q, want %q", decoded.Username, username)
+	}
+	if pullAuths[1] != "" {
+		t.Fatalf("additional sidecar pull sent X-Registry-Auth %q, want empty", pullAuths[1])
+	}
 }
