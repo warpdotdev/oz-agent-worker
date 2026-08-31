@@ -345,16 +345,20 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			return
 		}
 		// Finished failed Jobs are left in place for post-mortem inspection and
-		// TTL garbage collection. Failures that return while the Job is still
-		// live (unschedulable timeout, image pull, watch errors) must delete it:
-		// TTLSecondsAfterFinished does not start until the Job completes, so a
-		// leftover Pending Job can still be scheduled after this worker has
-		// already reported failure. Successful Jobs are deleted immediately.
+		// TTL garbage collection, including when the task container already
+		// exited before the JobFailed condition arrives. Failures that return
+		// while the Job is still live (unschedulable timeout, image pull, watch
+		// errors) must delete it: TTLSecondsAfterFinished does not start until
+		// the Job completes, so a leftover Pending Job can still be scheduled
+		// after this worker has already reported failure. Successful Jobs are
+		// deleted immediately.
 		if res.Error != nil && retainFailedJob {
 			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
 			return
 		}
-		if err := b.deleteJob(context.Background(), jobName); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+		defer cleanupCancel()
+		if err := b.deleteJob(cleanupCtx, jobName); err != nil {
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
 	}()
@@ -437,6 +441,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				if logs != "" {
 					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
 				}
+				retainFailedJob = taskContainerTerminated(pod)
 				return executeError(failure)
 			}
 
@@ -462,6 +467,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				setupPhases.observePod(ctx, &pods[i])
 			}
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
+				retainFailedJob = anyTaskContainerTerminated(pods)
 				return executeError(failure)
 			}
 		}
@@ -1564,6 +1570,24 @@ func jobComplete(job *batchv1.Job) bool {
 func jobFailed(job *batchv1.Job) bool {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func taskContainerTerminated(pod *corev1.Pod) bool {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == kubernetesTaskContainerName && status.State.Terminated != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func anyTaskContainerTerminated(pods []corev1.Pod) bool {
+	for i := range pods {
+		if taskContainerTerminated(&pods[i]) {
 			return true
 		}
 	}

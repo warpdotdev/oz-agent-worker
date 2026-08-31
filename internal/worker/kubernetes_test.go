@@ -13,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedbatchv1 "k8s.io/client-go/kubernetes/typed/batch/v1"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -1628,6 +1630,93 @@ func TestExecuteTaskDeletesJobOnUnschedulableTimeout(t *testing.T) {
 	assertJobCount(t, fakeClient, "agents", 0)
 }
 
+func TestExecuteTaskRetainsJobWhenTaskContainerExitsBeforeJobFailed(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		podWatch.Add(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodFailed,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: kubernetesTaskContainerName,
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+						},
+					},
+				},
+			},
+		})
+	}()
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil {
+		t.Fatalf("expected task-container exit error, got %+v", result)
+	}
+
+	assertJobCount(t, fakeClient, "agents", 1)
+}
+
+func TestExecuteTaskDeleteHonorsCleanupTimeout(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	deleteStarted := make(chan struct{})
+	client := &deleteOverrideClientset{
+		Interface: fakeClient,
+		deleteFn: func(ctx context.Context, name string) error {
+			close(deleteStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	emitUnschedulablePod(podWatch)
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:             "worker-123",
+			Namespace:            "agents",
+			UnschedulableTimeout: durationPtr(time.Nanosecond),
+		},
+		clientset: client,
+	}
+
+	start := time.Now()
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	elapsed := time.Since(start)
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "unschedulable") {
+		t.Fatalf("expected unschedulable ExecuteTask error, got %+v", result)
+	}
+	select {
+	case <-deleteStarted:
+	default:
+		t.Fatal("expected cleanup to call delete")
+	}
+	if elapsed < BackendShutdownTimeout {
+		t.Fatalf("ExecuteTask returned before cleanup timeout: %v", elapsed)
+	}
+	if elapsed > BackendShutdownTimeout+2*time.Second {
+		t.Fatalf("ExecuteTask blocked longer than cleanup timeout: %v", elapsed)
+	}
+}
+
 func TestExecuteTaskDeletesJobOnImagePullFailure(t *testing.T) {
 	fakeClient, podWatch := startExecuteTaskWatches(t)
 	go func() {
@@ -1784,6 +1873,33 @@ func emitUnschedulablePod(podWatch *watch.FakeWatcher) {
 			},
 		})
 	}()
+}
+
+type deleteOverrideClientset struct {
+	kubernetes.Interface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (c *deleteOverrideClientset) BatchV1() typedbatchv1.BatchV1Interface {
+	return &deleteOverrideBatchV1{BatchV1Interface: c.Interface.BatchV1(), deleteFn: c.deleteFn}
+}
+
+type deleteOverrideBatchV1 struct {
+	typedbatchv1.BatchV1Interface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (b *deleteOverrideBatchV1) Jobs(namespace string) typedbatchv1.JobInterface {
+	return &deleteOverrideJobs{JobInterface: b.BatchV1Interface.Jobs(namespace), deleteFn: b.deleteFn}
+}
+
+type deleteOverrideJobs struct {
+	typedbatchv1.JobInterface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (j *deleteOverrideJobs) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+	return j.deleteFn(ctx, name)
 }
 
 func assertJobCount(t *testing.T, fakeClient *fake.Clientset, namespace string, want int) {
