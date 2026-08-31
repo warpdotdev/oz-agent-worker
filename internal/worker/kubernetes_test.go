@@ -13,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedbatchv1 "k8s.io/client-go/kubernetes/typed/batch/v1"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -1536,8 +1538,8 @@ func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
 	}
 }
 
-// On failure the worker leaves the task Job (and its pod) in place so it can be
-// inspected; the Job's TTLSecondsAfterFinished handles eventual cleanup.
+// On a finished JobFailed condition the worker leaves the task Job in place so
+// it can be inspected; the Job's TTLSecondsAfterFinished handles eventual cleanup.
 func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
@@ -1599,6 +1601,315 @@ func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
 	}
 	if len(jobs.Items) != 1 {
 		t.Fatalf("expected failed task Job to be preserved, got %d", len(jobs.Items))
+	}
+}
+
+func TestExecuteTaskDeletesJobOnUnschedulableTimeout(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	emitUnschedulablePod(podWatch)
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:             "worker-123",
+			Namespace:            "agents",
+			UnschedulableTimeout: durationPtr(time.Nanosecond),
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "unschedulable") {
+		t.Fatalf("expected unschedulable ExecuteTask error, got %+v", result)
+	}
+
+	assertJobCount(t, fakeClient, "agents", 0)
+}
+
+func TestExecuteTaskRetainsJobWhenTaskContainerExitsBeforeJobFailed(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		podWatch.Add(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodFailed,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: kubernetesTaskContainerName,
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+						},
+					},
+				},
+			},
+		})
+	}()
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil {
+		t.Fatalf("expected task-container exit error, got %+v", result)
+	}
+
+	assertJobCount(t, fakeClient, "agents", 1)
+}
+
+func TestExecuteTaskDeleteHonorsCleanupTimeout(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	deleteStarted := make(chan struct{})
+	client := &deleteOverrideClientset{
+		Interface: fakeClient,
+		deleteFn: func(ctx context.Context, name string) error {
+			close(deleteStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	emitUnschedulablePod(podWatch)
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:             "worker-123",
+			Namespace:            "agents",
+			UnschedulableTimeout: durationPtr(time.Nanosecond),
+		},
+		clientset: client,
+	}
+
+	start := time.Now()
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	elapsed := time.Since(start)
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "unschedulable") {
+		t.Fatalf("expected unschedulable ExecuteTask error, got %+v", result)
+	}
+	select {
+	case <-deleteStarted:
+	default:
+		t.Fatal("expected cleanup to call delete")
+	}
+	if elapsed < BackendShutdownTimeout {
+		t.Fatalf("ExecuteTask returned before cleanup timeout: %v", elapsed)
+	}
+	if elapsed > BackendShutdownTimeout+2*time.Second {
+		t.Fatalf("ExecuteTask blocked longer than cleanup timeout: %v", elapsed)
+	}
+}
+
+func TestExecuteTaskDeletesJobOnImagePullFailure(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		podWatch.Add(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: kubernetesTaskContainerName,
+						State: corev1.ContainerState{
+							Waiting: &corev1.ContainerStateWaiting{
+								Reason:  "ErrImagePull",
+								Message: "not found",
+							},
+						},
+					},
+				},
+			},
+		})
+	}()
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "ErrImagePull") {
+		t.Fatalf("expected image pull ExecuteTask error, got %+v", result)
+	}
+
+	assertJobCount(t, fakeClient, "agents", 0)
+}
+
+func TestExecuteTaskRetainsUnschedulableJobWhenNoCleanup(t *testing.T) {
+	fakeClient, podWatch := startExecuteTaskWatches(t)
+	emitUnschedulablePod(podWatch)
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:             "worker-123",
+			Namespace:            "agents",
+			NoCleanup:            true,
+			UnschedulableTimeout: durationPtr(time.Nanosecond),
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "unschedulable") {
+		t.Fatalf("expected unschedulable ExecuteTask error, got %+v", result)
+	}
+
+	assertJobCount(t, fakeClient, "agents", 1)
+}
+
+func TestCancelTaskDeletesJob(t *testing.T) {
+	const taskID, executionID = "task-1", "execution-1"
+	jobName := kubernetesTaskJobName(taskID, executionID)
+	fakeClient := fake.NewSimpleClientset(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "agents"},
+	})
+	backend := &KubernetesBackend{
+		config:    KubernetesBackendConfig{Namespace: "agents"},
+		clientset: fakeClient,
+	}
+
+	if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: taskID, ExecutionID: executionID}); err != nil {
+		t.Fatalf("CancelTask returned %v", err)
+	}
+	assertJobCount(t, fakeClient, "agents", 0)
+}
+
+func TestCancelTaskRetainsJobWhenNoCleanup(t *testing.T) {
+	const taskID, executionID = "task-1", "execution-1"
+	jobName := kubernetesTaskJobName(taskID, executionID)
+	fakeClient := fake.NewSimpleClientset(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "agents"},
+	})
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+			NoCleanup: true,
+		},
+		clientset: fakeClient,
+	}
+
+	if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: taskID, ExecutionID: executionID}); err != nil {
+		t.Fatalf("CancelTask returned %v", err)
+	}
+	assertJobCount(t, fakeClient, "agents", 1)
+}
+
+func TestCancelTaskIgnoresMissingJob(t *testing.T) {
+	backend := &KubernetesBackend{
+		config:    KubernetesBackendConfig{Namespace: "agents"},
+		clientset: fake.NewSimpleClientset(),
+	}
+	if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "execution-1"}); err != nil {
+		t.Fatalf("CancelTask returned %v, want nil for a missing Job", err)
+	}
+}
+
+func startExecuteTaskWatches(t *testing.T) (*fake.Clientset, *watch.FakeWatcher) {
+	t.Helper()
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	t.Cleanup(jobWatch.Stop)
+	t.Cleanup(podWatch.Stop)
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+	return fakeClient, podWatch
+}
+
+func emitUnschedulablePod(podWatch *watch.FakeWatcher) {
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		podWatch.Add(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "task-pod",
+				Namespace:         "agents",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  corev1.PodReasonUnschedulable,
+						Message: "no nodes available",
+					},
+				},
+			},
+		})
+	}()
+}
+
+type deleteOverrideClientset struct {
+	kubernetes.Interface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (c *deleteOverrideClientset) BatchV1() typedbatchv1.BatchV1Interface {
+	return &deleteOverrideBatchV1{BatchV1Interface: c.Interface.BatchV1(), deleteFn: c.deleteFn}
+}
+
+type deleteOverrideBatchV1 struct {
+	typedbatchv1.BatchV1Interface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (b *deleteOverrideBatchV1) Jobs(namespace string) typedbatchv1.JobInterface {
+	return &deleteOverrideJobs{JobInterface: b.BatchV1Interface.Jobs(namespace), deleteFn: b.deleteFn}
+}
+
+type deleteOverrideJobs struct {
+	typedbatchv1.JobInterface
+	deleteFn func(ctx context.Context, name string) error
+}
+
+func (j *deleteOverrideJobs) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+	return j.deleteFn(ctx, name)
+}
+
+func assertJobCount(t *testing.T, fakeClient *fake.Clientset, namespace string, want int) {
+	t.Helper()
+	jobs, err := fakeClient.BatchV1().Jobs(namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != want {
+		t.Fatalf("job count = %d, want %d", len(jobs.Items), want)
 	}
 }
 

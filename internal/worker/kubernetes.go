@@ -334,6 +334,8 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	// the pod watch and the safety poll below.
 	setupPhases := newKubernetesSetupPhaseTracker(params.SetupEvents)
 
+	var retainFailedJob bool
+
 	defer func() {
 		if ctx.Err() != nil {
 			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
@@ -342,15 +344,21 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if b.config.NoCleanup {
 			return
 		}
-		// Preserve failed task Jobs (and their pods) so operators can inspect logs
-		// and pod state after the fact. They are garbage-collected by the Job's
-		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
-		// Jobs are deleted immediately to keep the namespace clean.
-		if res.Error != nil {
+		// Finished failed Jobs are left in place for post-mortem inspection and
+		// TTL garbage collection, including when the task container already
+		// exited before the JobFailed condition arrives. Failures that return
+		// while the Job is still live (unschedulable timeout, image pull, watch
+		// errors) must delete it: TTLSecondsAfterFinished does not start until
+		// the Job completes, so a leftover Pending Job can still be scheduled
+		// after this worker has already reported failure. Successful Jobs are
+		// deleted immediately.
+		if res.Error != nil && retainFailedJob {
 			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
 			return
 		}
-		if err := b.deleteJob(context.Background(), jobName); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+		defer cleanupCancel()
+		if err := b.deleteJob(cleanupCtx, jobName); err != nil {
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
 	}()
@@ -400,6 +408,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				continue
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
+				retainFailedJob = jobFailed(jobState)
 				return result.outcome()
 			}
 
@@ -432,6 +441,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				if logs != "" {
 					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
 				}
+				retainFailedJob = taskContainerTerminated(pod)
 				return executeError(failure)
 			}
 
@@ -445,6 +455,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err)))
 			}
 			if result := b.handleJobState(ctx, jobState, params.TaskID, executionID); result != nil {
+				retainFailedJob = jobFailed(jobState)
 				return result.outcome()
 			}
 
@@ -456,15 +467,31 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				setupPhases.observePod(ctx, &pods[i])
 			}
 			if failure := b.detectPodFailure(ctx, pods); failure != nil {
+				retainFailedJob = anyTaskContainerTerminated(pods)
 				return executeError(failure)
 			}
 		}
 	}
 }
 
-// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
-// Kubernetes-backend task.
-func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+// CancelTask deletes the task Job so a cancelled execution cannot later be
+// scheduled. No-op when cleanup is disabled.
+func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	if b.config.NoCleanup {
+		log.Infof(ctx, "Skipping Kubernetes Job deletion for cancelled task %s because cleanup is disabled", params.TaskID)
+		return nil
+	}
+	executionID := strings.TrimSpace(params.ExecutionID)
+	if executionID == "" {
+		executionID = params.TaskID
+	}
+	jobName := kubernetesTaskJobName(params.TaskID, executionID)
+	log.Infof(ctx, "Deleting Kubernetes Job %s for cancelled task %s", jobName, params.TaskID)
+	if err := b.deleteJob(ctx, jobName); err != nil {
+		return fmt.Errorf("failed to delete Kubernetes Job %s for cancelled task %s: %w", jobName, params.TaskID, err)
+	}
+	return nil
+}
 
 // Shutdown intentionally does not delete task Jobs.
 //
@@ -1543,6 +1570,24 @@ func jobComplete(job *batchv1.Job) bool {
 func jobFailed(job *batchv1.Job) bool {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func taskContainerTerminated(pod *corev1.Pod) bool {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == kubernetesTaskContainerName && status.State.Terminated != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func anyTaskContainerTerminated(pods []corev1.Pod) bool {
+	for i := range pods {
+		if taskContainerTerminated(&pods[i]) {
 			return true
 		}
 	}
