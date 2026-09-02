@@ -2,4 +2,4 @@ apiVersion: v2
 name: oz-agent-worker
 description: Namespace-scoped Helm chart for deploying oz-agent-worker on Kubernetes
 type: application
-version: 0.1.0
+version: 0.2.0
