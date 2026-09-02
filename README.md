@@ -155,6 +155,10 @@ The dispatch contract:
 Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
 The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
 
+To host the worker in Kubernetes, see [Command backend with Helm](#command-backend-with-helm).
+
+Reference scripts are available in [`examples/command-backend`](./examples/command-backend).
+
 ### Kubernetes
 
 The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
@@ -225,6 +229,60 @@ pod_template:
               key: secret-key
 ```
 
+#### Command backend with Helm
+
+The worker can run in Kubernetes while dispatching tasks through the command backend instead of creating task Jobs. Opt in with `backend.type=command`. `commandBackend.dispatchCommand` is required; `cancelCommand`, `dispatchTimeout`, and `environment` are optional.
+
+Add scripts through an existing ConfigMap and credentials through a Secret. The example below uses the reference [`dispatch.py` and `cancel.py` scripts](./examples/command-backend). These scripts require Python, which is not included in the standard worker image, so replace the image with one that includes Python to run the example. Use an image with the appropriate tools for your own scripts.
+
+Create the release namespace before creating namespaced resources, then create the script ConfigMap and dispatch credential:
+
+```bash
+kubectl create namespace agents --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap oz-dispatch \
+  --from-file=dispatch.py=examples/command-backend/dispatch.py \
+  --from-file=cancel.py=examples/command-backend/cancel.py \
+  --namespace agents
+
+kubectl create secret generic oz-dispatch-credentials \
+  --from-literal=OZ_DISPATCH_AUTH_HEADER='<replace-with-credential>' \
+  --namespace agents
+```
+
+Then configure the chart, mounted scripts, and Secret-backed worker environment:
+
+```yaml
+backend:
+  type: command
+commandBackend:
+  dispatchCommand: "python3 /opt/oz/dispatch.py"
+  cancelCommand: "python3 /opt/oz/cancel.py"
+  environment:
+    - name: OZ_DISPATCH_AUTH_HEADER
+image:
+  repository: example.registry.internal/oz-agent-worker-python
+  tag: <version>
+worker:
+  workerId: my-worker
+  extraEnv:
+    - name: OZ_DISPATCH_AUTH_HEADER
+      valueFrom:
+        secretKeyRef:
+          name: oz-dispatch-credentials
+          key: OZ_DISPATCH_AUTH_HEADER
+  extraVolumes:
+    - name: dispatch-scripts
+      configMap:
+        name: oz-dispatch
+  extraVolumeMounts:
+    - name: dispatch-scripts
+      mountPath: /opt/oz
+      readOnly: true
+```
+
+The custom image placeholder above must be replaced with an image that contains both `oz-agent-worker` and Python. The `worker.extraEnv` entry loads the credential from the Kubernetes Secret into the worker Pod, and the matching `commandBackend.environment` entry omits `value` so the dispatch and cancel commands inherit it.
+
+> **Warning:** Literal `commandBackend.environment[].value` entries are rendered into the chart's worker `ConfigMap`. Do not put credentials there. Use `worker.extraEnv[].valueFrom.secretKeyRef` as above, or mount a Secret read-only with `worker.extraVolumes` / `worker.extraVolumeMounts`.
 
 ### Helm Chart
 
@@ -234,15 +292,16 @@ The chart deploys:
 
 - a long-lived `Deployment` for `oz-agent-worker`
 - a namespaced `ServiceAccount`
-- a namespaced `Role` / `RoleBinding`
+- a namespaced `Role` / `RoleBinding` for the Kubernetes backend
 - a `ConfigMap` containing the worker config
 - an optional `Secret` for `WARP_API_KEY` (or a reference to an existing `Secret`)
 
-At runtime, the deployed worker connects outbound to Warp and creates one Kubernetes `Job` per task. The built-in Kubernetes Job controller then manages the task Pod lifecycle.
+At runtime, the deployed worker connects outbound to Warp. The default Kubernetes backend creates one Kubernetes `Job` per task, and the built-in Kubernetes Job controller manages the task Pod lifecycle. Command mode does not create task Jobs or their Role/RoleBinding; it invokes the operator-provided dispatcher mounted in the worker Pod.
 
 Recommended install flow:
 
 ```bash
+kubectl create namespace agents --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic oz-agent-worker \
   --from-literal=WARP_API_KEY="wk-abc123" \
   --namespace agents

@@ -48,3 +48,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- required "warp.apiKeySecret.name is required when warp.apiKeySecret.create=false" .Values.warp.apiKeySecret.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Resolve and validate the worker execution backend.
+Supported: kubernetes (default), command.
+*/}}
+{{- define "oz-agent-worker.backendType" -}}
+{{- $type := default "kubernetes" .Values.backend.type -}}
+{{- if not (or (eq $type "kubernetes") (eq $type "command")) -}}
+{{- fail (printf "backend.type must be \"kubernetes\" or \"command\", got %q" $type) -}}
+{{- end -}}
+{{- $type -}}
+{{- end -}}
