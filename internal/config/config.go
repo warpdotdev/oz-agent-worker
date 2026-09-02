@@ -62,12 +62,26 @@ type DockerConfig struct {
 
 // DirectConfig holds direct-backend-specific configuration.
 type DirectConfig struct {
-	WorkspaceRoot   string     `yaml:"workspace_root"`
-	TargetDir       string     `yaml:"target_dir"`
-	OzPath          string     `yaml:"oz_path"`
-	SetupCommand    string     `yaml:"setup_command"`
-	TeardownCommand string     `yaml:"teardown_command"`
-	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+	WorkspaceRoot   string            `yaml:"workspace_root"`
+	TargetDir       string            `yaml:"target_dir"`
+	OzPath          string            `yaml:"oz_path"`
+	SetupCommand    string            `yaml:"setup_command"`
+	TeardownCommand string            `yaml:"teardown_command"`
+	Environment     []EnvEntry        `yaml:"environment" validate:"dive"`
+	// HarnessConfigDirs maps a harness name (e.g. "claude", "codex") to a host
+	// directory path. When set, the backend copies the specified host directory
+	// into the workspace's per-task harness config directory before task
+	// execution. This makes local plugins and user settings available to the
+	// harness inside each isolated task workspace.
+	//
+	// If the source directory does not exist the seed step is silently skipped
+	// so that the worker can be configured ahead of any actual plugin install.
+	//
+	// Example:
+	//   harness_config_dirs:
+	//     claude: "/home/operator/.claude"
+	//     codex:  "/home/operator/.codex"
+	HarnessConfigDirs map[string]string `yaml:"harness_config_dirs"`
 }
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.

@@ -480,6 +480,112 @@ Direct mappings for the questions enterprise operators most commonly ask:
 - **Reconnect storms:**
   `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
 
+## Claude Code harness: local plugins and settings
+
+When a task runs with the Claude Code (`claude`) or Codex (`codex`) harness, the
+worker isolates each task's harness config into a per-task subdirectory (e.g.
+`<workspace>/.claude` with `CLAUDE_CONFIG_DIR` pointing at it). This prevents
+concurrent tasks from interfering with each other but means the task starts with
+an empty config directory — local plugins, skills, and user settings are not
+automatically carried over.
+
+### Direct backend: `harness_config_dirs`
+
+For self-hosted workers using the **direct backend**, set `harness_config_dirs`
+in the worker config file to copy a host directory into each task's harness
+config directory before the task runs:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  direct:
+    workspace_root: "/var/lib/oz/workspaces"
+    oz_path: "/usr/local/bin/oz"
+    harness_config_dirs:
+      claude: "/home/operator/.claude"  # seed from host ~/.claude into each task's CLAUDE_CONFIG_DIR
+      codex:  "/home/operator/.codex"   # similarly for Codex
+```
+
+The host directory is **copied** (not mounted), so each task gets its own
+isolated copy and writes do not accumulate back on the host. If the host
+directory does not exist the seed step is silently skipped, so you can configure
+the path before installing Claude Code.
+
+> **Note:** The seeded copy is per-task and discarded after the task completes.
+> Any state Claude Code writes during a task (conversation history, cached
+> credentials) stays in the workspace and is removed on cleanup.
+
+### Docker backend: volume mounts
+
+For the **Docker backend**, Claude Code uses `~/.claude` inside the container
+(the `CLAUDE_CONFIG_DIR` variable is not explicitly set). Mount your local
+Claude config directory as a read-only bind mount:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    volumes:
+      - "/home/operator/.claude:/root/.claude:ro"
+```
+
+Adjust the target path (`/root/.claude`) to match the `HOME` of the user that
+Claude Code runs as inside the task image.
+
+### Kubernetes backend: PVC or custom sidecar
+
+For the **Kubernetes backend** there are two recommended approaches:
+
+**Option A – PersistentVolumeClaim:** Mount a PVC containing your Claude config
+into each task pod via `backend.kubernetes.pod_template`:
+
+```yaml
+backend:
+  kubernetes:
+    pod_template:
+      volumes:
+        - name: claude-config
+          persistentVolumeClaim:
+            claimName: claude-config-pvc
+      containers:
+        - name: task
+          env:
+            - name: CLAUDE_CONFIG_DIR
+              value: /mnt/claude-config
+          volumeMounts:
+            - name: claude-config
+              mountPath: /mnt/claude-config
+              readOnly: true
+```
+
+**Option B – Custom sidecar image:** Build a Docker image that has your plugins
+pre-installed and configure it as a custom coding CLI sidecar. Because the
+bundled sidecar already carries the `claude` binary, you can layer your plugins
+on top of it:
+
+```yaml
+backend:
+  kubernetes:
+    coding_cli_sidecars:
+      claude: "registry.internal.example.com/claude-with-plugins:v1"
+```
+
+The image must expose the `claude` binary in the path the Warp entrypoint
+expects. Plugins baked into the sidecar image are available to every task that
+uses the Claude Code harness on this worker.
+
+### Warp-managed cloud environments
+
+For Warp-managed cloud environments (not self-hosted) there is no direct way to
+transfer local per-user Claude Code plugins and settings today. The current
+alternatives are:
+
+- **Plugin Marketplace plugins:** Plugins installed from Claude's Plugin
+  Marketplace are applied by Warp automatically via the official sidecar image.
+- **Team-shared plugins:** If your team uses the same set of plugins, build a
+  custom Docker image that includes them and configure it as a
+  `coding_cli_sidecars` entry in a self-hosted worker.
+
 ## License
 
 Copyright © 2026 Warp
