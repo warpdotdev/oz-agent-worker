@@ -19,8 +19,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-X main.Version=${VERSION}" -o o
 # Runtime stage
 FROM alpine:3.22
 
-# Install ca-certificates for HTTPS connections and create a non-root runtime user
-RUN apk --no-cache add ca-certificates \
+# Install ca-certificates for HTTPS connections and create a non-root runtime user.
+# Explicitly pin openssl>=3.5.8-r0 (fixes CVE-2026-63073 / CVE-2026-75803, was
+# 3.5.7-r0) since alpine:3.22 is a rolling tag and the base image layer alone
+# may not yet carry the fix.
+RUN apk --no-cache add ca-certificates "openssl>=3.5.8-r0" \
     && addgroup -S oz \
     && adduser -S -D -u 10001 -G oz oz
 
