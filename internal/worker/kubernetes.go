@@ -126,6 +126,9 @@ type KubernetesBackend struct {
 func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
 	return true
 }
+func (b *KubernetesBackend) SupportsOzLifecycleHooks() bool {
+	return true
+}
 
 // NewKubernetesBackend creates a new Kubernetes backend and validates startup requirements.
 func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (*KubernetesBackend, error) {
@@ -462,9 +465,20 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 }
 
-// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
-// Kubernetes-backend task.
-func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+// CancelTask deletes the task Job so the task process and all of its child
+// processes terminate together.
+func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	propagation := metav1.DeletePropagationForeground
+	err := b.clientset.BatchV1().Jobs(b.config.Namespace).Delete(
+		ctx,
+		kubernetesTaskJobName(params.TaskID, params.ExecutionID),
+		metav1.DeleteOptions{PropagationPolicy: &propagation},
+	)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
 
 // Shutdown intentionally does not delete task Jobs.
 //

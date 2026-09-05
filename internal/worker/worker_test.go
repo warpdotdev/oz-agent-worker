@@ -38,6 +38,9 @@ func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 func (b *shutdownRecordingBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
+func (b *shutdownRecordingBackend) SupportsOzLifecycleHooks() bool {
+	return true
+}
 
 type preservingShutdownRecordingBackend struct {
 	shutdownRecordingBackend
@@ -63,6 +66,9 @@ func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error { re
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
 	return false
+}
+func (b *recordingBackend) SupportsOzLifecycleHooks() bool {
+	return true
 }
 
 func TestTaskFailureLabels(t *testing.T) {
@@ -666,40 +672,40 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 	}
 
 	t.Run("kubernetes config sidecar_image overrides server-provided image", func(t *testing.T) {
-		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		params := mustPrepareTaskParams(t, newK8sWorker(overrideImage), assignment(serverImage))
 		assertAgentSidecar(t, params, overrideImage)
 	})
 
 	t.Run("docker config sidecar_image overrides server-provided image", func(t *testing.T) {
-		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		params := mustPrepareTaskParams(t, newDockerWorker(overrideImage), assignment(serverImage))
 		assertAgentSidecar(t, params, overrideImage)
 	})
 
 	t.Run("server-provided image used when kubernetes config sidecar_image empty", func(t *testing.T) {
-		params := newK8sWorker("").prepareTaskParams(assignment(serverImage))
+		params := mustPrepareTaskParams(t, newK8sWorker(""), assignment(serverImage))
 		assertAgentSidecar(t, params, serverImage)
 	})
 
 	t.Run("server-provided image used when docker config sidecar_image empty", func(t *testing.T) {
-		params := newDockerWorker("").prepareTaskParams(assignment(serverImage))
+		params := mustPrepareTaskParams(t, newDockerWorker(""), assignment(serverImage))
 		assertAgentSidecar(t, params, serverImage)
 	})
 
 	t.Run("server-provided image used when docker config is nil", func(t *testing.T) {
 		w := &Worker{ctx: context.Background(), config: Config{}}
-		params := w.prepareTaskParams(assignment(serverImage))
+		params := mustPrepareTaskParams(t, w, assignment(serverImage))
 		assertAgentSidecar(t, params, serverImage)
 	})
 
 	t.Run("no sidecar when server provides empty sidecar image with kubernetes override", func(t *testing.T) {
-		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(""))
+		params := mustPrepareTaskParams(t, newK8sWorker(overrideImage), assignment(""))
 		if len(params.Sidecars) != 0 {
 			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
 		}
 	})
 
 	t.Run("no sidecar when server provides empty sidecar image with docker override", func(t *testing.T) {
-		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(""))
+		params := mustPrepareTaskParams(t, newDockerWorker(overrideImage), assignment(""))
 		if len(params.Sidecars) != 0 {
 			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
 		}
@@ -707,7 +713,7 @@ func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
 
 	t.Run("docker override does not rewrite additional sidecars", func(t *testing.T) {
 		extra := types.SidecarMount{Image: "docker.io/warpdotdev/extra:latest", MountPath: "/mnt/extra"}
-		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage, extra))
+		params := mustPrepareTaskParams(t, newDockerWorker(overrideImage), assignment(serverImage, extra))
 		if len(params.Sidecars) != 2 {
 			t.Fatalf("sidecar count = %d, want 2: %+v", len(params.Sidecars), params.Sidecars)
 		}
@@ -755,7 +761,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("overrides server-provided coding CLI sidecar at mount path", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID:       "task-1",
 			Task:         harnessTask(strPtr("claude")),
 			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
@@ -787,7 +793,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("injects coding CLI sidecar when server did not provide one", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task:   harnessTask(strPtr("claude")),
 		})
@@ -803,7 +809,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("trims whitespace from harness type", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task:   harnessTask(strPtr("  claude  ")),
 		})
@@ -814,7 +820,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("no override when harness type not configured", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task:   harnessTask(strPtr("codex")),
 		})
@@ -828,7 +834,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("no override when configured image is empty", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": ""})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task:   harnessTask(strPtr("claude")),
 		})
@@ -839,7 +845,7 @@ func TestPrepareTaskParamsCodingCLISidecarOverride(t *testing.T) {
 
 	t.Run("no override when task has no harness snapshot", func(t *testing.T) {
 		w := newWorker(map[string]string{"claude": "registry.internal/my-claude:v1"})
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task:   &types.Task{ID: "task-1"},
 		})
@@ -871,7 +877,7 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 
 	t.Run("includes --share team:edit for team-owned task", func(t *testing.T) {
 		w := newWorker()
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-1",
 			Task: &types.Task{
 				ID:    "task-1",
@@ -885,7 +891,7 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 
 	t.Run("omits --share team:edit for user-owned task", func(t *testing.T) {
 		w := newWorker()
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-2",
 			Task: &types.Task{
 				ID:    "task-2",
@@ -899,7 +905,7 @@ func TestPrepareTaskParamsTeamShareConditional(t *testing.T) {
 
 	t.Run("omits --share team:edit when owner is nil", func(t *testing.T) {
 		w := newWorker()
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-3",
 			Task: &types.Task{
 				ID: "task-3",
@@ -922,7 +928,7 @@ func TestPrepareTaskParamsThreadsInstanceShape(t *testing.T) {
 
 	t.Run("threads shape when present", func(t *testing.T) {
 		shape := &types.InstanceShape{Vcpus: 4, MemoryGb: 16}
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID:        "task-1",
 			Task:          &types.Task{ID: "task-1"},
 			InstanceShape: shape,
@@ -933,7 +939,7 @@ func TestPrepareTaskParamsThreadsInstanceShape(t *testing.T) {
 	})
 
 	t.Run("nil shape when absent", func(t *testing.T) {
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-2",
 			Task:   &types.Task{ID: "task-2"},
 		})
@@ -952,7 +958,7 @@ func TestPrepareTaskParamsIncludesServerRootURLForHarnessSupport(t *testing.T) {
 		},
 	}
 
-	params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+	params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1"},
 	})
@@ -988,7 +994,7 @@ func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
 
 	t.Run("forwards server supplemental oz args", func(t *testing.T) {
 		w := newWorker()
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID:           "task-skip",
 			Task:             &types.Task{ID: "task-skip"},
 			AdditionalOzArgs: []string{"--skip-initial-turn"},
@@ -999,7 +1005,7 @@ func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
 	})
 	t.Run("does not add omitted supplemental oz args", func(t *testing.T) {
 		w := newWorker()
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
+		params := mustPrepareTaskParams(t, w, &types.TaskAssignmentMessage{
 			TaskID: "task-no-skip",
 			Task:   &types.Task{ID: "task-no-skip"},
 		})

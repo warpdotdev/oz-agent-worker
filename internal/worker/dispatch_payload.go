@@ -9,7 +9,7 @@ import (
 // DispatchPayloadVersion is the schema version of DispatchPayload. It is bumped
 // when the payload contract changes in a way operator dispatch commands must be
 // aware of.
-const DispatchPayloadVersion = 1
+const DispatchPayloadVersion = 2
 
 // DispatchPayload is the stable, versioned JSON contract handed to an operator's
 // dispatch command (on stdin) by the command backend. It contains everything a
@@ -17,16 +17,17 @@ const DispatchPayloadVersion = 1
 // tokens) travel only inside Env here, never via the dispatch subprocess's own
 // environment or argv.
 type DispatchPayload struct {
-	Version       int                  `json:"version"`
-	RunID         string               `json:"run_id"`
-	ExecutionID   string               `json:"execution_id"`
-	ServerRootURL string               `json:"server_root_url"`
-	WorkerID      string               `json:"worker_id"`
-	DockerImage   string               `json:"docker_image"`
-	BaseArgs      []string             `json:"base_args"`
-	Env           map[string]string    `json:"env"`
-	Sidecars      []types.SidecarMount `json:"sidecars"`
-	Task          *types.Task          `json:"task"`
+	Version          int                            `json:"version"`
+	RunID            string                         `json:"run_id"`
+	ExecutionID      string                         `json:"execution_id"`
+	ServerRootURL    string                         `json:"server_root_url"`
+	WorkerID         string                         `json:"worker_id"`
+	DockerImage      string                         `json:"docker_image"`
+	BaseArgs         []string                       `json:"base_args"`
+	Env              map[string]string              `json:"env"`
+	Sidecars         []types.SidecarMount           `json:"sidecars"`
+	Task             *types.Task                    `json:"task"`
+	OzLifecycleHooks *types.OzLifecycleHooksContext `json:"oz_lifecycle_hooks,omitempty"`
 }
 
 // NewDispatchPayload builds a DispatchPayload from backend-agnostic TaskParams
@@ -41,15 +42,16 @@ func NewDispatchPayload(params *TaskParams, serverRootURL, workerID string) *Dis
 	}
 
 	return &DispatchPayload{
-		Version:       DispatchPayloadVersion,
-		RunID:         params.TaskID,
-		ExecutionID:   params.ExecutionID,
-		ServerRootURL: serverRootURL,
-		WorkerID:      workerID,
-		DockerImage:   params.DockerImage,
-		BaseArgs:      params.BaseArgs,
-		Env:           env,
-		Sidecars:      params.Sidecars,
-		Task:          params.Task,
+		Version:          DispatchPayloadVersion,
+		RunID:            params.TaskID,
+		ExecutionID:      params.ExecutionID,
+		ServerRootURL:    serverRootURL,
+		WorkerID:         workerID,
+		DockerImage:      params.DockerImage,
+		BaseArgs:         params.BaseArgs,
+		Env:              env,
+		Sidecars:         params.Sidecars,
+		Task:             params.Task,
+		OzLifecycleHooks: params.OzLifecycleHooks,
 	}
 }

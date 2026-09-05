@@ -89,6 +89,7 @@ var activeInstruments atomic.Pointer[instruments]
 // and alerts can query them by name even before the worker has handled a task.
 const (
 	RejectReasonAtCapacity       = "at_capacity"
+	RejectReasonIncompatibleTask = "incompatible_task"
 	WSReconnectReasonDialFailed  = "dial_failed"
 	WSReconnectReasonRemoteClose = "remote_close"
 )
@@ -302,9 +303,11 @@ func primeInstruments(ctx context.Context, set *instruments) {
 	set.tasksActive.Add(ctx, 0)
 	set.tasksMaxConcurrent.Record(ctx, 0)
 	set.tasksClaimed.Add(ctx, 0)
-	set.tasksRejected.Add(ctx, 0,
-		metric.WithAttributes(attribute.String("reason", RejectReasonAtCapacity)),
-	)
+	for _, reason := range []string{RejectReasonAtCapacity, RejectReasonIncompatibleTask} {
+		set.tasksRejected.Add(ctx, 0,
+			metric.WithAttributes(attribute.String("reason", reason)),
+		)
+	}
 	for _, r := range taskResults {
 		set.tasksCompleted.Add(ctx, 0,
 			metric.WithAttributes(attribute.String("result", string(r))),

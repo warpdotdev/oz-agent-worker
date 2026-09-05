@@ -131,6 +131,9 @@ type TaskParams struct {
 	TaskID      string
 	ExecutionID string
 	Task        *types.Task
+	// OzLifecycleHooks is the authenticated, non-secret hook context forwarded
+	// to the embedded first-party Oz runtime.
+	OzLifecycleHooks *types.OzLifecycleHooksContext
 
 	// EnvVars contains pre-resolved common environment variables (TASK_ID, Git config,
 	// assignment env vars). Backends append their own config-specific env vars.
@@ -174,6 +177,9 @@ type Backend interface {
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool
+	// SupportsOzLifecycleHooks reports whether the backend preserves Oz argv,
+	// sandbox placement, and task cancellation for hook-enabled tasks.
+	SupportsOzLifecycleHooks() bool
 	// Shutdown cleans up backend resources.
 	Shutdown(ctx context.Context)
 }
