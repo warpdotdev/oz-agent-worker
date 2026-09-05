@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 )
 
@@ -101,14 +102,15 @@ func (c *OzLifecycleHooksContext) Validate() error {
 		return fmt.Errorf("oz lifecycle hooks context requires project_trust")
 	}
 	for i, record := range c.ProjectTrust {
-		if strings.TrimSpace(record.GitRoot) == "" {
-			return fmt.Errorf("project trust record %d has an empty git_root", i)
+		if !filepath.IsAbs(record.GitRoot) || filepath.Clean(record.GitRoot) != record.GitRoot {
+			return fmt.Errorf("project trust record %d has a non-canonical git_root", i)
 		}
-		if strings.TrimSpace(record.ConfigPath) == "" {
-			return fmt.Errorf("project trust record %d has an empty config_path", i)
+		expectedConfigPath := filepath.Join(record.GitRoot, ".warp", "hooks.json")
+		if record.ConfigPath != expectedConfigPath {
+			return fmt.Errorf("project trust record %d has an invalid config_path", i)
 		}
 		hash, err := hex.DecodeString(record.SHA256)
-		if err != nil || len(hash) != 32 {
+		if err != nil || len(hash) != 32 || strings.ToLower(record.SHA256) != record.SHA256 {
 			return fmt.Errorf("project trust record %d has an invalid sha256", i)
 		}
 	}

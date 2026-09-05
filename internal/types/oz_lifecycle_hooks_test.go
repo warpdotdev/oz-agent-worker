@@ -55,8 +55,20 @@ func TestOzLifecycleHooksContextStrictUnmarshal(t *testing.T) {
 			json: fmt.Sprintf(`{"required":true,"supported_payload_schema_versions":["%s"]}`, OzHookPayloadSchemaV1),
 		},
 		{
+			name: "non-canonical git root",
+			json: strings.Replace(valid, `"/workspace/repo"`, `"workspace/repo"`, 1),
+		},
+		{
+			name: "mismatched config path",
+			json: strings.Replace(valid, `"/workspace/repo/.warp/hooks.json"`, `"/workspace/other/.warp/hooks.json"`, 1),
+		},
+		{
 			name: "invalid sha256",
 			json: strings.Replace(valid, strings.Repeat("a", 64), "not-a-hash", 1),
+		},
+		{
+			name: "non-canonical sha256",
+			json: strings.Replace(valid, strings.Repeat("a", 64), strings.Repeat("A", 64), 1),
 		},
 	}
 
