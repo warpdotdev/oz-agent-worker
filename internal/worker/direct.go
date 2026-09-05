@@ -265,7 +265,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	}
 
 	log.Infof(ctx, "Running oz agent in workspace %s", workspaceDir)
-	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
+	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(sanitizeArgsForLog(params.BaseArgs), " "))
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
@@ -280,6 +280,17 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
 	return executeCompleted()
+}
+
+func sanitizeArgsForLog(args []string) []string {
+	sanitized := append([]string(nil), args...)
+	for i := 0; i+1 < len(sanitized); i++ {
+		if sanitized[i] == ozLifecycleHooksContextArg {
+			sanitized[i+1] = "<redacted>"
+			i++
+		}
+	}
+	return sanitized
 }
 
 // agentExitCode extracts the agent subprocess's exit code from a cmd.Run error.

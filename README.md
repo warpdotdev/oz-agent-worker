@@ -123,7 +123,7 @@ backend:
 Config keys:
 
 - `dispatch_command` (required): shell command (run via `/bin/sh -c`) invoked once per task to dispatch it.
-- `cancel_command` (optional): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation.
+- `cancel_command` (optional for ordinary tasks, required for hook-enabled tasks): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation and rejects hook-enabled task assignments before claiming them.
 - `dispatch_timeout` (optional): how long the dispatch command may run before it is considered failed (humantime format, e.g. `60s`). Defaults to `60s`.
 - `environment`: extra environment variables exposed to the dispatch/cancel commands (same `name`/`value` semantics as the other backends; omit `value` to inherit from the host).
 
@@ -156,7 +156,7 @@ The dispatch contract:
   ```
 
   `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
-  Hook-enabled payloads include `oz_lifecycle_hooks` and the same context in `base_args` under `--oz-lifecycle-hooks-context`; runtimes must preserve both unchanged. The serialized context is limited to 64 KiB so it remains safely below Linux's per-argument limit.
+  Hook-enabled payloads include `oz_lifecycle_hooks` and the same context in `base_args` under `--oz-lifecycle-hooks-context`; runtimes must preserve both unchanged. The serialized context is limited to 64 KiB so it remains safely below Linux's per-argument limit. The worker accepts these payloads only when `cancel_command` is configured, so the remote runtime and any hook subprocesses can be contained by task cancellation.
 - Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
 - The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment, each with its `WARP_`-prefixed alias.
 

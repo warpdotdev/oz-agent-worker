@@ -150,7 +150,9 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 // PreservesTasksOnShutdown reports true: dispatched tasks run on the operator's
 // remote runtime, independent of this worker, so worker shutdown must not cancel them.
 func (b *CommandBackend) PreservesTasksOnShutdown() bool { return true }
-func (b *CommandBackend) SupportsOzLifecycleHooks() bool { return true }
+func (b *CommandBackend) SupportsOzLifecycleHooks() bool {
+	return b.config.CancelCommand != ""
+}
 
 // Shutdown has nothing to clean up; the backend owns no local resources.
 func (b *CommandBackend) Shutdown(ctx context.Context) {

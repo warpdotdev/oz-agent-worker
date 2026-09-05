@@ -294,6 +294,38 @@ func TestCommandBackendCancelTaskNoCommandIsNoop(t *testing.T) {
 		t.Fatalf("CancelTask() with no cancel command should be a no-op, got %v", err)
 	}
 }
+func TestCommandBackendLifecycleHooksRequireCancelCommand(t *testing.T) {
+	tests := []struct {
+		name          string
+		cancelCommand string
+		wantAccepted  bool
+	}{
+		{name: "configured", cancelCommand: "true", wantAccepted: true},
+		{name: "missing", wantAccepted: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newTestCommandBackend(t, CommandBackendConfig{
+				DispatchCommand: "true",
+				CancelCommand:   test.cancelCommand,
+			})
+			if got := backend.SupportsOzLifecycleHooks(); got != test.wantAccepted {
+				t.Fatalf("SupportsOzLifecycleHooks() = %t, want %t", got, test.wantAccepted)
+			}
+
+			worker := &Worker{
+				ctx:     context.Background(),
+				backend: backend,
+				config:  Config{BackendType: "command"},
+			}
+			err := worker.validateTaskAssignment(ozHookAssignment(stringPtr("oz")))
+			if (err == nil) != test.wantAccepted {
+				t.Fatalf("validateTaskAssignment() error = %v, want accepted = %t", err, test.wantAccepted)
+			}
+		})
+	}
+}
 
 func TestNewWorkerSelectsCommandBackend(t *testing.T) {
 	w, err := New(context.Background(), Config{

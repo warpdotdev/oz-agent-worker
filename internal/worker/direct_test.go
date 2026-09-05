@@ -123,6 +123,34 @@ func TestDirectBackendCancellationTerminatesHookEnabledTask(t *testing.T) {
 	}
 }
 
+func TestSanitizeArgsForLogRedactsLifecycleHookContext(t *testing.T) {
+	args := []string{
+		"agent",
+		"run",
+		ozLifecycleHooksContextArg,
+		`{"project_trust":[{"git_root":"/workspace/private","sha256":"secret-hash"}]}`,
+		"--task-id",
+		"task-1",
+	}
+
+	got := sanitizeArgsForLog(args)
+	want := []string{"agent", "run", ozLifecycleHooksContextArg, "<redacted>", "--task-id", "task-1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("sanitizeArgsForLog() = %#v, want %#v", got, want)
+	}
+	if got := args[3]; strings.Contains(got, "<redacted>") {
+		t.Fatal("sanitizeArgsForLog() mutated the command arguments")
+	}
+}
+
+func TestSanitizeArgsForLogPreservesOtherArguments(t *testing.T) {
+	args := []string{"agent", "run", "--task-id", "task-1", ozLifecycleHooksContextArg}
+	got := sanitizeArgsForLog(args)
+	if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
+		t.Fatalf("sanitizeArgsForLog() = %#v, want %#v", got, args)
+	}
+}
+
 func TestDirectHarnessEnv(t *testing.T) {
 	workspaceDir := filepath.Join(string(filepath.Separator), "tmp", "workspace")
 
