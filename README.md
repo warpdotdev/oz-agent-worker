@@ -135,7 +135,7 @@ The dispatch contract:
 
   ```json
   {
-    "version": 1,
+    "version": 2,
     "run_id": "...",
     "execution_id": "...",
     "server_root_url": "https://app.warp.dev",
@@ -144,11 +144,19 @@ The dispatch contract:
     "base_args": ["agent", "run", "--task-id", "...", "--server-root-url", "..."],
     "env": { "GITHUB_ACCESS_TOKEN": "...", "...": "..." },
     "sidecars": [ { "image": "...", "mount_path": "/agent", "read_write": false } ],
-    "task": { "id": "...", "title": "...", "task_definition": { "prompt": "..." } }
+    "task": { "id": "...", "title": "...", "task_definition": { "prompt": "..." } },
+    "oz_lifecycle_hooks": {
+      "required": true,
+      "supported_payload_schema_versions": ["warp.oz_hook.v1"],
+      "project_trust": [
+        { "git_root": "/workspace", "config_path": "/workspace/.warp/hooks.json", "sha256": "..." }
+      ]
+    }
   }
   ```
 
   `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
+  Hook-enabled payloads include `oz_lifecycle_hooks` and the same context in `base_args` under `--oz-lifecycle-hooks-context`; runtimes must preserve both unchanged.
 - Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
 - The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment, each with its `WARP_`-prefixed alias.
 

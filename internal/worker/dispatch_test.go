@@ -20,6 +20,7 @@ func (b *dispatchBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResul
 func (b *dispatchBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 func (b *dispatchBackend) Shutdown(context.Context)                        {}
 func (b *dispatchBackend) PreservesTasksOnShutdown() bool                  { return true }
+func (b *dispatchBackend) SupportsOzLifecycleHooks() bool                  { return true }
 
 // cancelableDispatchBackend is a dispatchBackend that also records CancelTask calls.
 type cancelableDispatchBackend struct {

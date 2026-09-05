@@ -321,6 +321,9 @@ func (b *DirectBackend) Shutdown(ctx context.Context) {
 func (b *DirectBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
+func (b *DirectBackend) SupportsOzLifecycleHooks() bool {
+	return true
+}
 
 // runTeardownIfConfigured runs the teardown command if one is configured.
 func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir, gitConfigPath string) {

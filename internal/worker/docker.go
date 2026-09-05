@@ -269,6 +269,9 @@ func (b *DockerBackend) Shutdown(ctx context.Context) {
 func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
+func (b *DockerBackend) SupportsOzLifecycleHooks() bool {
+	return true
+}
 
 // normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,
 // defaulting an empty (omitted) value to PullPolicyAlways so existing installations keep
