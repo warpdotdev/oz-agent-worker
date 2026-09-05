@@ -11,9 +11,41 @@ import (
 
 const (
 	OzHookPayloadSchemaV1          = "warp.oz_hook.v1"
-	MaxOzLifecycleHooksContextSize = 256 << 10
+	MaxOzLifecycleHooksContextSize = 64 << 10
 	MaxOzLifecycleHookTrustRecords = 64
 )
+
+func (m *TaskAssignmentMessage) UnmarshalJSON(data []byte) error {
+	type assignmentAlias TaskAssignmentMessage
+	var decoded struct {
+		*assignmentAlias
+		OzLifecycleHooks json.RawMessage `json:"oz_lifecycle_hooks"`
+	}
+	decoded.assignmentAlias = (*assignmentAlias)(m)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	m.OzLifecycleHooks = nil
+	m.ozLifecycleHooksError = nil
+	if len(decoded.OzLifecycleHooks) == 0 || bytes.Equal(decoded.OzLifecycleHooks, []byte("null")) {
+		return nil
+	}
+	var context OzLifecycleHooksContext
+	if err := json.Unmarshal(decoded.OzLifecycleHooks, &context); err != nil {
+		m.ozLifecycleHooksError = err
+		return nil
+	}
+	m.OzLifecycleHooks = &context
+	return nil
+}
+
+func (m *TaskAssignmentMessage) OzLifecycleHooksValidationError() error {
+	if m == nil {
+		return nil
+	}
+	return m.ozLifecycleHooksError
+}
 
 type OzLifecycleHooksContext struct {
 	Required                       bool                         `json:"required"`

@@ -144,6 +144,38 @@ func TestValidateTaskAssignmentAcceptsSupportedAndUnhookedTasks(t *testing.T) {
 	}
 }
 
+func TestMalformedHookMetadataIsRejectedBeforeClaim(t *testing.T) {
+	worker := &Worker{
+		ctx:      context.Background(),
+		backend:  &recordingBackend{},
+		config:   Config{BackendType: "direct"},
+		sendChan: make(chan []byte, 1),
+	}
+	message := []byte(`{
+		"type":"task_assignment",
+		"data":{
+			"task_id":"task-1",
+			"task":{"id":"task-1","title":"test"},
+			"oz_lifecycle_hooks":{
+				"required":true,
+				"supported_payload_schema_versions":["warp.oz_hook.v1"],
+				"project_trust":[],
+				"unknown":true
+			}
+		}
+	}`)
+
+	worker.handleMessage(message)
+
+	rejected := readWebSocketMessage(t, worker.sendChan)
+	if rejected.Type != types.MessageTypeTaskRejected {
+		t.Fatalf("message type = %q, want task_rejected", rejected.Type)
+	}
+	if len(worker.activeTasks) != 0 {
+		t.Fatal("malformed hook task was added to active tasks")
+	}
+}
+
 type unsupportedOzLifecycleHooksBackend struct {
 	Backend
 }

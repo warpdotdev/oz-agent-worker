@@ -62,6 +62,9 @@ type Config struct {
 }
 
 func (w *Worker) validateTaskAssignment(assignment *types.TaskAssignmentMessage) error {
+	if err := assignment.OzLifecycleHooksValidationError(); err != nil {
+		return err
+	}
 	if assignment.OzLifecycleHooks == nil {
 		return nil
 	}

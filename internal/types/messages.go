@@ -64,7 +64,8 @@ type TaskAssignmentMessage struct {
 	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
 	// OzLifecycleHooks carries the authenticated, non-secret context required by
 	// the embedded first-party Oz runtime.
-	OzLifecycleHooks *OzLifecycleHooksContext `json:"oz_lifecycle_hooks,omitempty"`
+	OzLifecycleHooks      *OzLifecycleHooksContext `json:"oz_lifecycle_hooks,omitempty"`
+	ozLifecycleHooksError error
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
