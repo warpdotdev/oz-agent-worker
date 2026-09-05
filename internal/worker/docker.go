@@ -142,17 +142,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// Build Docker-specific command: entrypoint prefix + base args.
-	cmd := append([]string{"/agent/entrypoint.sh"}, params.BaseArgs...)
-
 	log.Debugf(ctx, "Creating Docker container with image=%s", imageName)
-
-	containerConfig := &container.Config{
-		Image:      imageName,
-		Cmd:        cmd,
-		Env:        envVars,
-		WorkingDir: "/workspace",
-	}
+	containerConfig := dockerTaskContainerConfig(params, envVars)
 
 	// Sidecar binds come first, then user-configured volumes.
 	binds := sidecarBinds
@@ -229,6 +220,15 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 
 	log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
 	return executeCompleted()
+}
+
+func dockerTaskContainerConfig(params *TaskParams, envVars []string) *container.Config {
+	return &container.Config{
+		Image:      params.DockerImage,
+		Cmd:        append([]string{"/agent/entrypoint.sh"}, params.BaseArgs...),
+		Env:        envVars,
+		WorkingDir: "/workspace",
+	}
 }
 
 // dockerResourcesForShape maps an instance shape to Docker container resource limits.

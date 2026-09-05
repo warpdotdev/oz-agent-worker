@@ -69,8 +69,7 @@ func (w *Worker) validateTaskAssignment(assignment *types.TaskAssignmentMessage)
 		return err
 	}
 	if assignment.Task == nil ||
-		assignment.Task.AgentConfigSnapshot == nil ||
-		!assignment.Task.AgentConfigSnapshot.Harness.IsOz() {
+		(assignment.Task.AgentConfigSnapshot != nil && !assignment.Task.AgentConfigSnapshot.Harness.IsOz()) {
 		return fmt.Errorf("oz lifecycle hooks require the first-party Oz harness")
 	}
 	for _, arg := range assignment.AdditionalOzArgs {

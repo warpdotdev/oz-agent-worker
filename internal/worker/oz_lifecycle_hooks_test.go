@@ -125,6 +125,25 @@ func TestValidateTaskAssignmentRejectsIncompatibleHookTasks(t *testing.T) {
 	}
 }
 
+func TestValidateTaskAssignmentAcceptsSupportedAndUnhookedTasks(t *testing.T) {
+	worker := &Worker{
+		ctx:     context.Background(),
+		backend: &recordingBackend{},
+		config:  Config{BackendType: "direct"},
+	}
+	implicitOz := ozHookAssignment(nil)
+	implicitOz.Task.AgentConfigSnapshot = nil
+	if err := worker.validateTaskAssignment(implicitOz); err != nil {
+		t.Fatalf("implicit Oz hook assignment rejected: %v", err)
+	}
+
+	unhookedThirdParty := ozHookAssignment(stringPtr("codex"))
+	unhookedThirdParty.OzLifecycleHooks = nil
+	if err := worker.validateTaskAssignment(unhookedThirdParty); err != nil {
+		t.Fatalf("unhooked third-party assignment rejected: %v", err)
+	}
+}
+
 type unsupportedOzLifecycleHooksBackend struct {
 	Backend
 }

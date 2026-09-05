@@ -252,6 +252,17 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	cmd.Env = mergeEnvVars(hostBaseEnv(), envVars)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
 
 	log.Infof(ctx, "Running oz agent in workspace %s", workspaceDir)
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))

@@ -468,7 +468,16 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 // CancelTask deletes the task Job so the task process and all of its child
 // processes terminate together.
 func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
-	return b.deleteJob(ctx, kubernetesTaskJobName(params.TaskID, params.ExecutionID))
+	propagation := metav1.DeletePropagationForeground
+	err := b.clientset.BatchV1().Jobs(b.config.Namespace).Delete(
+		ctx,
+		kubernetesTaskJobName(params.TaskID, params.ExecutionID),
+		metav1.DeleteOptions{PropagationPolicy: &propagation},
+	)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // Shutdown intentionally does not delete task Jobs.
