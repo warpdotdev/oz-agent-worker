@@ -11,13 +11,14 @@ func TestNewDispatchPayload(t *testing.T) {
 	task := &types.Task{ID: "task-1", Title: "do the thing"}
 	sidecars := []types.SidecarMount{{Image: "warpdotdev/warp-agent:latest", MountPath: "/agent"}}
 	params := &TaskParams{
-		TaskID:      "task-1",
-		ExecutionID: "exec-1",
-		Task:        task,
-		DockerImage: "ubuntu:22.04",
-		BaseArgs:    []string{"agent", "run", "--task-id", "task-1"},
-		EnvVars:     []string{"A=1", "B=2", "A=3", "URL=a=b"},
-		Sidecars:    sidecars,
+		TaskID:           "task-1",
+		ExecutionID:      "exec-1",
+		Task:             task,
+		OzLifecycleHooks: testOzLifecycleHooksContext(),
+		DockerImage:      "ubuntu:22.04",
+		BaseArgs:         []string{"agent", "run", "--task-id", "task-1"},
+		EnvVars:          []string{"A=1", "B=2", "A=3", "URL=a=b"},
+		Sidecars:         sidecars,
 	}
 
 	got := NewDispatchPayload(params, "https://app.warp.dev", "my-worker")
@@ -36,6 +37,9 @@ func TestNewDispatchPayload(t *testing.T) {
 	}
 	if got.Task != task {
 		t.Errorf("Task pointer not preserved")
+	}
+	if got.OzLifecycleHooks != params.OzLifecycleHooks {
+		t.Errorf("OzLifecycleHooks pointer not preserved")
 	}
 	if len(got.BaseArgs) != 4 || got.BaseArgs[0] != "agent" || got.BaseArgs[1] != "run" {
 		t.Errorf("BaseArgs = %v", got.BaseArgs)
@@ -79,5 +83,8 @@ func TestNewDispatchPayloadMarshalsSnakeCaseKeys(t *testing.T) {
 		if _, ok := generic[key]; !ok {
 			t.Errorf("payload JSON missing key %q", key)
 		}
+	}
+	if _, ok := generic["oz_lifecycle_hooks"]; ok {
+		t.Error("payload JSON must omit oz_lifecycle_hooks when disabled")
 	}
 }

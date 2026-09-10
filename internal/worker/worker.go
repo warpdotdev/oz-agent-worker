@@ -31,6 +31,8 @@ const (
 	BackendShutdownTimeout = 10 * time.Second
 
 	warpServerRootURLEnv = "WARP_SERVER_ROOT_URL"
+
+	ozLifecycleHooksContextArg = "--oz-lifecycle-hooks-context"
 )
 
 type Config struct {
@@ -57,6 +59,31 @@ type Config struct {
 	Direct     *DirectBackendConfig
 	Kubernetes *KubernetesBackendConfig
 	Command    *CommandBackendConfig
+}
+
+func (w *Worker) validateTaskAssignment(assignment *types.TaskAssignmentMessage) error {
+	if err := assignment.OzLifecycleHooksValidationError(); err != nil {
+		return err
+	}
+	if assignment.OzLifecycleHooks == nil {
+		return nil
+	}
+	if err := assignment.OzLifecycleHooks.Validate(); err != nil {
+		return err
+	}
+	if assignment.Task == nil ||
+		(assignment.Task.AgentConfigSnapshot != nil && !assignment.Task.AgentConfigSnapshot.Harness.IsOz()) {
+		return fmt.Errorf("oz lifecycle hooks require the first-party Oz harness")
+	}
+	for _, arg := range assignment.AdditionalOzArgs {
+		if arg == ozLifecycleHooksContextArg || strings.HasPrefix(arg, ozLifecycleHooksContextArg+"=") {
+			return fmt.Errorf("%s is reserved for authenticated hook metadata", ozLifecycleHooksContextArg)
+		}
+	}
+	if !w.backend.SupportsOzLifecycleHooks() {
+		return fmt.Errorf("backend %q does not support required Oz lifecycle hooks", w.config.BackendType)
+	}
+	return nil
 }
 
 type Worker struct {
@@ -421,6 +448,14 @@ func (w *Worker) cancelTaskOnBackend(params *CancelParams) {
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	receivedAt := time.Now()
+	if err := w.validateTaskAssignment(assignment); err != nil {
+		log.Warnf(w.ctx, "Rejecting task %s: %v", assignment.TaskID, err)
+		metrics.RecordTaskRejected(metrics.RejectReasonIncompatibleTask)
+		if sendErr := w.sendTaskRejected(assignment.TaskID, err.Error()); sendErr != nil {
+			log.Errorf(w.ctx, "Failed to send task rejected message: %v", sendErr)
+		}
+		return
+	}
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
@@ -482,7 +517,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
 // resolving common environment variables, default images, and base CLI arguments.
-func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *TaskParams {
+func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) (*TaskParams, error) {
 	task := assignment.Task
 
 	// Resolve Docker image.
@@ -526,6 +561,13 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	})
 	if w.config.SessionSharingServerURL != "" {
 		baseArgs = append(baseArgs, "--session-sharing-server-url", w.config.SessionSharingServerURL)
+	}
+	if assignment.OzLifecycleHooks != nil {
+		hookContext, err := assignment.OzLifecycleHooks.MarshalForCLI()
+		if err != nil {
+			return nil, err
+		}
+		baseArgs = append(baseArgs, ozLifecycleHooksContextArg, hookContext)
 	}
 
 	// Build a unified sidecar list:
@@ -588,16 +630,17 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 
 	return &TaskParams{
-		TaskID:        assignment.TaskID,
-		ExecutionID:   assignment.ExecutionID,
-		Task:          task,
-		EnvVars:       envVars,
-		BaseArgs:      baseArgs,
-		DockerImage:   dockerImage,
-		Sidecars:      sidecars,
-		InstanceShape: assignment.InstanceShape,
-		SetupEvents:   setupEvents,
-	}
+		TaskID:           assignment.TaskID,
+		ExecutionID:      assignment.ExecutionID,
+		Task:             task,
+		OzLifecycleHooks: assignment.OzLifecycleHooks,
+		EnvVars:          envVars,
+		BaseArgs:         baseArgs,
+		DockerImage:      dockerImage,
+		Sidecars:         sidecars,
+		InstanceShape:    assignment.InstanceShape,
+		SetupEvents:      setupEvents,
+	}, nil
 }
 
 // configuredWarpAgentSidecarImage returns the operator-configured warp-agent sidecar
@@ -660,7 +703,15 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
 	metrics.AddTaskEvent(ctx, "task.started")
 
-	params := w.prepareTaskParams(assignment)
+	params, err := w.prepareTaskParams(assignment)
+	if err != nil {
+		result = metrics.TaskResultFailed
+		log.Errorf(ctx, "Failed to prepare task parameters: taskID=%s, error=%v", taskID, err)
+		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err), metrics.TaskFailureReasonUnknown, 0); statusErr != nil {
+			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
+		}
+		return
+	}
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
 		attribute.String("docker.image", params.DockerImage),

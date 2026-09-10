@@ -16,13 +16,14 @@ import (
 
 func testTaskParams() *TaskParams {
 	return &TaskParams{
-		TaskID:      "task-1",
-		ExecutionID: "exec-1",
-		Task:        &types.Task{ID: "task-1", Title: "test"},
-		DockerImage: "ubuntu:22.04",
-		BaseArgs:    []string{"agent", "run", "--task-id", "task-1"},
-		EnvVars:     []string{"SUPER_SECRET_TOKEN=hunter2"},
-		Sidecars:    []types.SidecarMount{{Image: "warpdotdev/warp-agent:latest", MountPath: "/agent"}},
+		TaskID:           "task-1",
+		ExecutionID:      "exec-1",
+		Task:             &types.Task{ID: "task-1", Title: "test"},
+		OzLifecycleHooks: testOzLifecycleHooksContext(),
+		DockerImage:      "ubuntu:22.04",
+		BaseArgs:         []string{"agent", "run", "--task-id", "task-1", ozLifecycleHooksContextArg, "hook-context-json"},
+		EnvVars:          []string{"SUPER_SECRET_TOKEN=hunter2"},
+		Sidecars:         []types.SidecarMount{{Image: "warpdotdev/warp-agent:latest", MountPath: "/agent"}},
 	}
 }
 
@@ -50,6 +51,7 @@ func assertBackendFailureReason(t *testing.T, err error, wantReason metrics.Task
 }
 
 func TestCommandBackendDispatchesPayloadOnStdin(t *testing.T) {
+	t.Setenv("WARP_WORKER_API_KEY", "worker-control-secret")
 	outFile := filepath.Join(t.TempDir(), "payload.json")
 	b := newTestCommandBackend(t, CommandBackendConfig{
 		DispatchCommand: "cat > " + outFile,
@@ -85,8 +87,14 @@ func TestCommandBackendDispatchesPayloadOnStdin(t *testing.T) {
 	if got.Env["SUPER_SECRET_TOKEN"] != "hunter2" {
 		t.Errorf("Env[SUPER_SECRET_TOKEN] = %q, want hunter2", got.Env["SUPER_SECRET_TOKEN"])
 	}
+	if _, ok := got.Env["WARP_WORKER_API_KEY"]; ok {
+		t.Error("worker control-plane credential leaked into dispatched task environment")
+	}
 	if len(got.Sidecars) != 1 || got.Sidecars[0].MountPath != "/agent" {
 		t.Errorf("Sidecars = %v", got.Sidecars)
+	}
+	if got.OzLifecycleHooks == nil || len(got.OzLifecycleHooks.ProjectTrust) != 1 {
+		t.Errorf("OzLifecycleHooks = %+v", got.OzLifecycleHooks)
 	}
 }
 
@@ -143,6 +151,10 @@ func TestCommandBackendDoesNotLeakSecretsIntoSubprocessEnv(t *testing.T) {
 	}
 	if strings.Contains(env, "SUPER_SECRET_TOKEN") {
 		t.Errorf("task secret must NOT appear in subprocess env; got:\n%s", env)
+	}
+	if strings.Contains(env, testOzLifecycleHooksContext().ProjectTrust[0].SHA256) ||
+		strings.Contains(env, "hook-context-json") {
+		t.Errorf("hook metadata must NOT appear in subprocess env; got:\n%s", env)
 	}
 }
 
@@ -280,6 +292,38 @@ func TestCommandBackendCancelTaskNoCommandIsNoop(t *testing.T) {
 	b := newTestCommandBackend(t, CommandBackendConfig{DispatchCommand: "true"})
 	if err := b.CancelTask(context.Background(), &CancelParams{TaskID: "task-1"}); err != nil {
 		t.Fatalf("CancelTask() with no cancel command should be a no-op, got %v", err)
+	}
+}
+func TestCommandBackendLifecycleHooksRequireCancelCommand(t *testing.T) {
+	tests := []struct {
+		name          string
+		cancelCommand string
+		wantAccepted  bool
+	}{
+		{name: "configured", cancelCommand: "true", wantAccepted: true},
+		{name: "missing", wantAccepted: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newTestCommandBackend(t, CommandBackendConfig{
+				DispatchCommand: "true",
+				CancelCommand:   test.cancelCommand,
+			})
+			if got := backend.SupportsOzLifecycleHooks(); got != test.wantAccepted {
+				t.Fatalf("SupportsOzLifecycleHooks() = %t, want %t", got, test.wantAccepted)
+			}
+
+			worker := &Worker{
+				ctx:     context.Background(),
+				backend: backend,
+				config:  Config{BackendType: "command"},
+			}
+			err := worker.validateTaskAssignment(ozHookAssignment(stringPtr("oz")))
+			if (err == nil) != test.wantAccepted {
+				t.Fatalf("validateTaskAssignment() error = %v, want accepted = %t", err, test.wantAccepted)
+			}
+		})
 	}
 }
 

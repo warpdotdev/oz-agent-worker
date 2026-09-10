@@ -62,6 +62,10 @@ type TaskAssignmentMessage struct {
 	// backends size the task container/pod from it; omitted when the run has no explicit
 	// runner instance shape, in which case the worker keeps its default sizing.
 	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
+	// OzLifecycleHooks carries the authenticated, non-secret context required by
+	// the embedded first-party Oz runtime.
+	OzLifecycleHooks      *OzLifecycleHooksContext `json:"oz_lifecycle_hooks,omitempty"`
+	ozLifecycleHooksError error
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task

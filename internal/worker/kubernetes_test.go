@@ -9,6 +9,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,6 +20,26 @@ import (
 
 func durationPtr(value time.Duration) *time.Duration {
 	return &value
+}
+
+func TestKubernetesCancelTaskDeletesHookProcessJob(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{Namespace: "agents"},
+	}
+	jobName := kubernetesTaskJobName("task-1", "execution-1")
+	backend.clientset = fake.NewSimpleClientset(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: "agents"},
+	})
+
+	if err := backend.CancelTask(context.Background(), &CancelParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+	}); err != nil {
+		t.Fatalf("CancelTask() error = %v", err)
+	}
+	if _, err := backend.clientset.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("task Job still exists after cancellation: %v", err)
+	}
 }
 
 func TestKubernetesTaskJobNameEmbedsFullRunIDAndExecSuffix(t *testing.T) {
@@ -1279,6 +1300,7 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 // End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the
 // created Job's task container as requests and limits (else-branch, no pod_template).
 func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
+	t.Setenv("WARP_WORKER_API_KEY", "worker-control-secret")
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1323,12 +1345,17 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 		},
 		clientset: fakeClient,
 	}
+	contextJSON, err := testOzLifecycleHooksContext().MarshalForCLI()
+	if err != nil {
+		t.Fatalf("failed to marshal hook context: %v", err)
+	}
 
 	result := backend.ExecuteTask(context.Background(), &TaskParams{
-		TaskID:        "task-1",
-		DockerImage:   "ubuntu:22.04",
-		BaseArgs:      []string{"run"},
-		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
+		TaskID:           "task-1",
+		DockerImage:      "ubuntu:22.04",
+		OzLifecycleHooks: testOzLifecycleHooksContext(),
+		BaseArgs:         []string{ozLifecycleHooksContextArg, contextJSON},
+		InstanceShape:    &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
 	})
 	if result.Error != nil {
 		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
@@ -1338,6 +1365,17 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	if taskContainer.WorkingDir != defaultWorkspaceMountPath {
+		t.Fatalf("task working directory = %q, want %q", taskContainer.WorkingDir, defaultWorkspaceMountPath)
+	}
+	if len(taskContainer.Args) != 2 || taskContainer.Args[0] != ozLifecycleHooksContextArg || taskContainer.Args[1] != contextJSON {
+		t.Fatalf("task args = %v", taskContainer.Args)
+	}
+	for _, env := range taskContainer.Env {
+		if env.Name == "WARP_WORKER_API_KEY" {
+			t.Fatal("worker control-plane credential leaked to task pod")
+		}
+	}
 	if got := taskContainer.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
 		t.Fatalf("cpu request = %d, want 4", got.Value())
 	}

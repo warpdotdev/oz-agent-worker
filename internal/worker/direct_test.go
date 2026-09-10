@@ -2,14 +2,154 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
+
+func TestDirectBackendHookContextUsesWorkspaceAndExcludesWorkerCredentials(t *testing.T) {
+	testDir := t.TempDir()
+	workspaceRoot := filepath.Join(testDir, "workspaces")
+	argvCapture := filepath.Join(testDir, "argv.json")
+	envCapture := filepath.Join(testDir, "env.txt")
+	cwdCapture := filepath.Join(testDir, "cwd.txt")
+	ozPath := filepath.Join(testDir, "oz")
+	script := `#!/bin/sh
+set -eu
+printf '%s' "$2" > "$ARGV_CAPTURE"
+env > "$ENV_CAPTURE"
+pwd > "$CWD_CAPTURE"
+`
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	t.Setenv("WARP_WORKER_API_KEY", "worker-control-secret")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/worker/control-plane.json")
+	t.Setenv("KUBECONFIG", "/worker/kubeconfig")
+	t.Setenv("HOME", testDir)
+
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: workspaceRoot,
+		OzPath:        ozPath,
+		NoCleanup:     true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	contextJSON, err := testOzLifecycleHooksContext().MarshalForCLI()
+	if err != nil {
+		t.Fatalf("failed to marshal hook context: %v", err)
+	}
+	params := &TaskParams{
+		TaskID:           "task-1",
+		OzLifecycleHooks: testOzLifecycleHooksContext(),
+		BaseArgs:         []string{ozLifecycleHooksContextArg, contextJSON},
+		EnvVars: []string{
+			"ARGV_CAPTURE=" + argvCapture,
+			"ENV_CAPTURE=" + envCapture,
+			"CWD_CAPTURE=" + cwdCapture,
+		},
+	}
+	if result := backend.ExecuteTask(context.Background(), params); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
+	}
+
+	capturedJSON, err := os.ReadFile(argvCapture)
+	if err != nil {
+		t.Fatalf("failed to read captured argv: %v", err)
+	}
+	var capturedContext types.OzLifecycleHooksContext
+	if err := json.Unmarshal(capturedJSON, &capturedContext); err != nil {
+		t.Fatalf("captured hook context is invalid: %v", err)
+	}
+	capturedEnv, err := os.ReadFile(envCapture)
+	if err != nil {
+		t.Fatalf("failed to read captured environment: %v", err)
+	}
+	for _, forbidden := range []string{"WARP_WORKER_API_KEY=", "GOOGLE_APPLICATION_CREDENTIALS=", "KUBECONFIG="} {
+		if strings.Contains(string(capturedEnv), forbidden) {
+			t.Errorf("worker control-plane environment leaked to task: %s", forbidden)
+		}
+	}
+	capturedCWD, err := os.ReadFile(cwdCapture)
+	if err != nil {
+		t.Fatalf("failed to read captured cwd: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(capturedCWD)), filepath.Join(workspaceRoot, "task-1"); got != want {
+		t.Fatalf("task cwd = %q, want %q", got, want)
+	}
+}
+
+func TestDirectBackendCancellationTerminatesHookEnabledTask(t *testing.T) {
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+		OzPath:        ozPath,
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan ExecuteResult, 1)
+	go func() {
+		done <- backend.ExecuteTask(ctx, &TaskParams{
+			TaskID:           "task-1",
+			OzLifecycleHooks: testOzLifecycleHooksContext(),
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case result := <-done:
+		if result.Error == nil || !errors.Is(result.Error, context.Canceled) {
+			t.Fatalf("expected cancellation error, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook-enabled task did not terminate with its cancellation context")
+	}
+}
+
+func TestSanitizeArgsForLogRedactsLifecycleHookContext(t *testing.T) {
+	args := []string{
+		"agent",
+		"run",
+		ozLifecycleHooksContextArg,
+		`{"project_trust":[{"git_root":"/workspace/private","sha256":"secret-hash"}]}`,
+		"--task-id",
+		"task-1",
+	}
+
+	got := sanitizeArgsForLog(args)
+	want := []string{"agent", "run", ozLifecycleHooksContextArg, "<redacted>", "--task-id", "task-1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("sanitizeArgsForLog() = %#v, want %#v", got, want)
+	}
+	if got := args[3]; strings.Contains(got, "<redacted>") {
+		t.Fatal("sanitizeArgsForLog() mutated the command arguments")
+	}
+}
+
+func TestSanitizeArgsForLogPreservesOtherArguments(t *testing.T) {
+	args := []string{"agent", "run", "--task-id", "task-1", ozLifecycleHooksContextArg}
+	got := sanitizeArgsForLog(args)
+	if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
+		t.Fatalf("sanitizeArgsForLog() = %#v, want %#v", got, args)
+	}
+}
 
 func TestDirectHarnessEnv(t *testing.T) {
 	workspaceDir := filepath.Join(string(filepath.Separator), "tmp", "workspace")

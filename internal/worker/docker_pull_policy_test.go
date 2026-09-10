@@ -135,6 +135,29 @@ func newTestDockerBackend(t *testing.T, engine *fakeDockerEngine, policy string)
 	}
 }
 
+func TestDockerTaskContainerPreservesHookContextWithoutWorkerCredentials(t *testing.T) {
+	t.Setenv("WARP_WORKER_API_KEY", "worker-control-secret")
+	contextJSON, err := testOzLifecycleHooksContext().MarshalForCLI()
+	if err != nil {
+		t.Fatalf("failed to marshal hook context: %v", err)
+	}
+	config := dockerTaskContainerConfig(&TaskParams{
+		DockerImage:      "ubuntu:22.04",
+		OzLifecycleHooks: testOzLifecycleHooksContext(),
+		BaseArgs:         []string{ozLifecycleHooksContextArg, contextJSON},
+	}, []string{"TASK_ENV=present"})
+
+	if config.WorkingDir != "/workspace" {
+		t.Fatalf("working directory = %q, want /workspace", config.WorkingDir)
+	}
+	if !reflect.DeepEqual(config.Cmd, []string{"/agent/entrypoint.sh", ozLifecycleHooksContextArg, contextJSON}) {
+		t.Fatalf("container command = %v", config.Cmd)
+	}
+	if !reflect.DeepEqual(config.Env, []string{"TASK_ENV=present"}) {
+		t.Fatalf("container environment = %v", config.Env)
+	}
+}
+
 func TestPrepareImagePullPolicy(t *testing.T) {
 	const imageName = "example.com/task-image:v1"
 
