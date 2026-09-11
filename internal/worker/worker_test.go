@@ -165,7 +165,10 @@ func TestAgentExitCode(t *testing.T) {
 
 func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
 	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
-	if err := w.sendTaskFailed("task-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143); err != nil {
+	failureDetails := &types.FailureDetails{
+		Kubernetes: &types.KubernetesFailureDetails{SchemaVersion: 1},
+	}
+	if err := w.sendTaskFailed("task-1", "execution-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143, failureDetails); err != nil {
 		t.Fatalf("sendTaskFailed returned error: %v", err)
 	}
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -178,6 +181,31 @@ func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
 	}
 	if failed.ExitCode != 143 {
 		t.Fatalf("exit_code = %d, want 143", failed.ExitCode)
+	}
+	if failed.ExecutionID != "execution-1" {
+		t.Fatalf("execution_id = %q, want execution-1", failed.ExecutionID)
+	}
+	if failed.FailureDetails == nil || failed.FailureDetails.Kubernetes == nil {
+		t.Fatal("expected Kubernetes failure details")
+	}
+}
+
+func TestTerminalMessageOptionalFieldsAreOmitted(t *testing.T) {
+	for name, message := range map[string]any{
+		"failed":    types.TaskFailedMessage{TaskID: "task-1", Message: "failed"},
+		"completed": types.TaskCompletedMessage{TaskID: "task-1", Message: "completed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(message)
+			if err != nil {
+				t.Fatalf("failed to marshal terminal message: %v", err)
+			}
+			for _, field := range []string{"execution_id", "failure_details"} {
+				if strings.Contains(string(encoded), field) {
+					t.Fatalf("optional field %q was not omitted: %s", field, encoded)
+				}
+			}
+		})
 	}
 }
 
@@ -193,8 +221,9 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 		backend: &recordingBackend{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, context.Canceled)},
 	}
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -224,8 +253,9 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		backend: &recordingBackend{err: context.Canceled},
 	}
 	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -239,6 +269,9 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	}
 	if completed.TaskID != "task-1" {
 		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
+	}
+	if completed.ExecutionID != "execution-1" {
+		t.Errorf("execution ID = %q, want %q", completed.ExecutionID, "execution-1")
 	}
 	if completed.TaskState == nil || *completed.TaskState != types.TaskStateCancelled {
 		t.Fatalf("task state = %v, want %q", completed.TaskState, types.TaskStateCancelled)
@@ -261,8 +294,9 @@ func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *test
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -319,8 +353,9 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
 	msg := readWebSocketMessage(t, w.sendChan)
@@ -334,6 +369,9 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	}
 	if completed.TaskID != "task-1" {
 		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
+	}
+	if completed.ExecutionID != "execution-1" {
+		t.Errorf("execution ID = %q, want %q", completed.ExecutionID, "execution-1")
 	}
 	if completed.Message != "Task completed successfully" {
 		t.Errorf("message = %q, want %q", completed.Message, "Task completed successfully")
