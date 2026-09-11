@@ -78,6 +78,14 @@ kubernetesBackend:
   useImageVolumes: false
   preflightImage: ""
   sidecarImage: ""
+  # Optional: map a harness config name (e.g. claude, codex) to a custom Docker
+  # image mounted as that harness's coding CLI sidecar at /mnt/{harness}-cli-sidecar.
+  # Use this when your cluster runs a custom or internal Claude Code binary wrapper
+  # instead of the Warp-provided image. The custom image must have the harness binary
+  # on PATH (typically /usr/local/bin). Example:
+  #   codingCliSidecars:
+  #     claude: "registry.internal.example.com/my-claude-wrapper:v1"
+  codingCliSidecars: {}
   setupCommand: ""
   teardownCommand: ""
   extraLabels: {}
