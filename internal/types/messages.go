@@ -78,6 +78,41 @@ type HarnessAuthSecrets struct {
 	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
 }
 
+// RepositoryHeadType identifies how a prepared repository HEAD is resolved.
+type RepositoryHeadType string
+
+const (
+	RepositoryHeadTypeCommitSHA RepositoryHeadType = "COMMIT_SHA"
+	RepositoryHeadTypeBranch    RepositoryHeadType = "BRANCH"
+)
+
+// RepositoryHeadRef identifies a repository HEAD by type and value.
+type RepositoryHeadRef struct {
+	Type  RepositoryHeadType `json:"type"`
+	Value string             `json:"value"`
+}
+
+// RepositoryIdentity identifies one repository independently of checkout path spelling.
+type RepositoryIdentity struct {
+	CodeForge string `json:"code_forge"`
+	Owner     string `json:"owner"`
+	Repo      string `json:"repo"`
+}
+
+// RepositoryHeadOverride describes a server-computed repository checkout override.
+// The server has already validated and frozen these values (e.g. for benchmark
+// trials); the worker forwards them to the CLI as-is via --repository-head-override-json.
+type RepositoryHeadOverride struct {
+	CodeForge string            `json:"code_forge"`
+	RepoOwner string            `json:"repo_owner"`
+	RepoName  string            `json:"repo_name"`
+	Head      RepositoryHeadRef `json:"head"`
+	// CloneFrom, when set, identifies a different repository to clone from while
+	// keeping this repository's own name/path for the checkout (substitution).
+	CloneFrom      *RepositoryIdentity `json:"clone_from,omitempty"`
+	PreserveOrigin bool                `json:"preserve_origin,omitempty"`
+}
+
 // AmbientAgentConfig represents the agent configuration.
 type AmbientAgentConfig struct {
 	EnvironmentID      *string                    `json:"environment_id,omitempty"`
@@ -90,6 +125,9 @@ type AmbientAgentConfig struct {
 	IdleTimeoutMinutes *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness            *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
+	// RepositoryHeadOverrides identify repositories and optionally configure alternate
+	// clone remotes and origin retention. Currently only populated for benchmark trials.
+	RepositoryHeadOverrides []RepositoryHeadOverride `json:"repository_head_overrides,omitempty"`
 }
 
 // Task represents an ambient agent job.

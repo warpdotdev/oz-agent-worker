@@ -1,7 +1,9 @@
 package common
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
@@ -96,4 +98,102 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRepositoryHeadOverrideArgsForTask(t *testing.T) {
+	marshal := func(t *testing.T, override types.RepositoryHeadOverride) string {
+		t.Helper()
+		b, err := json.Marshal(override)
+		if err != nil {
+			t.Fatalf("failed to marshal fixture override: %v", err)
+		}
+		return string(b)
+	}
+
+	t.Run("no overrides adds nothing", func(t *testing.T) {
+		task := &types.Task{AgentConfigSnapshot: &types.AmbientAgentConfig{}}
+		got := repositoryHeadOverrideArgsForTask(task)
+		if got != nil {
+			t.Fatalf("expected nil args, got: %#v", got)
+		}
+	})
+
+	t.Run("single override without clone_from", func(t *testing.T) {
+		override := types.RepositoryHeadOverride{
+			CodeForge: "GITHUB",
+			RepoOwner: "warpdotdev",
+			RepoName:  "warp-server",
+			Head:      types.RepositoryHeadRef{Type: types.RepositoryHeadTypeBranch, Value: "develop"},
+		}
+		task := &types.Task{
+			AgentConfigSnapshot: &types.AmbientAgentConfig{
+				RepositoryHeadOverrides: []types.RepositoryHeadOverride{override},
+			},
+		}
+		expected := []string{
+			"--repository-head-override-json", marshal(t, override),
+			"--remove-repository-origins",
+		}
+		got := repositoryHeadOverrideArgsForTask(task)
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, expected)
+		}
+	})
+
+	t.Run("override with clone_from marshals the substitution fields", func(t *testing.T) {
+		override := types.RepositoryHeadOverride{
+			CodeForge: "GITHUB",
+			RepoOwner: "warpdotdev",
+			RepoName:  "warp",
+			Head: types.RepositoryHeadRef{
+				Type:  types.RepositoryHeadTypeCommitSHA,
+				Value: "0123456789abcdef0123456789abcdef01234567",
+			},
+			CloneFrom: &types.RepositoryIdentity{
+				CodeForge: "GITHUB",
+				Owner:     "warpdotdev",
+				Repo:      "warp-for-benchmarks",
+			},
+			PreserveOrigin: true,
+		}
+		task := &types.Task{
+			AgentConfigSnapshot: &types.AmbientAgentConfig{
+				RepositoryHeadOverrides: []types.RepositoryHeadOverride{override},
+			},
+		}
+		got := repositoryHeadOverrideArgsForTask(task)
+		jsonArg := marshal(t, override)
+		if !strings.Contains(jsonArg, `"clone_from":{"code_forge":"GITHUB","owner":"warpdotdev","repo":"warp-for-benchmarks"}`) {
+			t.Fatalf("fixture JSON missing expected clone_from shape: %s", jsonArg)
+		}
+		expected := []string{"--repository-head-override-json", jsonArg, "--remove-repository-origins"}
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, expected)
+		}
+	})
+
+	t.Run("multiple overrides emit one flag each and a single trailing remove-origins flag", func(t *testing.T) {
+		first := types.RepositoryHeadOverride{
+			CodeForge: "GITHUB", RepoOwner: "warpdotdev", RepoName: "warp",
+			Head: types.RepositoryHeadRef{Type: types.RepositoryHeadTypeBranch, Value: "develop"},
+		}
+		second := types.RepositoryHeadOverride{
+			CodeForge: "GITHUB", RepoOwner: "warpdotdev", RepoName: "warp-server",
+			Head: types.RepositoryHeadRef{Type: types.RepositoryHeadTypeBranch, Value: "develop"},
+		}
+		task := &types.Task{
+			AgentConfigSnapshot: &types.AmbientAgentConfig{
+				RepositoryHeadOverrides: []types.RepositoryHeadOverride{first, second},
+			},
+		}
+		expected := []string{
+			"--repository-head-override-json", marshal(t, first),
+			"--repository-head-override-json", marshal(t, second),
+			"--remove-repository-origins",
+		}
+		got := repositoryHeadOverrideArgsForTask(task)
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("args mismatch\n got: %#v\nwant: %#v", got, expected)
+		}
+	})
 }
