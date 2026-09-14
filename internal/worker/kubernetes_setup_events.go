@@ -76,6 +76,13 @@ func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, po
 	if expected == 0 {
 		return
 	}
+	for _, container := range pod.Spec.InitContainers {
+		if strings.HasPrefix(container.Name, kubernetesSidecarInitPrefix) &&
+			container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			t.observeReadySidecarPrep(ctx, pod)
+			return
+		}
+	}
 
 	var start, finish time.Time
 	terminated := 0
@@ -147,13 +154,23 @@ func (t *kubernetesSetupPhaseTracker) observeTaskStart(ctx context.Context, pod 
 // therefore never move the anchor.
 func (t *kubernetesSetupPhaseTracker) taskStartAnchor(pod *corev1.Pod) time.Time {
 	var anchor time.Time
+	restartable := restartableInitContainerNames(pod)
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.State.Terminated != nil && status.State.Terminated.FinishedAt.Time.After(anchor) {
+		if !restartable[status.Name] && status.State.Terminated != nil && status.State.Terminated.FinishedAt.Time.After(anchor) {
 			anchor = status.State.Terminated.FinishedAt.Time
 		}
 	}
 	if !anchor.IsZero() {
 		return anchor
+	}
+	for name := range restartable {
+		if strings.HasPrefix(name, kubernetesSidecarInitPrefix) {
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == corev1.PodInitialized && condition.Status == corev1.ConditionTrue {
+					return condition.LastTransitionTime.Time
+				}
+			}
+		}
 	}
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionTrue {
@@ -161,4 +178,68 @@ func (t *kubernetesSetupPhaseTracker) taskStartAnchor(pod *corev1.Pod) time.Time
 		}
 	}
 	return pod.CreationTimestamp.Time
+}
+
+// Kubernetes does not timestamp startup-probe success. Use the next init's
+// start (an upper bound that includes its image pull), or PodInitialized when
+// copies are the last init containers. Never time preparation through the
+// helpers' eventual shutdown after the task has finished.
+func (t *kubernetesSetupPhaseTracker) observeReadySidecarPrep(ctx context.Context, pod *corev1.Pod) {
+	var start time.Time
+	lastCopy := -1
+	for i, container := range pod.Spec.InitContainers {
+		if strings.HasPrefix(container.Name, kubernetesSidecarInitPrefix) {
+			lastCopy = i
+		}
+	}
+	for _, status := range pod.Status.InitContainerStatuses {
+		if !strings.HasPrefix(status.Name, kubernetesSidecarInitPrefix) {
+			continue
+		}
+		at := containerStartTime(status)
+		if !at.IsZero() && (start.IsZero() || at.Before(start)) {
+			start = at
+		}
+	}
+	for _, status := range pod.Status.InitContainerStatuses {
+		if !strings.HasPrefix(status.Name, kubernetesSidecarInitPrefix) {
+			continue
+		}
+		for _, term := range []*corev1.ContainerStateTerminated{status.State.Terminated, status.LastTerminationState.Terminated} {
+			if term != nil && strings.TrimSpace(term.Message) == sidecarCopyFailureMessage {
+				t.report(ctx, SetupEventSidecarPrep, start, term.FinishedAt.Time, true)
+				return
+			}
+		}
+	}
+	if lastCopy+1 < len(pod.Spec.InitContainers) {
+		next := pod.Spec.InitContainers[lastCopy+1].Name
+		for _, status := range pod.Status.InitContainerStatuses {
+			if status.Name == next {
+				t.report(ctx, SetupEventSidecarPrep, start, containerStartTime(status), false)
+				return
+			}
+		}
+		return
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodInitialized && condition.Status == corev1.ConditionTrue {
+			t.report(ctx, SetupEventSidecarPrep, start, condition.LastTransitionTime.Time, false)
+			return
+		}
+	}
+}
+
+func containerStartTime(status corev1.ContainerStatus) time.Time {
+	var start time.Time
+	if status.State.Running != nil {
+		start = status.State.Running.StartedAt.Time
+	}
+	if status.State.Terminated != nil {
+		start = status.State.Terminated.StartedAt.Time
+	}
+	if previous := status.LastTerminationState.Terminated; previous != nil && (start.IsZero() || previous.StartedAt.Time.Before(start)) {
+		start = previous.StartedAt.Time
+	}
+	return start
 }

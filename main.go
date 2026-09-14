@@ -191,6 +191,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			defaultImage          string
 			imagePullPolicy       string
 			useImageVolumes       bool
+			sidecarCopyReadiness  bool
 			preflightImage        string
 			sidecarImage          string
 			codingCLISidecars     map[string]string
@@ -213,6 +214,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			defaultImage = kc.DefaultImage
 			imagePullPolicy = kc.ImagePullPolicy
 			useImageVolumes = kc.UseImageVolumes
+			sidecarCopyReadiness = kc.SidecarCopyReadiness
 			preflightImage = kc.PreflightImage
 			sidecarImage = kc.SidecarImage
 			codingCLISidecars = copyStringMap(kc.CodingCLISidecars)
@@ -267,6 +269,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			DefaultImage:          defaultImage,
 			ImagePullPolicy:       imagePullPolicy,
 			UseImageVolumes:       useImageVolumes,
+			SidecarCopyReadiness:  sidecarCopyReadiness,
 			PreflightImage:        preflightImage,
 			SidecarImage:          sidecarImage,
 			CodingCLISidecars:     codingCLISidecars,

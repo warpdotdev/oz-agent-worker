@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -79,6 +80,7 @@ type KubernetesBackendConfig struct {
 	DefaultImage          string
 	ImagePullPolicy       string
 	UseImageVolumes       bool
+	SidecarCopyReadiness  bool
 	PreflightImage        string
 	SidecarImage          string
 	SetupCommand          string
@@ -129,6 +131,9 @@ func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
 
 // NewKubernetesBackend creates a new Kubernetes backend and validates startup requirements.
 func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (*KubernetesBackend, error) {
+	if config.UseImageVolumes && config.SidecarCopyReadiness {
+		return nil, fmt.Errorf("sidecar_copy_readiness and use_image_volumes are mutually exclusive")
+	}
 	if config.Namespace == "" {
 		config.Namespace = defaultKubernetesNamespace
 	}
@@ -223,7 +228,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
-		initContainers = append(initContainers, corev1.Container{
+		copyInit := corev1.Container{
 			Name:            fmt.Sprintf("%s%d", kubernetesSidecarInitPrefix, i),
 			Image:           sidecar.Image,
 			ImagePullPolicy: pullPolicy,
@@ -239,7 +244,14 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 					MountPath: sidecarCopyTargetMountPath,
 				},
 			},
-		})
+		}
+		if b.config.SidecarCopyReadiness {
+			stateVolumeName := fmt.Sprintf("sidecar-%d-copy-state", i)
+			volumes = append(volumes, sidecarCopyStateVolume(stateVolumeName))
+			configureSidecarCopyReadiness(&copyInit, stateVolumeName)
+			copyInit.Command = []string{"/bin/sh", "-ec", kubernetesSidecarReadinessScript()}
+		}
+		initContainers = append(initContainers, copyInit)
 
 		mainVolumeMounts = append(mainVolumeMounts, corev1.VolumeMount{
 			Name:      dataVolumeName,
@@ -342,11 +354,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if b.config.NoCleanup {
 			return
 		}
-		// Preserve failed task Jobs (and their pods) so operators can inspect logs
+		// Failed restartable copies cannot recover without a new Pod. Delete their
+		// Jobs to avoid leaving live crash loops after reporting the failure.
+		// Preserve other failed task Jobs (and their pods) so operators can inspect logs
 		// and pod state after the fact. They are garbage-collected by the Job's
 		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
 		// Jobs are deleted immediately to keep the namespace clean.
-		if res.Error != nil {
+		var failure *TaskFailure
+		copyFailed := errors.As(res.Error, &failure) && failure.metricsReason == metrics.TaskFailureReasonSidecarPrep
+		if res.Error != nil && !copyFailed {
 			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
 			return
 		}
@@ -777,6 +793,13 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 			},
 		}
 	}
+	if b.config.SidecarCopyReadiness {
+		const stateVolume = "preflight-copy-state"
+		podSpec.Volumes = append(podSpec.Volumes, sidecarCopyStateVolume(stateVolume))
+		init := &podSpec.InitContainers[0]
+		configureSidecarCopyReadiness(init, stateVolume)
+		init.Command = []string{"/bin/sh", "-ec", "touch " + sidecarCopyCompletePath + "\n" + kubernetesSidecarHoldScript()}
+	}
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("oz-preflight-%s-%d", kubernetesLabelHash(b.config.WorkerID), time.Now().UnixNano()),
@@ -793,8 +816,8 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 }
 
 func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
-	if b.config.UseImageVolumes {
-		return b.waitForImageVolumeStartupPreflight(logCtx, ctx, job)
+	if b.config.UseImageVolumes || b.config.SidecarCopyReadiness {
+		return b.waitForCompletionStartupPreflight(logCtx, ctx, job)
 	}
 	return b.waitForLegacyStartupPreflight(logCtx, ctx, job)
 }
@@ -843,7 +866,7 @@ func (b *KubernetesBackend) waitForLegacyStartupPreflight(logCtx, ctx context.Co
 	}
 }
 
-func (b *KubernetesBackend) waitForImageVolumeStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
+func (b *KubernetesBackend) waitForCompletionStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
 	podSelector := fmt.Sprintf("job-name=%s", job.Name)
 	eventSelector := fmt.Sprintf("involvedObject.uid=%s", job.UID)
 	ticker := time.NewTicker(startupPreflightPollInterval)
@@ -921,6 +944,9 @@ func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) er
 }
 
 func (b *KubernetesBackend) startupPreflightError(err error) error {
+	if b.config.SidecarCopyReadiness {
+		return fmt.Errorf("kubernetes startup preflight failed: sidecar_copy_readiness requires native sidecars (restartPolicy Always with startup probes) and root init containers: %w", err)
+	}
 	if b.config.UseImageVolumes {
 		return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs that mount sidecars via image volumes; verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
 	}
@@ -975,6 +1001,13 @@ func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.P
 	restartableSidecars := restartableInitContainerNames(pod)
 
 	for _, status := range pod.Status.InitContainerStatuses {
+		if restartableSidecars[status.Name] && strings.HasPrefix(status.Name, kubernetesSidecarInitPrefix) {
+			for _, term := range []*corev1.ContainerStateTerminated{status.State.Terminated, status.LastTerminationState.Terminated} {
+				if term != nil && strings.TrimSpace(term.Message) == sidecarCopyFailureMessage {
+					return newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, b.containerTerminatedFailureError(pod, "copy init container", status.Name, term), terminatedExitCode(term))
+				}
+			}
+		}
 		// Init containers declared with restartPolicy: Always are native
 		// sidecar containers: the kubelet restarts them while the pod runs and
 		// stops them with SIGTERM once the main containers finish, and their
@@ -1264,17 +1297,19 @@ func kubernetesTaskWrapperScript() string {
 }
 
 func kubernetesSidecarMaterializationScript() string {
-	return strings.Join([]string{
-		"tar \\",
-		"  --exclude=./target \\",
-		"  --exclude=./proc \\",
-		"  --exclude=./sys \\",
-		"  --exclude=./dev \\",
-		"  --exclude=./.dockerenv \\",
-		"  --exclude=./var/run/secrets \\",
-		"  --exclude=./run/secrets \\",
-		"  -C / -cf - . | tar --no-same-owner --no-same-permissions -C /target -xf -",
-	}, "\n")
+	return kubernetesSidecarArchiveCommand() + " | " + kubernetesSidecarExtractCommand
+}
+
+const kubernetesSidecarExtractCommand = "tar --no-same-owner --no-same-permissions -C /target -xf -"
+
+func kubernetesSidecarArchiveCommand(extraExcludes ...string) string {
+	excludes := []string{"target", "proc", "sys", "dev", ".dockerenv", "var/run/secrets", "run/secrets"}
+	excludes = append(excludes, extraExcludes...)
+	lines := []string{"tar \\"}
+	for _, path := range excludes {
+		lines = append(lines, "  --exclude=./"+path+" \\")
+	}
+	return strings.Join(append(lines, "  -C / -cf - ."), "\n")
 }
 
 // mergeKubernetesEnvVars merges base and override env var slices.

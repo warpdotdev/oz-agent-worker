@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -279,4 +280,63 @@ func TestKubernetesSetupPhaseTrackerNilSafe(t *testing.T) {
 
 	var nilTracker *kubernetesSetupPhaseTracker
 	nilTracker.observePod(context.Background(), &corev1.Pod{})
+}
+
+func TestReadySidecarPrepEndsBeforeHelpersExit(t *testing.T) {
+	for _, withSetup := range []bool{false, true} {
+		t.Run(fmt.Sprint(withSetup), func(t *testing.T) {
+			tracker, captured := newTrackerForTest(t)
+			base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			restart := corev1.ContainerRestartPolicyAlways
+			pod := &corev1.Pod{Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: kubernetesSidecarInitPrefix + "0", RestartPolicy: &restart}, {Name: kubernetesSidecarInitPrefix + "1", RestartPolicy: &restart}}}, Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{Name: kubernetesSidecarInitPrefix + "0", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(base)}}}, {Name: kubernetesSidecarInitPrefix + "1", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(base.Add(2 * time.Second))}}}}}}
+			tracker.observeSidecarPrep(context.Background(), pod)
+			if tracker.reported[SetupEventSidecarPrep] {
+				t.Fatal("reported before startup advanced")
+			}
+			if withSetup {
+				pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{Name: kubernetesSetupContainerName})
+				pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses, terminatedInitStatus(kubernetesSetupContainerName, base.Add(5*time.Second), base.Add(8*time.Second), 0))
+			} else {
+				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodInitialized, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(base.Add(5 * time.Second))}}
+			}
+			tracker.observeSidecarPrep(context.Background(), pod)
+			captured.waitForEvents(t, 1)
+			event, _ := captured.get(SetupEventSidecarPrep)
+			if event.Payload.LatencyMS != 5000 || event.Payload.IsError {
+				t.Fatalf("unexpected prep timing: %+v", event.Payload)
+			}
+			// A delayed first observation after shutdown must use the same boundary.
+			for i := 0; i < 2; i++ {
+				pod.Status.InitContainerStatuses[i] = terminatedInitStatus(kubernetesSidecarInitPrefix+fmt.Sprint(i), base.Add(time.Duration(i)*2*time.Second), base.Add(time.Minute), 143)
+			}
+			late, lateCaptured := newTrackerForTest(t)
+			late.observeSidecarPrep(context.Background(), pod)
+			lateCaptured.waitForEvents(t, 1)
+			event, _ = lateCaptured.get(SetupEventSidecarPrep)
+			if event.Payload.LatencyMS != 5000 || event.Payload.IsError {
+				t.Fatal("helper shutdown was counted as startup")
+			}
+			anchor := late.taskStartAnchor(pod)
+			if anchor.After(base.Add(8 * time.Second)) {
+				t.Fatal("helper shutdown moved the task startup anchor")
+			}
+		})
+	}
+}
+
+func TestReadySidecarPrepReportsCopyFailure(t *testing.T) {
+	tracker, captured := newTrackerForTest(t)
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	restart := corev1.ContainerRestartPolicyAlways
+	failed := terminatedInitStatus(kubernetesSidecarInitPrefix+"0", base, base.Add(2*time.Second), 42)
+	failed.State.Terminated.Message = sidecarCopyFailureMessage
+	failed.LastTerminationState = failed.State
+	failed.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: failed.Name, RestartPolicy: &restart}}}, Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{failed}}}
+	tracker.observeSidecarPrep(context.Background(), pod)
+	captured.waitForEvents(t, 1)
+	event, _ := captured.get(SetupEventSidecarPrep)
+	if !event.Payload.IsError || event.Payload.LatencyMS != 2000 {
+		t.Fatalf("unexpected failure phase: %+v", event.Payload)
+	}
 }
