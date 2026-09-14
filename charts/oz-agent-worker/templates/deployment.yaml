@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "oz-agent-worker.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "oz-agent-worker.labels" . | nindent 4 }}
   {{- with .Values.worker.deploymentAnnotations }}
@@ -29,6 +30,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "oz-agent-worker.serviceAccountName" . }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
@@ -62,6 +64,36 @@ spec:
                 secretKeyRef:
                   name: {{ include "oz-agent-worker.apiKeySecretName" . }}
                   key: {{ .Values.warp.apiKeySecret.key }}
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: OTEL_METRICS_EXPORTER
+              value: {{ .Values.metrics.exporter | quote }}
+            {{- if eq .Values.metrics.exporter "prometheus" }}
+            # Bind to all interfaces inside the pod so the kubelet/Prometheus
+            # can scrape the worker via the Service. The autoexport default
+            # of localhost would only be reachable from inside the container.
+            - name: OTEL_EXPORTER_PROMETHEUS_HOST
+              value: "0.0.0.0"
+            - name: OTEL_EXPORTER_PROMETHEUS_PORT
+              value: {{ .Values.metrics.port | quote }}
+            {{- end }}
+            {{- with .Values.metrics.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- else }}
+            # The worker defaults an unset exporter to OTLP, so disabling
+            # chart-managed metrics must explicitly disable metric export.
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
+            {{- end }}
+          {{- if and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/oz-agent-worker

@@ -16,6 +16,7 @@ Self-hosted worker for Oz cloud agents.
   - Docker daemon access for the Docker backend
   - Local `oz` CLI access plus a writable workspace root for the Direct backend
   - Kubernetes API access plus cluster credentials for the Kubernetes backend
+  - An operator-provided dispatch command for the Command backend (dispatch to any runtime over any transport)
 
 ## Usage
 
@@ -26,10 +27,55 @@ The worker needs access to the Docker daemon to spawn task containers. Mount the
 ```bash
 docker run -v /var/run/docker.sock:/var/run/docker.sock \
   -e WARP_API_KEY="wk-abc123" \
-  warpdotdev/oz-agent-worker --worker-id "my-worker"
+  warpdotdev/oz-agent-worker:<release-tag> --worker-id "my-worker"
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+#### Docker backend configuration
+
+`backend.docker.image_pull_policy` controls how the Docker backend gets the task image and each Warp/additional sidecar image before it starts a container. The accepted values match the Kubernetes backend's `image_pull_policy`:
+
+- `Always` (the default for this backend when you omit the key): pull the image from the registry, then use the pulled image.
+- `IfNotPresent`: use the image if it is already stored locally. Pull the image only when it is not present locally.
+- `Never`: do not contact the registry. Use the image if it is already stored locally. If the image is not present locally, the task setup fails with a clear error.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    image_pull_policy: "IfNotPresent"
+```
+
+This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
+
+`backend.docker.sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when the worker host cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    sidecar_image: "my-registry.io/warpdotdev/warp-agent:latest"
+```
+
+### Image releases and pinning
+
+Production self-hosted workers should pin an immutable image version instead of relying on `latest`.
+
+Each merge to `main` creates a GitHub release and publishes a multi-architecture Docker image with a UTC timestamp tag:
+
+```text
+warpdotdev/oz-agent-worker:vYYYY-MM-DD-HH-MM-SS
+```
+
+The GitHub release body includes both the Docker tag and digest. Use either the timestamp tag or the digest in production deployments:
+
+```bash
+docker pull warpdotdev/oz-agent-worker:v2026-06-01-10-09-37
+docker pull warpdotdev/oz-agent-worker@sha256:<digest>
+```
+
+`latest` is updated to the same image when a release is published, but it is a moving tag intended for quick testing only.
 
 ### Direct
 
@@ -44,6 +90,70 @@ backend:
     workspace_root: "/var/lib/oz/workspaces"
     oz_path: "/usr/local/bin/oz"
 ```
+
+The `setup_command` and `teardown_command` hooks run with these variables set, each under both
+its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
+
+- `OZ_RUN_ID` — the run being executed.
+- `OZ_WORKER_BACKEND` — always `direct` here.
+- `OZ_WORKSPACE_ROOT` — the per-task workspace directory, which is also the hook's working directory.
+- `OZ_ENVIRONMENT_FILE` — setup only. Write `KEY=VALUE` lines here to add variables to the agent's environment.
+
+The teardown hook additionally gets `GIT_CONFIG_GLOBAL`, pointing at the task's isolated git config.
+These names are worker-owned: the worker writes them last, so an entry with one of these names in
+the backend's `environment` is overwritten rather than honoured.
+
+### Command
+
+The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
+
+Example config:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+    cancel_command: "/opt/oz/cancel.sh"
+    dispatch_timeout: "60s"
+    environment:
+      - name: MY_RUNTIME_TOKEN
+```
+
+Config keys:
+
+- `dispatch_command` (required): shell command (run via `/bin/sh -c`) invoked once per task to dispatch it.
+- `cancel_command` (optional): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation.
+- `dispatch_timeout` (optional): how long the dispatch command may run before it is considered failed (humantime format, e.g. `60s`). Defaults to `60s`.
+- `environment`: extra environment variables exposed to the dispatch/cancel commands (same `name`/`value` semantics as the other backends; omit `value` to inherit from the host).
+
+The dispatch contract:
+
+- The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
+- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`. Each is also set under a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, `WARP_WORKER_BACKEND`, `WARP_SERVER_ROOT_URL`, `WARP_DOCKER_IMAGE`); read whichever name you prefer. One exception to "just an alias": `WARP_SERVER_ROOT_URL` is also the Warp CLI's own server-root-URL override, so inside the dispatch and cancel subprocesses it points any `oz`/`warp` invocation at that server. The value is the same one the worker already uses, so this changes nothing in practice — but do not treat that one name as inert.
+- The JSON payload looks like:
+
+  ```json
+  {
+    "version": 1,
+    "run_id": "...",
+    "execution_id": "...",
+    "server_root_url": "https://app.warp.dev",
+    "worker_id": "my-worker",
+    "docker_image": "ubuntu:22.04",
+    "base_args": ["agent", "run", "--task-id", "...", "--server-root-url", "..."],
+    "env": { "GITHUB_ACCESS_TOKEN": "...", "...": "..." },
+    "sidecars": [ { "image": "...", "mount_path": "/agent", "read_write": false } ],
+    "task": { "id": "...", "title": "...", "task_definition": { "prompt": "..." } }
+  }
+  ```
+
+  `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
+- Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
+- The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment, each with its `WARP_`-prefixed alias.
+
+Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
+The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
 
 ### Kubernetes
 
@@ -80,7 +190,18 @@ Notes:
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
 - `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
+- the worker owns a set of names in the task container's environment and writes them last, so an entry with one of these names in `task_env` or `pod_template` is overwritten rather than honoured: `OZ_RUN_ID`, `OZ_WORKER_BACKEND`, `OZ_WORKSPACE_ROOT`, `OZ_ENVIRONMENT_FILE`, and the `WARP_`-prefixed name of each (`WARP_RUN_ID` and so on). Pick different names for operator-supplied variables. Warp reserves the `WARP_` names against managed secrets too, but a worker's own config is yours, so nothing stops you setting them — they just will not survive
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
+- `coding_cli_sidecars` maps a harness config name (e.g. `claude`, `codex`) to a custom Docker image that will be mounted as the coding CLI sidecar for runs using that harness. When set, the worker replaces the server-provided sidecar image (or injects a new entry if the server did not send one) at the standard mount path `/mnt/{harness}-cli-sidecar`. Use this when your cluster uses a custom or internal Claude Code binary wrapper instead of the Warp-provided image. Example:
+
+```yaml
+backend:
+  kubernetes:
+    coding_cli_sidecars:
+      claude: "registry.internal.example.com/my-claude-wrapper:v1"
+```
+
+  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked
 - by default, the Kubernetes backend materializes sidecars with root init containers into `emptyDir` volumes, matching the existing behavior
 - set `use_image_volumes: true` to opt into native image volumes for sidecars; in that mode, sidecar mounts are read-only and Kubernetes/runtime support for the built-in `ImageVolume` Pod volume source is required
 - Kubernetes `1.35+` is the recommended and tested target for `use_image_volumes: true`; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes
@@ -88,6 +209,8 @@ Notes:
 - `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
+- when a run's runner specifies an instance shape, the worker sets the `task` container's CPU and memory **requests and limits** from that shape on a per-run basis, overriding any matching `resources` set on the `task` container in `pod_template` (other resource entries are preserved). Runs whose runner has no instance shape keep your `pod_template`/cluster defaults unchanged. The Docker backend applies the same shape as container CPU/memory limits; the Direct backend runs on the host and does not enforce shapes
+- to run services (databases, brokers, caches, etc.) alongside the task container, declare them in `pod_template.initContainers` with `restartPolicy: Always` (native sidecar containers). Matching Kubernetes Job semantics, the worker ignores their exit codes when detecting task failure: the kubelet stops sidecars with SIGTERM after the task container finishes, so services that exit non-zero on SIGTERM (e.g. JVM-based services exiting 143) do not fail the task. Init containers without `restartPolicy` remain run-to-completion setup steps whose non-zero exit fails the task
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
 
 ```yaml
@@ -128,7 +251,7 @@ helm install oz-agent-worker ./charts/oz-agent-worker \
   --namespace agents \
   --create-namespace \
   --set worker.workerId=my-worker \
-  --set image.tag=v1.2.3
+  --set image.tag=v2026-06-01-10-09-37
 ```
 
 The chart assumes the worker runs inside the target cluster and uses in-cluster Kubernetes auth by default. It does not create CRDs or cluster-scoped RBAC. Set `image.tag` explicitly for each install so the worker image is pinned instead of defaulting to `latest`.
@@ -138,6 +261,27 @@ The chart always deploys a single replica for a given `worker.workerId`. If you 
 The chart defaults the long-lived worker `Deployment` to a non-root security context and conservative starting resource requests of `100m` CPU and `128Mi` memory. Tune `worker.resources` for your workload and cluster policy.
 
 The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
+
+When the long-lived worker pod is terminated by normal Kubernetes disruption
+(for example Karpenter node consolidation), the Kubernetes backend preserves
+active task Jobs instead of deleting them during worker shutdown. This protects
+running Oz sessions from worker pod rotation as long as the task Job and task Pod
+remain healthy. The default `worker.terminationGracePeriodSeconds` only needs to
+cover WebSocket close and metrics flush.
+
+This does not make task Pods disruption-proof. If Karpenter or another cluster
+operation evicts the node that is actually running the task Pod, the live Oz
+session can still be interrupted because the process and any pod-local workspace
+state are on that task Pod. For stronger protection, schedule worker pods and
+task pods independently (for example with separate node pools, selectors,
+tolerations, or disruption budgets) so worker rotation does not imply task pod
+eviction.
+
+When cleanup is enabled, successful task Jobs are deleted immediately by the
+worker when it observes completion, while failed task Jobs (and Jobs orphaned by
+worker disruption) are left in place for post-mortem debugging and cleaned up by
+the Kubernetes Job TTL (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
+When cleanup is disabled, no TTL is set and task Jobs remain indefinitely.
 
 Recommended namespace-scoped permissions for the worker are:
 
@@ -185,7 +329,7 @@ When using Docker to run the worker, note that `-e` flags for the worker itself 
 ```bash
 docker run -v /var/run/docker.sock:/var/run/docker.sock \
   -e WARP_API_KEY="wk-abc123" \
-  warpdotdev/oz-agent-worker --worker-id "my-worker" -e MY_SECRET=hunter2
+  warpdotdev/oz-agent-worker:<release-tag> --worker-id "my-worker" -e MY_SECRET=hunter2
 ```
 
 When configuring the Kubernetes backend via YAML or Helm, declarative task-container env belongs in `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate` rather than a separate top-level Kubernetes env list. The `-e` / `--env` flags remain available as backend-agnostic runtime overrides.
@@ -212,6 +356,129 @@ export DOCKER_TLS_VERIFY=1
 export DOCKER_CERT_PATH="/path/to/certs"
 oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ```
+
+## Monitoring
+
+The worker can export metrics over OpenTelemetry. Exporter selection is
+driven by the standard
+[OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),
+implemented via
+[`go.opentelemetry.io/contrib/exporters/autoexport`](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/exporters/autoexport).
+When `OTEL_METRICS_EXPORTER` is unset, the worker delegates to autoexport's
+default, which is OTLP push to `OTEL_EXPORTER_OTLP_ENDPOINT` (defaulting to
+`http://localhost:4318` for `http/protobuf` or `http://localhost:4317` for
+`grpc`). To fully disable metrics export, set `OTEL_METRICS_EXPORTER=none`.
+
+### Quick start with Prometheus
+
+```bash
+export OTEL_METRICS_EXPORTER=prometheus
+export OTEL_EXPORTER_PROMETHEUS_HOST=0.0.0.0
+export OTEL_EXPORTER_PROMETHEUS_PORT=9464
+oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
+
+# In another shell:
+curl -s localhost:9464/metrics | grep oz_worker_
+```
+
+### Quick start with OTLP
+
+```bash
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc:4318
+oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
+```
+
+Tracing is opt-in. Set `OTEL_TRACES_EXPORTER` to a non-`none` exporter such as
+`otlp` to emit per-task spans and lifecycle events; leave it unset to export
+metrics only.
+
+### Helm
+
+```bash
+helm install oz-agent-worker ./charts/oz-agent-worker \
+  --namespace agents --create-namespace \
+  --set worker.workerId=my-worker \
+  --set image.tag=v2026-06-01-10-09-37 \
+  --set metrics.enabled=true
+```
+
+With `metrics.enabled=true` and the default `metrics.exporter=prometheus`, the
+chart adds:
+
+- a `containerPort: metrics` (default 9464) on the worker Deployment
+- the `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_PROMETHEUS_HOST`, and
+  `OTEL_EXPORTER_PROMETHEUS_PORT` environment variables
+- a namespace-scoped `Service` named `<release>-oz-agent-worker-metrics` with
+  `prometheus.io/scrape` annotations
+- optionally a `PodMonitor` (`metrics.podMonitor.create=true`) for clusters
+  using the Prometheus Operator
+
+For OTLP push instead, set `metrics.exporter=otlp` and forward the relevant
+endpoint variables via `metrics.extraEnv`:
+
+```yaml
+metrics:
+  enabled: true
+  exporter: otlp
+  extraEnv:
+    - name: OTEL_TRACES_EXPORTER
+      value: otlp
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://otel-collector.observability.svc:4318
+```
+
+### Metric catalog
+
+All metrics carry the resource attributes `service.name=oz-agent-worker`,
+`service.version`, `worker.id`, and `worker.backend`, so each worker process
+shows up as a distinct series.
+
+- `oz_worker_connected` (gauge): `1` while the worker has an active WebSocket
+  connection to warp-server, `0` otherwise. Aggregate to count connected
+  workers: `sum(oz_worker_connected)`.
+- `oz_worker_tasks_active` (gauge / UpDownCounter): tasks currently executing
+  on this worker. To count workers running ≥1 task:
+  `count(oz_worker_tasks_active > 0)`.
+- `oz_worker_tasks_max_concurrent` (gauge): configured concurrency limit
+  (`0` means unlimited).
+- `oz_worker_tasks_rejected_total{reason}` (counter): tasks the worker
+  declined, e.g. `reason="at_capacity"`.
+- `oz_worker_tasks_completed_total{result}` (counter): completed tasks
+  labeled `result="succeeded"`, `result="failed"`, or `result="cancelled"`.
+  Success rate over 5m:
+  `sum(rate(oz_worker_tasks_completed_total{result="succeeded"}[5m])) /
+   sum(rate(oz_worker_tasks_completed_total[5m]))`.
+- `oz_worker_task_duration_seconds{result}` (histogram): wall-clock task
+  duration on the worker. p95: `histogram_quantile(0.95,
+   sum by (le) (rate(oz_worker_task_duration_seconds_bucket[5m])))`.
+- `oz_worker_task_failures_total{phase,reason}` (counter): bounded failure
+  classification for task failures, such as `phase="backend"` with
+  `reason="image_pull"`, `reason="unschedulable"`, or
+  `reason="container_oom"`.
+- `oz_worker_websocket_reconnects_total{reason}` (counter): reconnect
+  attempts; spikes indicate flapping workers.
+- `oz_worker_info{version,backend,worker_id}` (gauge, value `1`): build and
+  runtime metadata, useful for joining other series by labels.
+
+### Sample dashboards / alerts
+
+Direct mappings for the questions enterprise operators most commonly ask:
+
+- **Workers available:** `sum(oz_worker_connected)`
+- **Workers active (running ≥1 task):**
+  `count(oz_worker_tasks_active > 0)`
+- **Saturation:**
+  `sum(oz_worker_tasks_active) /
+   sum(oz_worker_tasks_max_concurrent > 0)`
+- **Failure rate:**
+  `sum(rate(oz_worker_tasks_completed_total{result="failed"}[5m]))`
+- **Failure modes:**
+  `sum by (phase, reason) (rate(oz_worker_task_failures_total[5m]))`
+- **Reconnect storms:**
+  `sum(rate(oz_worker_websocket_reconnects_total[5m])) > 0.1`
 
 ## License
 

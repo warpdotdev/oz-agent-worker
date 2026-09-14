@@ -12,6 +12,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
@@ -19,9 +20,13 @@ import (
 	sigsk8syaml "sigs.k8s.io/yaml"
 )
 
+// Version is the build-time version string. Override at link time with
+// -ldflags="-X main.Version=...".
+var Version = "dev"
+
 var CLI struct {
 	ConfigFile              string   `help:"Path to YAML config file" type:"path"`
-	Backend                 string   `help:"Backend type (docker, direct, or kubernetes)" enum:"docker,direct,kubernetes," default:""`
+	Backend                 string   `help:"Backend type (docker, direct, kubernetes, or command)" enum:"docker,direct,kubernetes,command," default:""`
 	APIKey                  string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID                string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL            string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -63,6 +68,20 @@ func main() {
 		log.Fatalf(ctx, "%v", err)
 	}
 
+	// Set up the metrics pipeline before constructing the worker so that early
+	// reconnect attempts on Start() are observed. Failures here are
+	// non-fatal: the worker must continue even if metrics export breaks.
+	metricsShutdown, err := metrics.Init(ctx, metrics.Config{
+		WorkerID: workerConfig.WorkerID,
+		Backend:  workerConfig.BackendType,
+		Version:  Version,
+	})
+	if err != nil {
+		log.Errorf(ctx, "Failed to initialize metrics export: %v (continuing without metrics)", err)
+	}
+	metrics.SetMaxConcurrent(workerConfig.MaxConcurrentTasks)
+	metrics.SetWorkerInfo(Version, workerConfig.BackendType, workerConfig.WorkerID)
+
 	w, err := worker.New(ctx, workerConfig)
 	if err != nil {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
@@ -84,6 +103,17 @@ func main() {
 	log.Infof(ctx, "Received signal %v, shutting down gracefully...", sig)
 
 	w.Shutdown()
+
+	// Flush and stop the metrics exporter after the worker has stopped
+	// recording new data points. We use a fresh context with a short timeout
+	// because ctx may already be cancelled by the time we get here.
+	if metricsShutdown != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := metricsShutdown(shutdownCtx); err != nil {
+			log.Warnf(ctx, "Failed to shut down metrics exporter cleanly: %v", err)
+		}
+		cancel()
+	}
 
 	log.Infof(ctx, "Worker shutdown complete")
 }
@@ -110,6 +140,8 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			backendType = "direct"
 		} else if fileConfig.Backend.Kubernetes != nil {
 			backendType = "kubernetes"
+		} else if fileConfig.Backend.Command != nil {
+			backendType = "command"
 		} else if fileConfig.Backend.Docker != nil {
 			backendType = "docker"
 		}
@@ -161,14 +193,17 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			useImageVolumes       bool
 			preflightImage        string
 			sidecarImage          string
+			codingCLISidecars     map[string]string
 			setupCmd              string
 			teardownCmd           string
 			extraLabels           map[string]string
 			extraAnnotations      map[string]string
 			activeDeadlineSeconds *int64
+			ttlSecondsAfterFinish *int32
 			workspaceSizeLimit    *resource.Quantity
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
+			preflightResources    *corev1.ResourceRequirements
 		)
 
 		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
@@ -180,11 +215,13 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
 			sidecarImage = kc.SidecarImage
+			codingCLISidecars = copyStringMap(kc.CodingCLISidecars)
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
 			extraLabels = copyStringMap(kc.ExtraLabels)
 			extraAnnotations = copyStringMap(kc.ExtraAnnotations)
 			activeDeadlineSeconds = kc.ActiveDeadlineSeconds
+			ttlSecondsAfterFinish = kc.TTLSecondsAfterFinish
 			if kc.WorkspaceSizeLimit != "" {
 				quantity, err := resource.ParseQuantity(kc.WorkspaceSizeLimit)
 				if err != nil {
@@ -210,6 +247,17 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 				}
 				podTemplate = &ps
 			}
+			if kc.PreflightResources != nil {
+				yamlBytes, err := yaml.Marshal(kc.PreflightResources.Node)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("failed to marshal backend.kubernetes.preflight_resources: %w", err)
+				}
+				var rr corev1.ResourceRequirements
+				if err := sigsk8syaml.Unmarshal(yamlBytes, &rr); err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.preflight_resources: %w", err)
+				}
+				preflightResources = &rr
+			}
 		}
 
 		wc.Kubernetes = &worker.KubernetesBackendConfig{
@@ -221,16 +269,19 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			UseImageVolumes:       useImageVolumes,
 			PreflightImage:        preflightImage,
 			SidecarImage:          sidecarImage,
+			CodingCLISidecars:     codingCLISidecars,
 			SetupCommand:          setupCmd,
 			TeardownCommand:       teardownCmd,
 			NoCleanup:             noCleanup,
 			ExtraLabels:           extraLabels,
 			ExtraAnnotations:      extraAnnotations,
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
+			TTLSecondsAfterFinish: ttlSecondsAfterFinish,
 			WorkspaceSizeLimit:    workspaceSizeLimit,
 			UnschedulableTimeout:  unschedulableTimeout,
 			TaskEnv:               copyStringMap(cliEnv),
 			PodTemplate:           podTemplate,
+			PreflightResources:    preflightResources,
 		}
 	case "direct":
 		// Merge env: config file first, then CLI overlay.
@@ -266,6 +317,39 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			Env:             mergedEnv,
 		}
 
+	case "command":
+		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
+		mergedEnv := make(map[string]string)
+		var dispatchCmd, cancelCmd, dispatchTimeoutStr string
+		if fileConfig != nil && fileConfig.Backend.Command != nil {
+			cc := fileConfig.Backend.Command
+			mergedEnv = config.ResolveEnv(cc.Environment)
+			dispatchCmd = cc.DispatchCommand
+			cancelCmd = cc.CancelCommand
+			dispatchTimeoutStr = cc.DispatchTimeout
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+
+		var dispatchTimeout time.Duration
+		if dispatchTimeoutStr != "" {
+			d, err := time.ParseDuration(dispatchTimeoutStr)
+			if err != nil {
+				return worker.Config{}, fmt.Errorf("invalid backend.command.dispatch_timeout %q: %w", dispatchTimeoutStr, err)
+			}
+			dispatchTimeout = d
+		}
+
+		wc.Command = &worker.CommandBackendConfig{
+			DispatchCommand: dispatchCmd,
+			CancelCommand:   cancelCmd,
+			DispatchTimeout: dispatchTimeout,
+			Env:             mergedEnv,
+			ServerRootURL:   CLI.ServerRootURL,
+			WorkerID:        workerID,
+		}
+
 	default: // docker
 		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
 		mergedEnv := make(map[string]string)
@@ -278,15 +362,20 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 
 		// Merge volumes: config file + CLI (concatenated).
 		var volumes []string
+		var imagePullPolicy, sidecarImage string
 		if fileConfig != nil && fileConfig.Backend.Docker != nil {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
+			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
+			sidecarImage = fileConfig.Backend.Docker.SidecarImage
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
 		wc.Docker = &worker.DockerBackendConfig{
-			NoCleanup: noCleanup,
-			Volumes:   volumes,
-			Env:       mergedEnv,
+			NoCleanup:       noCleanup,
+			Volumes:         volumes,
+			Env:             mergedEnv,
+			ImagePullPolicy: imagePullPolicy,
+			SidecarImage:    sidecarImage,
 		}
 	}
 

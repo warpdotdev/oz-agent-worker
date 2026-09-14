@@ -21,21 +21,49 @@ func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
 
-func TestSanitizeKubernetesJobNameUsesHashSuffix(t *testing.T) {
-	first := sanitizeKubernetesJobName("Task A")
-	second := sanitizeKubernetesJobName("Task-A")
+func TestKubernetesTaskJobNameEmbedsFullRunIDAndExecSuffix(t *testing.T) {
+	runID := "019f5de4-bfd1-762e-92ed-199c971abcba"
+	execID := "019f5df0-aaaa-bbbb-cccc-abcdef012345"
 
-	if first == second {
-		t.Fatalf("expected distinct job names for distinct task IDs, got %q", first)
+	name := kubernetesTaskJobName(runID, execID)
+	want := "oz-task-019f5de4-bfd1-762e-92ed-199c971abcba-exec-ef012345"
+	if name != want {
+		t.Fatalf("job name = %q, want %q", name, want)
 	}
-	if !strings.HasPrefix(first, "oz-task-task-a-") {
-		t.Fatalf("unexpected job name prefix: %q", first)
+	if !strings.Contains(name, runID) {
+		t.Fatalf("expected full run ID %q in job name %q", runID, name)
 	}
-	if len(first) > 63 {
-		t.Fatalf("job name too long: %d", len(first))
+	if len(name) > 63 {
+		t.Fatalf("job name too long: %d", len(name))
 	}
-	if strings.ContainsAny(first, "_.") {
-		t.Fatalf("job name contains invalid DNS label characters: %q", first)
+	if strings.ContainsAny(name, "_.") {
+		t.Fatalf("job name contains invalid DNS label characters: %q", name)
+	}
+}
+
+func TestKubernetesTaskJobNameFallsBackForEmptyIDs(t *testing.T) {
+	if name := kubernetesTaskJobName("", ""); name != "oz-task-run-exec-exec" {
+		t.Fatalf("job name = %q, want %q", name, "oz-task-run-exec-exec")
+	}
+}
+
+func TestKubernetesTaskJobNameSanitizesIDs(t *testing.T) {
+	// Uppercase and non-DNS characters are lowercased/replaced; short IDs are used in full.
+	if name := kubernetesTaskJobName("RUN_1", "exec.2"); name != "oz-task-run-1-exec-exec-2" {
+		t.Fatalf("job name = %q, want %q", name, "oz-task-run-1-exec-exec-2")
+	}
+}
+
+func TestKubernetesTaskJobNameTruncatesOverlongRunID(t *testing.T) {
+	// A pathologically long run ID is truncated so the Job name fits in 63 chars,
+	// but the execution suffix (the uniqueness discriminator) is preserved.
+	longRunID := strings.Repeat("a", 100)
+	name := kubernetesTaskJobName(longRunID, "019f5df0-aaaa-bbbb-cccc-abcdef012345")
+	if len(name) > 63 {
+		t.Fatalf("job name too long: %d (%q)", len(name), name)
+	}
+	if !strings.HasSuffix(name, "-exec-ef012345") {
+		t.Fatalf("expected execution suffix preserved, got %q", name)
 	}
 }
 
@@ -46,18 +74,33 @@ func TestKubernetesBackendBaseLabelsIncludeStableHashes(t *testing.T) {
 		},
 	}
 
-	labels := backend.baseLabels("Task A")
+	labels := backend.baseLabels("Task A", "Execution A")
 	if labels[kubernetesWorkerIDLabel] != "worker-a" {
 		t.Fatalf("worker label = %q, want %q", labels[kubernetesWorkerIDLabel], "worker-a")
 	}
 	if labels[kubernetesTaskIDLabel] != "task-a" {
 		t.Fatalf("task label = %q, want %q", labels[kubernetesTaskIDLabel], "task-a")
 	}
+	if labels[kubernetesExecutionIDLabel] != "execution-a" {
+		t.Fatalf("execution label = %q, want %q", labels[kubernetesExecutionIDLabel], "execution-a")
+	}
 	if labels[kubernetesWorkerHashLabel] != kubernetesLabelHash("Worker A") {
 		t.Fatalf("worker hash = %q, want %q", labels[kubernetesWorkerHashLabel], kubernetesLabelHash("Worker A"))
 	}
 	if labels[kubernetesTaskHashLabel] != kubernetesLabelHash("Task A") {
 		t.Fatalf("task hash = %q, want %q", labels[kubernetesTaskHashLabel], kubernetesLabelHash("Task A"))
+	}
+	if labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("Execution A") {
+		t.Fatalf("execution hash = %q, want %q", labels[kubernetesExecutionHashLabel], kubernetesLabelHash("Execution A"))
+	}
+}
+
+func TestTaskExecutionIDFallsBackToTaskID(t *testing.T) {
+	if got := taskExecutionID(&TaskParams{TaskID: "task-1", ExecutionID: " execution-1 "}); got != "execution-1" {
+		t.Fatalf("execution ID = %q, want %q", got, "execution-1")
+	}
+	if got := taskExecutionID(&TaskParams{TaskID: "task-1"}); got != "task-1" {
+		t.Fatalf("fallback execution ID = %q, want %q", got, "task-1")
 	}
 }
 
@@ -78,6 +121,21 @@ func TestKubernetesSidecarMaterializationScriptMatchesExpectedShell(t *testing.T
 	}
 }
 
+func TestKubernetesTaskWrapperScriptDelegatesToEntrypoint(t *testing.T) {
+	script := kubernetesTaskWrapperScript()
+	requiredSnippets := []string{
+		". \"$OZ_ENVIRONMENT_FILE\"",
+		"exec /agent/entrypoint.sh \"$@\"",
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(script, snippet) {
+			t.Fatalf("expected wrapper script to contain %q, got:\n%s", snippet, script)
+		}
+	}
+	if strings.Contains(script, "report-shutdown") {
+		t.Fatalf("expected wrapper script to rely on entrypoint shutdown reporting, got:\n%s", script)
+	}
+}
 func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	ctx := context.Background()
@@ -97,7 +155,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -106,7 +164,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err == nil || !strings.Contains(err.Error(), "unschedulable") {
 			t.Fatalf("expected unschedulable error, got %v", err)
 		}
@@ -121,7 +179,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -130,7 +188,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err != nil {
 			t.Fatalf("expected no error before timeout, got %v", err)
 		}
@@ -145,7 +203,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -154,11 +212,274 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err != nil {
 			t.Fatalf("expected no error when timeout is disabled, got %v", err)
 		}
 	})
+}
+
+func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+
+	err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task-pod",
+			Namespace: "agents",
+			Labels: map[string]string{
+				"job-name": "task-job",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: kubernetesTaskContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 143,
+						},
+					},
+				},
+			},
+		},
+	}, nil, "testing")
+	if err == nil {
+		t.Fatal("expected container termination error")
+	}
+
+	message := err.Error()
+	for _, want := range []string{
+		"container task",
+		"pod task-pod",
+		"namespace agents",
+		"job task-job",
+		"exited with code 143",
+		"SIGTERM",
+		"Pod phase: Failed",
+		"check pod events and node activity",
+		"eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("expected error message to contain %q, got %q", want, message)
+		}
+	}
+}
+
+func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
+	sidecarPolicy := corev1.ContainerRestartPolicyAlways
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			Namespace: "agents",
+		},
+		clientset: fake.NewSimpleClientset(),
+	}
+	podSpec := corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{Name: kubernetesSidecarInitPrefix + "0"},
+			{Name: "zookeeper", RestartPolicy: &sidecarPolicy},
+		},
+	}
+
+	t.Run("restartable sidecar SIGTERM exit does not fail the task", func(t *testing.T) {
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+						},
+					},
+				},
+			},
+		}, nil, "testing")
+		if err != nil {
+			t.Fatalf("expected no failure for terminated restartable sidecar, got %v", err)
+		}
+	})
+
+	t.Run("plain init container exit still fails the task", func(t *testing.T) {
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: kubernetesSidecarInitPrefix + "0",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+						},
+					},
+				},
+			},
+		}, nil, "testing")
+		if err == nil || !strings.Contains(err.Error(), "init container copy-sidecar-0") {
+			t.Fatalf("expected init container failure, got %v", err)
+		}
+	})
+
+	t.Run("sidecar exit does not mask task container failure", func(t *testing.T) {
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodFailed,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+						},
+					},
+				},
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: kubernetesTaskContainerName,
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 2},
+						},
+					},
+				},
+			},
+		}, nil, "testing")
+		if err == nil || !strings.Contains(err.Error(), "container task") || !strings.Contains(err.Error(), "exited with code 2") {
+			t.Fatalf("expected task container failure attribution, got %v", err)
+		}
+	})
+
+	t.Run("sidecar image pull failure still fails the task", func(t *testing.T) {
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
+			Spec:       podSpec,
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "zookeeper",
+						State: corev1.ContainerState{
+							Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "pull failed"},
+						},
+					},
+				},
+			},
+		}, nil, "testing")
+		if err == nil || !strings.Contains(err.Error(), "ImagePullBackOff") {
+			t.Fatalf("expected image pull failure, got %v", err)
+		}
+	})
+}
+
+// End-to-end regression test for the wind-down race that misreported
+// successful tasks as failed: the pod watch delivers the pod state carrying a
+// restartable sidecar's SIGTERM termination (exit 143) before the Job
+// controller stamps JobComplete. inspectPodFailure must ignore the sidecar
+// exit so the watch loop keeps waiting for the Job Complete event.
+func TestExecuteTaskSucceedsWhenSidecarExitsBeforeJobComplete(t *testing.T) {
+	sidecarPolicy := corev1.ContainerRestartPolicyAlways
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	// The Job Complete condition arrives only after the pod wind-down event
+	// below has been delivered and inspected.
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	// The pod watch fires first with the wind-down state: task container
+	// exited 0, restartable sidecar SIGTERM'd with exit 143.
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			podWatch.Modify(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "task-pod",
+					Namespace: "agents",
+					Labels:    map[string]string{"job-name": "task-job"},
+				},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						{Name: "zookeeper", RestartPolicy: &sidecarPolicy},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "zookeeper",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{ExitCode: 143},
+							},
+						},
+					},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: kubernetesTaskContainerName,
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+							},
+						},
+					},
+				},
+			})
+		}()
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Error != nil {
+		t.Fatalf("expected success when sidecar exits 143 before Job Complete, got error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
+	}
 }
 
 func TestHandleJobStateDetectsCompletion(t *testing.T) {
@@ -177,7 +498,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "agents"},
 			Status:     batchv1.JobStatus{},
 		}
-		if result := backend.handleJobState(ctx, job, "task-1"); result != nil {
+		if result := backend.handleJobState(ctx, job, "task-1", "execution-1"); result != nil {
 			t.Fatalf("expected nil for in-progress job, got %v", result.err)
 		}
 	})
@@ -191,7 +512,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 				},
 			},
 		}
-		result := backend.handleJobState(ctx, job, "task-1")
+		result := backend.handleJobState(ctx, job, "task-1", "execution-1")
 		if result == nil {
 			t.Fatal("expected non-nil result for completed job")
 		}
@@ -209,7 +530,7 @@ func TestHandleJobStateDetectsCompletion(t *testing.T) {
 				},
 			},
 		}
-		result := backend.handleJobState(ctx, job, "task-1")
+		result := backend.handleJobState(ctx, job, "task-1", "execution-1")
 		if result == nil {
 			t.Fatal("expected non-nil result for failed job")
 		}
@@ -284,8 +605,8 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	taskID := "task-abc"
-	watcher, err := backend.watchTaskPods(context.Background(), taskID)
+	executionID := "execution-abc"
+	watcher, err := backend.watchTaskPods(context.Background(), executionID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -297,11 +618,11 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 			Name:      "task-pod",
 			Namespace: "agents",
 			Labels: map[string]string{
-				kubernetesTaskHashLabel: kubernetesLabelHash(taskID),
+				kubernetesExecutionHashLabel: kubernetesLabelHash(executionID),
 			},
 		},
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "task", Image: "ubuntu:22.04"}},
+			Containers: []corev1.Container{{Name: kubernetesTaskContainerName, Image: "ubuntu:22.04"}},
 		},
 	}
 	if _, err := fakeClient.CoreV1().Pods("agents").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
@@ -392,7 +713,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 				},
 				Containers: []corev1.Container{
 					{
-						Name:            "task",
+						Name:            kubernetesTaskContainerName,
 						ImagePullPolicy: corev1.PullAlways,
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -412,7 +733,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 	}
 
 	mainContainer := corev1.Container{
-		Name:            "task",
+		Name:            kubernetesTaskContainerName,
 		Image:           "ubuntu:22.04",
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Command:         []string{"/bin/sh", "-c", "run-task"},
@@ -443,7 +764,7 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 
 	var taskContainer *corev1.Container
 	for i := range podSpec.Containers {
-		if podSpec.Containers[i].Name == "task" {
+		if podSpec.Containers[i].Name == kubernetesTaskContainerName {
 			taskContainer = &podSpec.Containers[i]
 			break
 		}
@@ -473,6 +794,135 @@ func TestBuildTaskPodSpecUsesPodTemplateFieldsAndCLIEnv(t *testing.T) {
 		t.Fatalf("FROM_CLI = %q, want %q", envMap["FROM_CLI"], "1")
 	}
 }
+func TestApplyInstanceShapeToContainer(t *testing.T) {
+	const giB = int64(1) << 30
+
+	t.Run("nil shape is a no-op", func(t *testing.T) {
+		c := &corev1.Container{
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			},
+		}
+		applyInstanceShapeToContainer(c, nil)
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.String() != "250m" {
+			t.Fatalf("cpu request = %q, want 250m (unchanged)", got.String())
+		}
+		if c.Resources.Limits != nil {
+			t.Fatalf("limits should remain nil, got %v", c.Resources.Limits)
+		}
+	})
+
+	t.Run("full shape sets requests and limits", func(t *testing.T) {
+		c := &corev1.Container{}
+		applyInstanceShapeToContainer(c, &types.InstanceShape{Vcpus: 2, MemoryGb: 8})
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.Value() != 2 {
+			t.Fatalf("cpu request = %d, want 2", got.Value())
+		}
+		if got := c.Resources.Limits[corev1.ResourceCPU]; got.Value() != 2 {
+			t.Fatalf("cpu limit = %d, want 2", got.Value())
+		}
+		if got := c.Resources.Requests[corev1.ResourceMemory]; got.Value() != 8*giB {
+			t.Fatalf("memory request = %d, want %d", got.Value(), 8*giB)
+		}
+		if got := c.Resources.Limits[corev1.ResourceMemory]; got.Value() != 8*giB {
+			t.Fatalf("memory limit = %d, want %d", got.Value(), 8*giB)
+		}
+	})
+
+	t.Run("cpu-only shape leaves memory unset", func(t *testing.T) {
+		c := &corev1.Container{}
+		applyInstanceShapeToContainer(c, &types.InstanceShape{Vcpus: 1})
+		if got := c.Resources.Requests[corev1.ResourceCPU]; got.Value() != 1 {
+			t.Fatalf("cpu request = %d, want 1", got.Value())
+		}
+		if _, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			t.Fatal("expected no memory request for cpu-only shape")
+		}
+		if _, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			t.Fatal("expected no memory limit for cpu-only shape")
+		}
+	})
+}
+
+func TestMergeResourceRequirements(t *testing.T) {
+	base := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("500m"),
+		},
+	}
+	override := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+	}
+	merged := mergeResourceRequirements(base, override)
+
+	if got := merged.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4 (override wins)", got.Value())
+	}
+	if got := merged.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4 (override wins)", got.Value())
+	}
+	// Memory request is preserved from base since the override does not set it.
+	if got := merged.Requests[corev1.ResourceMemory]; got.Value() != int64(1)<<30 {
+		t.Fatalf("memory request = %d, want %d (preserved from base)", got.Value(), int64(1)<<30)
+	}
+}
+
+// A runner instance shape must override the matching pod-template task-container
+// resources, while leaving unrelated entries from the template intact.
+func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			PodTemplate: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: kubernetesTaskContainerName,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("1Gi"),
+							},
+							Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mainContainer := corev1.Container{Name: kubernetesTaskContainerName, Image: "ubuntu:22.04"}
+	applyInstanceShapeToContainer(&mainContainer, &types.InstanceShape{Vcpus: 4, MemoryGb: 16})
+
+	podSpec := backend.buildTaskPodSpec(nil, nil, mainContainer)
+
+	var tc *corev1.Container
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == kubernetesTaskContainerName {
+			tc = &podSpec.Containers[i]
+			break
+		}
+	}
+	if tc == nil {
+		t.Fatal("expected task container")
+	}
+	if got := tc.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4 (runner shape overrides template)", got.Value())
+	}
+	if got := tc.Resources.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4 (runner shape overrides template)", got.Value())
+	}
+	if got := tc.Resources.Requests[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory request = %d, want %d", got.Value(), int64(16)<<30)
+	}
+	if got := tc.Resources.Limits[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory limit = %d, want %d (runner shape adds a limit)", got.Value(), int64(16)<<30)
+	}
+}
+
 func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
 	err := validateTaskSidecars([]types.SidecarMount{
 		{
@@ -554,8 +1004,9 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
+		ExecutionID: "execution-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
 		Sidecars: []types.SidecarMount{
@@ -565,17 +1016,38 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
+	}
+	if createdJob.Name != kubernetesTaskJobName("task-1", "execution-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, kubernetesTaskJobName("task-1", "execution-1"))
+	}
+	if createdJob.Name == kubernetesTaskJobName("task-1", "task-1") {
+		t.Fatalf("job name should include the execution ID, got %q", createdJob.Name)
+	}
+	if createdJob.Labels[kubernetesTaskIDLabel] != "task-1" {
+		t.Fatalf("task label = %q, want %q", createdJob.Labels[kubernetesTaskIDLabel], "task-1")
+	}
+	if createdJob.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash("task-1") {
+		t.Fatalf("task hash label = %q, want %q", createdJob.Labels[kubernetesTaskHashLabel], kubernetesLabelHash("task-1"))
+	}
+	if createdJob.Labels[kubernetesExecutionIDLabel] != "execution-1" {
+		t.Fatalf("execution label = %q, want %q", createdJob.Labels[kubernetesExecutionIDLabel], "execution-1")
+	}
+	if createdJob.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("execution-1") {
+		t.Fatalf("execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("execution-1"))
 	}
 
 	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
 		t.Fatalf("expected only setup init container, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
-	if createdJob.Spec.Template.Spec.InitContainers[0].Name != "setup" {
+	if createdJob.Spec.Template.Spec.InitContainers[0].Name != kubernetesSetupContainerName {
 		t.Fatalf("expected setup init container, got %q", createdJob.Spec.Template.Spec.InitContainers[0].Name)
 	}
 	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
@@ -603,6 +1075,26 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]string, len(taskContainer.Env))
+	for _, env := range taskContainer.Env {
+		envMap[env.Name] = env.Value
+	}
+	if envMap["OZ_RUN_ID"] != "task-1" {
+		t.Fatalf("OZ_RUN_ID = %q, want %q", envMap["OZ_RUN_ID"], "task-1")
+	}
+	// Every well-known OZ_ variable on the Job's task container carries a WARP_ alias with
+	// the same value; the setup init container inherits this env, so it is covered too.
+	for _, name := range []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT", "OZ_ENVIRONMENT_FILE"} {
+		if envMap[name] == "" {
+			t.Fatalf("%s is unset, so its alias proves nothing", name)
+		}
+		if alias := "WARP_" + strings.TrimPrefix(name, "OZ_"); envMap[alias] != envMap[name] {
+			t.Fatalf("%s = %q, want it to mirror %s = %q", alias, envMap[alias], name, envMap[name])
+		}
+	}
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected OZ_EXECUTION_ID to be omitted from task container env")
+	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
 		if taskContainer.VolumeMounts[i].Name == "sidecar-0-image" {
@@ -687,7 +1179,7 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.ExecuteTask(context.Background(), &TaskParams{
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
 		TaskID:      "task-1",
 		DockerImage: "ubuntu:22.04",
 		BaseArgs:    []string{"run"},
@@ -699,18 +1191,33 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected ExecuteTask error: %v", err)
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+	if result.Outcome != ExecuteOutcomeCompleted {
+		t.Fatalf("ExecuteTask outcome = %v, want ExecuteOutcomeCompleted", result.Outcome)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
+	}
+	if createdJob.Name != kubernetesTaskJobName("task-1", "task-1") {
+		t.Fatalf("job name = %q, want %q", createdJob.Name, kubernetesTaskJobName("task-1", "task-1"))
+	}
+	if createdJob.Labels[kubernetesExecutionIDLabel] != "task-1" {
+		t.Fatalf("fallback execution label = %q, want %q", createdJob.Labels[kubernetesExecutionIDLabel], "task-1")
+	}
+	if createdJob.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash("task-1") {
+		t.Fatalf("fallback execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("task-1"))
+	}
+	if createdJob.Spec.TTLSecondsAfterFinished == nil || *createdJob.Spec.TTLSecondsAfterFinished != defaultJobTTLSecondsAfterFinish {
+		t.Fatalf("expected default ttlSecondsAfterFinished %d, got %v", defaultJobTTLSecondsAfterFinish, createdJob.Spec.TTLSecondsAfterFinished)
 	}
 
 	if len(createdJob.Spec.Template.Spec.InitContainers) != 2 {
 		t.Fatalf("expected copy init container plus setup, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
 	copyInit := createdJob.Spec.Template.Spec.InitContainers[0]
-	if copyInit.Name != "copy-sidecar-0" {
+	if copyInit.Name != kubernetesSidecarInitPrefix+"0" {
 		t.Fatalf("expected copy-sidecar init container, got %q", copyInit.Name)
 	}
 	if copyInit.Image != "registry.internal/agent:1.0" {
@@ -744,6 +1251,13 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]string, len(taskContainer.Env))
+	for _, env := range taskContainer.Env {
+		envMap[env.Name] = env.Value
+	}
+	if _, ok := envMap["OZ_EXECUTION_ID"]; ok {
+		t.Fatal("expected fallback OZ_EXECUTION_ID to be omitted from task container env")
+	}
 	var taskSidecarMount *corev1.VolumeMount
 	for i := range taskContainer.VolumeMounts {
 		if taskContainer.VolumeMounts[i].Name == "sidecar-0-data" {
@@ -759,6 +1273,332 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 	if taskSidecarMount.ReadOnly {
 		t.Fatal("expected task sidecar mount to remain writable on default path")
+	}
+}
+
+// End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the
+// created Job's task container as requests and limits (else-branch, no pod_template).
+func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completedJob := createdJob.DeepCopy()
+			completedJob.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completedJob)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:        "task-1",
+		DockerImage:   "ubuntu:22.04",
+		BaseArgs:      []string{"run"},
+		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
+	})
+	if result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+	if createdJob == nil {
+		t.Fatal("expected task job to be created")
+	}
+
+	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
+	if got := taskContainer.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu request = %d, want 4", got.Value())
+	}
+	if got := taskContainer.Resources.Limits[corev1.ResourceCPU]; got.Value() != 4 {
+		t.Fatalf("cpu limit = %d, want 4", got.Value())
+	}
+	if got := taskContainer.Resources.Requests[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory request = %d, want %d", got.Value(), int64(16)<<30)
+	}
+	if got := taskContainer.Resources.Limits[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
+		t.Fatalf("memory limit = %d, want %d", got.Value(), int64(16)<<30)
+	}
+}
+
+func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	created := make(chan string, 1)
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		created <- job.Name
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan ExecuteResult, 1)
+	go func() {
+		result := backend.ExecuteTask(ctx, &TaskParams{
+			TaskID:      "task-1",
+			DockerImage: "ubuntu:22.04",
+			BaseArgs:    []string{"run"},
+		})
+		done <- result
+	}()
+
+	var jobName string
+	select {
+	case jobName = <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task Job creation")
+	}
+	cancel()
+
+	select {
+	case result := <-done:
+		if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "context canceled") {
+			t.Fatalf("expected context cancellation error, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ExecuteTask to return")
+	}
+
+	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected Job %s to be preserved after context cancellation, got %v", jobName, err)
+	}
+}
+
+func TestKubernetesBackendShutdownPreservesWorkerJobs(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "task-job",
+			Namespace: "agents",
+			Labels:    backend.baseLabels("task-1", "execution-1"),
+		},
+	}
+	fakeClient := fake.NewSimpleClientset(job)
+	backend.clientset = fakeClient
+
+	backend.Shutdown(context.Background())
+
+	jobs, err := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected worker Job to be preserved, got %d jobs", len(jobs.Items))
+	}
+}
+
+func TestTaskJobTTLDisabledWhenCleanupDisabled(t *testing.T) {
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			NoCleanup: true,
+		},
+	}
+	if ttl := backend.taskJobTTLSecondsAfterFinished(); ttl != nil {
+		t.Fatalf("expected nil ttlSecondsAfterFinished when cleanup is disabled, got %v", *ttl)
+	}
+}
+
+func TestTaskJobTTLDefaultsToTwentyFourHours(t *testing.T) {
+	backend := &KubernetesBackend{}
+	ttl := backend.taskJobTTLSecondsAfterFinished()
+	if ttl == nil {
+		t.Fatal("expected non-nil ttlSecondsAfterFinished by default")
+	}
+	if *ttl != int32(24*60*60) {
+		t.Fatalf("expected default ttlSecondsAfterFinished of 24h (86400), got %d", *ttl)
+	}
+}
+
+// On success the worker actively deletes the task Job (and its pod) so the
+// namespace stays clean.
+func TestExecuteTaskDeletesJobOnSuccess(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			completed := createdJob.DeepCopy()
+			completed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			jobWatch.Modify(completed)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	}); result.Error != nil {
+		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
+	}
+
+	jobs, err := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("expected successful task Job to be deleted, got %d", len(jobs.Items))
+	}
+}
+
+// On failure the worker leaves the task Job (and its pod) in place so it can be
+// inspected; the Job's TTLSecondsAfterFinished handles eventual cleanup.
+func TestExecuteTaskPreservesJobOnFailure(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	var createdJob *batchv1.Job
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		createdJob = job.DeepCopy()
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			if createdJob == nil {
+				return
+			}
+			failed := createdJob.DeepCopy()
+			failed.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+			}
+			jobWatch.Modify(failed)
+		}()
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	result := backend.ExecuteTask(context.Background(), &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	if result.Outcome != ExecuteOutcomeError {
+		t.Fatal("expected ExecuteTask to return an error for a failed Job")
+	}
+
+	jobs, listErr := fakeClient.BatchV1().Jobs("agents").List(context.Background(), metav1.ListOptions{})
+	if listErr != nil {
+		t.Fatalf("failed to list jobs: %v", listErr)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected failed task Job to be preserved, got %d", len(jobs.Items))
 	}
 }
 

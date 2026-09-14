@@ -34,12 +34,30 @@ type BackendConfig struct {
 	Docker     *DockerConfig     `yaml:"docker"`
 	Direct     *DirectConfig     `yaml:"direct"`
 	Kubernetes *KubernetesConfig `yaml:"kubernetes"`
+	Command    *CommandConfig    `yaml:"command"`
+}
+
+// CommandConfig holds command-backend-specific configuration. The command
+// backend dispatches tasks to an operator-owned runtime over any transport by
+// invoking dispatch_command.
+type CommandConfig struct {
+	DispatchCommand string     `yaml:"dispatch_command" validate:"required"`
+	CancelCommand   string     `yaml:"cancel_command"`
+	DispatchTimeout string     `yaml:"dispatch_timeout"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
-	Volumes     []string   `yaml:"volumes"`
-	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+	Volumes []string `yaml:"volumes"`
+	// ImagePullPolicy controls how the Docker backend resolves the main task image and any
+	// Warp/additional sidecar images before use. Accepted values are the same as the
+	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
+	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
+	// backend's original unconditional-pull behavior for existing installations.
+	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	SidecarImage    string     `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.
@@ -66,13 +84,25 @@ type KubernetesConfig struct {
 	ExtraLabels           map[string]string `yaml:"extra_labels"`
 	ExtraAnnotations      map[string]string `yaml:"extra_annotations"`
 	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
+	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
 	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
+	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
+	// Docker image. When set, the worker overrides the server-provided sidecar image for
+	// that harness (or injects a new sidecar entry if the server did not send one),
+	// mounting it at /mnt/{harness}-cli-sidecar. Use this to bring your own Claude Code
+	// wrapper or custom harness binary instead of the Warp-provided sidecar image.
+	// The custom image must place the harness binary in the path where the Warp agent
+	// entrypoint expects it (e.g. /usr/local/bin for most sidecar layouts).
+	CodingCLISidecars map[string]string `yaml:"coding_cli_sidecars"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
 	// required fields at runtime. Declarative task Job configuration such as
 	// serviceAccountName, imagePullSecrets, node selectors, tolerations,
 	// resources, and env must be configured here.
 	PodTemplate *RawYAMLNode `yaml:"pod_template"`
+	// PreflightResources holds optional cpu/memory requests and limits for the
+	// startup preflight Job containers.
+	PreflightResources *RawYAMLNode `yaml:"preflight_resources"`
 }
 
 // RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation
@@ -113,7 +143,7 @@ func newConfigValidator() *validator.Validate {
 		cfg := sl.Current()
 		configured := 0
 		for i := 0; i < cfg.NumField(); i++ {
-			if cfg.Field(i).Kind() == reflect.Ptr && !cfg.Field(i).IsNil() {
+			if cfg.Field(i).Kind() == reflect.Pointer && !cfg.Field(i).IsNil() {
 				configured++
 			}
 		}
@@ -127,7 +157,7 @@ func newConfigValidator() *validator.Validate {
 
 // Load reads and validates a YAML config file.
 func Load(path string) (*FileConfig, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the config path is an explicit operator-supplied CLI/config input.
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}

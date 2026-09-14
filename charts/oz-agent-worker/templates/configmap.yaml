@@ -2,6 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "oz-agent-worker.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "oz-agent-worker.labels" . | nindent 4 }}
 data:
@@ -46,10 +47,17 @@ data:
         {{- if .Values.kubernetesBackend.activeDeadlineSeconds }}
         active_deadline_seconds: {{ .Values.kubernetesBackend.activeDeadlineSeconds }}
         {{- end }}
+        {{- if and .Values.worker.cleanup .Values.kubernetesBackend.ttlSecondsAfterFinished }}
+        ttl_seconds_after_finished: {{ .Values.kubernetesBackend.ttlSecondsAfterFinished }}
+        {{- end }}
         {{- if .Values.kubernetesBackend.workspaceSizeLimit }}
         workspace_size_limit: {{ .Values.kubernetesBackend.workspaceSizeLimit | quote }}
         {{- end }}
         {{- if .Values.kubernetesBackend.podTemplate }}
         pod_template:
 {{ toYaml .Values.kubernetesBackend.podTemplate | indent 10 }}
+        {{- end }}
+        {{- if .Values.kubernetesBackend.preflightResources }}
+        preflight_resources:
+{{ toYaml .Values.kubernetesBackend.preflightResources | indent 10 }}
         {{- end }}

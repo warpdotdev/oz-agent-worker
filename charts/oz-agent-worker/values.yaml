@@ -3,7 +3,9 @@ fullnameOverride: ""
 
 image:
   repository: warpdotdev/oz-agent-worker
-  # Set this explicitly to a published worker image tag for each install.
+  # Set this explicitly to a published immutable worker image tag for each
+  # install, e.g. v2026-06-01-10-09-37. Avoid using the mutable `latest` tag for
+  # production self-hosted workers.
   tag: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
@@ -32,9 +34,14 @@ worker:
   maxConcurrentTasks: 0
   idleOnComplete: ""
   extraArgs: []
+  extraEnv: []
   deploymentAnnotations: {}
   podAnnotations: {}
   podLabels: {}
+  # Bounded grace period for worker pod termination. The Kubernetes backend
+  # preserves active task Jobs when the worker pod is disrupted, so this only
+  # needs to cover WebSocket close and metrics shutdown.
+  terminationGracePeriodSeconds: 30
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 10001
@@ -75,10 +82,70 @@ kubernetesBackend:
   teardownCommand: ""
   extraLabels: {}
   extraAnnotations: {}
-  activeDeadlineSeconds: null
+  # Hard wall-clock cap on how long a single task Job (and its pod) may run
+  # before Kubernetes terminates it and marks the Job failed with a
+  # DeadlineExceeded condition. This is a safety backstop against tasks whose
+  # process never exits, so worker pods cannot linger indefinitely.
+  # Defaults to 8h (28800s); set to null to disable the cap.
+  activeDeadlineSeconds: 28800
+  # How long finished task Jobs that the worker leaves in place are retained before
+  # the Kubernetes Job TTL controller deletes them (and their pods). This covers
+  # failed task Jobs, which are kept for post-mortem debugging, and Jobs orphaned by
+  # worker disruption. Successful task Jobs are deleted immediately by the worker, so
+  # this does not keep them around. Defaults to 24h (86400s). When worker.cleanup=false
+  # the worker sets no TTL, so these Jobs remain indefinitely.
+  ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
   unschedulableTimeout: "30s"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
+  # Note: when a run's runner specifies an instance shape, the worker sets the task
+  # container's CPU/memory requests and limits from that shape per run, overriding any
+  # matching resources set on the "task" container here (other entries are preserved).
   podTemplate: {}
+  # Optional: cpu/memory requests and limits applied to the startup preflight
+  # Job containers. When omitted the worker applies default resource constraints.
+  # Example:
+  #   preflightResources:
+  #     requests:
+  #       cpu: 10m
+  #       memory: 16Mi
+  #     limits:
+  #       cpu: 100m
+  #       memory: 64Mi
+  preflightResources: {}
+
+# Metrics export uses the OpenTelemetry autoexport package, so the operator
+# selects the exporter via standard OpenTelemetry environment variables. When
+# `metrics.enabled` is false the worker emits no metrics, matching the
+# pre-existing behavior.
+metrics:
+  enabled: false
+  # Exporter to enable. Supported: prometheus | otlp | console | none.
+  # When set to prometheus, the worker exposes /metrics on `metrics.port`.
+  # When set to otlp, configure OTEL_EXPORTER_OTLP_ENDPOINT (and friends) via
+  # `metrics.extraEnv` below.
+  exporter: prometheus
+  # Port served by the embedded Prometheus exporter. Ignored for otlp/console.
+  port: 9464
+  # Extra environment variables forwarded to the worker container, e.g. to
+  # configure the OTLP endpoint:
+  #   - name: OTEL_EXPORTER_OTLP_ENDPOINT
+  #     value: http://otel-collector.observability.svc:4318
+  extraEnv: []
+  service:
+    create: true
+    type: ClusterIP
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9464"
+      prometheus.io/path: "/metrics"
+  # Optional Prometheus Operator PodMonitor for clusters that prefer
+  # PodMonitor/ServiceMonitor over scrape annotations. Disabled by default to
+  # avoid requiring monitoring.coreos.com CRDs at install time.
+  podMonitor:
+    create: false
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}

@@ -2,23 +2,34 @@ package worker
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/distribution/reference"
 	cliconfig "github.com/docker/cli/cli/config"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/registry"
+	"github.com/moby/moby/api/pkg/authconfig"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+)
+
+const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+
+// PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
+// backend.docker.image_pull_policy values. They mirror the Kubernetes backend's
+// image_pull_policy spelling so operators configure the same three values for either backend.
+const (
+	PullPolicyAlways       = "Always"
+	PullPolicyIfNotPresent = "IfNotPresent"
+	PullPolicyNever        = "Never"
 )
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
@@ -26,6 +37,20 @@ type DockerBackendConfig struct {
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
+	// ImagePullPolicy controls how the main task image and every Warp/additional sidecar image
+	// are resolved before use: PullPolicyAlways, PullPolicyIfNotPresent, or PullPolicyNever. An
+	// empty value defaults to PullPolicyAlways, preserving the backend's original
+	// unconditional-pull behavior for installations that don't set it.
+	ImagePullPolicy string
+	SidecarImage    string
+}
+
+func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient *client.Client, containerID string) bool {
+	inspect, err := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil || inspect.Container.State == nil {
+		return false
+	}
+	return inspect.Container.State.OOMKilled
 }
 
 // DockerBackend executes tasks in Docker containers.
@@ -33,11 +58,12 @@ type DockerBackend struct {
 	config       DockerBackendConfig
 	dockerClient *client.Client
 	platform     string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
+	platformSpec ocispec.Platform
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
 func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerBackend, error) {
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
@@ -46,7 +72,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 	defer pingCancel()
 
 	// Ping the Docker daemon to ensure it's reachable, as we depend on this.
-	if _, err := dockerClient.Ping(pingCtx); err != nil {
+	if _, err := dockerClient.Ping(pingCtx, client.PingOptions{}); err != nil {
 		if closeErr := dockerClient.Close(); closeErr != nil {
 			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
 		}
@@ -54,7 +80,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 	}
 
 	// Get the Docker daemon version to determine its platform.
-	versionInfo, err := dockerClient.ServerVersion(ctx)
+	versionInfo, err := dockerClient.ServerVersion(ctx, client.ServerVersionOptions{})
 	if err != nil {
 		if closeErr := dockerClient.Close(); closeErr != nil {
 			log.Warnf(ctx, "Failed to close Docker client: %v", closeErr)
@@ -78,26 +104,36 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 		config:       config,
 		dockerClient: dockerClient,
 		platform:     platform,
+		platformSpec: ocispec.Platform{
+			OS:           versionInfo.Os,
+			Architecture: versionInfo.Arch,
+		},
 	}, nil
 }
 
 // ExecuteTask runs the agent in a Docker container.
-func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
-	if err := b.pullImage(ctx, imageName, authStr); err != nil {
-		return err
+	if err := b.prepareImage(ctx, imageName, authStr, params.SetupEvents); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
 
 	// Prepare all sidecar volumes (Warp agent sidecar + any additional sidecars).
+	// Report the phase only when the task has sidecars, matching the Kubernetes
+	// backend; zero-sidecar tasks would otherwise emit ~0ms samples that skew
+	// the phase percentiles.
+	doneSidecarPrep := params.SetupEvents.startPhaseIf(ctx, SetupEventSidecarPrep, len(params.Sidecars) > 0)
 	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
 	if err != nil {
-		return err
+		doneSidecarPrep(true)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
+	doneSidecarPrep(false)
 
 	// Start with common env vars, then append backend-specific config env vars.
 	envVars := make([]string, len(params.EnvVars))
@@ -123,12 +159,18 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	binds = append(binds, b.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
-		Binds: binds,
+		Binds:     binds,
+		Resources: dockerResourcesForShape(params.InstanceShape),
 	}
 
-	resp, err := dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
+	doneContainerStart := params.SetupEvents.startPhase(ctx, SetupEventContainerStart)
+	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     containerConfig,
+		HostConfig: hostConfig,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		doneContainerStart(true)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err)))
 	}
 
 	containerID := resp.ID
@@ -136,25 +178,29 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	defer func() {
 		if containerID != "" && !b.config.NoCleanup {
-			if removeErr := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); removeErr != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+			defer cleanupCancel()
+			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			}
 		}
 	}()
 
-	if err := dockerClient.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
+	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+		doneContainerStart(true)
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
 	}
+	doneContainerStart(false)
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
 
-	statusCh, errCh := dockerClient.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case err := <-errCh:
+	case err := <-waitResult.Error:
 		if err != nil {
-			return fmt.Errorf("error waiting for container: %w", err)
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerWait, fmt.Errorf("error waiting for container: %w", err)))
 		}
-	case status := <-statusCh:
+	case status := <-waitResult.Result:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
 		logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
@@ -171,13 +217,45 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		}
 
 		if status.StatusCode != 0 {
-			return fmt.Errorf("container exited with non-zero status: %d", status.StatusCode)
+			metricsReason := metrics.TaskFailureReasonContainerExit
+			if b.containerWasOOMKilled(ctx, dockerClient, containerID) {
+				metricsReason = metrics.TaskFailureReasonContainerOOM
+			}
+			// Docker's StatusCode is already signal-coded (e.g. 137, 143), so it is
+			// recorded as-is for failure-cause classification.
+			return executeError(newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metricsReason, fmt.Errorf("container exited with non-zero status: %d", status.StatusCode), int(status.StatusCode)))
 		}
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", params.TaskID)
-	return nil
+	return executeCompleted()
 }
+
+// dockerResourcesForShape maps an instance shape to Docker container resource limits.
+// Each axis is applied only when positive; a nil shape (or non-positive axes) yields no
+// limits, so the container runs unconstrained as it does without a runner shape. Memory is
+// a hard cap: MemorySwap is pinned to Memory so the container cannot exceed memory_gb via
+// swap, matching the Kubernetes backend's memory limit and the requested SKU size regardless
+// of host swap configuration.
+func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
+	var res container.Resources
+	if shape == nil {
+		return res
+	}
+	if shape.Vcpus > 0 {
+		res.NanoCPUs = int64(shape.Vcpus) * 1_000_000_000
+	}
+	if shape.MemoryGb > 0 {
+		memoryBytes := int64(shape.MemoryGb) << 30
+		res.Memory = memoryBytes
+		res.MemorySwap = memoryBytes
+	}
+	return res
+}
+
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// Docker-backend task.
+func (b *DockerBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
@@ -188,12 +266,103 @@ func (b *DockerBackend) Shutdown(ctx context.Context) {
 	}
 }
 
-// pullImage pulls a Docker image. If authStr is non-empty, it will be used for registry authentication.
-// Docker only downloads changed layers, so this is efficient even if the image exists locally.
-func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string) error {
+func (b *DockerBackend) PreservesTasksOnShutdown() bool {
+	return false
+}
+
+// normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,
+// defaulting an empty (omitted) value to PullPolicyAlways so existing installations keep
+// pulling unconditionally. Config loading already rejects any other unrecognized value before
+// it reaches here, so falling back to PullPolicyAlways for an unrecognized value is purely
+// defensive (e.g. for callers that bypass config loading, such as tests).
+func normalizeDockerPullPolicy(policy string) string {
+	switch policy {
+	case PullPolicyAlways, PullPolicyIfNotPresent, PullPolicyNever:
+		return policy
+	default:
+		return PullPolicyAlways
+	}
+}
+
+// prepareImage ensures imageName is available locally per the Docker backend's configured
+// image pull policy, validating the resolved image's platform before it is used to create a
+// container. It is the single entry point for image resolution shared by the main task image
+// and every Warp/additional sidecar image, so the two cannot drift in how they interpret the
+// policy. authStr is used for registry authentication only for the calls that actually pull.
+// setupEvents is non-nil for the main task image and nil for sidecars, whose image resolution
+// is already included in the sidecar-preparation phase.
+func (b *DockerBackend) prepareImage(ctx context.Context, imageName, authStr string, setupEvents *setupEventReporter) error {
+	switch normalizeDockerPullPolicy(b.config.ImagePullPolicy) {
+	case PullPolicyNever:
+		return b.useLocalImageOnly(ctx, imageName)
+	case PullPolicyIfNotPresent:
+		return b.pullIfNotPresent(ctx, imageName, authStr, setupEvents)
+	default: // PullPolicyAlways
+		return b.pullImage(ctx, imageName, authStr, setupEvents)
+	}
+}
+
+// pullIfNotPresent implements pull policy IfNotPresent: it reuses a local image when present,
+// validating its platform, and pulls (then validates) only when the image isn't present
+// locally. Any inspection failure other than "not found" is propagated as-is, so a transient
+// Engine error isn't misread as a missing image and silently converted into a pull.
+func (b *DockerBackend) pullIfNotPresent(ctx context.Context, imageName, authStr string, setupEvents *setupEventReporter) error {
+	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
+	switch {
+	case err == nil:
+		log.Infof(ctx, "Reusing local image (pull policy %s): %s", PullPolicyIfNotPresent, imageName)
+		return b.validateImagePlatform(inspect, imageName)
+	case cerrdefs.IsNotFound(err):
+		log.Infof(ctx, "Image %s not found locally (pull policy %s); pulling", imageName, PullPolicyIfNotPresent)
+		return b.pullImage(ctx, imageName, authStr, setupEvents)
+	default:
+		return fmt.Errorf("failed to inspect local image %s: %w", imageName, err)
+	}
+}
+
+// useLocalImageOnly implements pull policy Never: it never contacts the registry. It requires
+// imageName to already be present locally, validates its platform when found, and otherwise
+// returns a clear setup error naming the policy, distinguishing this configuration/setup
+// problem from a transient inspection failure (which is propagated as-is).
+func (b *DockerBackend) useLocalImageOnly(ctx context.Context, imageName string) error {
+	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
+	switch {
+	case err == nil:
+		log.Infof(ctx, "Using local image (pull policy %s): %s", PullPolicyNever, imageName)
+		return b.validateImagePlatform(inspect, imageName)
+	case cerrdefs.IsNotFound(err):
+		return fmt.Errorf("image %s not found locally and pull policy is %s", imageName, PullPolicyNever)
+	default:
+		return fmt.Errorf("failed to inspect local image %s: %w", imageName, err)
+	}
+}
+
+// validateImagePlatform verifies that a resolved image's platform matches this Docker daemon's
+// platform. Docker may resolve a pull to an image built for a different architecture than
+// requested (see https://github.com/moby/moby/pull/42325), so this check applies both to images
+// just pulled and to images already present locally that pull policy IfNotPresent/Never reuse.
+func (b *DockerBackend) validateImagePlatform(inspect client.ImageInspectResult, imageName string) error {
+	imagePlatform := fmt.Sprintf("%s/%s", inspect.Os, inspect.Architecture)
+	if imagePlatform != b.platform {
+		return fmt.Errorf(
+			"image %s is for platform %s, but this worker requires %s",
+			imageName, imagePlatform, b.platform,
+		)
+	}
+	return nil
+}
+
+// pullImage unconditionally pulls a Docker image (pull policy Always), then validates its
+// resolved platform. If authStr is non-empty, it is used for registry authentication. Docker
+// only downloads changed layers, so this is efficient even if the image exists locally.
+func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr string, setupEvents *setupEventReporter) (err error) {
 	log.Infof(ctx, "Pulling image: %s", imageName)
-	pullOptions := image.PullOptions{
-		Platform:     b.platform,
+	doneImagePull := setupEvents.startPhase(ctx, SetupEventImagePull)
+	defer func() {
+		doneImagePull(err != nil)
+	}()
+	pullOptions := client.ImagePullOptions{
+		Platforms:    []ocispec.Platform{b.platformSpec},
 		RegistryAuth: authStr,
 	}
 	reader, err := b.dockerClient.ImagePull(ctx, imageName, pullOptions)
@@ -211,19 +380,12 @@ func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr
 		return fmt.Errorf("failed to read image pull output: %w", err)
 	}
 
-	// Verify the pulled image matches the host platform. Docker may pull an image for a different
-	// architecture then what is specified in image.PullOptions.Platform
-	// See: https://github.com/moby/moby/pull/42325
 	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
 	if err != nil {
 		return fmt.Errorf("failed to inspect pulled image %s: %w", imageName, err)
 	}
-	imagePlatform := fmt.Sprintf("%s/%s", inspect.Os, inspect.Architecture)
-	if imagePlatform != b.platform {
-		return fmt.Errorf(
-			"image %s is for platform %s, but this worker requires %s",
-			imageName, imagePlatform, b.platform,
-		)
+	if err := b.validateImagePlatform(inspect, imageName); err != nil {
+		return err
 	}
 
 	log.Infof(ctx, "Successfully pulled image: %s", imageName)
@@ -247,14 +409,7 @@ func (b *DockerBackend) getRegistryAuth(ctx context.Context, imageName string) s
 		return ""
 	}
 
-	// Get the registry hostname (e.g., "docker.io", "gcr.io").
-	repoInfo, err := registry.ParseRepositoryInfo(ref)
-	if err != nil {
-		log.Warnf(ctx, "Failed to parse repository info: %v", err)
-		return ""
-	}
-
-	authKey := registry.GetAuthConfigKey(repoInfo.Index)
+	authKey := getAuthConfigKey(reference.Domain(ref))
 
 	authConfig, err := cfg.GetAuthConfig(authKey)
 	if err != nil {
@@ -265,13 +420,24 @@ func (b *DockerBackend) getRegistryAuth(ctx context.Context, imageName string) s
 		return ""
 	}
 
-	authJSON, _ := json.Marshal(authConfig)
+	authStr, err := authconfig.Encode(registry.AuthConfig{
+		Username:      authConfig.Username,
+		Password:      authConfig.Password,
+		ServerAddress: authConfig.ServerAddress,
+		Auth:          authConfig.Auth,
+		IdentityToken: authConfig.IdentityToken,
+		RegistryToken: authConfig.RegistryToken,
+	}) // #nosec G117 -- Docker RegistryAuth requires marshaling credentials before base64 encoding; the value is not logged.
+	if err != nil {
+		log.Warnf(ctx, "Failed to encode auth config for registry %s: %v", authKey, err)
+		return ""
+	}
 	log.Debugf(ctx, "Using Docker credentials for registry %s (username: %s)", authKey, authConfig.Username)
-	return base64.URLEncoding.EncodeToString(authJSON)
+	return authStr
 }
 
 func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *client.Client, containerID string) (string, error) {
-	out, err := dockerClient.ContainerLogs(ctx, containerID, container.LogsOptions{
+	out, err := dockerClient.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Timestamps: false,
@@ -308,7 +474,10 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		AutoRemove: true,
 	}
 
-	sidecarResp, err := dockerClient.ContainerCreate(ctx, sidecarConfig, sidecarHostConfig, nil, nil, "")
+	sidecarResp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     sidecarConfig,
+		HostConfig: sidecarHostConfig,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create sidecar container: %w", err)
 	}
@@ -318,7 +487,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	log.Infof(ctx, "Created sidecar container: %s", sidecarContainerID)
 
 	// Export the full filesystem of the sidecar.
-	tarReader, err := dockerClient.ContainerExport(ctx, sidecarContainerID)
+	tarReader, err := dockerClient.ContainerExport(ctx, sidecarContainerID, client.ContainerExportOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to export sidecar container: %w", err)
 	}
@@ -352,7 +521,10 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		},
 	}
 
-	extractResp, err := dockerClient.ContainerCreate(ctx, extractConfig, extractHostConfig, nil, nil, "")
+	extractResp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     extractConfig,
+		HostConfig: extractHostConfig,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create extraction container: %w", err)
 	}
@@ -361,7 +533,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 
 	log.Infof(ctx, "Created extraction container: %s", extractContainerID)
 
-	attachResp, err := dockerClient.ContainerAttach(ctx, extractContainerID, container.AttachOptions{
+	attachResp, err := dockerClient.ContainerAttach(ctx, extractContainerID, client.ContainerAttachOptions{
 		Stdin:  true,
 		Stream: true,
 	})
@@ -370,7 +542,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	}
 	defer attachResp.Close()
 
-	if err := dockerClient.ContainerStart(ctx, extractContainerID, container.StartOptions{}); err != nil {
+	if _, err := dockerClient.ContainerStart(ctx, extractContainerID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("failed to start extraction container: %w", err)
 	}
 
@@ -385,13 +557,13 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		}
 	}()
 
-	statusCh, errCh := dockerClient.ContainerWait(ctx, extractContainerID, container.WaitConditionNotRunning)
+	waitResult := dockerClient.ContainerWait(ctx, extractContainerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case err := <-errCh:
+	case err := <-waitResult.Error:
 		if err != nil {
 			return fmt.Errorf("error waiting for extraction container: %w", err)
 		}
-	case status := <-statusCh:
+	case status := <-waitResult.Result:
 		if status.StatusCode != 0 {
 			logOutput, _ := b.getContainerLogs(ctx, dockerClient, extractContainerID)
 			return fmt.Errorf("extraction container exited with status %d. Logs: %s", status.StatusCode, logOutput)
@@ -402,8 +574,9 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	return nil
 }
 
-// prepareSidecars pulls each sidecar image, creates a Docker volume from its filesystem,
-// and returns the list of bind mount strings to add to the container.
+// prepareSidecars resolves each sidecar image according to the configured image pull policy,
+// creates a Docker volume from its filesystem, and returns the list of bind mount strings to
+// add to the container.
 func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
 	var binds []string
 	seenMountPaths := make(map[string]bool)
@@ -422,9 +595,9 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 
 		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
 
-		// Additional sidecar images are public, so no auth is needed.
-		if err := b.pullImage(ctx, sidecar.Image, ""); err != nil {
-			return nil, fmt.Errorf("failed to pull additional sidecar image %s: %w", sidecar.Image, err)
+		// Additional sidecar images are public, so no auth is needed when a pull is required.
+		if err := b.prepareImage(ctx, sidecar.Image, "", nil); err != nil {
+			return nil, fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
 		}
 
 		digest, err := b.getImageDigest(ctx, sidecar.Image)
@@ -435,18 +608,18 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 		volumeName := sanitizeVolumeName(sidecar.Image, digest)
 		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
 
-		_, err = dockerClient.VolumeInspect(ctx, volumeName)
+		_, err = dockerClient.VolumeInspect(ctx, volumeName, client.VolumeInspectOptions{})
 		if err == nil {
 			log.Debugf(ctx, "Reusing existing volume %s for additional sidecar", volumeName)
 		} else {
 			log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
-			if _, err := dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: volumeName}); err != nil {
+			if _, err := dockerClient.VolumeCreate(ctx, client.VolumeCreateOptions{Name: volumeName}); err != nil {
 				return nil, fmt.Errorf("failed to create volume for additional sidecar %s: %w", sidecar.Image, err)
 			}
 
 			if err := b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName); err != nil {
 				// Clean up the empty volume so it isn't silently reused on retry.
-				if removeErr := dockerClient.VolumeRemove(ctx, volumeName, false); removeErr != nil {
+				if _, removeErr := dockerClient.VolumeRemove(ctx, volumeName, client.VolumeRemoveOptions{}); removeErr != nil {
 					log.Warnf(ctx, "Failed to clean up volume %s after copy failure: %v", volumeName, removeErr)
 				}
 				return nil, fmt.Errorf("failed to copy additional sidecar %s to volume: %w", sidecar.Image, err)
@@ -477,8 +650,14 @@ func sanitizeVolumeName(imageName, digest string) string {
 		repoName = imageName
 	}
 
-	// Sanitize the repository name for use in volume name
-	baseName := strings.ReplaceAll(repoName, "/", "-")
+	// Local-registry image refs can contain ':' and '/', but Docker volume names
+	// only allow [a-zA-Z0-9_.-], so map every other character to '-'.
+	baseName := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-' {
+			return r
+		}
+		return '-'
+	}, repoName)
 
 	// digest format is typically "sha256:abc123..."
 	parts := strings.Split(digest, ":")
@@ -516,4 +695,12 @@ func (b *DockerBackend) getImageDigest(ctx context.Context, imageName string) (s
 	}
 
 	return "", fmt.Errorf("no digest found for image %s", imageName)
+}
+
+// getAuthConfigKey special-cases Docker Hub's credential key and returns the registry hostname for private registries.
+func getAuthConfigKey(domainName string) string {
+	if domainName == "docker.io" || domainName == "index.docker.io" {
+		return dockerHubAuthConfigKey
+	}
+	return domainName
 }

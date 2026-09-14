@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +22,14 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+)
+
+type kubernetesFailureObservationSource string
+
+const (
+	kubernetesFailureSourcePodWatch   kubernetesFailureObservationSource = "pod_watch"
+	kubernetesFailureSourceJobWatch   kubernetesFailureObservationSource = "job_watch"
+	kubernetesFailureSourceSafetyPoll kubernetesFailureObservationSource = "safety_poll"
 )
 
 const (
@@ -34,17 +43,47 @@ const (
 	kubernetesBackendTypeName        = "kubernetes"
 	sidecarCopyTargetMountPath       = "/target"
 	kubernetesStartupPreflightImage  = "busybox:1.36"
+	defaultJobTTLSecondsAfterFinish  = int32(24 * 60 * 60)
 	startupPreflightImageVolumeName  = "preflight-image"
 	startupPreflightImageMountPath   = "/preflight-image"
 	kubernetesWorkerIDLabel          = "oz-worker-id"
 	kubernetesWorkerHashLabel        = "oz-worker-hash"
 	kubernetesTaskIDLabel            = "oz-task-id"
 	kubernetesTaskHashLabel          = "oz-task-hash"
+	kubernetesExecutionIDLabel       = "oz-execution-id"
+	kubernetesExecutionHashLabel     = "oz-execution-hash"
+
+	// Task pod container names. kubernetesSetupPhaseTracker keys its phase
+	// reporting on these, so both the pod-spec construction below and the
+	// tracker must use these constants: a rename in one place would silently
+	// break phase reporting in the other.
+	kubernetesTaskContainerName  = "task"
+	kubernetesSetupContainerName = "setup"
+	kubernetesSidecarInitPrefix  = "copy-sidecar-"
 
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
 	maxLogBytes = 1 << 20 // 1 MiB
+
+	kubernetesFailureDetailsSchemaVersion = 1
+	maxKubernetesFailureReasonBytes       = 256
+	maxKubernetesFailureConditions        = 16
+	maxKubernetesFailureEvents            = 10
+	maxFailureDetailsBytes                = 32 * 1024
 )
+
+// kubernetesTaskOwnedEnvVars returns exactly the worker-owned variables this backend puts on
+// the task container — no operator TaskEnv and no server-supplied task env.
+// TestBackendEnvPairsEveryOZName runs its pairing assertion over these, so a variable added
+// here under only one of its two names fails the build.
+func kubernetesTaskOwnedEnvVars(taskID string) []string {
+	return concatEnvVars(
+		environmentFileEnvVars(defaultSetupEnvironmentFile),
+		workspaceRootEnvVars(defaultWorkspaceMountPath),
+		workerBackendEnvVars(kubernetesBackendTypeName),
+		runIDEnvVars(taskID),
+	)
+}
 
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
@@ -62,20 +101,44 @@ type KubernetesBackendConfig struct {
 	ExtraLabels           map[string]string
 	ExtraAnnotations      map[string]string
 	ActiveDeadlineSeconds *int64
+	TTLSecondsAfterFinish *int32
 	WorkspaceSizeLimit    *resource.Quantity
 	UnschedulableTimeout  *time.Duration
+	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
+	// Docker image for the coding CLI sidecar. When non-empty for a task's harness,
+	// the worker overrides or injects the sidecar at /mnt/{harness}-cli-sidecar.
+	CodingCLISidecars map[string]string
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
 	// task container env in file or Helm config should be set in PodTemplate.
 	TaskEnv map[string]string
 	// PodTemplate, when non-nil, is the declarative PodSpec template for task
 	// Jobs. Worker-required fields are overlaid at execution time.
 	PodTemplate *corev1.PodSpec
+	// PreflightResources, when non-nil, overrides the default cpu/memory
+	// requests and limits applied to startup preflight Job containers.
+	// Defaults: requests 10m CPU / 16Mi memory; limits 100m CPU / 64Mi memory.
+	PreflightResources *corev1.ResourceRequirements
+}
+
+// terminatedExitCode returns the terminated container's exit status,
+// normalized to 128+signal for signal terminations — the form failure-cause
+// classification keys on to tell crashes and operator shutdowns apart from
+// ordinary failures.
+func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
+	if terminated.Signal > 0 {
+		return 128 + int(terminated.Signal)
+	}
+	return int(terminated.ExitCode)
 }
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
 	config    KubernetesBackendConfig
 	clientset kubernetes.Interface
+}
+
+func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
+	return true
 }
 
 // NewKubernetesBackend creates a new Kubernetes backend and validates startup requirements.
@@ -119,25 +182,21 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 }
 
 // ExecuteTask runs the agent in a Kubernetes Job.
-func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
-		return err
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
-	jobName := sanitizeKubernetesJobName(params.TaskID)
-	jobLabels := b.baseLabels(params.TaskID)
+	executionID := taskExecutionID(params)
+	jobName := kubernetesTaskJobName(params.TaskID, executionID)
+	jobLabels := b.baseLabels(params.TaskID, executionID)
 	jobAnnotations := copyStringMap(b.config.ExtraAnnotations)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
-	baseEnv := envSliceFromMap(b.config.TaskEnv)
-	mainEnv := mergeEnvVars(params.EnvVars, append(baseEnv,
-		fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", defaultSetupEnvironmentFile),
-		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", defaultWorkspaceMountPath),
-		"OZ_WORKER_BACKEND="+kubernetesBackendTypeName,
-		fmt.Sprintf("OZ_RUN_ID=%s", params.TaskID),
-	))
+	backendEnv := append(envSliceFromMap(b.config.TaskEnv), kubernetesTaskOwnedEnvVars(params.TaskID)...)
+	mainEnv := mergeEnvVars(params.EnvVars, backendEnv)
 
 	volumes := []corev1.Volume{
 		workspaceVolume(b.config.WorkspaceSizeLimit),
@@ -179,7 +238,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			},
 		})
 		initContainers = append(initContainers, corev1.Container{
-			Name:            fmt.Sprintf("copy-sidecar-%d", i),
+			Name:            fmt.Sprintf("%s%d", kubernetesSidecarInitPrefix, i),
 			Image:           sidecar.Image,
 			ImagePullPolicy: pullPolicy,
 			Command: []string{
@@ -211,7 +270,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	if b.config.SetupCommand != "" {
 		setupEnv := envStringsToKubernetesEnv(mainEnv)
 		initContainers = append(initContainers, corev1.Container{
-			Name:            "setup",
+			Name:            kubernetesSetupContainerName,
 			Image:           params.DockerImage,
 			ImagePullPolicy: pullPolicy,
 			Command:         []string{"/bin/sh", "-c", b.config.SetupCommand},
@@ -223,7 +282,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	mainEnvVars := envStringsToKubernetesEnv(mainEnv)
 	mainContainer := corev1.Container{
-		Name:            "task",
+		Name:            kubernetesTaskContainerName,
 		Image:           params.DockerImage,
 		ImagePullPolicy: pullPolicy,
 		Command: []string{
@@ -247,6 +306,11 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}
 
+	// Size the task container from the runner's instance shape when one is set. Self-hosted
+	// compute is operator-owned, so this is applied as-is (the server does the entitlement
+	// capping). A nil shape leaves pod-template/cluster defaults untouched.
+	applyInstanceShapeToContainer(&mainContainer, params.InstanceShape)
+
 	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
 
 	backoffLimit := int32(0)
@@ -258,8 +322,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			Annotations: jobAnnotations,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          &backoffLimit,
-			ActiveDeadlineSeconds: b.config.ActiveDeadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			ActiveDeadlineSeconds:   b.config.ActiveDeadlineSeconds,
+			TTLSecondsAfterFinished: b.taskJobTTLSecondsAfterFinished(),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      jobLabels,
@@ -271,31 +336,53 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
-	if _, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("failed to create Kubernetes Job: %w", err)
+	doneJobCreate := params.SetupEvents.startPhase(ctx, SetupEventJobCreate)
+	createdJob, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		doneJobCreate(true)
+		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
+		return executeError(withFailureDetails(failure, buildKubernetesFailureDetails("", job, nil, nil, nil)))
 	}
+	job = createdJob
+	doneJobCreate(false)
 
-	deleted := false
+	// Derive the remaining setup phases (scheduling, sidecar prep, setup
+	// command, task container start) from pod status snapshots delivered by
+	// the pod watch and the safety poll below.
+	setupPhases := newKubernetesSetupPhaseTracker(params.SetupEvents)
+
 	defer func() {
-		if deleted {
+		if ctx.Err() != nil {
+			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
 			return
 		}
-		if ctx.Err() != nil || !b.config.NoCleanup {
-			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
-			}
+		if b.config.NoCleanup {
+			return
+		}
+		// Preserve failed task Jobs (and their pods) so operators can inspect logs
+		// and pod state after the fact. They are garbage-collected by the Job's
+		// TTLSecondsAfterFinished (see taskJobTTLSecondsAfterFinished). Successful
+		// Jobs are deleted immediately to keep the namespace clean.
+		if res.Error != nil {
+			log.Infof(ctx, "Leaving failed Kubernetes Job %s in place for TTL-based cleanup", jobName)
+			return
+		}
+		if err := b.deleteJob(context.Background(), jobName); err != nil {
+			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
 	}()
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
 	if err != nil {
-		return fmt.Errorf("failed to watch Job %s: %w", jobName, err)
+		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to watch Job %s: %w", jobName, err))
+		return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceJobWatch, job, nil, nil)))
 	}
 	defer jobWatcher.Stop()
 
-	podWatcher, err := b.watchTaskPods(ctx, params.TaskID)
+	podWatcher, err := b.watchTaskPods(ctx, executionID)
 	if err != nil {
-		return fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err)
+		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err))
+		return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
 	}
 	defer podWatcher.Stop()
 
@@ -305,11 +392,8 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	for {
 		select {
 		case <-ctx.Done():
-			if err := b.deleteJob(context.Background(), jobName); err != nil {
-				log.Warnf(ctx, "Failed to delete Job %s on cancellation: %v", jobName, err)
-			}
-			deleted = true
-			return ctx.Err()
+			log.Infof(ctx, "Stopping local watch for Kubernetes Job %s after task context cancellation", jobName)
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 
 		case event, ok := <-jobWatcher.ResultChan():
 			if !ok {
@@ -317,7 +401,8 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
+					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceJobWatch, job, nil, nil)))
 				}
 				continue
 			}
@@ -326,7 +411,8 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				jobWatcher.Stop()
 				jobWatcher, err = b.watchJob(ctx, jobName)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Job %s: %w", jobName, err)
+					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to re-watch Job %s: %w", jobName, err))
+					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceJobWatch, job, nil, nil)))
 				}
 				continue
 			}
@@ -334,26 +420,28 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				continue
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
-				return result.err
+			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, executionID, kubernetesFailureSourceJobWatch); result != nil {
+				return result.outcome()
 			}
 
 		case event, ok := <-podWatcher.ResultChan():
 			if !ok {
 				// Watch closed; reopen.
 				podWatcher.Stop()
-				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
+					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
 				}
 				continue
 			}
 			if event.Type == watch.Error {
 				log.Warnf(ctx, "Pod watch error for Job %s, reopening", jobName)
 				podWatcher.Stop()
-				podWatcher, err = b.watchTaskPods(ctx, params.TaskID)
+				podWatcher, err = b.watchTaskPods(ctx, executionID)
 				if err != nil {
-					return fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err)
+					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
+					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
 				}
 				continue
 			}
@@ -361,12 +449,14 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			if !ok {
 				continue
 			}
-			if failure := b.inspectPodFailure(ctx, pod); failure != nil {
+			setupPhases.observePod(ctx, pod)
+			if failure := b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch); failure != nil {
+				b.refreshFailureJobDetails(ctx, failure, jobName)
 				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
 				if logs != "" {
 					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
 				}
-				return failure
+				return executeError(failure)
 			}
 
 		case <-safetyTicker.C:
@@ -374,40 +464,59 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			jobState, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 			if err != nil {
 				if apierrors.IsNotFound(err) && ctx.Err() != nil {
-					return ctx.Err()
+					return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 				}
-				return fmt.Errorf("failed to get Job %s: %w", jobName, err)
+				failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobWatch, fmt.Errorf("failed to get Job %s: %w", jobName, err))
+				return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceSafetyPoll, job, nil, nil)))
 			}
-			if result := b.handleJobState(ctx, jobState, params.TaskID); result != nil {
-				return result.err
+			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, executionID, kubernetesFailureSourceSafetyPoll); result != nil {
+				return result.outcome()
 			}
 
-			pods, err := b.listTaskPods(ctx, params.TaskID)
+			pods, err := b.listTaskPods(ctx, executionID)
 			if err != nil {
-				return fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err)
+				failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err))
+				return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceSafetyPoll, jobState, nil, nil)))
 			}
-			if failure := b.detectPodFailure(ctx, pods); failure != nil {
-				return failure
+			for i := range pods {
+				setupPhases.observePod(ctx, &pods[i])
+			}
+			if failure := b.detectPodFailureAt(ctx, pods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
+				return executeError(failure)
 			}
 		}
 	}
 }
 
-// Shutdown deletes all Jobs still labeled for this worker.
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// Kubernetes-backend task.
+func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+
+// Shutdown intentionally does not delete task Jobs.
+//
+// Kubernetes Jobs are the durable execution unit for this backend. During
+// worker pod disruption (for example Karpenter node rotation), deleting Jobs
+// here would kill otherwise healthy running sessions.
 func (b *KubernetesBackend) Shutdown(ctx context.Context) {
-	selector := fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
-	jobs, err := b.clientset.BatchV1().Jobs(b.config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
-		log.Warnf(ctx, "Failed to list lingering Jobs during shutdown: %v", err)
-		return
+	log.Infof(ctx, "Preserving Kubernetes task Jobs during worker shutdown")
+}
+
+// taskJobTTLSecondsAfterFinished returns the value applied to a task Job's
+// TTLSecondsAfterFinished. It bounds how long finished Jobs that the worker
+// leaves in place - failed Jobs (kept for post-mortem debugging) and Jobs
+// orphaned by worker disruption - and their pods survive before the Kubernetes
+// Job TTL controller deletes them. Successful Jobs are deleted immediately by the
+// worker, so this does not delay their cleanup. Returns nil when cleanup is
+// disabled, so those Jobs are retained indefinitely.
+func (b *KubernetesBackend) taskJobTTLSecondsAfterFinished() *int32 {
+	if b.config.NoCleanup {
+		return nil
 	}
-	for _, job := range jobs.Items {
-		if err := b.deleteJob(ctx, job.Name); err != nil {
-			log.Warnf(ctx, "Failed to delete lingering Job %s: %v", job.Name, err)
-		}
+	if b.config.TTLSecondsAfterFinish != nil {
+		return b.config.TTLSecondsAfterFinish
 	}
+	value := defaultJobTTLSecondsAfterFinish
+	return &value
 }
 
 // jobResult wraps a terminal job outcome so handleJobState can signal the
@@ -416,13 +525,25 @@ type jobResult struct {
 	err error
 }
 
+// outcome converts a terminal jobResult into ExecuteTask's result.
+func (r *jobResult) outcome() ExecuteResult {
+	if r.err != nil {
+		return executeError(r.err)
+	}
+	return executeCompleted()
+}
+
 // handleJobState checks whether a Job has reached a terminal state and, if so,
 // returns a *jobResult. A nil return means the Job is still in progress.
-func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID string) *jobResult {
+func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID, executionID string) *jobResult {
+	return b.handleJobStateAt(ctx, jobState, taskID, executionID, "")
+}
+
+func (b *KubernetesBackend) handleJobStateAt(ctx context.Context, jobState *batchv1.Job, taskID, executionID string, source kubernetesFailureObservationSource) *jobResult {
 	jobName := jobState.Name
 	if jobComplete(jobState) {
 		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-			pods, _ := b.listTaskPods(ctx, taskID)
+			pods, _ := b.listTaskPods(ctx, executionID)
 			logs := b.collectPodLogs(ctx, pods)
 			if logs != "" {
 				log.Debugf(ctx, "Job %s output:\n%s", jobName, logs)
@@ -432,12 +553,17 @@ func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv
 		return &jobResult{err: nil}
 	}
 	if jobFailed(jobState) {
-		pods, _ := b.listTaskPods(ctx, taskID)
+		pods, _ := b.listTaskPods(ctx, executionID)
 		logs := b.collectPodLogs(ctx, pods)
 		if logs != "" {
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
 		}
-		return &jobResult{err: fmt.Errorf("job %s failed", jobName)}
+		if failure := b.detectPodFailureAt(ctx, pods, jobState, source); failure != nil {
+			return &jobResult{err: failure}
+		}
+		metricsReason := classifyJobFailure(jobState)
+		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.jobFailureError(jobState))
+		return &jobResult{err: withFailureDetails(failure, b.kubernetesFailureDetails(ctx, source, jobState, nil, nil))}
 	}
 	return nil
 }
@@ -448,9 +574,9 @@ func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch
 	})
 }
 
-func (b *KubernetesBackend) watchTaskPods(ctx context.Context, taskID string) (watch.Interface, error) {
+func (b *KubernetesBackend) watchTaskPods(ctx context.Context, executionID string) (watch.Interface, error) {
 	return b.clientset.CoreV1().Pods(b.config.Namespace).Watch(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesExecutionHashLabel, kubernetesLabelHash(executionID)),
 	})
 }
 
@@ -483,7 +609,7 @@ func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, 
 
 	taskIdx := -1
 	for i, c := range podSpec.Containers {
-		if c.Name == "task" {
+		if c.Name == kubernetesTaskContainerName {
 			taskIdx = i
 			break
 		}
@@ -502,11 +628,60 @@ func (b *KubernetesBackend) buildTaskPodSpec(initContainers []corev1.Container, 
 		if mainContainer.Lifecycle != nil {
 			tc.Lifecycle = mainContainer.Lifecycle
 		}
+		// Runner instance shape (carried on mainContainer.Resources) overrides the matching
+		// pod-template task-container resources per axis, preserving unrelated entries.
+		tc.Resources = mergeResourceRequirements(tc.Resources, mainContainer.Resources)
 	} else {
 		podSpec.Containers = append(podSpec.Containers, mainContainer)
 	}
 
 	return podSpec
+}
+
+// applyInstanceShapeToContainer sets CPU/memory requests and limits on the container from
+// the instance shape. Each axis is applied only when positive, so a partial shape overrides
+// only the resource it specifies. Setting requests == limits pins the task container to the
+// requested size, which drives pod scheduling (node fit) and in-pod enforcement. Only the
+// task container is sized here (the setup/sidecar init containers are not), so the pod is
+// not strictly Guaranteed QoS. A nil shape is a no-op, leaving pod-template/cluster defaults.
+func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceShape) {
+	if shape == nil {
+		return
+	}
+	setResource := func(name corev1.ResourceName, qty resource.Quantity) {
+		if c.Resources.Requests == nil {
+			c.Resources.Requests = corev1.ResourceList{}
+		}
+		if c.Resources.Limits == nil {
+			c.Resources.Limits = corev1.ResourceList{}
+		}
+		c.Resources.Requests[name] = qty
+		c.Resources.Limits[name] = qty
+	}
+	if shape.Vcpus > 0 {
+		setResource(corev1.ResourceCPU, *resource.NewQuantity(int64(shape.Vcpus), resource.DecimalSI))
+	}
+	if shape.MemoryGb > 0 {
+		setResource(corev1.ResourceMemory, *resource.NewQuantity(int64(shape.MemoryGb)<<30, resource.BinarySI))
+	}
+}
+
+// mergeResourceRequirements overlays override's requests/limits onto base per resource
+// name, preserving base entries for resources the override does not set.
+func mergeResourceRequirements(base, override corev1.ResourceRequirements) corev1.ResourceRequirements {
+	for name, qty := range override.Requests {
+		if base.Requests == nil {
+			base.Requests = corev1.ResourceList{}
+		}
+		base.Requests[name] = qty
+	}
+	for name, qty := range override.Limits {
+		if base.Limits == nil {
+			base.Limits = corev1.ResourceList{}
+		}
+		base.Limits[name] = qty
+	}
+	return base
 }
 
 func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
@@ -592,6 +767,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
+	preflightRes := b.preflightResourceRequirements()
 	if b.config.UseImageVolumes {
 		podSpec.InitContainers = nil
 		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
@@ -601,6 +777,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				Image:           b.config.PreflightImage,
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "test -d " + startupPreflightImageMountPath},
+				Resources:       preflightRes,
 				VolumeMounts: []corev1.VolumeMount{
 					{
 						Name:      startupPreflightImageVolumeName,
@@ -618,6 +795,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "true"},
 				SecurityContext: rootSecurityContext(),
+				Resources:       preflightRes,
 			},
 		}
 		podSpec.Containers = []corev1.Container{
@@ -626,6 +804,7 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 				Image:           b.config.PreflightImage,
 				ImagePullPolicy: pullPolicy,
 				Command:         []string{"/bin/sh", "-c", "true"},
+				Resources:       preflightRes,
 			},
 		}
 	}
@@ -779,21 +958,26 @@ func (b *KubernetesBackend) startupPreflightError(err error) error {
 	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 
-func (b *KubernetesBackend) baseLabels(taskID string) map[string]string {
+func (b *KubernetesBackend) baseLabels(taskID, executionID string) map[string]string {
+	if strings.TrimSpace(executionID) == "" {
+		executionID = taskID
+	}
 	labels := copyStringMap(b.config.ExtraLabels)
 	if labels == nil {
-		labels = make(map[string]string, 4)
+		labels = make(map[string]string, 6)
 	}
 	labels[kubernetesWorkerIDLabel] = sanitizeKubernetesLabelValue(b.config.WorkerID)
 	labels[kubernetesWorkerHashLabel] = kubernetesLabelHash(b.config.WorkerID)
 	labels[kubernetesTaskIDLabel] = sanitizeKubernetesLabelValue(taskID)
 	labels[kubernetesTaskHashLabel] = kubernetesLabelHash(taskID)
+	labels[kubernetesExecutionIDLabel] = sanitizeKubernetesLabelValue(executionID)
+	labels[kubernetesExecutionHashLabel] = kubernetesLabelHash(executionID)
 	return labels
 }
 
-func (b *KubernetesBackend) listTaskPods(ctx context.Context, taskID string) ([]corev1.Pod, error) {
+func (b *KubernetesBackend) listTaskPods(ctx context.Context, executionID string) ([]corev1.Pod, error) {
 	podList, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", kubernetesTaskHashLabel, kubernetesLabelHash(taskID)),
+		LabelSelector: fmt.Sprintf("%s=%s", kubernetesExecutionHashLabel, kubernetesLabelHash(executionID)),
 	})
 	if err != nil {
 		return nil, err
@@ -802,8 +986,12 @@ func (b *KubernetesBackend) listTaskPods(ctx context.Context, taskID string) ([]
 }
 
 func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.Pod) error {
+	return b.detectPodFailureAt(ctx, pods, nil, "")
+}
+
+func (b *KubernetesBackend) detectPodFailureAt(ctx context.Context, pods []corev1.Pod, job *batchv1.Job, source kubernetesFailureObservationSource) error {
 	for _, pod := range pods {
-		if failure := b.inspectPodFailure(ctx, &pod); failure != nil {
+		if failure := b.inspectPodFailureAt(ctx, &pod, job, source); failure != nil {
 			logs := b.collectPodLogs(ctx, []corev1.Pod{pod})
 			if logs != "" {
 				log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
@@ -814,61 +1002,97 @@ func (b *KubernetesBackend) detectPodFailure(ctx context.Context, pods []corev1.
 	return nil
 }
 
-func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
+func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1.Pod, job *batchv1.Job, source kubernetesFailureObservationSource) error {
+	var events []corev1.Event
+	eventsLoaded := false
+	loadEvents := func() []corev1.Event {
+		if !eventsLoaded {
+			events = b.collectKubernetesFailureEvents(ctx, job, pod)
+			eventsLoaded = true
+		}
+		return events
+	}
+	withDetails := func(err error, container *types.KubernetesContainerFailureDetails) error {
+		return withFailureDetails(err, buildKubernetesFailureDetails(source, job, pod, container, loadEvents()))
+	}
+	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {
+		return withDetails(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonEvicted, b.podFailureError(pod)), nil)
+	}
+
+	restartableSidecars := restartableInitContainerNames(pod)
 
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return fmt.Errorf("init container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode)
+		// Init containers declared with restartPolicy: Always are native
+		// sidecar containers: the kubelet restarts them while the pod runs and
+		// stops them with SIGTERM once the main containers finish, and their
+		// exit codes never determine pod or Job outcome. Skip the exit-code
+		// check for them so normal pod wind-down (e.g. JVM services exiting
+		// 143 on SIGTERM) is not misreported as a task failure. The waiting
+		// checks below still apply to sidecars: one that cannot start blocks
+		// the task container from ever running.
+		if status.State.Terminated != nil && terminatedExitCode(status.State.Terminated) != 0 && !restartableSidecars[status.Name] {
+			err := newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonInitContainer, b.containerTerminatedFailureError(pod, "init container", status.Name, status.State.Terminated), terminatedExitCode(status.State.Terminated))
+			return withDetails(err, terminatedContainerFailureDetails("init", status.Name, status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return fmt.Errorf("init container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting))
+			kind := "init"
+			if restartableSidecars[status.Name] {
+				kind = "sidecar"
+			}
+			err := newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), b.containerWaitingFailureError(pod, "init container", status.Name, status.State.Waiting))
+			return withDetails(err, waitingContainerFailureDetails(kind, status.Name, status.State.Waiting))
 		}
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-			return fmt.Errorf("container %s in pod %s exited with code %d", status.Name, pod.Name, status.State.Terminated.ExitCode)
+		if status.State.Terminated != nil && terminatedExitCode(status.State.Terminated) != 0 {
+			err := newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, classifyTerminatedReason(status.State.Terminated.Reason), b.containerTerminatedFailureError(pod, "container", status.Name, status.State.Terminated), terminatedExitCode(status.State.Terminated))
+			return withDetails(err, terminatedContainerFailureDetails("regular", status.Name, status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			return fmt.Errorf("container %s in pod %s is waiting: %s", status.Name, pod.Name, waitingMessage(status.State.Waiting))
+			err := newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), b.containerWaitingFailureError(pod, "container", status.Name, status.State.Waiting))
+			return withDetails(err, waitingContainerFailureDetails("regular", status.Name, status.State.Waiting))
 		}
 	}
 
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable {
 			if b.shouldFailUnschedulablePod(pod) {
-				return fmt.Errorf("pod %s is unschedulable: %s", pod.Name, condition.Message)
+				return withDetails(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonUnschedulable, b.podConditionFailureError(pod, "is unschedulable", condition.Reason, condition.Message)), nil)
 			}
 		}
 	}
 
-	// Only query Events when the Pod shows signs of trouble to avoid
-	// expensive API calls on every healthy poll/watch cycle.
 	if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodFailed {
-		events, err := b.clientset.CoreV1().Events(b.config.Namespace).List(ctx, metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("involvedObject.uid=%s", pod.UID),
-		})
-		if err != nil {
-			log.Warnf(ctx, "Failed to list events for pod %s: %v", pod.Name, err)
-			return nil
-		}
-		for _, event := range events.Items {
+		for _, event := range loadEvents() {
 			if event.Reason == "FailedMount" || strings.Contains(event.Message, "MountVolume.SetUp failed") {
-				return fmt.Errorf("pod %s failed to mount a volume: %s", pod.Name, event.Message)
+				return withDetails(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonVolumeMount, b.podEventFailureError(pod, "failed to mount a volume", event)), nil)
 			}
 		}
 	}
 	if pod.Status.Phase == corev1.PodFailed {
-		if pod.Status.Message != "" {
-			return fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Message)
+		metricsReason := metrics.TaskFailureReasonJobFailed
+		if strings.Contains(strings.ToLower(pod.Status.Reason+" "+pod.Status.Message), "deadline") {
+			metricsReason = metrics.TaskFailureReasonActiveDeadline
 		}
-		if pod.Status.Reason != "" {
-			return fmt.Errorf("pod %s failed: %s", pod.Name, pod.Status.Reason)
-		}
-		return fmt.Errorf("pod %s failed", pod.Name)
+		return withDetails(newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.podFailureError(pod)), nil)
 	}
 
 	return nil
+}
+
+// restartableInitContainerNames returns the names of init containers declared
+// with restartPolicy: Always (native sidecar containers). Kubernetes excludes
+// their exit codes from pod and Job outcome, so task failure detection must
+// not treat their terminations as fatal.
+func restartableInitContainerNames(pod *corev1.Pod) map[string]bool {
+	names := make(map[string]bool, len(pod.Spec.InitContainers))
+	for _, container := range pod.Spec.InitContainers {
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			names[container.Name] = true
+		}
+	}
+	return names
 }
 
 func (b *KubernetesBackend) collectPodLogs(ctx context.Context, pods []corev1.Pod) string {
@@ -967,23 +1191,50 @@ func copyStringMap(values map[string]string) map[string]string {
 	return result
 }
 
-func sanitizeKubernetesJobName(taskID string) string {
-	suffix := sanitizeKubernetesNameFragment(taskID)
-	if suffix == "" {
-		suffix = "task"
+// taskJobExecIDSuffixLen is how many trailing characters of the execution ID are
+// appended after the full run ID in a task Job name. It disambiguates re-executions
+// (follow-up/handoff) of the same run while keeping the Job name within Kubernetes'
+// 63-character limit for the job-name label the controller stamps on Pods.
+const taskJobExecIDSuffixLen = 8
+
+// kubernetesTaskJobName builds the task Job name as oz-task-<run>-exec-<exec-suffix>.
+// The Job controller appends a random suffix when it creates the task Pod, so the Pod
+// name becomes oz-task-<run>-exec-<exec-suffix>-<random>. The full run ID is embedded so
+// Jobs and Pods stay greppable by run, while a short execution-ID suffix keeps the name
+// unique across re-executions of the same run. The run fragment is truncated only as a
+// defensive fallback so the name stays within the 63-character limit; a standard
+// 36-character UUID run ID always fits without truncation.
+func kubernetesTaskJobName(runID, executionID string) string {
+	execFragment := lastKubernetesIDFragment(executionID, taskJobExecIDSuffixLen)
+	if execFragment == "" {
+		execFragment = "exec"
 	}
 
-	hash := kubernetesLabelHash(taskID)
-	maxSuffixLength := 63 - len("oz-task--") - len(hash)
-	if len(suffix) > maxSuffixLength {
-		suffix = suffix[:maxSuffixLength]
-		suffix = strings.Trim(suffix, "-")
+	const prefix, sep = "oz-task-", "-exec-"
+	maxRunLen := 63 - len(prefix) - len(sep) - len(execFragment)
+	if maxRunLen < 0 {
+		maxRunLen = 0
 	}
-	if suffix == "" {
-		suffix = "task"
+	runFragment := sanitizeKubernetesNameFragment(runID)
+	if len(runFragment) > maxRunLen {
+		runFragment = strings.Trim(runFragment[:maxRunLen], "-")
+	}
+	if runFragment == "" {
+		runFragment = "run"
 	}
 
-	return fmt.Sprintf("oz-task-%s-%s", suffix, hash)
+	return prefix + runFragment + sep + execFragment
+}
+
+// lastKubernetesIDFragment returns a DNS-label-safe fragment built from the last n
+// characters of the sanitized id. It returns an empty string when id has no usable
+// characters, so callers can substitute a fallback.
+func lastKubernetesIDFragment(id string, n int) string {
+	sanitized := sanitizeKubernetesNameFragment(id)
+	if len(sanitized) > n {
+		sanitized = strings.Trim(sanitized[len(sanitized)-n:], "-")
+	}
+	return sanitized
 }
 
 func sanitizeKubernetesLabelValue(value string) string {
@@ -1036,6 +1287,16 @@ func kubernetesLabelHash(value string) string {
 	return fmt.Sprintf("%x", sum[:8])
 }
 
+func taskExecutionID(params *TaskParams) string {
+	if params == nil {
+		return ""
+	}
+	if executionID := strings.TrimSpace(params.ExecutionID); executionID != "" {
+		return executionID
+	}
+	return params.TaskID
+}
+
 func kubernetesTaskWrapperScript() string {
 	return strings.Join([]string{
 		"if [ -f \"$OZ_ENVIRONMENT_FILE\" ]; then",
@@ -1043,7 +1304,8 @@ func kubernetesTaskWrapperScript() string {
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
 		"  set +a",
 		"fi",
-		"/bin/sh /agent/entrypoint.sh \"$@\"",
+		"",
+		"exec /agent/entrypoint.sh \"$@\"",
 	}, "\n")
 }
 
@@ -1080,12 +1342,176 @@ func mergeKubernetesEnvVars(base, override []corev1.EnvVar) []corev1.EnvVar {
 	return result
 }
 
+// preflightResourceRequirements returns the cpu/memory requests and limits for
+// the startup preflight Job containers. When the backend config supplies
+// PreflightResources, those values are used. Otherwise the built-in defaults
+// are returned.
+func (b *KubernetesBackend) preflightResourceRequirements() corev1.ResourceRequirements {
+	if b.config.PreflightResources != nil {
+		return *b.config.PreflightResources
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("10m"),
+			corev1.ResourceMemory: resource.MustParse("16Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+	}
+}
+
 func rootSecurityContext() *corev1.SecurityContext {
 	rootUser := int64(0)
 	rootGroup := int64(0)
 	return &corev1.SecurityContext{
 		RunAsUser:  &rootUser,
 		RunAsGroup: &rootGroup,
+	}
+}
+
+func (b *KubernetesBackend) jobFailureError(job *batchv1.Job) error {
+	details := []string{
+		fmt.Sprintf("kubernetes Job %s in namespace %s failed", job.Name, b.objectNamespace(job.Namespace)),
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		if condition.Reason != "" {
+			details = append(details, "Job reason: "+condition.Reason)
+		}
+		if condition.Message != "" {
+			details = append(details, "Job message: "+condition.Message)
+		}
+		break
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+// TODO: Send these Kubernetes diagnostics to the server as structured failure
+// details so the UI/API can format them without parsing this human-readable
+// message string.
+func (b *KubernetesBackend) containerTerminatedFailureError(pod *corev1.Pod, kind, containerName string, terminated *corev1.ContainerStateTerminated) error {
+	message := fmt.Sprintf("%s %s in %s exited with code %d", kind, containerName, b.podContext(pod), terminated.ExitCode)
+	if signal := exitSignalName(terminated); signal != "" {
+		message = fmt.Sprintf("%s (%s)", message, signal)
+	}
+	details := append([]string{message}, b.podStatusDetails(pod, terminated.Reason, terminated.Message)...)
+	if guidance := b.terminationGuidance(kind, terminated); guidance != "" {
+		details = append(details, guidance)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) containerWaitingFailureError(pod *corev1.Pod, kind, containerName string, waiting *corev1.ContainerStateWaiting) error {
+	message := fmt.Sprintf("%s %s in %s is waiting: %s", kind, containerName, b.podContext(pod), waitingMessage(waiting))
+	return fmt.Errorf("%s", strings.Join(append([]string{message}, b.podStatusDetails(pod, waiting.Reason, waiting.Message)...), ". "))
+}
+
+func (b *KubernetesBackend) podConditionFailureError(pod *corev1.Pod, summary, reason, message string) error {
+	details := []string{fmt.Sprintf("%s %s", b.podContext(pod), summary)}
+	if reason != "" {
+		details = append(details, "Pod reason: "+reason)
+	}
+	if message != "" {
+		details = append(details, "Pod message: "+message)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) podEventFailureError(pod *corev1.Pod, summary string, event corev1.Event) error {
+	details := []string{fmt.Sprintf("%s %s", b.podContext(pod), summary)}
+	if event.Reason != "" {
+		details = append(details, "Kubernetes event reason: "+event.Reason)
+	}
+	if event.Message != "" {
+		details = append(details, "Kubernetes event message: "+event.Message)
+	}
+	return fmt.Errorf("%s", strings.Join(details, ". "))
+}
+
+func (b *KubernetesBackend) podFailureError(pod *corev1.Pod) error {
+	details := []string{fmt.Sprintf("%s failed", b.podContext(pod))}
+	return fmt.Errorf("%s", strings.Join(append(details, b.podStatusDetails(pod, "", "")...), ". "))
+}
+
+func (b *KubernetesBackend) podContext(pod *corev1.Pod) string {
+	details := []string{"namespace " + b.objectNamespace(pod.Namespace)}
+	if pod.Labels["job-name"] != "" {
+		details = append(details, "job "+pod.Labels["job-name"])
+	}
+	return fmt.Sprintf("pod %s (%s)", pod.Name, strings.Join(details, ", "))
+}
+
+func (b *KubernetesBackend) objectNamespace(namespace string) string {
+	if namespace != "" {
+		return namespace
+	}
+	return b.config.Namespace
+}
+
+func (b *KubernetesBackend) podStatusDetails(pod *corev1.Pod, reason, message string) []string {
+	var details []string
+	if pod.Status.Phase != "" {
+		details = append(details, "Pod phase: "+string(pod.Status.Phase))
+	}
+	if reason == "" {
+		reason = pod.Status.Reason
+	}
+	if reason != "" {
+		details = append(details, "Pod reason: "+reason)
+	}
+	if message == "" {
+		message = pod.Status.Message
+	}
+	if message != "" {
+		details = append(details, "Pod message: "+message)
+	}
+	return details
+}
+
+func (b *KubernetesBackend) terminationGuidance(kind string, terminated *corev1.ContainerStateTerminated) string {
+	if exitSignalName(terminated) != "SIGTERM" {
+		return ""
+	}
+	switch kind {
+	case "container":
+		return "SIGTERM usually means Kubernetes or the container runtime asked the task process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	case "init container":
+		return "SIGTERM usually means Kubernetes or the container runtime asked the setup process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	default:
+		return "SIGTERM usually means Kubernetes or the container runtime asked the process to stop; check pod events and node activity for eviction, preemption, node drain, activeDeadlineSeconds, or manual deletion."
+	}
+}
+
+func exitSignalName(terminated *corev1.ContainerStateTerminated) string {
+	if signal := signalName(terminated.Signal); signal != "" {
+		return signal
+	}
+	return signalName(terminated.ExitCode - 128)
+}
+
+func signalName(signal int32) string {
+	switch signal {
+	case 1:
+		return "SIGHUP"
+	case 2:
+		return "SIGINT"
+	case 3:
+		return "SIGQUIT"
+	case 6:
+		return "SIGABRT"
+	case 9:
+		return "SIGKILL"
+	case 15:
+		return "SIGTERM"
+	default:
+		if signal > 0 {
+			return fmt.Sprintf("signal %d", signal)
+		}
+		return ""
 	}
 }
 
@@ -1103,6 +1529,45 @@ func isImmediateContainerFailure(reason string) bool {
 	default:
 		return false
 	}
+}
+
+func classifyJobFailure(job *batchv1.Job) metrics.TaskFailureReason {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		detail := strings.ToLower(condition.Reason + " " + condition.Message)
+		if strings.Contains(detail, "deadline") {
+			return metrics.TaskFailureReasonActiveDeadline
+		}
+	}
+	return metrics.TaskFailureReasonJobFailed
+}
+
+func classifyWaitingReason(reason string, initContainer bool) metrics.TaskFailureReason {
+	switch reason {
+	case "ErrImagePull", "ImagePullBackOff":
+		return metrics.TaskFailureReasonImagePull
+	case "InvalidImageName":
+		return metrics.TaskFailureReasonInvalidImage
+	case "CreateContainerConfigError", "CreateContainerError":
+		if initContainer {
+			return metrics.TaskFailureReasonInitContainer
+		}
+		return metrics.TaskFailureReasonContainerCreate
+	default:
+		if initContainer {
+			return metrics.TaskFailureReasonInitContainer
+		}
+		return metrics.TaskFailureReasonContainerWait
+	}
+}
+
+func classifyTerminatedReason(reason string) metrics.TaskFailureReason {
+	if reason == "OOMKilled" {
+		return metrics.TaskFailureReasonContainerOOM
+	}
+	return metrics.TaskFailureReasonContainerExit
 }
 
 func waitingMessage(waiting *corev1.ContainerStateWaiting) string {

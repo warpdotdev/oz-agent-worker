@@ -172,6 +172,74 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	}
 }
 
+func TestMergeConfigCommandFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	CLI.ServerRootURL = "https://app.warp.dev"
+	CLI.Env = []string{"CLI_ONLY=1"}
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				CancelCommand:   "/opt/oz/cancel.sh",
+				DispatchTimeout: "30s",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "command" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "command")
+	}
+	if wc.Command == nil {
+		t.Fatal("expected command backend config")
+	}
+	if wc.Command.DispatchCommand != "/opt/oz/dispatch.sh" {
+		t.Errorf("DispatchCommand = %q, want %q", wc.Command.DispatchCommand, "/opt/oz/dispatch.sh")
+	}
+	if wc.Command.CancelCommand != "/opt/oz/cancel.sh" {
+		t.Errorf("CancelCommand = %q, want %q", wc.Command.CancelCommand, "/opt/oz/cancel.sh")
+	}
+	if wc.Command.DispatchTimeout != 30*time.Second {
+		t.Errorf("DispatchTimeout = %v, want 30s", wc.Command.DispatchTimeout)
+	}
+	if wc.Command.ServerRootURL != "https://app.warp.dev" {
+		t.Errorf("ServerRootURL = %q, want %q", wc.Command.ServerRootURL, "https://app.warp.dev")
+	}
+	if wc.Command.WorkerID != "command-worker" {
+		t.Errorf("WorkerID = %q, want %q", wc.Command.WorkerID, "command-worker")
+	}
+	if wc.Command.Env["CLI_ONLY"] != "1" {
+		t.Errorf("Env[CLI_ONLY] = %q, want %q", wc.Command.Env["CLI_ONLY"], "1")
+	}
+}
+
+func TestMergeConfigCommandInvalidDispatchTimeout(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				DispatchTimeout: "nope",
+			},
+		},
+	}
+
+	if _, err := mergeConfig(fileConfig); err == nil {
+		t.Fatal("expected error for invalid dispatch_timeout")
+	}
+}
+
 func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
@@ -194,5 +262,147 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 0 {
 		t.Fatalf("UnschedulableTimeout = %v, want 0", wc.Kubernetes.UnschedulableTimeout)
+	}
+}
+
+func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				ImagePullPolicy: "Never",
+				Volumes:         []string{"/data:/data"},
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "Never" {
+		t.Errorf("ImagePullPolicy = %q, want %q", wc.Docker.ImagePullPolicy, "Never")
+	}
+	if len(wc.Docker.Volumes) != 1 || wc.Docker.Volumes[0] != "/data:/data" {
+		t.Errorf("Volumes = %v, want [/data:/data]", wc.Docker.Volumes)
+	}
+}
+
+func TestMergeConfigDockerSidecarImageFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				SidecarImage: "my-registry.io/warpdotdev/warp-agent:latest",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "my-registry.io/warpdotdev/warp-agent:latest" {
+		t.Errorf("SidecarImage = %q, want %q", wc.Docker.SidecarImage, "my-registry.io/warpdotdev/warp-agent:latest")
+	}
+}
+
+func TestMergeConfigDockerSidecarImageOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "" {
+		t.Errorf("SidecarImage = %q, want empty", wc.Docker.SidecarImage)
+	}
+}
+
+func TestMergeConfigDockerImagePullPolicyOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "" {
+		t.Errorf("ImagePullPolicy = %q, want empty (defaulting happens at the worker layer)", wc.Docker.ImagePullPolicy)
+	}
+}
+
+func TestMergeConfigKubernetesCodingCLISidecars(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "worker-123",
+		Backend: config.BackendConfig{
+			Kubernetes: &config.KubernetesConfig{
+				CodingCLISidecars: map[string]string{
+					"claude": "registry.internal/my-claude:v1",
+				},
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Kubernetes == nil {
+		t.Fatal("expected kubernetes backend config")
+	}
+	if got := wc.Kubernetes.CodingCLISidecars["claude"]; got != "registry.internal/my-claude:v1" {
+		t.Errorf("CodingCLISidecars[claude] = %q, want %q", got, "registry.internal/my-claude:v1")
+	}
+
+	// mergeConfig must copy the map rather than alias the file config's map, so a
+	// later mutation of the file config does not leak into the merged worker config.
+	fileConfig.Backend.Kubernetes.CodingCLISidecars["claude"] = "mutated"
+	if got := wc.Kubernetes.CodingCLISidecars["claude"]; got != "registry.internal/my-claude:v1" {
+		t.Errorf("expected merged config to be insulated from file config mutation, got %q", got)
 	}
 }
