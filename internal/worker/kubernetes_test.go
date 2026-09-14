@@ -155,7 +155,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -164,7 +164,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err == nil || !strings.Contains(err.Error(), "unschedulable") {
 			t.Fatalf("expected unschedulable error, got %v", err)
 		}
@@ -179,7 +179,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -188,7 +188,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err != nil {
 			t.Fatalf("expected no error before timeout, got %v", err)
 		}
@@ -203,7 +203,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			clientset: fakeClient,
 		}
 
-		err := backend.inspectPodFailure(ctx, &corev1.Pod{
+		err := backend.inspectPodFailureAt(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "task-pod",
 				Namespace:         "agents",
@@ -212,7 +212,7 @@ func TestInspectPodFailureRespectsUnschedulableTimeout(t *testing.T) {
 			Status: corev1.PodStatus{
 				Conditions: []corev1.PodCondition{unschedulableCondition},
 			},
-		})
+		}, nil, "testing")
 		if err != nil {
 			t.Fatalf("expected no error when timeout is disabled, got %v", err)
 		}
@@ -227,7 +227,7 @@ func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
 		clientset: fake.NewSimpleClientset(),
 	}
 
-	err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+	err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "task-pod",
 			Namespace: "agents",
@@ -248,7 +248,7 @@ func TestInspectPodFailureReportsContainerExitDiagnostics(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, nil, "testing")
 	if err == nil {
 		t.Fatal("expected container termination error")
 	}
@@ -287,7 +287,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 	}
 
 	t.Run("restartable sidecar SIGTERM exit does not fail the task", func(t *testing.T) {
-		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
 			Spec:       podSpec,
 			Status: corev1.PodStatus{
@@ -301,14 +301,14 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, nil, "testing")
 		if err != nil {
 			t.Fatalf("expected no failure for terminated restartable sidecar, got %v", err)
 		}
 	})
 
 	t.Run("plain init container exit still fails the task", func(t *testing.T) {
-		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
 			Spec:       podSpec,
 			Status: corev1.PodStatus{
@@ -321,14 +321,14 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, nil, "testing")
 		if err == nil || !strings.Contains(err.Error(), "init container copy-sidecar-0") {
 			t.Fatalf("expected init container failure, got %v", err)
 		}
 	})
 
 	t.Run("sidecar exit does not mask task container failure", func(t *testing.T) {
-		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
 			Spec:       podSpec,
 			Status: corev1.PodStatus{
@@ -350,14 +350,14 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, nil, "testing")
 		if err == nil || !strings.Contains(err.Error(), "container task") || !strings.Contains(err.Error(), "exited with code 2") {
 			t.Fatalf("expected task container failure attribution, got %v", err)
 		}
 	})
 
 	t.Run("sidecar image pull failure still fails the task", func(t *testing.T) {
-		err := backend.inspectPodFailure(context.Background(), &corev1.Pod{
+		err := backend.inspectPodFailureAt(context.Background(), &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "task-pod", Namespace: "agents"},
 			Spec:       podSpec,
 			Status: corev1.PodStatus{
@@ -371,7 +371,7 @@ func TestInspectPodFailureIgnoresRestartableSidecarExitCodes(t *testing.T) {
 					},
 				},
 			},
-		})
+		}, nil, "testing")
 		if err == nil || !strings.Contains(err.Error(), "ImagePullBackOff") {
 			t.Fatalf("expected image pull failure, got %v", err)
 		}
