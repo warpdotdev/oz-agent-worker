@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
@@ -197,8 +198,9 @@ type TaskFailure struct {
 	metricsReason metrics.TaskFailureReason
 	// exitCode is the failing process's exit status, normalized to 128+signal
 	// for signal terminations. Zero means no exit status was observed.
-	exitCode int
-	err      error
+	exitCode       int
+	failureDetails *types.FailureDetails
+	err            error
 }
 
 func (e *TaskFailure) Error() string {
@@ -223,4 +225,20 @@ func newBackendFailureWithExitCode(metricsPhase metrics.TaskFailurePhase, metric
 		return nil
 	}
 	return &TaskFailure{metricsPhase: metricsPhase, metricsReason: metricsReason, err: err, exitCode: exitCode}
+}
+
+func withFailureDetails(err error, details *types.FailureDetails) error {
+	var failure *TaskFailure
+	if details != nil && errors.As(err, &failure) {
+		failure.failureDetails = details
+	}
+	return err
+}
+
+func taskFailureDetails(err error) *types.FailureDetails {
+	var failure *TaskFailure
+	if errors.As(err, &failure) {
+		return failure.failureDetails
+	}
+	return nil
 }

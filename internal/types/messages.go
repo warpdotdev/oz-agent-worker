@@ -24,6 +24,71 @@ type WebSocketMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// FailureDetails contains backend-specific structured diagnostics.
+type FailureDetails struct {
+	Kubernetes *KubernetesFailureDetails `json:"kubernetes,omitempty"`
+}
+
+// KubernetesFailureDetails contains bounded Kubernetes metadata captured when a task fails.
+type KubernetesFailureDetails struct {
+	SchemaVersion     int                                `json:"schema_version"`
+	ObservationSource string                             `json:"observation_source,omitempty"`
+	ObservedAt        time.Time                          `json:"observed_at"`
+	Job               *KubernetesJobFailureDetails       `json:"job,omitempty"`
+	Pod               *KubernetesPodFailureDetails       `json:"pod,omitempty"`
+	Container         *KubernetesContainerFailureDetails `json:"container,omitempty"`
+	Events            []KubernetesEventDetails           `json:"events,omitempty"`
+	Truncated         bool                               `json:"truncated,omitempty"`
+}
+
+// KubernetesJobFailureDetails identifies a worker-created Job and its terminal conditions.
+type KubernetesJobFailureDetails struct {
+	Name       string                       `json:"name,omitempty"`
+	UID        string                       `json:"uid,omitempty"`
+	Conditions []KubernetesConditionDetails `json:"conditions,omitempty"`
+}
+
+// KubernetesPodFailureDetails identifies a task Pod and its structured status.
+type KubernetesPodFailureDetails struct {
+	Name              string                       `json:"name,omitempty"`
+	UID               string                       `json:"uid,omitempty"`
+	Phase             string                       `json:"phase,omitempty"`
+	Reason            string                       `json:"reason,omitempty"`
+	DeletionTimestamp *time.Time                   `json:"deletion_timestamp,omitempty"`
+	Conditions        []KubernetesConditionDetails `json:"conditions,omitempty"`
+}
+
+// KubernetesConditionDetails contains condition fields that Kubernetes represents structurally.
+type KubernetesConditionDetails struct {
+	Type               string     `json:"type,omitempty"`
+	Status             string     `json:"status,omitempty"`
+	Reason             string     `json:"reason,omitempty"`
+	LastTransitionTime *time.Time `json:"last_transition_time,omitempty"`
+}
+
+// KubernetesContainerFailureDetails identifies the failing container and its current state.
+type KubernetesContainerFailureDetails struct {
+	Kind               string     `json:"kind,omitempty"`
+	Name               string     `json:"name,omitempty"`
+	State              string     `json:"state,omitempty"`
+	WaitingReason      string     `json:"waiting_reason,omitempty"`
+	TerminationReason  string     `json:"termination_reason,omitempty"`
+	RawExitCode        *int32     `json:"raw_exit_code,omitempty"`
+	NormalizedExitCode *int       `json:"normalized_exit_code,omitempty"`
+	Signal             *int32     `json:"signal,omitempty"`
+	StartedAt          *time.Time `json:"started_at,omitempty"`
+	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+}
+
+// KubernetesEventDetails contains privacy-filtered Event metadata.
+type KubernetesEventDetails struct {
+	Type            string     `json:"type,omitempty"`
+	Reason          string     `json:"reason,omitempty"`
+	Count           int32      `json:"count,omitempty"`
+	FirstObservedAt *time.Time `json:"first_observed_at,omitempty"`
+	LastObservedAt  *time.Time `json:"last_observed_at,omitempty"`
+}
+
 // SidecarMount describes an additional sidecar image to mount into the task container.
 type SidecarMount struct {
 	Image     string `json:"image"`      // Docker image to pull.
@@ -72,9 +137,10 @@ type TaskClaimedMessage struct {
 
 // TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
 type TaskCompletedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID      string     `json:"task_id"`
+	ExecutionID string     `json:"execution_id,omitempty"`
+	Message     string     `json:"message"`
+	TaskState   *TaskState `json:"task_state,omitempty"`
 }
 
 // TaskFailedMessage is sent from worker to server if task launch fails.
@@ -82,11 +148,13 @@ type TaskCompletedMessage struct {
 // metrics.TaskFailureReason value) and ExitCode is the failing process's
 // exit status normalized to 128+signal.
 type TaskFailedMessage struct {
-	TaskID        string     `json:"task_id"`
-	Message       string     `json:"message"`
-	TaskState     *TaskState `json:"task_state,omitempty"`
-	FailureReason string     `json:"failure_reason,omitempty"`
-	ExitCode      int        `json:"exit_code,omitempty"`
+	TaskID         string          `json:"task_id"`
+	ExecutionID    string          `json:"execution_id,omitempty"`
+	Message        string          `json:"message"`
+	TaskState      *TaskState      `json:"task_state,omitempty"`
+	FailureReason  string          `json:"failure_reason,omitempty"`
+	ExitCode       int             `json:"exit_code,omitempty"`
+	FailureDetails *FailureDetails `json:"failure_details,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
