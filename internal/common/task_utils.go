@@ -124,6 +124,7 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			args = append(args, "--environment", env)
 		}
 	}
+	args = append(args, repositoryHeadOverrideArgsForTask(task)...)
 
 	args = append(args, opts.AdditionalOzArgs...)
 
@@ -137,6 +138,31 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
+}
+
+// repositoryHeadOverrideArgsForTask forwards server-computed repository checkout
+// overrides to the CLI as one --repository-head-override-json flag per repository,
+// followed by --remove-repository-origins when any override is present. The server
+// has already validated and frozen these values (currently only for benchmark
+// trials), so this only re-marshals them into the wire shape the CLI expects.
+func repositoryHeadOverrideArgsForTask(task *types.Task) []string {
+	if task == nil || task.AgentConfigSnapshot == nil {
+		return nil
+	}
+	overrides := task.AgentConfigSnapshot.RepositoryHeadOverrides
+	if len(overrides) == 0 {
+		return nil
+	}
+
+	args := make([]string, 0, 2*len(overrides)+1)
+	for _, override := range overrides {
+		jsonValue, err := json.Marshal(override)
+		if err != nil {
+			continue
+		}
+		args = append(args, "--repository-head-override-json", string(jsonValue))
+	}
+	return append(args, "--remove-repository-origins")
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string
