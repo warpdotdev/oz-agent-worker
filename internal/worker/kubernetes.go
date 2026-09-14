@@ -1002,10 +1002,6 @@ func (b *KubernetesBackend) detectPodFailureAt(ctx context.Context, pods []corev
 	return nil
 }
 
-func (b *KubernetesBackend) inspectPodFailure(ctx context.Context, pod *corev1.Pod) error {
-	return b.inspectPodFailureAt(ctx, pod, nil, "")
-}
-
 func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1.Pod, job *batchv1.Job, source kubernetesFailureObservationSource) error {
 	var events []corev1.Event
 	eventsLoaded := false
