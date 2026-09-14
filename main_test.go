@@ -406,3 +406,16 @@ func TestMergeConfigKubernetesCodingCLISidecars(t *testing.T) {
 		t.Errorf("expected merged config to be insulated from file config mutation, got %q", got)
 	}
 }
+
+func TestMergeConfigKubernetesCopyReadiness(t *testing.T) {
+	resetCLIForTest()
+	defer resetCLIForTest()
+	fileConfig := &config.FileConfig{WorkerID: "worker-123", Backend: config.BackendConfig{Kubernetes: &config.KubernetesConfig{SidecarCopyReadiness: true}}}
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wc.Kubernetes.SidecarCopyReadiness {
+		t.Fatal("copy readiness was not forwarded to backend")
+	}
+}

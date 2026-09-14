@@ -808,3 +808,19 @@ worker_id: "test"
 		}
 	})
 }
+
+func TestLoadKubernetesCopyReadiness(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "kubernetes-worker"
+backend:
+  kubernetes:
+    sidecar_copy_readiness: true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Backend.Kubernetes.SidecarCopyReadiness {
+		t.Fatal("copy readiness was not loaded")
+	}
+}

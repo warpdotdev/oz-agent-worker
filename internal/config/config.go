@@ -77,6 +77,7 @@ type KubernetesConfig struct {
 	DefaultImage          string            `yaml:"default_image" validate:"omitempty,no_whitespace"`
 	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
 	UseImageVolumes       bool              `yaml:"use_image_volumes"`
+	SidecarCopyReadiness  bool              `yaml:"sidecar_copy_readiness"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SidecarImage          string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
 	SetupCommand          string            `yaml:"setup_command"`

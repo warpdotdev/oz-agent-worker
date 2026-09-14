@@ -76,6 +76,9 @@ kubernetesBackend:
   defaultImage: ""
   imagePullPolicy: IfNotPresent
   useImageVolumes: false
+  # Start the next init/task after copying succeeds, before copy helpers exit.
+  # Requires native sidecars; mutually exclusive with useImageVolumes.
+  sidecarCopyReadiness: false
   preflightImage: ""
   sidecarImage: ""
   setupCommand: ""
