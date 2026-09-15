@@ -283,6 +283,12 @@ worker disruption) are left in place for post-mortem debugging and cleaned up by
 the Kubernetes Job TTL (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
 When cleanup is disabled, no TTL is set and task Jobs remain indefinitely.
 
+When Warp cancels a run (a user cancel, or a server-side timeout such as the agent
+boot deadline), the worker deletes the task Job immediately, regardless of the
+cleanup setting. This is deliberate: a Job whose Pod is still pending would
+otherwise outlive the cancellation and start an agent against a run Warp has
+already finished.
+
 Recommended namespace-scoped permissions for the worker are:
 
 - create, get, list, watch, delete `jobs`
