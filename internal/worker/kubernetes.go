@@ -353,7 +353,9 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	defer func() {
 		if ctx.Err() != nil {
-			log.Infof(ctx, "Leaving Kubernetes Job %s in place after task context cancellation", jobName)
+			// Worker shutdown never cancels this context (see PreservesTasksOnShutdown), so
+			// this is a server-requested cancellation, and CancelTask owns the deletion.
+			log.Infof(ctx, "Stopped watching Kubernetes Job %s after task context cancellation; deletion is handled by CancelTask", jobName)
 			return
 		}
 		if b.config.NoCleanup {
@@ -488,9 +490,23 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 }
 
-// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
-// Kubernetes-backend task.
-func (b *KubernetesBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+// CancelTask deletes the task Job so a server-requested cancellation actually stops the
+// sandbox. Cancelling the ExecuteTask context only stops the local watch: the Job is
+// deliberately left in place on context cancellation so that worker shutdown never kills a
+// healthy run, which means an explicit cancellation has to remove it here. Without this, a
+// Job whose pod is still pending outlives the cancellation and boots an agent against a run
+// the server has already finished. A Job that no longer exists is not an error.
+func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	if params == nil {
+		return fmt.Errorf("cancel params are required")
+	}
+	jobName := kubernetesTaskJobName(params.TaskID, executionIDOrTaskID(params.TaskID, params.ExecutionID))
+	log.Infof(ctx, "Deleting Kubernetes Job %s after task cancellation", jobName)
+	if err := b.deleteJob(ctx, jobName); err != nil {
+		return fmt.Errorf("failed to delete Kubernetes Job %s: %w", jobName, err)
+	}
+	return nil
+}
 
 // Shutdown intentionally does not delete task Jobs.
 //
@@ -1291,10 +1307,17 @@ func taskExecutionID(params *TaskParams) string {
 	if params == nil {
 		return ""
 	}
-	if executionID := strings.TrimSpace(params.ExecutionID); executionID != "" {
+	return executionIDOrTaskID(params.TaskID, params.ExecutionID)
+}
+
+// executionIDOrTaskID is the execution identity a task Job is named after. Execution and
+// cancellation must derive it identically, or a cancellation would target a Job that was
+// never created.
+func executionIDOrTaskID(taskID, executionID string) string {
+	if executionID := strings.TrimSpace(executionID); executionID != "" {
 		return executionID
 	}
-	return params.TaskID
+	return taskID
 }
 
 func kubernetesTaskWrapperScript() string {

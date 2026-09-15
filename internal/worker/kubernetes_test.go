@@ -9,6 +9,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1418,6 +1419,155 @@ func TestExecuteTaskPreservesJobOnContextCancellation(t *testing.T) {
 
 	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected Job %s to be preserved after context cancellation, got %v", jobName, err)
+	}
+}
+
+func TestCancelTaskDeletesJob(t *testing.T) {
+	newBackendWithJob := func(taskID, executionID string) (*KubernetesBackend, string) {
+		backend := &KubernetesBackend{
+			config: KubernetesBackendConfig{
+				WorkerID:  "worker-123",
+				Namespace: "agents",
+			},
+		}
+		jobName := kubernetesTaskJobName(taskID, executionID)
+		backend.clientset = fake.NewSimpleClientset(&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobName,
+				Namespace: "agents",
+				Labels:    backend.baseLabels(taskID, executionID),
+			},
+		})
+		return backend, jobName
+	}
+	assertJobDeleted := func(t *testing.T, backend *KubernetesBackend, jobName string) {
+		t.Helper()
+		_, err := backend.clientset.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{})
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("expected Job %s to be deleted, got err=%v", jobName, err)
+		}
+	}
+
+	t.Run("deletes the Job named for the execution", func(t *testing.T) {
+		backend, jobName := newBackendWithJob("task-1", "execution-1")
+		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "execution-1"}); err != nil {
+			t.Fatalf("CancelTask returned error: %v", err)
+		}
+		assertJobDeleted(t, backend, jobName)
+	})
+
+	t.Run("falls back to the task ID when the execution ID is empty", func(t *testing.T) {
+		backend, jobName := newBackendWithJob("task-1", "task-1")
+		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1"}); err != nil {
+			t.Fatalf("CancelTask returned error: %v", err)
+		}
+		assertJobDeleted(t, backend, jobName)
+	})
+
+	t.Run("leaves other executions of the same run alone", func(t *testing.T) {
+		backend, retainedJobName := newBackendWithJob("task-1", "execution-2")
+		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "execution-1"}); err != nil {
+			t.Fatalf("CancelTask returned error: %v", err)
+		}
+		if _, err := backend.clientset.BatchV1().Jobs("agents").Get(context.Background(), retainedJobName, metav1.GetOptions{}); err != nil {
+			t.Fatalf("expected Job %s for another execution to be retained, got %v", retainedJobName, err)
+		}
+	})
+
+	t.Run("tolerates a Job that no longer exists", func(t *testing.T) {
+		backend := &KubernetesBackend{
+			config:    KubernetesBackendConfig{Namespace: "agents"},
+			clientset: fake.NewSimpleClientset(),
+		}
+		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "execution-1"}); err != nil {
+			t.Fatalf("expected missing Job to be tolerated, got %v", err)
+		}
+	})
+
+	t.Run("rejects nil params", func(t *testing.T) {
+		backend := &KubernetesBackend{
+			config:    KubernetesBackendConfig{Namespace: "agents"},
+			clientset: fake.NewSimpleClientset(),
+		}
+		if err := backend.CancelTask(context.Background(), nil); err == nil {
+			t.Fatal("expected error for nil params")
+		}
+	})
+}
+
+// The worker cancels a task by calling CancelTask and then cancelling the ExecuteTask
+// context. Together those must remove the Job, even though context cancellation alone
+// preserves it (see TestExecuteTaskPreservesJobOnContextCancellation).
+func TestCancelTaskDeletesJobWhileExecuteTaskIsWatching(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset()
+	jobWatch := watch.NewFake()
+	podWatch := watch.NewFake()
+	defer jobWatch.Stop()
+	defer podWatch.Stop()
+
+	created := make(chan string, 1)
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateActionImpl)
+		if !ok {
+			t.Fatalf("expected create action, got %T", action)
+		}
+		job, ok := createAction.GetObject().(*batchv1.Job)
+		if !ok {
+			t.Fatalf("expected Job object, got %T", createAction.GetObject())
+		}
+		created <- job.Name
+		return false, nil, nil
+	})
+	fakeClient.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, jobWatch, nil
+	})
+	fakeClient.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, podWatch, nil
+	})
+
+	backend := &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:  "worker-123",
+			Namespace: "agents",
+		},
+		clientset: fakeClient,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan ExecuteResult, 1)
+	go func() {
+		done <- backend.ExecuteTask(ctx, &TaskParams{
+			TaskID:      "task-1",
+			ExecutionID: "execution-1",
+			DockerImage: "ubuntu:22.04",
+			BaseArgs:    []string{"run"},
+		})
+	}()
+
+	var jobName string
+	select {
+	case jobName = <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task Job creation")
+	}
+
+	if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "task-1", ExecutionID: "execution-1"}); err != nil {
+		t.Fatalf("CancelTask returned error: %v", err)
+	}
+	cancel()
+
+	select {
+	case result := <-done:
+		if result.Outcome != ExecuteOutcomeError || result.Error == nil || !strings.Contains(result.Error.Error(), "context canceled") {
+			t.Fatalf("expected context cancellation error, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ExecuteTask to return")
+	}
+
+	if _, err := fakeClient.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected Job %s to be deleted after cancellation, got err=%v", jobName, err)
 	}
 }
 
