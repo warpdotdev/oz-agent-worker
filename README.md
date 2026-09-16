@@ -364,10 +364,9 @@ driven by the standard
 [OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),
 implemented via
 [`go.opentelemetry.io/contrib/exporters/autoexport`](https://github.com/open-telemetry/opentelemetry-go-contrib/tree/main/exporters/autoexport).
-When `OTEL_METRICS_EXPORTER` is unset, the worker delegates to autoexport's
-default, which is OTLP push to `OTEL_EXPORTER_OTLP_ENDPOINT` (defaulting to
-`http://localhost:4318` for `http/protobuf` or `http://localhost:4317` for
-`grpc`). To fully disable metrics export, set `OTEL_METRICS_EXPORTER=none`.
+Metrics export is opt-in: set `OTEL_METRICS_EXPORTER` to `prometheus`, `otlp`,
+or `console` to enable it. When the variable is unset, empty, or `none`, the
+worker does not initialize a metrics exporter.
 
 ### Quick start with Prometheus
 
@@ -392,8 +391,8 @@ oz-agent-worker --api-key "$WARP_API_KEY" --worker-id "my-worker"
 ```
 
 Tracing is opt-in. Set `OTEL_TRACES_EXPORTER` to a non-`none` exporter such as
-`otlp` to emit per-task spans and lifecycle events; leave it unset to export
-metrics only.
+`otlp` to emit per-task spans and lifecycle events. Metrics and traces are
+configured independently.
 
 ### Helm
 

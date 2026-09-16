@@ -14,12 +14,8 @@
 //   - console:    writes metrics to stdout.
 //   - none:       disables metrics export entirely.
 //
-// When OTEL_METRICS_EXPORTER is unset, we delegate to autoexport's default,
-// which is OTLP push (to OTEL_EXPORTER_OTLP_ENDPOINT, defaulting to
-// http://localhost:4318 for http/protobuf or http://localhost:4317 for grpc).
-// This matches the OpenTelemetry SDK convention so a worker dropped into an
-// environment that already has an OTLP collector picks it up automatically.
-// Operators who want to fully disable export can set OTEL_METRICS_EXPORTER=none.
+// Metrics export is opt-in. When OTEL_METRICS_EXPORTER is unset, empty, or
+// "none", the worker does not initialize a metrics exporter.
 //
 // All instruments are package-level singletons. Helpers are safe to call
 // before Init runs: they fall back to no-op instruments backed by the
@@ -201,14 +197,11 @@ func init() {
 }
 
 // Init wires up the metrics pipeline based on the OTEL_METRICS_EXPORTER
-// environment variable. When the variable is set to "none", Init is a no-op
-// and returns a no-op shutdown function. Otherwise (including the unset
-// case) it constructs an SDK MeterProvider with a worker-scoped resource
-// and replaces the package instruments with SDK-backed versions, delegating
-// exporter selection to autoexport. Following autoexport's convention, an
-// unset OTEL_METRICS_EXPORTER produces an OTLP exporter targeting the
-// OTEL_EXPORTER_OTLP_* defaults; operators who do not run an OTLP collector
-// should set OTEL_METRICS_EXPORTER=none to avoid periodic push errors.
+// environment variable. When the variable is unset, empty, or "none", Init
+// does not initialize a metrics exporter. Otherwise it constructs an SDK
+// MeterProvider with a worker-scoped resource and replaces the package
+// instruments with SDK-backed versions, delegating exporter selection to
+// autoexport.
 //
 // Init must only be called once. The returned shutdown function flushes and
 // stops the exporter; it is safe to call after Init returns an error.
@@ -226,7 +219,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		return res, err
 	}
 
-	if os.Getenv("OTEL_METRICS_EXPORTER") != "none" {
+	if shouldInitMetrics() {
 		reader, err := autoexport.NewMetricReader(ctx)
 		if err != nil {
 			initErr = errors.Join(initErr, err)
@@ -284,6 +277,10 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	}, initErr
 }
 
+func shouldInitMetrics() bool {
+	exporter := strings.TrimSpace(os.Getenv("OTEL_METRICS_EXPORTER"))
+	return exporter != "" && !strings.EqualFold(exporter, "none")
+}
 func shouldInitTraces() bool {
 	exporter := strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
 	return exporter != "" && !strings.EqualFold(exporter, "none")
