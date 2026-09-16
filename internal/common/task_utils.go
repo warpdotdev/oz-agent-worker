@@ -12,7 +12,7 @@ import (
 // Add new CLI overrides here rather than as extra parameters.
 type TaskAugmentOptions struct {
 	// IdleOnComplete is passed to --idle-on-complete. Empty string uses the oz CLI default
-	// (45m). Use "0s" to exit immediately after the conversation finishes.
+	// (45m).
 	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
 	// AdditionalOzArgs are server-resolved supplemental oz CLI arguments.
@@ -184,7 +184,7 @@ func resolveIdleOnComplete(task *types.Task, opts TaskAugmentOptions) (string, b
 	if task != nil &&
 		task.AgentConfigSnapshot != nil &&
 		task.AgentConfigSnapshot.IdleTimeoutMinutes != nil &&
-		*task.AgentConfigSnapshot.IdleTimeoutMinutes > 0 {
+		*task.AgentConfigSnapshot.IdleTimeoutMinutes >= 0 {
 		return fmt.Sprintf("%dm", *task.AgentConfigSnapshot.IdleTimeoutMinutes), true
 	}
 
