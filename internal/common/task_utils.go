@@ -184,7 +184,7 @@ func resolveIdleOnComplete(task *types.Task, opts TaskAugmentOptions) (string, b
 	if task != nil &&
 		task.AgentConfigSnapshot != nil &&
 		task.AgentConfigSnapshot.IdleTimeoutMinutes != nil &&
-		*task.AgentConfigSnapshot.IdleTimeoutMinutes > 0 {
+		*task.AgentConfigSnapshot.IdleTimeoutMinutes >= 0 {
 		return fmt.Sprintf("%dm", *task.AgentConfigSnapshot.IdleTimeoutMinutes), true
 	}
 
