@@ -89,7 +89,7 @@ func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, po
 		if start.IsZero() || term.StartedAt.Time.Before(start) {
 			start = term.StartedAt.Time
 		}
-		if term.FinishedAt.Time.After(finish) {
+		if term.FinishedAt.After(finish) {
 			finish = term.FinishedAt.Time
 		}
 		if term.ExitCode != 0 {
@@ -148,7 +148,7 @@ func (t *kubernetesSetupPhaseTracker) observeTaskStart(ctx context.Context, pod 
 func (t *kubernetesSetupPhaseTracker) taskStartAnchor(pod *corev1.Pod) time.Time {
 	var anchor time.Time
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.State.Terminated != nil && status.State.Terminated.FinishedAt.Time.After(anchor) {
+		if status.State.Terminated != nil && status.State.Terminated.FinishedAt.After(anchor) {
 			anchor = status.State.Terminated.FinishedAt.Time
 		}
 	}

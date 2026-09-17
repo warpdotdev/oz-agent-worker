@@ -42,7 +42,8 @@ var CLI struct {
 }
 
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	kong.Parse(&CLI,
 		kong.Name("oz-agent-worker"),
@@ -69,7 +70,7 @@ func main() {
 	}
 
 	// Set up the metrics pipeline before constructing the worker so that early
-	// reconnect attempts on Start() are observed. Failures here are
+	// reconnect attempts in Run() are observed. Failures here are
 	// non-fatal: the worker must continue even if metrics export breaks.
 	metricsShutdown, err := metrics.Init(ctx, metrics.Config{
 		WorkerID: workerConfig.WorkerID,
@@ -87,22 +88,9 @@ func main() {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
 	}
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Start worker in background
-	go func() {
-		if err := w.Start(); err != nil {
-			log.Errorf(ctx, "Worker stopped with error: %v", err)
-		}
-	}()
-
-	// Wait for signal
-	sig := <-sigChan
-	log.Infof(ctx, "Received signal %v, shutting down gracefully...", sig)
-
-	w.Shutdown()
+	if err := w.Run(); err != nil {
+		log.Errorf(ctx, "Worker stopped with error: %v", err)
+	}
 
 	// Flush and stop the metrics exporter after the worker has stopped
 	// recording new data points. We use a fresh context with a short timeout
