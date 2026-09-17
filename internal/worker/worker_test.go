@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/semaphore"
 )
 
 type shutdownRecordingBackend struct {
@@ -63,6 +66,131 @@ func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error { re
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
 	return false
+}
+
+type blockingBackend struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingBackend) ExecuteTask(ctx context.Context, _ *TaskParams) ExecuteResult {
+	close(b.started)
+	select {
+	case <-b.release:
+		return executeCompleted()
+	case <-ctx.Done():
+		return executeError(ctx.Err())
+	}
+}
+
+func (b *blockingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+func (b *blockingBackend) Shutdown(context.Context)                        {}
+func (b *blockingBackend) PreservesTasksOnShutdown() bool                  { return false }
+
+func TestNewValidatesOneShotBackendCapabilityBeforeConstruction(t *testing.T) {
+	for _, backendType := range []string{"", "docker", "kubernetes", "command"} {
+		t.Run(backendType, func(t *testing.T) {
+			_, err := New(context.Background(), Config{
+				BackendType: backendType,
+				OneShot:     true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "does not support one-shot mode") {
+				t.Fatalf("New() error = %v, want unsupported one-shot error", err)
+			}
+		})
+	}
+}
+
+func TestNewAcceptsOneShotDirectBackend(t *testing.T) {
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+
+	w, err := New(context.Background(), Config{
+		BackendType: "direct",
+		OneShot:     true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, ok := w.backend.(*DirectBackend); !ok {
+		t.Fatalf("backend = %T, want *DirectBackend", w.backend)
+	}
+	if w.config.MaxConcurrentTasks != 1 || w.taskSemaphore == nil {
+		t.Fatalf("one-shot concurrency = %d, semaphore=%v; want 1 with semaphore", w.config.MaxConcurrentTasks, w.taskSemaphore)
+	}
+	w.shutdownBackend()
+}
+
+func TestOneShotAcceptsOnlyOneTaskAndWaitsForCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend := &blockingBackend{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	w := &Worker{
+		config: Config{
+			BackendType:        "direct",
+			MaxConcurrentTasks: 1,
+			OneShot:            true,
+		},
+		ctx:           ctx,
+		outbound:      newOutboundQueue(8),
+		activeTasks:   make(map[string]activeTask),
+		oneShot:       newOneShotState(),
+		backend:       backend,
+		taskSemaphore: semaphore.NewWeighted(1),
+	}
+	assignment := func(taskID string) *types.TaskAssignmentMessage {
+		return &types.TaskAssignmentMessage{
+			TaskID:      taskID,
+			ExecutionID: "execution-" + taskID,
+			Task:        &types.Task{ID: taskID, Title: taskID},
+		}
+	}
+
+	w.handleTaskAssignment(assignment("task-1"))
+	select {
+	case <-backend.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first task did not start")
+	}
+	w.handleTaskAssignment(assignment("task-2"))
+
+	select {
+	case <-w.oneShot.doneChannel():
+		t.Fatal("one-shot worker completed before the accepted task")
+	default:
+	}
+
+	close(backend.release)
+	select {
+	case <-w.oneShot.doneChannel():
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot worker did not complete after the accepted task")
+	}
+
+	var claimed, rejected, completed int
+	for _, msg := range drainMessages(t, w.outbound.messages) {
+		switch msg.Type {
+		case types.MessageTypeTaskClaimed:
+			claimed++
+		case types.MessageTypeTaskRejected:
+			rejected++
+		case types.MessageTypeTaskCompleted:
+			completed++
+		}
+	}
+	if claimed != 1 || rejected != 1 || completed != 1 {
+		t.Fatalf("message counts = claimed:%d rejected:%d completed:%d, want 1 each", claimed, rejected, completed)
+	}
 }
 
 func TestTaskFailureLabels(t *testing.T) {
@@ -244,8 +372,9 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	taskCancel()
 	w := &Worker{
 		ctx:      context.Background(),
-		config:   Config{},
+		config:   Config{OneShot: true},
 		outbound: newOutboundQueue(1),
+		oneShot:  newOneShotState(),
 		activeTasks: map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceUser,
@@ -282,6 +411,7 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *testing.T) {
@@ -346,9 +476,10 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
-		config:      Config{},
+		config:      Config{OneShot: true},
 		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{},
 	}
 
@@ -379,14 +510,16 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
-		config:      Config{},
+		config:      Config{OneShot: true},
 		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
@@ -413,6 +546,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
@@ -498,6 +632,15 @@ func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketM
 	return types.WebSocketMessage{}
 }
 
+func assertOneShotDone(t *testing.T, w *Worker) {
+	t.Helper()
+	select {
+	case <-w.oneShot.doneChannel():
+	default:
+		t.Fatal("one-shot worker did not signal completion")
+	}
+}
+
 func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	connected := make(chan struct{})
@@ -532,6 +675,7 @@ func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
 		ctx:               serverCtx,
 		outbound:          newOutboundQueue(8),
 		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
 		backend:           backend,
 		heartbeatInterval: HeartbeatInterval,
 	}
@@ -564,6 +708,267 @@ func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("protocol did not send a normal WebSocket close frame")
+	}
+}
+
+func TestOneShotRunDrainsAndClosesProtocolBeforeReturning(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	serverConn := make(chan *websocket.Conn, 1)
+	received := make(chan types.WebSocketMessage, 8)
+	closeCode := make(chan int, 1)
+	serverClosed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		defer close(serverClosed)
+		defer func() {
+			_ = conn.Close()
+		}()
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					closeCode <- closeErr.Code
+				}
+				return
+			}
+			var msg types.WebSocketMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				return
+			}
+			received <- msg
+		}
+	}))
+	defer srv.Close()
+
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := New(ctx, Config{
+		APIKey:        "test-api-key",
+		WorkerID:      "one-shot-worker",
+		WebSocketURL:  "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ServerRootURL: "https://app.warp.dev",
+		BackendType:   "direct",
+		OneShot:       true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- w.Run()
+	}()
+
+	var conn *websocket.Conn
+	select {
+	case conn = <-serverConn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not connect")
+	}
+	assignmentData, err := json.Marshal(types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task: &types.Task{
+			ID:    "task-1",
+			Title: "one-shot task",
+			Owner: &types.TaskOwner{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal task assignment: %v", err)
+	}
+	assignmentMessage, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeTaskAssignment,
+		Data: assignmentData,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal WebSocket assignment: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, assignmentMessage); err != nil {
+		t.Fatalf("failed to send assignment: %v", err)
+	}
+
+	select {
+	case err := <-startResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after one-shot completion")
+	}
+
+	select {
+	case <-serverClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol did not close the worker connection before Run returned")
+	}
+	select {
+	case code := <-closeCode:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("WebSocket close code = %d, want %d", code, websocket.CloseNormalClosure)
+		}
+	default:
+		t.Fatal("server did not receive a WebSocket close frame")
+	}
+
+	var claimed, completed bool
+	for {
+		select {
+		case msg := <-received:
+			switch msg.Type {
+			case types.MessageTypeTaskClaimed:
+				claimed = true
+			case types.MessageTypeTaskCompleted:
+				completed = true
+			}
+		default:
+			if !claimed || !completed {
+				t.Fatalf("received claimed=%t completed=%t, want both before close", claimed, completed)
+			}
+			return
+		}
+	}
+}
+
+func TestOneShotReconnectsBeforeTaskCompletion(t *testing.T) {
+	assignmentData, err := json.Marshal(types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task: &types.Task{
+			ID:    "task-1",
+			Title: "one-shot reconnect task",
+			Owner: &types.TaskOwner{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal task assignment: %v", err)
+	}
+	assignmentMessage, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeTaskAssignment,
+		Data: assignmentData,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal WebSocket assignment: %v", err)
+	}
+
+	upgrader := websocket.Upgrader{}
+	var connectionCount atomic.Int64
+	secondConnection := make(chan struct{})
+	terminalReceived := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+		connectionNumber := connectionCount.Add(1)
+		switch connectionNumber {
+		case 1:
+			if err := conn.WriteMessage(websocket.TextMessage, assignmentMessage); err != nil {
+				return
+			}
+		case 2:
+			close(secondConnection)
+		}
+
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg types.WebSocketMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				return
+			}
+			if connectionNumber == 1 && msg.Type == types.MessageTypeTaskClaimed {
+				return
+			}
+			if connectionNumber == 2 &&
+				(msg.Type == types.MessageTypeTaskCompleted || msg.Type == types.MessageTypeTaskFailed) {
+				select {
+				case terminalReceived <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	testDir := t.TempDir()
+	releaseFile := filepath.Join(testDir, "release")
+	ozPath := filepath.Join(testDir, "oz")
+	script := "#!/bin/sh\nwhile [ ! -f \"$RELEASE_FILE\" ]; do sleep 0.01; done\n"
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := New(ctx, Config{
+		APIKey:        "test-api-key",
+		WorkerID:      "one-shot-worker",
+		WebSocketURL:  "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ServerRootURL: "https://app.warp.dev",
+		BackendType:   "direct",
+		OneShot:       true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+			Env:           map[string]string{"RELEASE_FILE": releaseFile},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- w.Run()
+	}()
+
+	select {
+	case <-secondConnection:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not reconnect after the first connection closed")
+	}
+	select {
+	case err := <-startResult:
+		t.Fatalf("Run() returned before task completion: %v", err)
+	default:
+	}
+	if err := os.WriteFile(releaseFile, nil, 0o600); err != nil {
+		t.Fatalf("failed to release fake oz executable: %v", err)
+	}
+	select {
+	case err := <-startResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after task completion")
+	}
+
+	select {
+	case <-terminalReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement connection did not receive terminal task status")
+	}
+	if got := connectionCount.Load(); got < 2 {
+		t.Fatalf("connection count = %d, want at least 2", got)
 	}
 }
 
@@ -616,6 +1021,7 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		ctx:               context.Background(),
 		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
 		backend:           &recordingBackend{},
 		heartbeatInterval: time.Millisecond,
 	}

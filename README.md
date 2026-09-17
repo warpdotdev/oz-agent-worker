@@ -91,6 +91,30 @@ backend:
     oz_path: "/usr/local/bin/oz"
 ```
 
+The Direct backend also supports one-shot workers that accept one task and exit
+after that task succeeds, fails, or is cancelled:
+
+```bash
+oz-agent-worker --worker-id "my-worker" --backend direct --one-shot
+```
+
+The equivalent config-file setting is top-level:
+
+```yaml
+worker_id: "my-worker"
+one_shot: true
+backend:
+  direct:
+    workspace_root: "/var/lib/oz/workspaces"
+```
+
+One-shot mode forces `max_concurrent_tasks` to `1` and permanently stops the
+worker from claiming another task after its first accepted assignment. The
+worker flushes queued task status messages through the WebSocket writer before
+closing its connection and exiting. If no task is assigned, it remains
+connected until it receives a shutdown signal. Docker, Kubernetes, and Command
+backends reject one-shot mode during worker startup.
+
 The `setup_command` and `teardown_command` hooks run with these variables set, each under both
 its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
 

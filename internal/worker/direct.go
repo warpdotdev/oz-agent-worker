@@ -114,6 +114,10 @@ type DirectBackend struct {
 	ozPath string // resolved path to the oz CLI
 }
 
+func (b *DirectBackend) Capabilities() backendCapabilities {
+	return backendCapabilities{supportsOneShot: true}
+}
+
 // NewDirectBackend creates a new direct backend, verifying the oz CLI is available.
 func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectBackend, error) {
 	ozPath := config.OzPath

@@ -47,6 +47,9 @@ type Config struct {
 	// (e.g. command), a slot is held only for the brief dispatch and the limit
 	// effectively does not bound the number of remote tasks running at once.
 	MaxConcurrentTasks int
+	// OneShot makes the worker accept one task and exit after it reaches a
+	// terminal outcome. Backend support is validated before initialization.
+	OneShot bool
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
@@ -68,6 +71,7 @@ type Worker struct {
 	tasksMutex    sync.Mutex
 	taskWG        sync.WaitGroup
 	shuttingDown  bool
+	oneShot       oneShotState
 	backend       Backend
 	taskSemaphore *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
@@ -79,8 +83,49 @@ type runOutcome int
 
 const (
 	runOutcomeConnectionClosed runOutcome = iota
+	runOutcomeOneShotComplete
 	runOutcomeServerShutdown
 )
+
+type oneShotState struct {
+	mutex        sync.Mutex
+	accepted     bool
+	done         chan struct{}
+	completeOnce sync.Once
+}
+
+func newOneShotState() oneShotState {
+	return oneShotState{done: make(chan struct{})}
+}
+
+func (s *oneShotState) tryAccept() bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.accepted {
+		return false
+	}
+	s.accepted = true
+	return true
+}
+
+func (s *oneShotState) resetAcceptance() {
+	s.mutex.Lock()
+	s.accepted = false
+	s.mutex.Unlock()
+}
+
+func (s *oneShotState) complete() {
+	if s.done == nil {
+		return
+	}
+	s.completeOnce.Do(func() {
+		close(s.done)
+	})
+}
+
+func (s *oneShotState) doneChannel() <-chan struct{} {
+	return s.done
+}
 
 type taskCancellationSource string
 
@@ -103,10 +148,19 @@ type activeTask struct {
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
+	backendType := config.BackendType
+	capabilities, err := capabilitiesForBackend(backendType)
+	if err != nil {
+		return nil, err
+	}
+	if config.OneShot && !capabilities.supportsOneShot {
+		return nil, fmt.Errorf("backend %q does not support one-shot mode", backendType)
+	}
+	if config.OneShot {
+		config.MaxConcurrentTasks = 1
+	}
 
 	var backend Backend
-	var err error
-
 	switch config.BackendType {
 	case "kubernetes":
 		if config.Kubernetes == nil {
@@ -129,7 +183,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		}
 		backend, err = NewDockerBackend(ctx, *config.Docker)
 	default:
-		return nil, fmt.Errorf("unknown backend type: %q", config.BackendType)
+		return nil, fmt.Errorf("unknown backend type: %q", backendType)
 	}
 
 	if err != nil {
@@ -146,14 +200,30 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		ctx:               ctx,
 		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
 	}, nil
 }
 
+func capabilitiesForBackend(backendType string) (backendCapabilities, error) {
+	switch backendType {
+	case "direct":
+		return (&DirectBackend{}).Capabilities(), nil
+	case "docker", "":
+		return (&DockerBackend{}).Capabilities(), nil
+	case "kubernetes":
+		return (&KubernetesBackend{}).Capabilities(), nil
+	case "command":
+		return (&CommandBackend{}).Capabilities(), nil
+	default:
+		return backendCapabilities{}, fmt.Errorf("unknown backend type: %q", backendType)
+	}
+}
+
 // Run drives the worker's processing loops until the server context is cancelled
-// for graceful shutdown:
+// for graceful shutdown or a one-shot task finishes:
 // - The WebSocket connection loop
 // - Task acceptance and processing
 // - Client state maintained by backends
@@ -203,7 +273,7 @@ func (w *Worker) Run() error {
 		metrics.SetConnected(true)
 		outcome := w.serveConnection(protocolCtx, conn)
 		metrics.SetConnected(false)
-		if outcome == runOutcomeServerShutdown {
+		if outcome == runOutcomeOneShotComplete || outcome == runOutcomeServerShutdown {
 			return nil
 		}
 		metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonRemoteClose)
@@ -284,6 +354,17 @@ func (w *Worker) serveConnection(protocolCtx context.Context, conn *websocket.Co
 		w.shutdownTasks()
 		w.gracefullyCloseConnection(conn, connectionCancel, &writerWG, groupDone)
 		return runOutcomeServerShutdown
+	case <-w.oneShot.doneChannel():
+		select {
+		case err := <-groupDone:
+			if err != nil && protocolCtx.Err() == nil {
+				log.Warnf(w.ctx, "Connection closed: %v", err)
+			}
+			return runOutcomeConnectionClosed
+		default:
+		}
+		w.gracefullyCloseConnection(conn, connectionCancel, &writerWG, groupDone)
+		return runOutcomeOneShotComplete
 	}
 }
 
@@ -473,6 +554,9 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	case w.shuttingDown || w.ctx.Err() != nil:
 		rejectionReason = "worker is shutting down"
 		rejectionMetric = metrics.RejectReasonShuttingDown
+	case w.config.OneShot && !w.oneShot.tryAccept():
+		rejectionReason = "one-shot worker has already accepted a task"
+		rejectionMetric = metrics.RejectReasonOneShotComplete
 	default:
 		w.taskWG.Add(1)
 	}
@@ -485,6 +569,11 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	// Check concurrency limit before claiming the task.
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
+			w.tasksMutex.Lock()
+			if w.config.OneShot {
+				w.oneShot.resetAcceptance()
+			}
+			w.tasksMutex.Unlock()
 			w.taskWG.Done()
 			w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
 			return
@@ -499,6 +588,9 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 
 	w.tasksMutex.Lock()
 	if w.shuttingDown || w.ctx.Err() != nil {
+		if w.config.OneShot {
+			w.oneShot.resetAcceptance()
+		}
 		w.tasksMutex.Unlock()
 		taskCancel()
 		if w.taskSemaphore != nil {
@@ -697,6 +789,10 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
+	// One-shot-capable backends always wait for a terminal outcome. Register
+	// this first so the task bookkeeping defer below runs before completion is
+	// signalled.
+	defer w.signalOneShotComplete()
 
 	defer func() {
 		taskCancel()
@@ -792,6 +888,13 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	if err := w.sendTaskCompleted(taskID, assignment.ExecutionID, "Task completed successfully"); err != nil {
 		log.Errorf(ctx, "Failed to send task completed message: %v", err)
 	}
+}
+
+func (w *Worker) signalOneShotComplete() {
+	if !w.config.OneShot {
+		return
+	}
+	w.oneShot.complete()
 }
 
 func (w *Worker) cancellationSource(taskID string) taskCancellationSource {

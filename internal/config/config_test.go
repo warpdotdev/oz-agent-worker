@@ -564,6 +564,35 @@ worker_id: "test"
 	})
 }
 
+func TestLoadOneShot(t *testing.T) {
+	t.Run("parses one_shot when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+one_shot: true
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.OneShot == nil || !*cfg.OneShot {
+			t.Fatalf("one_shot = %v, want true", cfg.OneShot)
+		}
+	})
+
+	t.Run("one_shot is nil when omitted", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.OneShot != nil {
+			t.Fatalf("one_shot = %v, want nil", *cfg.OneShot)
+		}
+	})
+}
+
 func TestLoadValidKubernetesPodTemplateConfig(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "k8s-worker"

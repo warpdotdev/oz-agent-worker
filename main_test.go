@@ -20,6 +20,7 @@ func resetCLIForTest() {
 	CLI.Volumes = nil
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
+	CLI.OneShot = false
 	CLI.IdleOnComplete = ""
 }
 
@@ -32,6 +33,10 @@ func stringPtr(v string) *string {
 }
 
 func int64Ptr(v int64) *int64 {
+	return &v
+}
+
+func intPtr(v int) *int {
 	return &v
 }
 
@@ -133,6 +138,48 @@ containers:
 	}
 	if len(wc.Kubernetes.PodTemplate.ImagePullSecrets) != 1 || wc.Kubernetes.PodTemplate.ImagePullSecrets[0].Name != "registry-creds" {
 		t.Fatalf("ImagePullSecrets = %+v, want registry-creds", wc.Kubernetes.PodTemplate.ImagePullSecrets)
+	}
+}
+
+func TestMergeConfigOneShot(t *testing.T) {
+	tests := []struct {
+		name       string
+		cliOneShot bool
+		fileValue  *bool
+		maxTasks   *int
+		want       bool
+	}{
+		{name: "disabled by default", want: false},
+		{name: "enabled from file", fileValue: boolPtr(true), want: true},
+		{name: "enabled from CLI", cliOneShot: true, fileValue: boolPtr(false), want: true},
+		{name: "overrides configured concurrency", fileValue: boolPtr(true), maxTasks: intPtr(8), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			CLI.OneShot = tt.cliOneShot
+			fileConfig := &config.FileConfig{
+				WorkerID:           "direct-worker",
+				OneShot:            tt.fileValue,
+				MaxConcurrentTasks: tt.maxTasks,
+				Backend: config.BackendConfig{
+					Direct: &config.DirectConfig{},
+				},
+			}
+
+			wc, err := mergeConfig(fileConfig)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if wc.OneShot != tt.want {
+				t.Fatalf("OneShot = %t, want %t", wc.OneShot, tt.want)
+			}
+			if tt.want && wc.MaxConcurrentTasks != 1 {
+				t.Fatalf("MaxConcurrentTasks = %d, want 1", wc.MaxConcurrentTasks)
+			}
+		})
 	}
 }
 
