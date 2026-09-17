@@ -121,7 +121,7 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 	}
 
 	// The worker must have sent task_claimed but no terminal message.
-	msgs := drainMessages(t, w.sendChan)
+	msgs := drainMessages(t, w.outbound.messages)
 	var sawClaimed bool
 	for _, m := range msgs {
 		switch m.Type {
@@ -145,7 +145,7 @@ func TestIntegrationCommandBackendDispatchFailureReportsTaskFailed(t *testing.T)
 
 	var failedCount int
 	waitFor(t, 5*time.Second, func() bool {
-		for _, m := range drainMessages(t, w.sendChan) {
+		for _, m := range drainMessages(t, w.outbound.messages) {
 			if m.Type == types.MessageTypeTaskFailed {
 				failedCount++
 			}

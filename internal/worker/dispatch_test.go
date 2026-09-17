@@ -36,7 +36,7 @@ func newDispatchWorker(backend Backend) *Worker {
 	return &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 4),
+		outbound:    newOutboundQueue(4),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}, executionID: "exec-1"}},
 		backend:     backend,
 	}
@@ -56,8 +56,8 @@ func TestExecuteTaskDispatchedSuppressesTerminalMessage(t *testing.T) {
 
 	runDispatchTask(w)
 
-	if len(w.sendChan) != 0 {
-		msg := readWebSocketMessage(t, w.sendChan)
+	if len(w.outbound.messages) != 0 {
+		msg := readWebSocketMessage(t, w.outbound.messages)
 		t.Fatalf("expected no terminal message after dispatch, got %q", msg.Type)
 	}
 	w.tasksMutex.Lock()
@@ -103,7 +103,7 @@ func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 	backend := &cancelableDispatchBackend{cancelCalled: make(chan *CancelParams, 1)}
 	w := &Worker{
 		ctx:         context.Background(),
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
 		backend:     backend,
 	}
@@ -133,7 +133,7 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 	defer taskCancel()
 	w := &Worker{
 		ctx:      context.Background(),
-		sendChan: make(chan []byte, 1),
+		outbound: newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {
 			ctx:         taskCtx,
 			cancel:      taskCancel,
@@ -171,7 +171,7 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 func TestHandleTaskCancellationSpawnedNoopCancelEmitsNoMessage(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
 		backend:     &dispatchBackend{},
 	}
@@ -180,8 +180,8 @@ func TestHandleTaskCancellationSpawnedNoopCancelEmitsNoMessage(t *testing.T) {
 	// backend's CancelTask is a no-op.
 	w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "task-1"})
 
-	if len(w.sendChan) != 0 {
-		t.Fatalf("expected no message for no-op-cancel spawned task, got %d", len(w.sendChan))
+	if len(w.outbound.messages) != 0 {
+		t.Fatalf("expected no message for no-op-cancel spawned task, got %d", len(w.outbound.messages))
 	}
 }
 
@@ -190,7 +190,7 @@ func TestExecuteTaskSuccessStillReportsCompleted(t *testing.T) {
 
 	runDispatchTask(w)
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskCompleted {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
 	}

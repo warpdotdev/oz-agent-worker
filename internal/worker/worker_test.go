@@ -164,14 +164,14 @@ func TestAgentExitCode(t *testing.T) {
 }
 
 func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
-	w := &Worker{ctx: context.Background(), sendChan: make(chan []byte, 1)}
+	w := &Worker{ctx: context.Background(), outbound: newOutboundQueue(1)}
 	failureDetails := &types.FailureDetails{
 		Kubernetes: &types.KubernetesFailureDetails{SchemaVersion: 1},
 	}
 	if err := w.sendTaskFailed("task-1", "execution-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143, failureDetails); err != nil {
 		t.Fatalf("sendTaskFailed returned error: %v", err)
 	}
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	var failed types.TaskFailedMessage
 	if err := json.Unmarshal(msg.Data, &failed); err != nil {
 		t.Fatalf("failed to decode task_failed: %v", err)
@@ -213,7 +213,7 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),
 		config:   Config{},
-		sendChan: make(chan []byte, 1),
+		outbound: newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceShutdown,
@@ -226,7 +226,7 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -245,7 +245,7 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),
 		config:   Config{},
-		sendChan: make(chan []byte, 1),
+		outbound: newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceUser,
@@ -258,7 +258,7 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskCompleted {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
 	}
@@ -288,7 +288,7 @@ func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *test
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
 	}
@@ -299,7 +299,7 @@ func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *test
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -311,7 +311,7 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 
 	w := &Worker{
 		ctx:      context.Background(),
-		sendChan: make(chan []byte, 1),
+		outbound: newOutboundQueue(1),
 		activeTasks: map[string]activeTask{
 			"task-1": {
 				ctx:    taskCtx,
@@ -347,7 +347,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{},
 	}
@@ -358,7 +358,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskCompleted {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
 	}
@@ -385,7 +385,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
@@ -395,7 +395,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -419,7 +419,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
@@ -429,7 +429,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -498,6 +498,75 @@ func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketM
 	return types.WebSocketMessage{}
 }
 
+func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	connected := make(chan struct{})
+	closeCode := make(chan int, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+		close(connected)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					closeCode <- closeErr.Code
+				}
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	backend := &shutdownRecordingBackend{}
+	w := &Worker{
+		config: Config{
+			WorkerID:     "test-worker",
+			WebSocketURL: "ws" + strings.TrimPrefix(srv.URL, "http"),
+		},
+		ctx:               serverCtx,
+		outbound:          newOutboundQueue(8),
+		activeTasks:       make(map[string]activeTask),
+		backend:           backend,
+		heartbeatInterval: HeartbeatInterval,
+	}
+
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- w.Run()
+	}()
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not connect")
+	}
+	cancelServer()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after server cancellation")
+	}
+	if !backend.shutdownCalled {
+		t.Fatal("Run() returned without shutting down the backend")
+	}
+	select {
+	case code := <-closeCode:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("WebSocket close code = %d, want %d", code, websocket.CloseNormalClosure)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol did not send a normal WebSocket close frame")
+	}
+}
+
 // TestRunHeartbeatAndWritesAreConcurrencySafe is a regression test for the
 // "concurrent write to websocket connection" panic: the heartbeat loop used
 // to send pings via WriteMessage, racing writeLoop's data writes on the same
@@ -516,7 +585,9 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 			return
 		}
 		defer close(serverConnClosed)
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 		conn.SetPingHandler(func(string) error {
 			pingsReceived.Add(1)
 			return nil
@@ -536,29 +607,25 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		t.Fatalf("failed to dial test server: %v", err)
 	}
 	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	protocolCtx, cancelProtocol := context.WithCancel(context.Background())
 	w := &Worker{
 		config:            Config{},
-		conn:              conn,
-		ctx:               ctx,
-		cancel:            cancel,
-		sendChan:          make(chan []byte, 256),
+		ctx:               context.Background(),
+		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[string]activeTask),
+		backend:           &recordingBackend{},
 		heartbeatInterval: time.Millisecond,
 	}
 
 	runDone := make(chan struct{})
 	go func() {
-		w.run()
+		w.serveConnection(protocolCtx, conn)
 		close(runDone)
 	}()
 
-	// Flood data writes while heartbeats fire so the two write paths overlap
-	// constantly for the duration of the test window.
 	message := []byte(`{"type":"task_claimed","data":{"task_id":"task-1"}}`)
 	deadline := time.After(500 * time.Millisecond)
 flood:
@@ -566,18 +633,15 @@ flood:
 		select {
 		case <-deadline:
 			break flood
-		case w.sendChan <- message:
+		case w.outbound.messages <- message:
 		}
 	}
 
-	// Tear down: cancelling the context stops writeLoop/heartbeatLoop, and
-	// closing the connection unblocks readLoop so run() returns.
-	cancel()
-	conn.Close()
+	cancelProtocol()
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("run() did not return after context cancellation and connection close")
+		t.Fatal("connection run did not return after protocol cancellation")
 	}
 	select {
 	case <-serverConnClosed:
@@ -1047,17 +1111,14 @@ func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
 	})
 }
 
-func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
-	workerCtx, cancel := context.WithCancel(context.Background())
+func TestShutdownBackendUsesFreshContextForCleanup(t *testing.T) {
 	backend := &shutdownRecordingBackend{}
 	w := &Worker{
-		ctx:         workerCtx,
-		cancel:      cancel,
+		ctx:         context.Background(),
 		activeTasks: make(map[string]activeTask),
 		backend:     backend,
 	}
-
-	w.Shutdown()
+	w.shutdownBackend()
 
 	if !backend.shutdownCalled {
 		t.Fatal("expected backend shutdown to be called")
@@ -1068,12 +1129,10 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 }
 
 func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
-	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &preservingShutdownRecordingBackend{}
 	cancelledTask := false
 	w := &Worker{
-		ctx:    workerCtx,
-		cancel: cancel,
+		ctx: context.Background(),
 		activeTasks: map[string]activeTask{
 			"task-1": {cancel: func() {
 				cancelledTask = true
@@ -1082,7 +1141,8 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 		backend: backend,
 	}
 
-	w.Shutdown()
+	w.shutdownTasks()
+	w.shutdownBackend()
 
 	if cancelledTask {
 		t.Fatal("expected active task to be preserved, but cancel function was called")
@@ -1097,9 +1157,8 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 	cancel()
 	w := &Worker{
 		ctx:         workerCtx,
-		cancel:      cancel,
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: make(map[string]activeTask),
 		backend:     &preservingShutdownRecordingBackend{},
 	}
@@ -1111,5 +1170,29 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 
 	if len(w.activeTasks) != 0 {
 		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
+	}
+}
+
+func TestHandleTaskAssignmentRejectsAfterShutdownStarts(t *testing.T) {
+	w := &Worker{
+		ctx:          context.Background(),
+		config:       Config{},
+		outbound:     newOutboundQueue(1),
+		activeTasks:  make(map[string]activeTask),
+		shuttingDown: true,
+		backend:      &recordingBackend{},
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	if len(w.activeTasks) != 0 {
+		t.Fatalf("expected no active tasks after shutdown started, got %d", len(w.activeTasks))
+	}
+	msg := readWebSocketMessage(t, w.outbound.messages)
+	if msg.Type != types.MessageTypeTaskRejected {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskRejected)
 	}
 }
