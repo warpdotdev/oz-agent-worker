@@ -12,7 +12,7 @@ import (
 // Add new CLI overrides here rather than as extra parameters.
 type TaskAugmentOptions struct {
 	// IdleOnComplete is passed to --idle-on-complete. Empty string uses the oz CLI default
-	// (45m).
+	// (45m). Use "0s" to exit immediately after the conversation finishes.
 	// Task-level config.idle_timeout_minutes takes precedence when set.
 	IdleOnComplete string
 	// AdditionalOzArgs are server-resolved supplemental oz CLI arguments.

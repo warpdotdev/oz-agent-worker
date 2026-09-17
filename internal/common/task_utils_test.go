@@ -50,7 +50,7 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--computer-use", "--idle-on-complete"},
 		},
 		{
-			name: "task zero disables idle shutdown instead of falling back to worker value",
+			name: "task zero requests immediate shutdown instead of falling back to worker value",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
 					IdleTimeoutMinutes: intPtr(0),
