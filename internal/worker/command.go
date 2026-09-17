@@ -74,6 +74,10 @@ type CommandBackend struct {
 
 var _ Backend = (*CommandBackend)(nil)
 
+func (b *CommandBackend) Capabilities() backendCapabilities {
+	return backendCapabilities{}
+}
+
 // NewCommandBackend constructs a command backend, requiring a dispatch command.
 func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*CommandBackend, error) {
 	if config.DispatchCommand == "" {

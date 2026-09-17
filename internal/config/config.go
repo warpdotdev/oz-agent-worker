@@ -17,6 +17,7 @@ type FileConfig struct {
 	WorkerID           string `yaml:"worker_id"`
 	Cleanup            *bool  `yaml:"cleanup"`
 	MaxConcurrentTasks *int   `yaml:"max_concurrent_tasks"`
+	OneShot            *bool  `yaml:"one_shot"`
 	// IdleOnComplete controls how long the oz CLI process stays alive after a task's
 	// conversation finishes, to allow follow-up interactions via the shared session.
 	// Uses humantime format (e.g. "45m", "10m", "0s"). When nil, the oz CLI default

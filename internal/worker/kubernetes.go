@@ -137,6 +137,10 @@ type KubernetesBackend struct {
 	clientset kubernetes.Interface
 }
 
+func (b *KubernetesBackend) Capabilities() backendCapabilities {
+	return backendCapabilities{}
+}
+
 func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
 	return true
 }

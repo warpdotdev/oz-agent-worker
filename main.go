@@ -37,6 +37,7 @@ var CLI struct {
 	Volumes                 []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                     []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks      int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
+	OneShot                 bool     `help:"Exit after running one task (direct backend only)"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 	SessionSharingServerURL string   `help:"Session sharing server WebSocket URL to pass through to the oz CLI (e.g. ws://127.0.0.1:8081)" hidden:""`
 }
@@ -134,6 +135,9 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			backendType = "docker"
 		}
 	}
+	if backendType == "" {
+		backendType = "docker"
+	}
 
 	// Merge cleanup: --no-cleanup flag > config file cleanup > default (cleanup=true).
 	noCleanup := CLI.NoCleanup
@@ -152,6 +156,16 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if maxConcurrentTasks == 0 && fileConfig != nil && fileConfig.MaxConcurrentTasks != nil {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
+	// Resolve one_shot: CLI true > config file > false. One-shot workers only
+	// ever run one task, so make that explicit in the concurrency configuration
+	// in addition to enforcing lifetime exclusivity in the worker.
+	oneShot := CLI.OneShot
+	if !oneShot && fileConfig != nil && fileConfig.OneShot != nil {
+		oneShot = *fileConfig.OneShot
+	}
+	if oneShot {
+		maxConcurrentTasks = 1
+	}
 
 	// Resolve idle_on_complete: CLI (non-empty) > config file > "" (oz CLI default = 45m).
 	idleOnComplete := CLI.IdleOnComplete
@@ -167,6 +181,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		LogLevel:                CLI.LogLevel,
 		BackendType:             backendType,
 		MaxConcurrentTasks:      maxConcurrentTasks,
+		OneShot:                 oneShot,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}

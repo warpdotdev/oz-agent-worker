@@ -270,6 +270,10 @@ func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
 
+func (b *DockerBackend) Capabilities() backendCapabilities {
+	return backendCapabilities{}
+}
+
 // normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,
 // defaulting an empty (omitted) value to PullPolicyAlways so existing installations keep
 // pulling unconditionally. Config loading already rejects any other unrecognized value before

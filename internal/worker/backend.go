@@ -124,6 +124,14 @@ func executeSpawned() ExecuteResult {
 	return ExecuteResult{Outcome: ExecuteOutcomeSpawned}
 }
 
+// backendCapabilities are declared by each concrete backend without requiring
+// backend construction or access to external resources.
+type backendCapabilities struct {
+	// supportsOneShot requires ExecuteTask to wait for a terminal outcome; a
+	// backend that returns ExecuteOutcomeSpawned cannot support one-shot mode.
+	supportsOneShot bool
+}
+
 // TaskParams contains pre-processed task parameters common to all backends.
 // This provides a layer of abstraction between the wire-format TaskAssignmentMessage
 // and the backend interface, so backends don't need to handle common concerns like
