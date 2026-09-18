@@ -56,3 +56,11 @@ jobs:
 
             `latest` was updated to this same image as part of this release. For production self-hosted workers, pin the immutable release tag or digest instead of `latest`.
           files: artifacts/**/*
+
+  update-homebrew-formula:
+    needs: [generate-tag, release]
+    permissions: {}
+    uses: ./.github/workflows/update_homebrew_formula.yml
+    secrets: inherit
+    with:
+      release_tag: ${{ needs.generate-tag.outputs.tag_name }}

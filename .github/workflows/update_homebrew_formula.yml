@@ -1,0 +1,90 @@
+name: Update Homebrew formula
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish to Homebrew
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Release tag to publish to Homebrew
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_PAT:
+        required: true
+
+permissions:
+  contents: read
+concurrency:
+  group: update-homebrew-formula-${{ inputs.release_tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  update-formula:
+    runs-on: namespace-profile-ubuntu-small
+    steps:
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@f8d4222eb633e65c2a0157383cf80861fc7fae7f # 2026.09.07.1
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_PAT }}
+          brew-gh-api-token: ${{ secrets.HOMEBREW_TAP_PAT }}
+
+      - name: Tap Homebrew repository
+        run: brew tap warpdotdev/warp
+
+      - name: Configure machine user
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+        run: |
+          user="$(gh api user)"
+          login="$(jq -r '.login' <<< "${user}")"
+          email="$(jq -r '.email // empty' <<< "${user}")"
+          if [[ -z "${email}" ]]; then
+            user_id="$(jq -r '.id' <<< "${user}")"
+            email="${user_id}+${login}@users.noreply.github.com"
+          fi
+          git config --global user.name "${login}"
+          git config --global user.email "${email}"
+
+      - name: Wait for livecheck to observe release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Unexpected release tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          expected_version="${RELEASE_TAG#v}"
+          for attempt in 1 2 3 4 5; do
+            latest_version="$(brew livecheck \
+              --quiet \
+              --json \
+              --formula \
+              warpdotdev/warp/oz-agent-worker |
+              jq -r '.[0].version.latest')"
+            if [[ "${latest_version}" == "${expected_version}" ]]; then
+              exit 0
+            fi
+
+            echo "Livecheck returned ${latest_version}; waiting for ${expected_version}."
+            if (( attempt < 5 )); then
+              sleep "$((attempt * 5))"
+            fi
+          done
+
+          echo "::error::Livecheck did not observe release ${RELEASE_TAG}."
+          exit 1
+
+      - name: Open version bump pull request
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew bump --open-pr --no-fork --formula warpdotdev/warp/oz-agent-worker
