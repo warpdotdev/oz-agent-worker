@@ -1,4 +1,5 @@
-{{- if .Values.rbac.create }}
+{{- /* Bind task Job/Pod Role only when the kubernetes backend is selected. */ -}}
+{{- if and .Values.rbac.create (eq (include "oz-agent-worker.backendType" .) "kubernetes") }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

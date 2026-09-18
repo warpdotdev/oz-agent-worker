@@ -14,6 +14,21 @@ data:
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
     {{- end }}
     backend:
+      {{- $backendType := include "oz-agent-worker.backendType" . }}
+      {{- if eq $backendType "command" }}
+      command:
+        dispatch_command: {{ required "commandBackend.dispatchCommand is required when backend.type=command" .Values.commandBackend.dispatchCommand | quote }}
+        {{- if .Values.commandBackend.cancelCommand }}
+        cancel_command: {{ .Values.commandBackend.cancelCommand | quote }}
+        {{- end }}
+        {{- if .Values.commandBackend.dispatchTimeout }}
+        dispatch_timeout: {{ .Values.commandBackend.dispatchTimeout | quote }}
+        {{- end }}
+        {{- with .Values.commandBackend.environment }}
+        environment:
+{{ toYaml . | indent 10 }}
+        {{- end }}
+      {{- else }}
       kubernetes:
         namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace | quote }}
         {{- if .Values.kubernetesBackend.defaultImage }}
@@ -61,3 +76,4 @@ data:
         preflight_resources:
 {{ toYaml .Values.kubernetesBackend.preflightResources | indent 10 }}
         {{- end }}
+      {{- end }}
