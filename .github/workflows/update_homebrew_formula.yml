@@ -19,8 +19,7 @@ on:
       HOMEBREW_TAP_PAT:
         required: true
 
-permissions:
-  contents: read
+permissions: {}
 concurrency:
   group: update-homebrew-formula-${{ inputs.release_tag || github.event.release.tag_name }}
   cancel-in-progress: false
