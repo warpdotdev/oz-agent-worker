@@ -37,6 +37,9 @@ jobs:
       - name: Tap Homebrew repository
         run: brew tap warpdotdev/warp
 
+      - name: Trust Homebrew repository
+        run: brew trust warpdotdev/warp
+
       - name: Configure machine user
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
