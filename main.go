@@ -193,7 +193,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			kubeconfig            string
 			defaultImage          string
 			imagePullPolicy       string
-			useImageVolumes       bool
+			useImageVolumes       *bool
 			preflightImage        string
 			sidecarImage          string
 			codingCLISidecars     map[string]string
