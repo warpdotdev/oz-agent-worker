@@ -63,6 +63,8 @@ func buildKubernetesFailureDetails(
 }
 
 func (b *KubernetesBackend) collectKubernetesFailureEvents(ctx context.Context, job *batchv1.Job, pod *corev1.Pod) []corev1.Event {
+	ctx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	defer cancel()
 	type objectReference struct {
 		kind string
 		name string
@@ -92,6 +94,8 @@ func (b *KubernetesBackend) collectKubernetesFailureEvents(ctx context.Context, 
 }
 
 func (b *KubernetesBackend) refreshFailureJobDetails(ctx context.Context, err error, jobName string) {
+	ctx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	defer cancel()
 	job, getErr := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
 	if getErr != nil {
 		log.Warnf(ctx, "Failed to refresh Job %s for failure details: %v", jobName, getErr)

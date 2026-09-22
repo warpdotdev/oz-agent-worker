@@ -30,6 +30,10 @@ warp:
 worker:
   workerId: ""
   logLevel: info
+  # False retains finished Jobs indefinitely (no TTL). True deletes successful
+  # Jobs immediately and retains failed Jobs for kubernetesBackend.ttlSecondsAfterFinished.
+  # Cancellation and terminal task failure still stop active Jobs;
+  # worker shutdown preserves them.
   cleanup: true
   maxConcurrentTasks: 0
   idleOnComplete: ""
@@ -96,7 +100,7 @@ kubernetesBackend:
   # the worker sets no TTL, so these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
-  unschedulableTimeout: "30s"
+  unschedulableTimeout: "10m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).
