@@ -68,7 +68,7 @@ func TestMergeConfigKubernetesFromFile(t *testing.T) {
 				Namespace:       "agents",
 				Kubeconfig:      "/tmp/kubeconfig",
 				ImagePullPolicy: "IfNotPresent",
-				UseImageVolumes: true,
+				UseImageVolumes: boolPtr(true),
 				PreflightImage:  "registry.internal/platform/preflight:1.0",
 				SetupCommand:    "setup.sh",
 				TeardownCommand: "teardown.sh",
@@ -115,7 +115,7 @@ containers:
 	if wc.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("PreflightImage = %q, want %q", wc.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
 	}
-	if !wc.Kubernetes.UseImageVolumes {
+	if wc.Kubernetes.UseImageVolumes == nil || !*wc.Kubernetes.UseImageVolumes {
 		t.Fatal("expected UseImageVolumes to be true")
 	}
 	if wc.Kubernetes.TaskEnv["CLI_ONLY"] != "1" {
@@ -138,6 +138,44 @@ containers:
 	}
 	if len(wc.Kubernetes.PodTemplate.ImagePullSecrets) != 1 || wc.Kubernetes.PodTemplate.ImagePullSecrets[0].Name != "registry-creds" {
 		t.Fatalf("ImagePullSecrets = %+v, want registry-creds", wc.Kubernetes.PodTemplate.ImagePullSecrets)
+	}
+}
+
+func TestMergeConfigKubernetesPreservesImageVolumePreference(t *testing.T) {
+	tests := []struct {
+		name       string
+		preference *bool
+	}{
+		{name: "omitted"},
+		{name: "enabled", preference: boolPtr(true)},
+		{name: "disabled", preference: boolPtr(false)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			fileConfig := &config.FileConfig{
+				WorkerID: "worker-123",
+				Backend: config.BackendConfig{
+					Kubernetes: &config.KubernetesConfig{UseImageVolumes: tt.preference},
+				},
+			}
+
+			wc, err := mergeConfig(fileConfig)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.preference == nil {
+				if wc.Kubernetes.UseImageVolumes != nil {
+					t.Fatalf("UseImageVolumes = %v, want nil", *wc.Kubernetes.UseImageVolumes)
+				}
+				return
+			}
+			if wc.Kubernetes.UseImageVolumes == nil || *wc.Kubernetes.UseImageVolumes != *tt.preference {
+				t.Fatalf("UseImageVolumes = %v, want %t", wc.Kubernetes.UseImageVolumes, *tt.preference)
+			}
+		})
 	}
 }
 

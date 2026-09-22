@@ -75,7 +75,9 @@ kubernetesBackend:
   namespace: ""
   defaultImage: ""
   imagePullPolicy: IfNotPresent
-  useImageVolumes: false
+  # null auto-detects image-volume support with the startup preflight. Set true
+  # to require image volumes or false to always use the legacy copy path.
+  useImageVolumes: null
   preflightImage: ""
   sidecarImage: ""
   setupCommand: ""

@@ -73,11 +73,12 @@ type DirectConfig struct {
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.
 type KubernetesConfig struct {
-	Namespace             string            `yaml:"namespace"`
-	Kubeconfig            string            `yaml:"kubeconfig"`
-	DefaultImage          string            `yaml:"default_image" validate:"omitempty,no_whitespace"`
-	ImagePullPolicy       string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
-	UseImageVolumes       bool              `yaml:"use_image_volumes"`
+	Namespace       string `yaml:"namespace"`
+	Kubeconfig      string `yaml:"kubeconfig"`
+	DefaultImage    string `yaml:"default_image" validate:"omitempty,no_whitespace"`
+	ImagePullPolicy string `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	// UseImageVolumes is nil when support should be detected by the startup preflight.
+	UseImageVolumes       *bool             `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SidecarImage          string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
 	SetupCommand          string            `yaml:"setup_command"`

@@ -21,6 +21,10 @@ func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
 
+func workerBoolPtr(value bool) *bool {
+	return &value
+}
+
 func TestKubernetesTaskJobNameEmbedsFullRunIDAndExecSuffix(t *testing.T) {
 	runID := "019f5de4-bfd1-762e-92ed-199c971abcba"
 	execID := "019f5df0-aaaa-bbbb-cccc-abcdef012345"
@@ -952,6 +956,28 @@ func TestValidateTaskSidecarsRejectsReadWriteMountsWhenImageVolumesEnabled(t *te
 	}
 }
 
+func TestUseImageVolumesForTask(t *testing.T) {
+	readWriteSidecar := []types.SidecarMount{{
+		Image:     "registry.internal/agent:1.0",
+		MountPath: "/agent",
+		ReadWrite: true,
+	}}
+
+	autoBackend := &KubernetesBackend{useImageVolumes: true}
+	useImageVolumes, err := autoBackend.useImageVolumesForTask(context.Background(), readWriteSidecar)
+	if err != nil {
+		t.Fatalf("auto mode returned an unexpected error: %v", err)
+	}
+	if useImageVolumes {
+		t.Fatal("auto mode should use the legacy copy path for a read-write sidecar")
+	}
+
+	forcedBackend := &KubernetesBackend{useImageVolumes: true, imageVolumesRequired: true}
+	if _, err := forcedBackend.useImageVolumesForTask(context.Background(), readWriteSidecar); err == nil {
+		t.Fatal("forced-on mode should reject a read-write sidecar")
+	}
+}
+
 func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
@@ -999,9 +1025,11 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			Namespace:       "agents",
 			ImagePullPolicy: string(corev1.PullAlways),
 			SetupCommand:    "true",
-			UseImageVolumes: true,
+			UseImageVolumes: workerBoolPtr(true),
 		},
-		clientset: fakeClient,
+		clientset:            fakeClient,
+		useImageVolumes:      true,
+		imageVolumesRequired: true,
 	}
 
 	result := backend.ExecuteTask(context.Background(), &TaskParams{
@@ -1671,8 +1699,141 @@ func TestRunStartupPreflightCreatesLegacyRootInitJobAndWaitsForPodCreationByDefa
 		clientset: fakeClient,
 	}
 
-	if err := backend.runStartupPreflight(context.Background()); err != nil {
+	if err := backend.runStartupPreflight(context.Background(), false); err != nil {
 		t.Fatalf("unexpected preflight error: %v", err)
+	}
+}
+
+func newImageVolumeModeTestBackend(t *testing.T, preference *bool, imageVolumesSupported bool) (*KubernetesBackend, *[]bool) {
+	t.Helper()
+
+	fakeClient := fake.NewSimpleClientset()
+	createdModes := make([]bool, 0, 2)
+	var currentJob *batchv1.Job
+	var currentMode bool
+
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateActionImpl)
+		currentJob = createAction.GetObject().(*batchv1.Job).DeepCopy()
+		currentJob.UID = "preflight-job-uid"
+		currentMode = false
+		for _, volume := range currentJob.Spec.Template.Spec.Volumes {
+			if volume.Image != nil {
+				currentMode = true
+				break
+			}
+		}
+		createdModes = append(createdModes, currentMode)
+		return true, currentJob, nil
+	})
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := currentJob.DeepCopy()
+		conditionType := batchv1.JobComplete
+		if currentMode && !imageVolumesSupported {
+			conditionType = batchv1.JobFailed
+		}
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type:   conditionType,
+			Status: corev1.ConditionTrue,
+		}}
+		return true, job, nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if currentMode {
+			return true, &corev1.PodList{}, nil
+		}
+		return true, &corev1.PodList{Items: []corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "preflight-pod",
+				Namespace: "agents",
+				Labels:    map[string]string{"job-name": currentJob.Name},
+			},
+		}}}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{}, nil
+	})
+	fakeClient.PrependReactor("delete", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil
+	})
+
+	return &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			PreflightImage:  "busybox:1.36",
+			UseImageVolumes: preference,
+		},
+		clientset: fakeClient,
+	}, &createdModes
+}
+
+func TestConfigureImageVolumes(t *testing.T) {
+	tests := []struct {
+		name                  string
+		preference            *bool
+		imageVolumesSupported bool
+		wantModes             []bool
+		wantUseImageVolumes   bool
+		wantRequired          bool
+		wantError             bool
+	}{
+		{
+			name:                  "auto probe success enables image volumes",
+			imageVolumesSupported: true,
+			wantModes:             []bool{true},
+			wantUseImageVolumes:   true,
+		},
+		{
+			name:                  "auto probe failure falls back to legacy preflight",
+			imageVolumesSupported: false,
+			wantModes:             []bool{true, false},
+		},
+		{
+			name:                  "explicit true fails closed",
+			preference:            workerBoolPtr(true),
+			imageVolumesSupported: false,
+			wantModes:             []bool{true},
+			wantError:             true,
+		},
+		{
+			name:                  "explicit false skips image-volume probe",
+			preference:            workerBoolPtr(false),
+			imageVolumesSupported: true,
+			wantModes:             []bool{false},
+		},
+		{
+			name:                  "explicit true preserves strict mode",
+			preference:            workerBoolPtr(true),
+			imageVolumesSupported: true,
+			wantModes:             []bool{true},
+			wantUseImageVolumes:   true,
+			wantRequired:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend, createdModes := newImageVolumeModeTestBackend(t, tt.preference, tt.imageVolumesSupported)
+			err := backend.configureImageVolumes(context.Background())
+			if (err != nil) != tt.wantError {
+				t.Fatalf("configureImageVolumes() error = %v, wantError %t", err, tt.wantError)
+			}
+			if len(*createdModes) != len(tt.wantModes) {
+				t.Fatalf("created preflight modes = %v, want %v", *createdModes, tt.wantModes)
+			}
+			for i := range tt.wantModes {
+				if (*createdModes)[i] != tt.wantModes[i] {
+					t.Fatalf("created preflight modes = %v, want %v", *createdModes, tt.wantModes)
+				}
+			}
+			if backend.useImageVolumes != tt.wantUseImageVolumes {
+				t.Fatalf("useImageVolumes = %t, want %t", backend.useImageVolumes, tt.wantUseImageVolumes)
+			}
+			if backend.imageVolumesRequired != tt.wantRequired {
+				t.Fatalf("imageVolumesRequired = %t, want %t", backend.imageVolumesRequired, tt.wantRequired)
+			}
+		})
 	}
 }
 
@@ -1777,10 +1938,9 @@ func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:        "worker-123",
-			Namespace:       "agents",
-			PreflightImage:  preflightImage,
-			UseImageVolumes: true,
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: preflightImage,
 			PodTemplate: &corev1.PodSpec{
 				ServiceAccountName: "oz-agent-worker",
 				ImagePullSecrets: []corev1.LocalObjectReference{
@@ -1791,7 +1951,7 @@ func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T
 		clientset: fakeClient,
 	}
 
-	if err := backend.runStartupPreflight(context.Background()); err != nil {
+	if err := backend.runStartupPreflight(context.Background(), true); err != nil {
 		t.Fatalf("unexpected preflight error: %v", err)
 	}
 }
@@ -1853,15 +2013,14 @@ func TestRunStartupPreflightFailsOnFailedMountEvent(t *testing.T) {
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:        "worker-123",
-			Namespace:       "agents",
-			PreflightImage:  "registry.internal/platform/preflight:1.0",
-			UseImageVolumes: true,
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: "registry.internal/platform/preflight:1.0",
 		},
 		clientset: fakeClient,
 	}
 
-	err := backend.runStartupPreflight(context.Background())
+	err := backend.runStartupPreflight(context.Background(), true)
 	if err == nil {
 		t.Fatal("expected preflight failure")
 	}
@@ -1922,7 +2081,7 @@ func TestRunStartupPreflightFailsOnFailedCreateEvent(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.runStartupPreflight(context.Background())
+	err := backend.runStartupPreflight(context.Background(), false)
 	if err == nil {
 		t.Fatal("expected preflight failure")
 	}

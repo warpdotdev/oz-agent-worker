@@ -20,7 +20,9 @@ data:
         default_image: {{ .Values.kubernetesBackend.defaultImage | quote }}
         {{- end }}
         image_pull_policy: {{ .Values.kubernetesBackend.imagePullPolicy | quote }}
+        {{- if ne .Values.kubernetesBackend.useImageVolumes nil }}
         use_image_volumes: {{ .Values.kubernetesBackend.useImageVolumes }}
+        {{- end }}
         unschedulable_timeout: {{ .Values.kubernetesBackend.unschedulableTimeout | quote }}
         {{- if .Values.kubernetesBackend.preflightImage }}
         preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}

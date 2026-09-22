@@ -226,10 +226,11 @@ backend:
 ```
 
   The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked
-- by default, the Kubernetes backend materializes sidecars with root init containers into `emptyDir` volumes, matching the existing behavior
-- set `use_image_volumes: true` to opt into native image volumes for sidecars; in that mode, sidecar mounts are read-only and Kubernetes/runtime support for the built-in `ImageVolume` Pod volume source is required
+- when `use_image_volumes` is omitted, the worker probes native image-volume support with a real startup Job. A successful probe enables image volumes; any failure is logged and falls back to root init containers that materialize sidecars into `emptyDir` volumes
+- set `use_image_volumes: true` to require native image volumes and fail worker startup if the probe fails, or `use_image_volumes: false` to skip the image-volume probe and always use the legacy copy path
+- image-volume sidecar mounts are read-only. In automatic mode, a task with a read-write sidecar falls back to the legacy copy path; forced-on mode rejects that task
 - Kubernetes `1.35+` is the recommended and tested target for `use_image_volumes: true`; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes
-- the worker runs a short-lived startup preflight Job for the configured sidecar-loading mode and waits for either preflight success or an early controller, mount, or admission failure, so incompatible cluster/runtime policy failures surface before the worker starts accepting tasks
+- the worker runs short-lived startup preflight Jobs and waits for either preflight success or an early controller, mount, or admission failure. Automatic mode reuses the image-volume preflight as its capability probe and then verifies the legacy path before falling back
 - `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
@@ -314,7 +315,7 @@ Recommended namespace-scoped permissions for the worker are:
 - get `pods/log`
 - list `events`
 
-The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root. By default, task Jobs still materialize sidecars with root init containers; set `kubernetesBackend.useImageVolumes=true` to opt into native image volumes instead. Kubernetes `1.35+` is the recommended and tested target for that opt-in path, while Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
+The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root. The chart leaves `kubernetesBackend.useImageVolumes` unset so the worker automatically enables image volumes when its real startup Job succeeds and otherwise falls back to root init containers. Set the value to `true` to require image volumes or `false` to always use the legacy copy path. Image volumes are read-only, so automatic mode falls back per task when a sidecar requests a read-write mount. Kubernetes `1.35+` is the recommended and tested target, while Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
 
 ### Go Install
 

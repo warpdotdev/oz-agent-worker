@@ -402,7 +402,7 @@ backend:
 	if cfg.Backend.Kubernetes.ImagePullPolicy != "IfNotPresent" {
 		t.Errorf("image_pull_policy = %q, want %q", cfg.Backend.Kubernetes.ImagePullPolicy, "IfNotPresent")
 	}
-	if !cfg.Backend.Kubernetes.UseImageVolumes {
+	if cfg.Backend.Kubernetes.UseImageVolumes == nil || !*cfg.Backend.Kubernetes.UseImageVolumes {
 		t.Fatal("expected use_image_volumes to be true")
 	}
 	if cfg.Backend.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
@@ -423,6 +423,40 @@ backend:
 	}
 	if !strings.Contains(string(podTemplateYAML), "serviceAccountName: \"oz-agent-worker\"") {
 		t.Fatalf("expected pod_template to retain serviceAccountName, got:\n%s", string(podTemplateYAML))
+	}
+}
+
+func TestLoadKubernetesUseImageVolumesTriState(t *testing.T) {
+	tests := []struct {
+		name       string
+		configLine string
+		wantSet    bool
+		wantValue  bool
+	}{
+		{name: "omitted"},
+		{name: "enabled", configLine: "    use_image_volumes: true\n", wantSet: true, wantValue: true},
+		{name: "disabled", configLine: "    use_image_volumes: false\n", wantSet: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestConfig(t, "backend:\n  kubernetes:\n    namespace: agents\n"+tt.configLine)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			got := cfg.Backend.Kubernetes.UseImageVolumes
+			if !tt.wantSet {
+				if got != nil {
+					t.Fatalf("UseImageVolumes = %v, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != tt.wantValue {
+				t.Fatalf("UseImageVolumes = %v, want %t", got, tt.wantValue)
+			}
+		})
 	}
 }
 
