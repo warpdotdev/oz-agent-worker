@@ -212,7 +212,7 @@ Notes:
 
 - `default_image` sets the Docker image for task Jobs when no Warp environment is configured on the run; this lets you skip creating a Warp environment entirely if all your tasks use the same base image (precedence: Warp environment image > `default_image` > `ubuntu:22.04`)
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
-- `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
+- `unschedulable_timeout` controls the Pod-age threshold for failing an unschedulable task; it defaults to `10m` to allow node autoscaling, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
 - the worker owns a set of names in the task container's environment and writes them last, so an entry with one of these names in `task_env` or `pod_template` is overwritten rather than honoured: `OZ_RUN_ID`, `OZ_WORKER_BACKEND`, `OZ_WORKSPACE_ROOT`, `OZ_ENVIRONMENT_FILE`, and the `WARP_`-prefixed name of each (`WARP_RUN_ID` and so on). Pick different names for operator-supplied variables. Warp reserves the `WARP_` names against managed secrets too, but a worker's own config is yours, so nothing stops you setting them — they just will not survive
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
@@ -301,17 +301,19 @@ task pods independently (for example with separate node pools, selectors,
 tolerations, or disruption budgets) so worker rotation does not imply task pod
 eviction.
 
-When cleanup is enabled, successful task Jobs are deleted immediately by the
-worker when it observes completion, while failed task Jobs (and Jobs orphaned by
-worker disruption) are left in place for post-mortem debugging and cleaned up by
-the Kubernetes Job TTL (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
-When cleanup is disabled, no TTL is set and task Jobs remain indefinitely.
+`cleanup` controls retention of **finished** task resources:
+- `true`: delete successful Jobs immediately; retain failed Jobs until their
+  configured TTL expires (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
+  The TTL also removes Jobs that finish after worker disruption.
+- `false`: retain finished Jobs and Pods indefinitely, with no TTL.
 
-When Warp cancels a run (a user cancel, or a server-side timeout such as the agent
-boot deadline), the worker deletes the task Job immediately, regardless of the
-cleanup setting. This is deliberate: a Job whose Pod is still pending would
-otherwise outlive the cancellation and start an agent against a run Warp has
-already finished.
+Regardless of `cleanup`, cancellation or terminal task failure deletes a
+still-active Job and its Pods so it cannot run later. Available diagnostics are
+collected first; unsuccessful deletion is reported and may require operator
+intervention. Worker shutdown preserves active Jobs instead.
+
+Transient Kubernetes API observation errors are retried with bounded backoff.
+
 
 Recommended namespace-scoped permissions for the worker are:
 
