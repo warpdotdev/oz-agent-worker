@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -19,6 +20,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"golang.org/x/sync/semaphore"
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
@@ -45,6 +47,11 @@ type DockerBackendConfig struct {
 	SidecarImage    string
 }
 
+type sidecarVolumeState struct {
+	gate  *semaphore.Weighted
+	dirty bool
+}
+
 func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient *client.Client, containerID string) bool {
 	inspect, err := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil || inspect.Container.State == nil {
@@ -55,10 +62,11 @@ func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient 
 
 // DockerBackend executes tasks in Docker containers.
 type DockerBackend struct {
-	config       DockerBackendConfig
-	dockerClient *client.Client
-	platform     string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
-	platformSpec ocispec.Platform
+	config         DockerBackendConfig
+	dockerClient   *client.Client
+	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
+	platformSpec   ocispec.Platform
+	sidecarVolumes sync.Map // volume name -> *sidecarVolumeState
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
@@ -612,22 +620,10 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 		volumeName := sanitizeVolumeName(sidecar.Image, digest)
 		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
 
-		_, err = dockerClient.VolumeInspect(ctx, volumeName, client.VolumeInspectOptions{})
-		if err == nil {
-			log.Debugf(ctx, "Reusing existing volume %s for additional sidecar", volumeName)
-		} else {
-			log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
-			if _, err := dockerClient.VolumeCreate(ctx, client.VolumeCreateOptions{Name: volumeName}); err != nil {
-				return nil, fmt.Errorf("failed to create volume for additional sidecar %s: %w", sidecar.Image, err)
-			}
-
-			if err := b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName); err != nil {
-				// Clean up the empty volume so it isn't silently reused on retry.
-				if _, removeErr := dockerClient.VolumeRemove(ctx, volumeName, client.VolumeRemoveOptions{}); removeErr != nil {
-					log.Warnf(ctx, "Failed to clean up volume %s after copy failure: %v", volumeName, removeErr)
-				}
-				return nil, fmt.Errorf("failed to copy additional sidecar %s to volume: %w", sidecar.Image, err)
-			}
+		if err := b.prepareSidecarVolume(ctx, dockerClient, volumeName, func(ctx context.Context) error {
+			return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName)
+		}); err != nil {
+			return nil, fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", sidecar.Image, err)
 		}
 
 		mode := ":ro"
@@ -638,6 +634,58 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 		binds = append(binds, fmt.Sprintf("%s:%s%s", volumeName, sidecar.MountPath, mode))
 	}
 	return binds, nil
+}
+func (b *DockerBackend) prepareSidecarVolume(ctx context.Context, dockerClient *client.Client, volumeName string, populate func(context.Context) error) error {
+	entry, _ := b.sidecarVolumes.LoadOrStore(volumeName, &sidecarVolumeState{gate: semaphore.NewWeighted(1)})
+	state := entry.(*sidecarVolumeState)
+	// Docker exposes the volume before extraction finishes. Keep inspection and
+	// population under the same gate so another task cannot mount partial contents.
+	if err := state.gate.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer state.gate.Release(1)
+
+	if state.dirty {
+		if err := b.removeIncompleteSidecarVolume(ctx, dockerClient, volumeName); err != nil {
+			return err
+		}
+		state.dirty = false
+	}
+
+	_, err := dockerClient.VolumeInspect(ctx, volumeName, client.VolumeInspectOptions{})
+	if err == nil {
+		log.Debugf(ctx, "Reusing existing volume %s for additional sidecar", volumeName)
+		return nil
+	}
+	if !cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("failed to inspect sidecar volume %s: %w", volumeName, err)
+	}
+
+	log.Infof(ctx, "Creating new Docker volume: %s", volumeName)
+	state.dirty = true
+	if _, err := dockerClient.VolumeCreate(ctx, client.VolumeCreateOptions{Name: volumeName}); err != nil {
+		return fmt.Errorf("failed to create sidecar volume %s: %w", volumeName, err)
+	}
+	if err := populate(ctx); err != nil {
+		// A canceled task must still remove its incomplete cache before releasing waiters.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
+		defer cancel()
+		if removeErr := b.removeIncompleteSidecarVolume(cleanupCtx, dockerClient, volumeName); removeErr != nil {
+			log.Warnf(ctx, "Failed to clean up volume %s after copy failure: %v", volumeName, removeErr)
+		} else {
+			state.dirty = false
+		}
+		return fmt.Errorf("failed to populate sidecar volume %s: %w", volumeName, err)
+	}
+	state.dirty = false
+	return nil
+}
+
+func (b *DockerBackend) removeIncompleteSidecarVolume(ctx context.Context, dockerClient *client.Client, volumeName string) error {
+	if _, err := dockerClient.VolumeRemove(ctx, volumeName, client.VolumeRemoveOptions{}); err != nil && !cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("failed to remove incomplete sidecar volume %s: %w", volumeName, err)
+	}
+	return nil
 }
 
 // sanitizeVolumeName creates a volume name from the image name and digest.
