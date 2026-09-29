@@ -57,7 +57,7 @@ func TestExpirationAfterObservationTimeout(t *testing.T) {
 		backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: client}
 		ctx, cancel := context.WithTimeout(context.Background(), kubernetesCleanupTimeout)
 		defer cancel()
-		if err := backend.finalizeFailedJob(ctx, job, errors.New("abandoned")); err != nil || !patched {
+		if err := backend.requestJobExecutionStop(ctx, job, errors.New("abandoned")); err != nil || !patched {
 			t.Fatalf("patched=%t err=%v", patched, err)
 		}
 	})
@@ -165,7 +165,7 @@ func TestFailedPodRetentionBeforeJobStatusCatchesUp(t *testing.T) {
 				}
 				backend.clientset = client
 				failure := withJobDisposition(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerExit, errors.New("container failed")), jobExecutionStopped)
-				if err := backend.finalizeFailedJob(context.Background(), job, failure); err != nil {
+				if err := backend.requestJobExecutionStop(context.Background(), job, failure); err != nil {
 					t.Fatal(err)
 				}
 				retained, err := client.BatchV1().Jobs("agents").Get(context.Background(), job.Name, metav1.GetOptions{})
@@ -223,7 +223,7 @@ func TestJobExpirationRetriesAndRechecksIdentity(t *testing.T) {
 					return false, nil, nil
 				})
 				backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: client}
-				err := backend.finalizeFailedJob(ctx, original, errors.New("abandoned"))
+				err := backend.requestJobExecutionStop(ctx, original, errors.New("abandoned"))
 				if (err != nil) != tc.replace {
 					t.Fatalf("err=%v, wantError=%t", err, tc.replace)
 				}
@@ -245,7 +245,7 @@ func TestJobExpirationRetriesAndRechecksIdentity(t *testing.T) {
 		}
 		client := fake.NewSimpleClientset(job)
 		backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: client}
-		if err := backend.finalizeFailedJob(context.Background(), job, errors.New("abandoned")); err != nil {
+		if err := backend.requestJobExecutionStop(context.Background(), job, errors.New("abandoned")); err != nil {
 			t.Fatal(err)
 		}
 		updated, err := client.BatchV1().Jobs("agents").Get(context.Background(), job.Name, metav1.GetOptions{})
@@ -266,7 +266,7 @@ func TestJobExpirationRetriesAndRechecksIdentity(t *testing.T) {
 			backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: client}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
-			if err := backend.finalizeFailedJob(ctx, job, errors.New("abandoned")); err == nil {
+			if err := backend.requestJobExecutionStop(ctx, job, errors.New("abandoned")); err == nil {
 				t.Fatal("expiration failure must not be reported as success")
 			}
 		})

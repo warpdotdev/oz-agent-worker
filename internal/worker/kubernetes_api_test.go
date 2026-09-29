@@ -122,7 +122,7 @@ func TestIsTransientKubernetesAPIError(t *testing.T) {
 	}
 }
 
-func TestFinalizeFailedJob(t *testing.T) {
+func TestRequestJobExecutionStop(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		condition        batchv1.JobConditionType
@@ -193,7 +193,7 @@ func TestFinalizeFailedJob(t *testing.T) {
 				return true, nil, nil
 			})
 			backend.clientset = client
-			err := backend.finalizeFailedJob(ctx, observed, errors.New("execution abandoned"))
+			err := backend.requestJobExecutionStop(ctx, observed, errors.New("execution abandoned"))
 			if (err != nil) != tc.wantError {
 				t.Fatalf("err=%v, wantError=%t", err, tc.wantError)
 			}

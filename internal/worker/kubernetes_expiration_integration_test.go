@@ -73,7 +73,7 @@ func TestJobExpirationWithController(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := backend.finalizeFailedJob(ctx, job, errors.New("execution abandoned")); err != nil {
+			if err := backend.requestJobExecutionStop(ctx, job, errors.New("execution abandoned")); err != nil {
 				t.Fatal(err)
 			}
 			err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, time.Minute, true, func(ctx context.Context) (bool, error) {

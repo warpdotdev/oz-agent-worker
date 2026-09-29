@@ -127,7 +127,9 @@ func (b *KubernetesBackend) getTaskJob(ctx context.Context, jobName string) (*ba
 	})
 }
 
-func (b *KubernetesBackend) finalizeFailedJob(ctx context.Context, observedJob *batchv1.Job, failure error) error {
+// requestJobExecutionStop requests termination unless execution is already stopped.
+// It preserves the Job's retention policy and does not wait for termination.
+func (b *KubernetesBackend) requestJobExecutionStop(ctx context.Context, observedJob *batchv1.Job, failure error) error {
 	if jobComplete(observedJob) || jobFailed(observedJob) {
 		return nil
 	}
@@ -148,6 +150,9 @@ func (b *KubernetesBackend) finalizeFailedJob(ctx context.Context, observedJob *
 	return err
 }
 
+// expireAbandonedJob rechecks execution state and, if needed, shortens the Job's
+// deadline and prevents new Pods. Kubernetes enforces termination asynchronously,
+// retaining the Job under its existing TTL policy but potentially deleting active Pods.
 func (b *KubernetesBackend) expireAbandonedJob(ctx context.Context, observedJob *batchv1.Job, disposition jobFailureDisposition) error {
 	refreshCtx, cancelRefresh := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
 	job, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(refreshCtx, observedJob.Name, metav1.GetOptions{})

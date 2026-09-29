@@ -365,7 +365,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if res.Error != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 			defer cancel()
-			if err := b.finalizeFailedJob(cleanupCtx, job, res.Error); err != nil {
+			if err := b.requestJobExecutionStop(cleanupCtx, job, res.Error); err != nil {
 				log.Errorf(ctx, "Failed to stop Kubernetes Job %s after terminal task failure; it may still be active: %v", jobName, err)
 				res.Error = fmt.Errorf("%w; failed to stop Kubernetes Job %s: %v", res.Error, jobName, err)
 			}
