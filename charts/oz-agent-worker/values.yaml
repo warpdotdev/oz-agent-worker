@@ -32,8 +32,8 @@ worker:
   logLevel: info
   # False retains finished Jobs indefinitely (no TTL). True deletes successful
   # Jobs immediately and retains failed Jobs for kubernetesBackend.ttlSecondsAfterFinished.
-  # Cancellation and terminal task failure still stop active Jobs;
-  # worker shutdown preserves them.
+  # Abandoned executions are expired, retaining the Job but not active Pods.
+  # Cancellation deletes Jobs; worker shutdown preserves them.
   cleanup: true
   maxConcurrentTasks: 0
   idleOnComplete: ""

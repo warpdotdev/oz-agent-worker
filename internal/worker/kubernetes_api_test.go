@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -121,7 +122,7 @@ func TestIsTransientKubernetesAPIError(t *testing.T) {
 	}
 }
 
-func TestCleanupFailedJob(t *testing.T) {
+func TestFinalizeFailedJob(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		condition        batchv1.JobConditionType
@@ -130,24 +131,28 @@ func TestCleanupFailedJob(t *testing.T) {
 		missing          bool
 		replaced         bool
 		getForbidden     bool
-		deleteForbidden  bool
-		wantDeleted      bool
+		patchForbidden   bool
+		wantExpired      bool
 		wantError        bool
 	}{
-		{name: "deletes active job", wantDeleted: true},
-		{name: "deletes active job even with cleanup disabled", noCleanup: true, wantDeleted: true},
+		{name: "expires active job", wantExpired: true},
+		{name: "expires active job even with cleanup disabled", noCleanup: true, wantExpired: true},
 		{name: "retains observed failed job", condition: batchv1.JobFailed, observedTerminal: true},
 		{name: "retains newly failed job", condition: batchv1.JobFailed},
 		{name: "retains newly completed job", condition: batchv1.JobComplete},
 		{name: "retains terminal job with cleanup disabled", condition: batchv1.JobFailed, noCleanup: true},
-		{name: "missing job is already stopped", missing: true, wantDeleted: true},
+		{name: "missing job is already stopped", missing: true},
 		{name: "does not delete replacement", replaced: true, wantError: true},
-		{name: "deletes original UID when refresh fails", getForbidden: true, wantDeleted: true},
-		{name: "reports deletion failure", deleteForbidden: true, wantError: true},
+		{name: "expires original UID when refresh fails", getForbidden: true, wantExpired: true},
+		{name: "reports expiration failure", patchForbidden: true, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			observed := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "task-exec-1", Namespace: "agents", UID: "original"}}
+			backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents", NoCleanup: tc.noCleanup}}
+			observed := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "task-exec-1", Namespace: "agents", UID: "original", ResourceVersion: "1"},
+				Spec:       batchv1.JobSpec{TTLSecondsAfterFinished: backend.taskJobTTLSecondsAfterFinished()},
+			}
 			stored := observed.DeepCopy()
 			if tc.condition != "" {
 				stored.Status.Conditions = []batchv1.JobCondition{{Type: tc.condition, Status: corev1.ConditionTrue}}
@@ -170,27 +175,48 @@ func TestCleanupFailedJob(t *testing.T) {
 					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "jobs"}, observed.Name, errors.New("denied"))
 				})
 			}
-			client.PrependReactor("delete", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
-				opts := action.(k8stesting.DeleteAction).GetDeleteOptions()
-				if opts.Preconditions == nil || opts.Preconditions.UID == nil || *opts.Preconditions.UID != observed.UID {
-					t.Error("deletion must be conditional on the original Job UID")
+			client.PrependReactor("patch", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				var patch batchv1.Job
+				if err := json.Unmarshal(action.(k8stesting.PatchAction).GetPatch(), &patch); err != nil {
+					t.Fatal(err)
 				}
-				if opts.PropagationPolicy == nil || *opts.PropagationPolicy != metav1.DeletePropagationBackground {
-					t.Error("deletion must cascade to task Pods")
+				if patch.UID != observed.UID || patch.ResourceVersion != observed.ResourceVersion {
+					t.Error("expiration must use the original UID and current resource version")
 				}
-				if tc.deleteForbidden {
+				if tc.patchForbidden {
 					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "jobs"}, observed.Name, errors.New("denied"))
 				}
 				return false, nil, nil
 			})
-			backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents", NoCleanup: tc.noCleanup}, clientset: client}
-			err := backend.cleanupFailedJob(ctx, observed)
+			client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+				t.Fatal("failure finalization must not delete Jobs")
+				return true, nil, nil
+			})
+			backend.clientset = client
+			err := backend.finalizeFailedJob(ctx, observed, errors.New("execution abandoned"))
 			if (err != nil) != tc.wantError {
 				t.Fatalf("err=%v, wantError=%t", err, tc.wantError)
 			}
-			_, err = client.Tracker().Get(batchv1.SchemeGroupVersion.WithResource("jobs"), "agents", observed.Name)
-			if apierrors.IsNotFound(err) != tc.wantDeleted {
-				t.Fatalf("get after cleanup=%v, wantDeleted=%t", err, tc.wantDeleted)
+			object, err := client.Tracker().Get(batchv1.SchemeGroupVersion.WithResource("jobs"), "agents", observed.Name)
+			if tc.missing {
+				if !apierrors.IsNotFound(err) {
+					t.Fatalf("expected missing Job, got %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				retained := object.(*batchv1.Job)
+				expired := retained.Spec.ActiveDeadlineSeconds != nil && *retained.Spec.ActiveDeadlineSeconds == 1
+				if expired != tc.wantExpired {
+					t.Fatalf("expired=%t, want %t", expired, tc.wantExpired)
+				}
+				if tc.wantExpired && (retained.Spec.Parallelism == nil || *retained.Spec.Parallelism != 0 || retained.Spec.Suspend == nil || *retained.Spec.Suspend) {
+					t.Fatal("expiration must prevent new Pods and enable deadline enforcement")
+				}
+				if (retained.Spec.TTLSecondsAfterFinished == nil) != tc.noCleanup {
+					t.Fatal("expiration changed the retention policy")
+				}
 			}
 			if _, err := client.Tracker().Get(batchv1.SchemeGroupVersion.WithResource("jobs"), "agents", sibling.Name); err != nil {
 				t.Fatalf("another execution's Job was affected: %v", err)
@@ -266,7 +292,7 @@ func TestKubernetesAPIOperationsRetry(t *testing.T) {
 
 func TestExecuteTaskStopsActiveJobOnFailure(t *testing.T) {
 	for _, noCleanup := range []bool{false, true} {
-		for _, failure := range []string{"unschedulable", "init exit", "watch forbidden", "delete forbidden"} {
+		for _, failure := range []string{"unschedulable", "init exit", "watch forbidden", "patch forbidden"} {
 			t.Run(failure+map[bool]string{false: "/cleanup", true: "/no cleanup"}[noCleanup], func(t *testing.T) {
 				client := fake.NewSimpleClientset()
 				jobWatch := watch.NewRaceFreeFake()
@@ -275,7 +301,10 @@ func TestExecuteTaskStopsActiveJobOnFailure(t *testing.T) {
 				defer podWatch.Stop()
 				var created *batchv1.Job
 				client.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
-					created = action.(k8stesting.CreateAction).GetObject().(*batchv1.Job).DeepCopy()
+					job := action.(k8stesting.CreateAction).GetObject().(*batchv1.Job)
+					job.UID = "original"
+					job.ResourceVersion = "1"
+					created = job.DeepCopy()
 					return false, nil, nil
 				})
 				client.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
@@ -300,8 +329,8 @@ func TestExecuteTaskStopsActiveJobOnFailure(t *testing.T) {
 					podWatch.Add(pod)
 					return true, podWatch, nil
 				})
-				if failure == "delete forbidden" {
-					client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+				if failure == "patch forbidden" {
+					client.PrependReactor("patch", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
 						return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "jobs"}, "task", errors.New("denied"))
 					})
 				}
@@ -318,13 +347,13 @@ func TestExecuteTaskStopsActiveJobOnFailure(t *testing.T) {
 				if taskFailureDetails(result.Error) == nil {
 					t.Fatal("failure details must survive cleanup")
 				}
-				_, err := client.BatchV1().Jobs("agents").Get(context.Background(), created.Name, metav1.GetOptions{})
-				if failure == "delete forbidden" {
+				retained, err := client.BatchV1().Jobs("agents").Get(context.Background(), created.Name, metav1.GetOptions{})
+				if failure == "patch forbidden" {
 					if err != nil || !strings.Contains(result.Error.Error(), "failed to stop Kubernetes Job") {
 						t.Fatalf("cleanup failure must be reported with Job retained: result=%+v get=%v", result, err)
 					}
-				} else if !apierrors.IsNotFound(err) {
-					t.Fatalf("active failed Job was not deleted: %v", err)
+				} else if err != nil || retained.Spec.ActiveDeadlineSeconds == nil || *retained.Spec.ActiveDeadlineSeconds != 1 {
+					t.Fatalf("active failed Job was not expired: job=%v err=%v", retained, err)
 				}
 			})
 		}
@@ -418,8 +447,8 @@ func TestExecuteTaskRejectsReplacedJob(t *testing.T) {
 				client.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
 					return true, podWatch, nil
 				})
-				client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
-					t.Error("replacement Job must not be deleted")
+				client.PrependReactor("patch", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+					t.Error("replacement Job must not be expired")
 					return false, nil, nil
 				})
 				backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: client}

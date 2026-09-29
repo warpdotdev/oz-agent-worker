@@ -365,7 +365,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if res.Error != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 			defer cancel()
-			if err := b.cleanupFailedJob(cleanupCtx, job); err != nil {
+			if err := b.finalizeFailedJob(cleanupCtx, job, res.Error); err != nil {
 				log.Errorf(ctx, "Failed to stop Kubernetes Job %s after terminal task failure; it may still be active: %v", jobName, err)
 				res.Error = fmt.Errorf("%w; failed to stop Kubernetes Job %s: %v", res.Error, jobName, err)
 			}
@@ -600,11 +600,11 @@ func (b *KubernetesBackend) handleJobStateAt(ctx context.Context, jobState *batc
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
 		}
 		if failure := b.detectPodFailureAt(ctx, pods, jobState, source); failure != nil {
-			return &jobResult{err: failure}
+			return &jobResult{err: withJobDisposition(failure, jobExecutionStopped)}
 		}
 		metricsReason := classifyJobFailure(jobState)
 		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metricsReason, b.jobFailureError(jobState))
-		return &jobResult{err: withFailureDetails(failure, b.kubernetesFailureDetails(ctx, source, jobState, nil, nil))}
+		return &jobResult{err: withJobDisposition(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, source, jobState, nil, nil)), jobExecutionStopped)}
 	}
 	return nil
 }
@@ -1066,6 +1066,11 @@ func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1
 		return events
 	}
 	withDetails := func(err error, container *types.KubernetesContainerFailureDetails) error {
+		disposition := jobTerminationRequired
+		if pod.Status.Phase == corev1.PodFailed || (job != nil && (jobFailed(job) || jobComplete(job))) {
+			disposition = jobExecutionStopped
+		}
+		err = withJobDisposition(err, disposition)
 		return withFailureDetails(err, buildKubernetesFailureDetails(source, job, pod, container, loadEvents()))
 	}
 	if strings.EqualFold(pod.Status.Reason, "Evicted") || strings.Contains(strings.ToLower(pod.Status.Message), "evict") {

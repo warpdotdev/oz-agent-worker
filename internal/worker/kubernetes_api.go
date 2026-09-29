@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -22,6 +24,29 @@ const (
 	kubernetesAPIRequestTimeout = 30 * time.Second
 	kubernetesCleanupTimeout    = 2 * time.Minute
 )
+
+type jobFailureDisposition uint8
+
+const (
+	jobTerminationRequired jobFailureDisposition = iota
+	jobExecutionStopped
+)
+
+func withJobDisposition(err error, disposition jobFailureDisposition) error {
+	var failure *TaskFailure
+	if errors.As(err, &failure) {
+		failure.jobDisposition = disposition
+	}
+	return err
+}
+
+func jobDisposition(err error) jobFailureDisposition {
+	var failure *TaskFailure
+	if errors.As(err, &failure) {
+		return failure.jobDisposition
+	}
+	return jobTerminationRequired
+}
 
 func kubernetesAPIBackoff() wait.Backoff {
 	return wait.Backoff{Duration: time.Second, Factor: 2, Jitter: 0.1, Cap: 10 * time.Second, Steps: 6}
@@ -102,34 +127,102 @@ func (b *KubernetesBackend) getTaskJob(ctx context.Context, jobName string) (*ba
 	})
 }
 
-func (b *KubernetesBackend) cleanupFailedJob(ctx context.Context, observedJob *batchv1.Job) error {
+func (b *KubernetesBackend) finalizeFailedJob(ctx context.Context, observedJob *batchv1.Job, failure error) error {
 	if jobComplete(observedJob) || jobFailed(observedJob) {
 		return nil
 	}
-	// Reserve time for deletion even if refreshing the Job keeps failing.
-	refreshCtx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
-	job, err := b.getTaskJob(refreshCtx, observedJob.Name)
-	cancel()
+	var lastErr error
+	err := wait.ExponentialBackoffWithContext(ctx, kubernetesAPIBackoff(), func(ctx context.Context) (bool, error) {
+		lastErr = b.expireAbandonedJob(ctx, observedJob, jobDisposition(failure))
+		if lastErr == nil {
+			return true, nil
+		}
+		if apierrors.IsConflict(lastErr) || isTransientKubernetesAPIError(lastErr) {
+			return false, nil
+		}
+		return false, lastErr
+	})
+	if err != nil && lastErr != nil && !errors.Is(err, lastErr) {
+		return fmt.Errorf("job expiration failed: %w (last error: %w)", err, lastErr)
+	}
+	return err
+}
+
+func (b *KubernetesBackend) expireAbandonedJob(ctx context.Context, observedJob *batchv1.Job, disposition jobFailureDisposition) error {
+	refreshCtx, cancelRefresh := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	job, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(refreshCtx, observedJob.Name, metav1.GetOptions{})
+	cancelRefresh()
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
-	if err == nil {
-		if job.UID != observedJob.UID {
-			return fmt.Errorf("job %s was replaced; refusing to delete another execution", observedJob.Name)
-		}
-		if jobComplete(job) || jobFailed(job) {
+	if err != nil {
+		// The UID and resource version fence the patch when observation is unavailable.
+		log.Warnf(ctx, "Cannot refresh abandoned Job %s; attempting expiration using its last observed identity: %v", observedJob.Name, err)
+		job = observedJob
+	}
+	if job.UID != observedJob.UID {
+		return fmt.Errorf("job %s was replaced; refusing to expire another execution", observedJob.Name)
+	}
+	if jobComplete(job) || jobFailed(job) {
+		return nil
+	}
+	if disposition == jobExecutionStopped {
+		checkCtx, cancelCheck := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+		stopped, checkErr := b.jobPodsStopped(checkCtx, job)
+		cancelCheck()
+		if checkErr == nil && stopped {
 			return nil
 		}
-	} else {
-		// A failed observation must not leave an execution we have ended runnable.
-		log.Warnf(ctx, "Cannot refresh failed Job %s before cleanup; deleting its original UID: %v", observedJob.Name, err)
+		if checkErr != nil {
+			log.Warnf(ctx, "Cannot confirm execution stopped for Job %s; requesting expiration: %v", job.Name, checkErr)
+		}
 	}
-	uid := observedJob.UID
-	if err := b.deleteTaskJob(ctx, observedJob.Name, &uid); err != nil {
+	// Zero parallelism also prevents startup if the controller has not set startTime.
+	// Resuming a suspended Job lets its shortened deadline take effect.
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"uid": job.UID, "resourceVersion": job.ResourceVersion},
+		"spec":     map[string]any{"activeDeadlineSeconds": 1, "parallelism": 0, "suspend": false},
+	})
+	if err != nil {
 		return err
 	}
-	log.Infof(ctx, "Requested deletion of active Kubernetes Job %s after terminal task failure", observedJob.Name)
+	patchCtx, cancelPatch := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	defer cancelPatch()
+	_, err = b.clientset.BatchV1().Jobs(b.config.Namespace).Patch(patchCtx, job.Name, k8stypes.MergePatchType, patch, metav1.PatchOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	log.Infof(ctx, "Requested expiration of abandoned Kubernetes Job %s; retaining it according to its TTL", job.Name)
 	return nil
+}
+func (b *KubernetesBackend) jobPodsStopped(ctx context.Context, job *batchv1.Job) (bool, error) {
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 || job.Spec.PodFailurePolicy != nil {
+		return false, nil
+	}
+	pods, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: batchv1.ControllerUidLabel + "=" + string(job.UID),
+	})
+	if err != nil {
+		return false, err
+	}
+	hasFailedPod := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, job) {
+			continue
+		}
+		switch pod.Status.Phase {
+		case corev1.PodFailed:
+			hasFailedPod = true
+		case corev1.PodSucceeded:
+		default:
+			return false, nil
+		}
+	}
+	return hasFailedPod, nil
 }
 
 func (b *KubernetesBackend) deleteTaskJob(ctx context.Context, jobName string, uid *k8stypes.UID) error {

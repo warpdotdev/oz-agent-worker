@@ -307,20 +307,25 @@ eviction.
   The TTL also removes Jobs that finish after worker disruption.
 - `false`: retain finished Jobs and Pods indefinitely, with no TTL.
 
-Regardless of `cleanup`, cancellation or terminal task failure deletes a
-still-active Job and its Pods so it cannot run later. Available diagnostics are
-collected first; unsuccessful deletion is reported and may require operator
-intervention. Worker shutdown preserves active Jobs instead.
+On task failure, the worker retains stopped executions for debugging. If execution
+is still possible or unknown, it expires the Job instead of deleting it.
+Kubernetes stops active Pods and marks the Job failed; the Job keeps its existing
+TTL policy. Expiration can delete active Pods, so available diagnostics are
+captured first. Unsuccessful expiration is reported and may require intervention.
+Explicit cancellation still deletes Jobs; worker shutdown preserves active Jobs.
 
 Transient Kubernetes API observation errors are retried with bounded backoff.
 
 
 Recommended namespace-scoped permissions for the worker are:
 
-- create, get, list, watch, delete `jobs`
+- create, get, list, watch, patch, delete `jobs`
 - get, list, watch `pods`
 - get `pods/log`
 - list `events`
+
+When upgrading an existing installation, update its Role to grant `patch` on Jobs
+before deploying the worker; this permission is required to expire abandoned Jobs.
 
 The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root. By default, task Jobs still materialize sidecars with root init containers; set `kubernetesBackend.useImageVolumes=true` to opt into native image volumes instead. Kubernetes `1.35+` is the recommended and tested target for that opt-in path, while Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
 
