@@ -208,6 +208,8 @@ type TaskFailure struct {
 	// for signal terminations. Zero means no exit status was observed.
 	exitCode       int
 	failureDetails *types.FailureDetails
+	// Kubernetes failures require termination unless execution was observed stopped.
+	jobDisposition jobFailureDisposition
 	err            error
 }
 
