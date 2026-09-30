@@ -48,10 +48,29 @@ func TestAugmentArgsForTask_IdleOnCompletePrecedence(t *testing.T) {
 			expected: []string{"agent", "run", "--idle-on-complete"},
 		},
 		{
-			name: "ignores non-positive task idle_timeout_minutes and falls back to worker value",
+			name: "zero task timeout overrides worker value",
 			task: &types.Task{
 				AgentConfigSnapshot: &types.AmbientAgentConfig{
 					IdleTimeoutMinutes: intPtr(0),
+				},
+			},
+			opts:     TaskAugmentOptions{IdleOnComplete: "20m"},
+			expected: []string{"agent", "run", "--idle-on-complete", "0m"},
+		},
+		{
+			name: "zero task timeout overrides cli default",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					IdleTimeoutMinutes: intPtr(0),
+				},
+			},
+			expected: []string{"agent", "run", "--idle-on-complete", "0m"},
+		},
+		{
+			name: "ignores negative task timeout and falls back to worker value",
+			task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					IdleTimeoutMinutes: intPtr(-1),
 				},
 			},
 			opts:     TaskAugmentOptions{IdleOnComplete: "20m"},
