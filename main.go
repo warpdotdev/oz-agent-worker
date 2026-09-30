@@ -26,7 +26,7 @@ var Version = "dev"
 
 var CLI struct {
 	ConfigFile              string   `help:"Path to YAML config file" type:"path"`
-	Backend                 string   `help:"Backend type (docker, direct, or kubernetes)" enum:"docker,direct,kubernetes," default:""`
+	Backend                 string   `help:"Backend type (docker, direct, kubernetes, or command)" enum:"docker,direct,kubernetes,command," default:""`
 	APIKey                  string   `help:"API key for authentication" env:"WARP_API_KEY" required:""`
 	WorkerID                string   `help:"Worker host identifier (required via flag or config file)"`
 	WebSocketURL            string   `default:"wss://oz.warp.dev/api/v1/selfhosted/worker/ws" hidden:""`
@@ -37,12 +37,14 @@ var CLI struct {
 	Volumes                 []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                     []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks      int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
+	OneShot                 bool     `help:"Exit after running one task (direct backend only)"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 	SessionSharingServerURL string   `help:"Session sharing server WebSocket URL to pass through to the oz CLI (e.g. ws://127.0.0.1:8081)" hidden:""`
 }
 
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	kong.Parse(&CLI,
 		kong.Name("oz-agent-worker"),
@@ -69,7 +71,7 @@ func main() {
 	}
 
 	// Set up the metrics pipeline before constructing the worker so that early
-	// reconnect attempts on Start() are observed. Failures here are
+	// reconnect attempts in Run() are observed. Failures here are
 	// non-fatal: the worker must continue even if metrics export breaks.
 	metricsShutdown, err := metrics.Init(ctx, metrics.Config{
 		WorkerID: workerConfig.WorkerID,
@@ -87,22 +89,9 @@ func main() {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
 	}
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Start worker in background
-	go func() {
-		if err := w.Start(); err != nil {
-			log.Errorf(ctx, "Worker stopped with error: %v", err)
-		}
-	}()
-
-	// Wait for signal
-	sig := <-sigChan
-	log.Infof(ctx, "Received signal %v, shutting down gracefully...", sig)
-
-	w.Shutdown()
+	if err := w.Run(); err != nil {
+		log.Errorf(ctx, "Worker stopped with error: %v", err)
+	}
 
 	// Flush and stop the metrics exporter after the worker has stopped
 	// recording new data points. We use a fresh context with a short timeout
@@ -140,9 +129,14 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			backendType = "direct"
 		} else if fileConfig.Backend.Kubernetes != nil {
 			backendType = "kubernetes"
+		} else if fileConfig.Backend.Command != nil {
+			backendType = "command"
 		} else if fileConfig.Backend.Docker != nil {
 			backendType = "docker"
 		}
+	}
+	if backendType == "" {
+		backendType = "docker"
 	}
 
 	// Merge cleanup: --no-cleanup flag > config file cleanup > default (cleanup=true).
@@ -162,6 +156,16 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if maxConcurrentTasks == 0 && fileConfig != nil && fileConfig.MaxConcurrentTasks != nil {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
+	// Resolve one_shot: CLI true > config file > false. One-shot workers only
+	// ever run one task, so make that explicit in the concurrency configuration
+	// in addition to enforcing lifetime exclusivity in the worker.
+	oneShot := CLI.OneShot
+	if !oneShot && fileConfig != nil && fileConfig.OneShot != nil {
+		oneShot = *fileConfig.OneShot
+	}
+	if oneShot {
+		maxConcurrentTasks = 1
+	}
 
 	// Resolve idle_on_complete: CLI (non-empty) > config file > "" (oz CLI default = 45m).
 	idleOnComplete := CLI.IdleOnComplete
@@ -177,6 +181,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		LogLevel:                CLI.LogLevel,
 		BackendType:             backendType,
 		MaxConcurrentTasks:      maxConcurrentTasks,
+		OneShot:                 oneShot,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}
@@ -315,6 +320,39 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			Env:             mergedEnv,
 		}
 
+	case "command":
+		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
+		mergedEnv := make(map[string]string)
+		var dispatchCmd, cancelCmd, dispatchTimeoutStr string
+		if fileConfig != nil && fileConfig.Backend.Command != nil {
+			cc := fileConfig.Backend.Command
+			mergedEnv = config.ResolveEnv(cc.Environment)
+			dispatchCmd = cc.DispatchCommand
+			cancelCmd = cc.CancelCommand
+			dispatchTimeoutStr = cc.DispatchTimeout
+		}
+		for k, v := range cliEnv {
+			mergedEnv[k] = v
+		}
+
+		var dispatchTimeout time.Duration
+		if dispatchTimeoutStr != "" {
+			d, err := time.ParseDuration(dispatchTimeoutStr)
+			if err != nil {
+				return worker.Config{}, fmt.Errorf("invalid backend.command.dispatch_timeout %q: %w", dispatchTimeoutStr, err)
+			}
+			dispatchTimeout = d
+		}
+
+		wc.Command = &worker.CommandBackendConfig{
+			DispatchCommand: dispatchCmd,
+			CancelCommand:   cancelCmd,
+			DispatchTimeout: dispatchTimeout,
+			Env:             mergedEnv,
+			ServerRootURL:   CLI.ServerRootURL,
+			WorkerID:        workerID,
+		}
+
 	default: // docker
 		// Merge env: config file first, then CLI overlay (CLI wins on key conflict).
 		mergedEnv := make(map[string]string)
@@ -327,15 +365,20 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 
 		// Merge volumes: config file + CLI (concatenated).
 		var volumes []string
+		var imagePullPolicy, sidecarImage string
 		if fileConfig != nil && fileConfig.Backend.Docker != nil {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
+			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
+			sidecarImage = fileConfig.Backend.Docker.SidecarImage
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
 		wc.Docker = &worker.DockerBackendConfig{
-			NoCleanup: noCleanup,
-			Volumes:   volumes,
-			Env:       mergedEnv,
+			NoCleanup:       noCleanup,
+			Volumes:         volumes,
+			Env:             mergedEnv,
+			ImagePullPolicy: imagePullPolicy,
+			SidecarImage:    sidecarImage,
 		}
 	}
 

@@ -30,6 +30,10 @@ warp:
 worker:
   workerId: ""
   logLevel: info
+  # False retains finished Jobs indefinitely (no TTL). True deletes successful
+  # Jobs immediately and retains failed Jobs for kubernetesBackend.ttlSecondsAfterFinished.
+  # Abandoned executions are expired, retaining the Job but not active Pods.
+  # Cancellation deletes Jobs; worker shutdown preserves them.
   cleanup: true
   maxConcurrentTasks: 0
   idleOnComplete: ""
@@ -82,13 +86,21 @@ kubernetesBackend:
   teardownCommand: ""
   extraLabels: {}
   extraAnnotations: {}
-  activeDeadlineSeconds: null
-  # Fallback cleanup for task Jobs that finish after the worker pod that created
-  # them has been disrupted. When worker.cleanup=false, the worker does not set
-  # a TTL so Jobs remain available for debugging.
+  # Hard wall-clock cap on how long a single task Job (and its pod) may run
+  # before Kubernetes terminates it and marks the Job failed with a
+  # DeadlineExceeded condition. This is a safety backstop against tasks whose
+  # process never exits, so worker pods cannot linger indefinitely.
+  # Defaults to 8h (28800s); set to null to disable the cap.
+  activeDeadlineSeconds: 28800
+  # How long finished task Jobs that the worker leaves in place are retained before
+  # the Kubernetes Job TTL controller deletes them (and their pods). This covers
+  # failed task Jobs, which are kept for post-mortem debugging, and Jobs orphaned by
+  # worker disruption. Successful task Jobs are deleted immediately by the worker, so
+  # this does not keep them around. Defaults to 24h (86400s). When worker.cleanup=false
+  # the worker sets no TTL, so these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
-  unschedulableTimeout: "30s"
+  unschedulableTimeout: "10m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
   # using standard K8s syntax (e.g. containers[].env with valueFrom.secretKeyRef).

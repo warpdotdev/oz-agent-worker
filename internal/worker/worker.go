@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -34,13 +35,21 @@ const (
 )
 
 type Config struct {
-	APIKey             string
-	WorkerID           string
-	WebSocketURL       string
-	ServerRootURL      string
-	LogLevel           string
-	BackendType        string // "docker", "direct", or "kubernetes"
-	MaxConcurrentTasks int    // 0 means unlimited
+	APIKey        string
+	WorkerID      string
+	WebSocketURL  string
+	ServerRootURL string
+	LogLevel      string
+	BackendType   string // "docker", "direct", or "kubernetes"
+	// MaxConcurrentTasks caps how many tasks may execute locally at once
+	// (0 means unlimited). A task's slot is released when the backend's
+	// ExecuteTask returns, so for backends that spawn tasks fire-and-forget
+	// (e.g. command), a slot is held only for the brief dispatch and the limit
+	// effectively does not bound the number of remote tasks running at once.
+	MaxConcurrentTasks int
+	// OneShot makes the worker accept one task and exit after it reaches a
+	// terminal outcome. Backend support is validated before initialization.
+	OneShot bool
 	// IdleOnComplete is passed to the oz CLI's --idle-on-complete flag for every task.
 	// Empty string means use the oz CLI default (45m). Use "0s" to disable idle.
 	IdleOnComplete string
@@ -51,25 +60,73 @@ type Config struct {
 	Docker     *DockerBackendConfig
 	Direct     *DirectBackendConfig
 	Kubernetes *KubernetesBackendConfig
+	Command    *CommandBackendConfig
 }
 
 type Worker struct {
-	config         Config
-	conn           *websocket.Conn
-	connMutex      sync.Mutex
-	ctx            context.Context
-	cancel         context.CancelFunc
-	reconnectDelay time.Duration
-	lastHeartbeat  time.Time
-	sendChan       chan []byte
-	activeTasks    map[string]activeTask
-	tasksMutex     sync.Mutex
-	backend        Backend
-	taskSemaphore  *semaphore.Weighted // nil when unlimited
+	config        Config
+	ctx           context.Context
+	outbound      *outboundQueue
+	activeTasks   map[string]activeTask
+	tasksMutex    sync.Mutex
+	taskWG        sync.WaitGroup
+	shuttingDown  bool
+	oneShot       oneShotState
+	backend       Backend
+	taskSemaphore *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
 }
+
+type runOutcome int
+
+const (
+	runOutcomeConnectionClosed runOutcome = iota
+	runOutcomeOneShotComplete
+	runOutcomeServerShutdown
+)
+
+type oneShotState struct {
+	mutex        sync.Mutex
+	accepted     bool
+	done         chan struct{}
+	completeOnce sync.Once
+}
+
+func newOneShotState() oneShotState {
+	return oneShotState{done: make(chan struct{})}
+}
+
+func (s *oneShotState) tryAccept() bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.accepted {
+		return false
+	}
+	s.accepted = true
+	return true
+}
+
+func (s *oneShotState) resetAcceptance() {
+	s.mutex.Lock()
+	s.accepted = false
+	s.mutex.Unlock()
+}
+
+func (s *oneShotState) complete() {
+	if s.done == nil {
+		return
+	}
+	s.completeOnce.Do(func() {
+		close(s.done)
+	})
+}
+
+func (s *oneShotState) doneChannel() <-chan struct{} {
+	return s.done
+}
+
 type taskCancellationSource string
 
 const (
@@ -81,14 +138,29 @@ type activeTask struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	cancellationSource taskCancellationSource
+	// executionID is retained so a cancellation can hand the backend full
+	// CancelParams without needing the original assignment.
+	executionID string
+	// spawned marks a task whose backend returned ExecuteOutcomeSpawned: it no
+	// longer executes locally, but the entry is kept so a later cancellation
+	// can be routed to the backend's CancelTask.
+	spawned bool
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
-	workerCtx, cancel := context.WithCancel(ctx)
+	backendType := config.BackendType
+	capabilities, err := capabilitiesForBackend(backendType)
+	if err != nil {
+		return nil, err
+	}
+	if config.OneShot && !capabilities.supportsOneShot {
+		return nil, fmt.Errorf("backend %q does not support one-shot mode", backendType)
+	}
+	if config.OneShot {
+		config.MaxConcurrentTasks = 1
+	}
 
 	var backend Backend
-	var err error
-
 	switch config.BackendType {
 	case "kubernetes":
 		if config.Kubernetes == nil {
@@ -97,22 +169,24 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		backend, err = NewKubernetesBackend(ctx, *config.Kubernetes)
 	case "direct":
 		if config.Direct == nil {
-			cancel()
 			return nil, fmt.Errorf("direct backend selected but no direct config provided")
 		}
 		backend, err = NewDirectBackend(ctx, *config.Direct)
+	case "command":
+		if config.Command == nil {
+			return nil, fmt.Errorf("command backend selected but no command config provided")
+		}
+		backend, err = NewCommandBackend(ctx, *config.Command)
 	case "docker", "":
 		if config.Docker == nil {
 			config.Docker = &DockerBackendConfig{}
 		}
 		backend, err = NewDockerBackend(ctx, *config.Docker)
 	default:
-		cancel()
-		return nil, fmt.Errorf("unknown backend type: %q", config.BackendType)
+		return nil, fmt.Errorf("unknown backend type: %q", backendType)
 	}
 
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 
@@ -123,51 +197,93 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 
 	return &Worker{
 		config:            config,
-		ctx:               workerCtx,
-		cancel:            cancel,
-		reconnectDelay:    InitialReconnectDelay,
-		sendChan:          make(chan []byte, 256),
+		ctx:               ctx,
+		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
 	}, nil
 }
 
-func (w *Worker) Start() error {
+func capabilitiesForBackend(backendType string) (backendCapabilities, error) {
+	switch backendType {
+	case "direct":
+		return (&DirectBackend{}).Capabilities(), nil
+	case "docker", "":
+		return (&DockerBackend{}).Capabilities(), nil
+	case "kubernetes":
+		return (&KubernetesBackend{}).Capabilities(), nil
+	case "command":
+		return (&CommandBackend{}).Capabilities(), nil
+	default:
+		return backendCapabilities{}, fmt.Errorf("unknown backend type: %q", backendType)
+	}
+}
+
+// Run drives the worker's processing loops until the server context is cancelled
+// for graceful shutdown or a one-shot task finishes:
+// - The WebSocket connection loop
+// - Task acceptance and processing
+// - Client state maintained by backends
+func (w *Worker) Run() error {
+	protocolCtx, protocolCancel := context.WithCancel(context.Background())
+	defer protocolCancel()
+	defer w.shutdownBackend()
+	reconnectDelay := InitialReconnectDelay
+
 	for {
-		select {
-		case <-w.ctx.Done():
-			return w.ctx.Err()
-		default:
+		if w.ctx.Err() != nil {
+			w.shutdownTasks()
+			w.outbound.Close()
+			return nil
 		}
 
-		if err := w.connect(); err != nil {
-			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, w.reconnectDelay)
+		conn, err := w.connect()
+		if err != nil {
+			if w.ctx.Err() != nil {
+				w.shutdownTasks()
+				w.outbound.Close()
+				return nil
+			}
+			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, reconnectDelay)
 			metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonDialFailed)
-			time.Sleep(w.reconnectDelay)
-
-			// Compute exponential back-off.
-			w.reconnectDelay = min(time.Duration(float64(w.reconnectDelay)*ReconnectBackoffRate), MaxReconnectDelay)
+			timer := time.NewTimer(reconnectDelay)
+			select {
+			case <-timer.C:
+			case <-w.ctx.Done():
+				// If the timer fired concurrently with cancellation, consume
+				// its tick when available before returning.
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				w.shutdownTasks()
+				w.outbound.Close()
+				return nil
+			}
+			reconnectDelay = min(time.Duration(float64(reconnectDelay)*ReconnectBackoffRate), MaxReconnectDelay)
 			continue
 		}
 
-		w.reconnectDelay = InitialReconnectDelay
+		reconnectDelay = InitialReconnectDelay
 		metrics.SetConnected(true)
-
-		w.run()
-
-		// run() returns when the connection is torn down. The Start loop will
-		// either exit via w.ctx.Done() above or reconnect on the next iteration.
+		outcome := w.serveConnection(protocolCtx, conn)
 		metrics.SetConnected(false)
+		if outcome == runOutcomeOneShotComplete || outcome == runOutcomeServerShutdown {
+			return nil
+		}
 		metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonRemoteClose)
 	}
 }
 
-func (w *Worker) connect() error {
+func (w *Worker) connect() (*websocket.Conn, error) {
 	u, err := url.Parse(w.config.WebSocketURL)
 	if err != nil {
-		return fmt.Errorf("invalid WebSocket URL: %w", err)
+		return nil, fmt.Errorf("invalid WebSocket URL: %w", err)
 	}
 
 	query := u.Query()
@@ -178,119 +294,144 @@ func (w *Worker) connect() error {
 	headers["Authorization"] = []string{fmt.Sprintf("Bearer %s", w.config.APIKey)}
 
 	log.Infof(w.ctx, "Connecting to %s", u.String())
-
 	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("failed to dial WebSocket: %w\n%s", err, resp.Status)
+			return nil, fmt.Errorf("failed to dial WebSocket: %w\n%s", err, resp.Status)
 		}
-		return fmt.Errorf("failed to dial WebSocket: %w", err)
+		return nil, fmt.Errorf("failed to dial WebSocket: %w", err)
 	}
 
-	w.connMutex.Lock()
-	w.conn = conn
-	w.connMutex.Unlock()
-
 	log.Infof(w.ctx, "Successfully connected to server")
-
 	conn.SetPongHandler(func(string) error {
-		w.lastHeartbeat = time.Now()
 		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
 			log.Warnf(w.ctx, "Failed to set read deadline in pong handler: %v", err)
 		}
 		return nil
 	})
-
-	return nil
+	return conn, nil
 }
 
-func (w *Worker) run() {
-	w.connMutex.Lock()
-	conn := w.conn
-	w.connMutex.Unlock()
-	if conn == nil {
-		return
-	}
+func (w *Worker) serveConnection(protocolCtx context.Context, conn *websocket.Conn) runOutcome {
+	connectionCtx, connectionCancel := context.WithCancel(protocolCtx)
+	defer connectionCancel()
+	group, groupCtx := errgroup.WithContext(connectionCtx)
+	closeConnectionOnCancel := context.AfterFunc(groupCtx, func() {
+		_ = conn.Close()
+	})
+	defer closeConnectionOnCancel()
 
-	done := make(chan struct{})
+	// group.Wait also waits for the reader and heartbeat, which only stop after
+	// connection cancellation. Track the writer separately so graceful
+	// shutdown can drain it before cancelling the connection.
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	group.Go(func() error {
+		return w.readLoop(groupCtx, conn)
+	})
+	group.Go(func() error {
+		defer writerWG.Done()
+		return w.writeLoop(groupCtx, conn)
+	})
+	group.Go(func() error {
+		return w.heartbeatLoop(groupCtx, conn)
+	})
 
-	// Each loop is bound to this connection. A loop from a previous
-	// connection must never write to a newer connection: gorilla/websocket
-	// supports at most one concurrent writer per connection, and a stale
-	// writer racing the current one panics the whole process with
-	// "concurrent write to websocket connection".
-	go w.readLoop(conn, done)
-	go w.writeLoop(conn, done)
-	go w.heartbeatLoop(conn, done)
+	// errgroup.Wait blocks rather than returning a channel, so adapt it to a
+	// channel that can be selected alongside server cancellation.
+	groupDone := make(chan error, 1)
+	go func() {
+		groupDone <- group.Wait()
+	}()
 
-	<-done
-
-	w.connMutex.Lock()
-	if w.conn != nil {
-		if err := w.conn.Close(); err != nil {
-			log.Warnf(w.ctx, "Error closing connection: %v", err)
+	select {
+	case err := <-groupDone:
+		if err != nil && protocolCtx.Err() == nil {
+			log.Warnf(w.ctx, "Connection closed: %v", err)
 		}
-		w.conn = nil
+		return runOutcomeConnectionClosed
+	case <-w.ctx.Done():
+		w.shutdownTasks()
+		w.gracefullyCloseConnection(conn, connectionCancel, &writerWG, groupDone)
+		return runOutcomeServerShutdown
+	case <-w.oneShot.doneChannel():
+		select {
+		case err := <-groupDone:
+			if err != nil && protocolCtx.Err() == nil {
+				log.Warnf(w.ctx, "Connection closed: %v", err)
+			}
+			return runOutcomeConnectionClosed
+		default:
+		}
+		w.gracefullyCloseConnection(conn, connectionCancel, &writerWG, groupDone)
+		return runOutcomeOneShotComplete
 	}
-	w.connMutex.Unlock()
-
-	log.Warnf(w.ctx, "Connection closed, will attempt to reconnect")
 }
 
-func (w *Worker) readLoop(conn *websocket.Conn, done chan struct{}) {
-	defer close(done)
+func (w *Worker) gracefullyCloseConnection(
+	conn *websocket.Conn,
+	connectionCancel context.CancelFunc,
+	writerWG *sync.WaitGroup,
+	groupDone <-chan error,
+) {
+	w.outbound.Close()
+	writerWG.Wait()
 
+	closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	if err := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(WriteWait)); err != nil {
+		log.Warnf(w.ctx, "Failed to send close message: %v", err)
+	}
+	connectionCancel()
+	<-groupDone
+}
+
+func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
 		select {
-		case <-w.ctx.Done():
-			return
+		case <-ctx.Done():
+			return nil
 		default:
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
-			log.Errorf(w.ctx, "Failed to set read deadline: %v", err)
-			return
+			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Errorf(w.ctx, "WebSocket read error: %v", err)
+			if ctx.Err() != nil {
+				return nil
 			}
-			return
+			return fmt.Errorf("WebSocket read failed: %w", err)
 		}
-
 		log.Debugf(w.ctx, "WebSocket received: %s", string(message))
-
 		w.handleMessage(message)
 	}
 }
 
 // writeLoop is the single writer of data frames on conn. All data messages
-// must go through sendChan; nothing else may call WriteMessage on conn while
-// this loop is running.
-func (w *Worker) writeLoop(conn *websocket.Conn, done chan struct{}) {
+// must go through the outbound queue; nothing else may call WriteMessage on
+// conn while this loop is running.
+func (w *Worker) writeLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
 		select {
-		case <-w.ctx.Done():
-			return
-		case <-done:
-			return
-		case message := <-w.sendChan:
+		case <-ctx.Done():
+			return nil
+		case message, ok := <-w.outbound.Messages():
+			if !ok {
+				return nil
+			}
 			log.Debugf(w.ctx, "WebSocket sending: %s", string(message))
-
 			if err := conn.SetWriteDeadline(time.Now().Add(WriteWait)); err != nil {
-				log.Errorf(w.ctx, "Failed to set write deadline: %v", err)
-				return
+				return fmt.Errorf("failed to set write deadline: %w", err)
 			}
 			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				log.Errorf(w.ctx, "WebSocket write error: %v", err)
-				return
+				return fmt.Errorf("WebSocket write failed: %w", err)
 			}
 		}
 	}
 }
 
-func (w *Worker) heartbeatLoop(conn *websocket.Conn, done chan struct{}) {
+func (w *Worker) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error {
 	interval := w.heartbeatInterval
 	if interval <= 0 {
 		interval = HeartbeatInterval
@@ -300,19 +441,15 @@ func (w *Worker) heartbeatLoop(conn *websocket.Conn, done chan struct{}) {
 
 	for {
 		select {
-		case <-w.ctx.Done():
-			return
-		case <-done:
-			return
+		case <-ctx.Done():
+			return nil
 		case <-ticker.C:
 			// Pings must use WriteControl: it is the only write method that
 			// gorilla/websocket documents as safe to call concurrently with
 			// the data writes performed by writeLoop. Using WriteMessage here
-			// races writeLoop and panics the process with "concurrent write
-			// to websocket connection".
+			// races writeLoop and can panic the process.
 			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(WriteWait)); err != nil {
-				log.Errorf(w.ctx, "Failed to send ping: %v", err)
-				return
+				return fmt.Errorf("failed to send ping: %w", err)
 			}
 		}
 	}
@@ -353,11 +490,20 @@ func (w *Worker) handleMessage(message []byte) {
 func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
 	w.tasksMutex.Lock()
 	task, ok := w.activeTasks[cancellation.TaskID]
-	if ok && task.cancellationSource == "" {
-		task.cancellationSource = taskCancellationSourceUser
-		w.activeTasks[cancellation.TaskID] = task
+	if ok {
+		if task.cancellationSource == "" {
+			task.cancellationSource = taskCancellationSourceUser
+			w.activeTasks[cancellation.TaskID] = task
+		}
+		if task.spawned {
+			// executeTask has already returned for a spawned task, so no
+			// deferred cleanup will remove the entry; drop it now that the
+			// cancellation is being routed to the backend.
+			delete(w.activeTasks, cancellation.TaskID)
+		}
 	}
 	w.tasksMutex.Unlock()
+
 	if !ok {
 		log.Warnf(w.ctx, "Received cancellation for inactive task: taskID=%s", cancellation.TaskID)
 		return
@@ -368,7 +514,27 @@ func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMess
 		attribute.String("source", "server"),
 		attribute.String("task.id", cancellation.TaskID),
 	)
+	// Every backend gets the same cancellation contract: its cancelation hook
+	// is invoked explicitly, and then its execution context is canceled..
+	w.cancelTaskOnBackend(&CancelParams{TaskID: cancellation.TaskID, ExecutionID: task.executionID})
 	task.cancel()
+}
+
+// cancelTaskOnBackend makes a best-effort attempt to cancel a task via the
+// backend's CancelTask.
+func (w *Worker) cancelTaskOnBackend(params *CancelParams) {
+	log.Infof(w.ctx, "Requesting backend cancellation for task %s", params.TaskID)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), BackendShutdownTimeout)
+		defer cancel()
+		if err := w.backend.CancelTask(ctx, params); err != nil {
+			log.Warnf(w.ctx, "Backend cancellation failed for task %s: %v", params.TaskID, err)
+			metrics.AddTaskEvent(ctx, "cancel.failed",
+				attribute.String("reason", string(metrics.TaskFailureReasonCancelCommand)),
+				attribute.String("task.id", params.TaskID),
+			)
+		}
+	}()
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
@@ -381,39 +547,37 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 		attribute.String("task.id", assignment.TaskID),
 	)
 
+	w.tasksMutex.Lock()
+	rejectionReason := ""
+	rejectionMetric := ""
+	switch {
+	case w.shuttingDown || w.ctx.Err() != nil:
+		rejectionReason = "worker is shutting down"
+		rejectionMetric = metrics.RejectReasonShuttingDown
+	case w.config.OneShot && !w.oneShot.tryAccept():
+		rejectionReason = "one-shot worker has already accepted a task"
+		rejectionMetric = metrics.RejectReasonOneShotComplete
+	default:
+		w.taskWG.Add(1)
+	}
+	w.tasksMutex.Unlock()
+	if rejectionReason != "" {
+		w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, rejectionReason, rejectionMetric)
+		return
+	}
+
 	// Check concurrency limit before claiming the task.
 	if w.taskSemaphore != nil {
 		if !w.taskSemaphore.TryAcquire(1) {
-			log.Warnf(w.ctx, "Rejecting task %s: worker at maximum concurrency (%d)", assignment.TaskID, w.config.MaxConcurrentTasks)
-			metrics.RecordTaskRejected(metrics.RejectReasonAtCapacity)
-			metrics.AddTaskEvent(taskCtx, "task.rejected",
-				attribute.String("reason", metrics.RejectReasonAtCapacity),
-			)
-			span.End()
-			if err := w.sendTaskRejected(assignment.TaskID, "worker at maximum concurrency"); err != nil {
-				log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
+			w.tasksMutex.Lock()
+			if w.config.OneShot {
+				w.oneShot.resetAcceptance()
 			}
+			w.tasksMutex.Unlock()
+			w.taskWG.Done()
+			w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
 			return
 		}
-	}
-
-	// It's important to update the task state to claimed as the task lifecycle treats this as a dependency to advance to further states.
-	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
-		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
-	}
-	metrics.RecordTaskClaim()
-	metrics.AddTaskEvent(taskCtx, "task.claimed")
-	metrics.IncTasksActive()
-	select {
-	case <-w.ctx.Done():
-		log.Infof(w.ctx, "Skipping task execution after worker shutdown during claim: taskID=%s", assignment.TaskID)
-		if w.taskSemaphore != nil {
-			w.taskSemaphore.Release(1)
-		}
-		metrics.DecTasksActive()
-		span.End()
-		return
-	default:
 	}
 
 	executionCtx := taskCtx
@@ -423,12 +587,50 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	taskCtx, taskCancel := context.WithCancel(executionCtx)
 
 	w.tasksMutex.Lock()
+	if w.shuttingDown || w.ctx.Err() != nil {
+		if w.config.OneShot {
+			w.oneShot.resetAcceptance()
+		}
+		w.tasksMutex.Unlock()
+		taskCancel()
+		if w.taskSemaphore != nil {
+			w.taskSemaphore.Release(1)
+		}
+		w.taskWG.Done()
+		w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, "worker is shutting down", metrics.RejectReasonShuttingDown)
+		return
+	}
 	w.activeTasks[assignment.TaskID] = activeTask{
-		ctx:    taskCtx,
-		cancel: taskCancel,
+		ctx:         taskCtx,
+		cancel:      taskCancel,
+		executionID: assignment.ExecutionID,
 	}
 	w.tasksMutex.Unlock()
-	go w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+
+	// It's important to update the task state to claimed as the task lifecycle
+	// treats this as a dependency to advance to further states.
+	if err := w.sendTaskClaimed(assignment.TaskID); err != nil {
+		log.Errorf(w.ctx, "Failed to send task claimed message: %v", err)
+	}
+	metrics.RecordTaskClaim()
+	metrics.AddTaskEvent(taskCtx, "task.claimed")
+	metrics.IncTasksActive()
+	go func() {
+		defer w.taskWG.Done()
+		w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+	}()
+}
+
+func (w *Worker) rejectTaskAssignment(ctx context.Context, span trace.Span, taskID, reason, metricReason string) {
+	log.Warnf(w.ctx, "Rejecting task %s: %s", taskID, reason)
+	metrics.RecordTaskRejected(metricReason)
+	metrics.AddTaskEvent(ctx, "task.rejected",
+		attribute.String("reason", metricReason),
+	)
+	span.End()
+	if err := w.sendTaskRejected(taskID, reason); err != nil {
+		log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
+	}
 }
 
 // prepareTaskParams converts a TaskAssignmentMessage into backend-agnostic TaskParams,
@@ -484,9 +686,9 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	var sidecars []types.SidecarMount
 	if assignment.SidecarImage != "" {
 		sidecarImage := assignment.SidecarImage
-		if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
-			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, w.config.Kubernetes.SidecarImage)
-			sidecarImage = w.config.Kubernetes.SidecarImage
+		if override := w.configuredWarpAgentSidecarImage(); override != "" {
+			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, override)
+			sidecarImage = override
 		}
 		sidecars = append(sidecars, types.SidecarMount{
 			Image:     sidecarImage,
@@ -526,6 +728,18 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		}
 	}
 
+	setupEvents := newSetupEventReporter(w.config.ServerRootURL, assignment)
+	if setupEvents == nil {
+		// Warn once per task: a fleet-wide config or credential change that
+		// disables setup event reporting must be visible in the worker logs,
+		// not silently drop the setup metrics.
+		reason := "the worker has no server root URL configured"
+		if w.config.ServerRootURL != "" {
+			reason = warpAPIKeyEnv + " is not present in the task assignment env vars"
+		}
+		log.Warnf(w.ctx, "Setup event reporting is disabled for task %s: %s", assignment.TaskID, reason)
+	}
+
 	return &TaskParams{
 		TaskID:        assignment.TaskID,
 		ExecutionID:   assignment.ExecutionID,
@@ -535,7 +749,21 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage:   dockerImage,
 		Sidecars:      sidecars,
 		InstanceShape: assignment.InstanceShape,
+		SetupEvents:   setupEvents,
 	}
+}
+
+// configuredWarpAgentSidecarImage returns the operator-configured warp-agent sidecar
+// image, or empty if neither backend set one. Only one backend config is populated
+// at runtime.
+func (w *Worker) configuredWarpAgentSidecarImage() string {
+	if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
+		return w.config.Kubernetes.SidecarImage
+	}
+	if w.config.Docker != nil && w.config.Docker.SidecarImage != "" {
+		return w.config.Docker.SidecarImage
+	}
+	return ""
 }
 
 // defaultImageForTask returns the Docker image to use for a task, applying the
@@ -561,12 +789,20 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
+	// One-shot-capable backends always wait for a terminal outcome. Register
+	// this first so the task bookkeeping defer below runs before completion is
+	// signalled.
+	defer w.signalOneShotComplete()
 
 	defer func() {
 		taskCancel()
 		span.End()
 		w.tasksMutex.Lock()
-		delete(w.activeTasks, assignment.TaskID)
+		// Spawned tasks stay in activeTasks so a later cancellation can be
+		// routed to the backend's CancelTask; everything else is done.
+		if task, tracked := w.activeTasks[assignment.TaskID]; !tracked || !task.spawned {
+			delete(w.activeTasks, assignment.TaskID)
+		}
 		w.tasksMutex.Unlock()
 
 		if w.taskSemaphore != nil {
@@ -587,8 +823,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		attribute.String("docker.image", params.DockerImage),
 	)
 
-	err := w.backend.ExecuteTask(ctx, params)
-	if err != nil {
+	executeResult := w.backend.ExecuteTask(ctx, params)
+	if executeResult.Error != nil {
+		err := executeResult.Error
 		if ctx.Err() == context.Canceled && w.cancellationSource(taskID) == taskCancellationSourceUser {
 			result = metrics.TaskResultCancelled
 			metrics.AddTaskEvent(ctx, "task.cancelled",
@@ -596,35 +833,68 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			)
 			span.SetStatus(codes.Ok, "task cancelled by user request")
 			log.Infof(ctx, "Task execution cancelled by user request: taskID=%s", taskID)
-			if statusErr := w.sendTaskCancelled(taskID, "Task cancelled by user request."); statusErr != nil {
+			if statusErr := w.sendTaskCancelled(taskID, assignment.ExecutionID, "Task cancelled by user request."); statusErr != nil {
 				log.Errorf(ctx, "Failed to send task cancelled message: %v", statusErr)
 			}
 			return
 		}
 
 		result = metrics.TaskResultFailed
-		phase, reason := taskFailureLabels(err)
-		metrics.RecordTaskFailure(phase, reason)
+		metricsPhase, metricsReason := taskFailureLabels(err)
+		exitCode := failureExitCode(err)
+		// Reclassify failures caused by a graceful worker shutdown (task
+		// cancelled, or agent killed by the shutdown's SIGTERM) as
+		// graceful_shutdown.
+		if w.cancellationSource(taskID) == taskCancellationSourceShutdown &&
+			(metricsReason == metrics.TaskFailureReasonTaskCancelled || exitCode == sigtermExitCode) {
+			metricsReason = metrics.TaskFailureReasonGracefulShutdown
+		}
+		metrics.RecordTaskFailure(metricsPhase, metricsReason)
 		metrics.AddTaskEvent(ctx, "task.failed",
-			attribute.String("failure.phase", phase),
-			attribute.String("failure.reason", reason),
+			attribute.String("failure.phase", string(metricsPhase)),
+			attribute.String("failure.reason", string(metricsReason)),
 			attribute.String("error.message", err.Error()),
 		)
 		span.RecordError(err)
-		span.SetStatus(codes.Error, reason)
+		span.SetStatus(codes.Error, string(metricsReason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
-		if statusErr := w.sendTaskFailed(taskID, userFacingTaskError(err)); statusErr != nil {
+		if statusErr := w.sendTaskFailed(taskID, assignment.ExecutionID, userFacingTaskError(err), metricsReason, exitCode, taskFailureDetails(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
+		return
+	}
+
+	if executeResult.Outcome == ExecuteOutcomeSpawned {
+		// If the backend spawned the task asynchronously, then we must not
+		// finalize the task now. Instead, we keep the active task record
+		// so that cancellation can be routed to the backend's CancelTask
+		// implementation later.
+		result = metrics.TaskResultDispatched
+		w.tasksMutex.Lock()
+		if task, tracked := w.activeTasks[taskID]; tracked && task.cancellationSource == "" {
+			task.spawned = true
+			w.activeTasks[taskID] = task
+		}
+		w.tasksMutex.Unlock()
+		metrics.AddTaskEvent(ctx, "task.dispatched")
+		span.SetStatus(codes.Ok, "task dispatched to remote runtime")
+		log.Infof(ctx, "Task %s dispatched", taskID)
 		return
 	}
 
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
 	metrics.AddTaskEvent(ctx, "task.completed")
 	span.SetStatus(codes.Ok, "task completed")
-	if err := w.sendTaskCompleted(taskID, "Task completed successfully"); err != nil {
+	if err := w.sendTaskCompleted(taskID, assignment.ExecutionID, "Task completed successfully"); err != nil {
 		log.Errorf(ctx, "Failed to send task completed message: %v", err)
 	}
+}
+
+func (w *Worker) signalOneShotComplete() {
+	if !w.config.OneShot {
+		return
+	}
+	w.oneShot.complete()
 }
 
 func (w *Worker) cancellationSource(taskID string) taskCancellationSource {
@@ -661,12 +931,13 @@ func (w *Worker) sendTaskClaimed(taskID string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskCancelled(taskID, message string) error {
+func (w *Worker) sendTaskCancelled(taskID, executionID, message string) error {
 	taskState := types.TaskStateCancelled
 	completedMsg := types.TaskCompletedMessage{
-		TaskID:    taskID,
-		Message:   message,
-		TaskState: &taskState,
+		TaskID:      taskID,
+		ExecutionID: executionID,
+		Message:     message,
+		TaskState:   &taskState,
 	}
 
 	data, err := json.Marshal(completedMsg)
@@ -711,10 +982,11 @@ func (w *Worker) sendTaskRejected(taskID, reason string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskCompleted(taskID, message string) error {
+func (w *Worker) sendTaskCompleted(taskID, executionID, message string) error {
 	completedMsg := types.TaskCompletedMessage{
-		TaskID:  taskID,
-		Message: message,
+		TaskID:      taskID,
+		ExecutionID: executionID,
+		Message:     message,
 	}
 
 	data, err := json.Marshal(completedMsg)
@@ -735,10 +1007,14 @@ func (w *Worker) sendTaskCompleted(taskID, message string) error {
 	return w.sendMessage(msgBytes)
 }
 
-func (w *Worker) sendTaskFailed(taskID, message string) error {
+func (w *Worker) sendTaskFailed(taskID, executionID, message string, reason metrics.TaskFailureReason, exitCode int, failureDetails *types.FailureDetails) error {
 	failedMsg := types.TaskFailedMessage{
-		TaskID:  taskID,
-		Message: message,
+		TaskID:         taskID,
+		ExecutionID:    executionID,
+		Message:        message,
+		FailureReason:  string(reason),
+		ExitCode:       exitCode,
+		FailureDetails: failureDetails,
 	}
 
 	data, err := json.Marshal(failedMsg)
@@ -760,21 +1036,20 @@ func (w *Worker) sendTaskFailed(taskID, message string) error {
 }
 
 func (w *Worker) sendMessage(message []byte) error {
-	select {
-	case w.sendChan <- message:
-		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout sending message")
-	case <-w.ctx.Done():
-		return fmt.Errorf("worker context cancelled")
+	if w.outbound == nil {
+		return fmt.Errorf("worker send queue is not initialized")
 	}
+	return w.outbound.Send(message)
 }
 
-func (w *Worker) Shutdown() {
-	log.Infof(w.ctx, "Shutting down worker...")
+func (w *Worker) shutdownTasks() {
 	preserveActiveTasks := w.backend.PreservesTasksOnShutdown()
-
 	w.tasksMutex.Lock()
+	if w.shuttingDown {
+		w.tasksMutex.Unlock()
+		return
+	}
+	w.shuttingDown = true
 	activeTaskCount := len(w.activeTasks)
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
@@ -796,29 +1071,22 @@ func (w *Worker) Shutdown() {
 	w.tasksMutex.Unlock()
 
 	if activeTaskCount > 0 && !preserveActiveTasks {
-		time.Sleep(500 * time.Millisecond)
+		tasksDone := make(chan struct{})
+		go func() {
+			w.taskWG.Wait()
+			close(tasksDone)
+		}()
+		select {
+		case <-tasksDone:
+		case <-time.After(BackendShutdownTimeout):
+			log.Warnf(w.ctx, "Timed out waiting for active tasks to finish during shutdown")
+		}
 	}
+}
 
-	w.cancel()
+func (w *Worker) shutdownBackend() {
+
 	backendShutdownCtx, backendShutdownCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
 	defer backendShutdownCancel()
 	w.backend.Shutdown(backendShutdownCtx)
-
-	w.connMutex.Lock()
-	if w.conn != nil {
-		// WriteControl is safe to call concurrently with writeLoop's data
-		// writes and enforces its own deadline, so shutdown can neither panic
-		// the process nor block indefinitely on a wedged connection.
-		closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		if err := w.conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(WriteWait)); err != nil {
-			log.Warnf(w.ctx, "Failed to send close message: %v", err)
-		}
-		if err := w.conn.Close(); err != nil {
-			log.Warnf(w.ctx, "Failed to close connection: %v", err)
-		}
-		w.conn = nil
-	}
-	w.connMutex.Unlock()
-
-	log.Infof(w.ctx, "Worker shutdown complete")
 }

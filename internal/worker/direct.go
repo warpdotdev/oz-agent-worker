@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -15,6 +17,31 @@ import (
 )
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
+
+// directBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
+const directBackendTypeName = "direct"
+
+// directSetupEnvVars and directTeardownEnvVars return exactly the worker-owned variables this
+// backend adds to the operator's setup and teardown hooks. TestBackendEnvPairsEveryOZName runs
+// its pairing assertion over these, so a variable added here under only one of its two names
+// fails the build. GIT_CONFIG_GLOBAL has no OZ_/WARP_ spelling and is left unpaired.
+func directSetupEnvVars(workspaceDir, taskID, environmentFile string) []string {
+	return concatEnvVars(
+		workspaceRootEnvVars(workspaceDir),
+		workerBackendEnvVars(directBackendTypeName),
+		runIDEnvVars(taskID),
+		environmentFileEnvVars(environmentFile),
+	)
+}
+
+func directTeardownEnvVars(workspaceDir, gitConfigPath, taskID string) []string {
+	return concatEnvVars(
+		workspaceRootEnvVars(workspaceDir),
+		[]string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)},
+		workerBackendEnvVars(directBackendTypeName),
+		runIDEnvVars(taskID),
+	)
+}
 
 // validateTaskIDForPath ensures task IDs are safe to use as a single path component.
 func validateTaskIDForPath(taskID string) error {
@@ -87,6 +114,10 @@ type DirectBackend struct {
 	ozPath string // resolved path to the oz CLI
 }
 
+func (b *DirectBackend) Capabilities() backendCapabilities {
+	return backendCapabilities{supportsOneShot: true}
+}
+
 // NewDirectBackend creates a new direct backend, verifying the oz CLI is available.
 func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectBackend, error) {
 	ozPath := config.OzPath
@@ -127,10 +158,10 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 }
 
 // ExecuteTask runs the agent directly on the host.
-func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) error {
+func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	taskID := params.TaskID
 	if err := validateTaskIDForPath(taskID); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))
 	}
 
 	// Determine working directory: shared target dir or per-task workspace.
@@ -143,13 +174,13 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 		// Create per-task workspace directory.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
 		if err := os.MkdirAll(workspaceDir, 0700); err != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err)))
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
 	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir)
 	if err != nil {
-		return err
+		return executeError(err)
 	}
 	defer cleanupGitConfig()
 	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
@@ -170,11 +201,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 	// 2. Create temp environment file for setup script to write to.
 	envFile, err := os.CreateTemp(workspaceDir, "oz-env-*")
 	if err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create environment file: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create environment file: %w", err)))
 	}
 	envFilePath := envFile.Name()
 	if err := envFile.Close(); err != nil {
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to close environment file: %w", err))
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to close environment file: %w", err)))
 	}
 	defer func() {
 		if err := os.Remove(envFilePath); err != nil && !os.IsNotExist(err) {
@@ -193,19 +224,14 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
-		setupEnv := append(envVars,
-			fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
-			"OZ_WORKER_BACKEND=direct",
-			fmt.Sprintf("OZ_RUN_ID=%s", taskID),
-			fmt.Sprintf("OZ_ENVIRONMENT_FILE=%s", envFilePath),
-		)
+		setupEnv := append(envVars, directSetupEnvVars(workspaceDir, taskID, envFilePath)...)
 
 		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
 		if err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv); err != nil {
 			if ctx.Err() != nil {
-				return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 			}
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err))
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err)))
 		}
 	}
 
@@ -236,14 +262,43 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) err
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err())
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
-		return newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err))
+		wrapped := fmt.Errorf("oz agent exited with error: %w", err)
+		if exitCode, ok := agentExitCode(err); ok {
+			return executeError(newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped, exitCode))
+		}
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, wrapped))
 	}
 
 	log.Infof(ctx, "Task %s execution completed successfully", taskID)
-	return nil
+	return executeCompleted()
 }
+
+// agentExitCode extracts the agent subprocess's exit code from a cmd.Run error.
+// os/exec reports signal deaths as exit code -1 rather than a signal-coded
+// status, so the signal is recovered from the wait status and normalized to
+// 128+signal — the form failure-cause classification keys on to tell crashes
+// and operator shutdowns apart from ordinary failures. ok is false when the
+// error does not carry a process exit status (e.g. the binary never launched).
+func agentExitCode(err error) (exitCode int, ok bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	status, isWaitStatus := exitErr.Sys().(syscall.WaitStatus)
+	if !isWaitStatus {
+		return 0, false
+	}
+	if status.Signaled() {
+		return 128 + int(status.Signal()), true
+	}
+	return status.ExitStatus(), true
+}
+
+// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
+// direct-backend task.
+func (b *DirectBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 // Shutdown cleans up any workspace directories left behind under the workspace root.
 func (b *DirectBackend) Shutdown(ctx context.Context) {
@@ -276,12 +331,7 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 	if b.config.TeardownCommand == "" {
 		return
 	}
-	teardownEnv := []string{
-		fmt.Sprintf("OZ_WORKSPACE_ROOT=%s", workspaceDir),
-		fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath),
-		"OZ_WORKER_BACKEND=direct",
-		fmt.Sprintf("OZ_RUN_ID=%s", taskID),
-	}
+	teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
 	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv); err != nil {
 		metrics.AddTaskEvent(ctx, "cleanup.failed",

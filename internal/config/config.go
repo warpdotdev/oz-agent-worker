@@ -17,6 +17,7 @@ type FileConfig struct {
 	WorkerID           string `yaml:"worker_id"`
 	Cleanup            *bool  `yaml:"cleanup"`
 	MaxConcurrentTasks *int   `yaml:"max_concurrent_tasks"`
+	OneShot            *bool  `yaml:"one_shot"`
 	// IdleOnComplete controls how long the oz CLI process stays alive after a task's
 	// conversation finishes, to allow follow-up interactions via the shared session.
 	// Uses humantime format (e.g. "45m", "10m", "0s"). When nil, the oz CLI default
@@ -34,12 +35,30 @@ type BackendConfig struct {
 	Docker     *DockerConfig     `yaml:"docker"`
 	Direct     *DirectConfig     `yaml:"direct"`
 	Kubernetes *KubernetesConfig `yaml:"kubernetes"`
+	Command    *CommandConfig    `yaml:"command"`
+}
+
+// CommandConfig holds command-backend-specific configuration. The command
+// backend dispatches tasks to an operator-owned runtime over any transport by
+// invoking dispatch_command.
+type CommandConfig struct {
+	DispatchCommand string     `yaml:"dispatch_command" validate:"required"`
+	CancelCommand   string     `yaml:"cancel_command"`
+	DispatchTimeout string     `yaml:"dispatch_timeout"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
-	Volumes     []string   `yaml:"volumes"`
-	Environment []EnvEntry `yaml:"environment" validate:"dive"`
+	Volumes []string `yaml:"volumes"`
+	// ImagePullPolicy controls how the Docker backend resolves the main task image and any
+	// Warp/additional sidecar images before use. Accepted values are the same as the
+	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
+	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
+	// backend's original unconditional-pull behavior for existing installations.
+	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	SidecarImage    string     `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
+	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.

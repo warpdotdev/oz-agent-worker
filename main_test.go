@@ -20,6 +20,7 @@ func resetCLIForTest() {
 	CLI.Volumes = nil
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
+	CLI.OneShot = false
 	CLI.IdleOnComplete = ""
 }
 
@@ -32,6 +33,10 @@ func stringPtr(v string) *string {
 }
 
 func int64Ptr(v int64) *int64 {
+	return &v
+}
+
+func intPtr(v int) *int {
 	return &v
 }
 
@@ -136,6 +141,48 @@ containers:
 	}
 }
 
+func TestMergeConfigOneShot(t *testing.T) {
+	tests := []struct {
+		name       string
+		cliOneShot bool
+		fileValue  *bool
+		maxTasks   *int
+		want       bool
+	}{
+		{name: "disabled by default", want: false},
+		{name: "enabled from file", fileValue: boolPtr(true), want: true},
+		{name: "enabled from CLI", cliOneShot: true, fileValue: boolPtr(false), want: true},
+		{name: "overrides configured concurrency", fileValue: boolPtr(true), maxTasks: intPtr(8), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			CLI.OneShot = tt.cliOneShot
+			fileConfig := &config.FileConfig{
+				WorkerID:           "direct-worker",
+				OneShot:            tt.fileValue,
+				MaxConcurrentTasks: tt.maxTasks,
+				Backend: config.BackendConfig{
+					Direct: &config.DirectConfig{},
+				},
+			}
+
+			wc, err := mergeConfig(fileConfig)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if wc.OneShot != tt.want {
+				t.Fatalf("OneShot = %t, want %t", wc.OneShot, tt.want)
+			}
+			if tt.want && wc.MaxConcurrentTasks != 1 {
+				t.Fatalf("MaxConcurrentTasks = %d, want 1", wc.MaxConcurrentTasks)
+			}
+		})
+	}
+}
+
 func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
@@ -172,6 +219,74 @@ func TestMergeConfigKubernetesCLIOverridesCleanupAndWorkerID(t *testing.T) {
 	}
 }
 
+func TestMergeConfigCommandFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	CLI.ServerRootURL = "https://app.warp.dev"
+	CLI.Env = []string{"CLI_ONLY=1"}
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				CancelCommand:   "/opt/oz/cancel.sh",
+				DispatchTimeout: "30s",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "command" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "command")
+	}
+	if wc.Command == nil {
+		t.Fatal("expected command backend config")
+	}
+	if wc.Command.DispatchCommand != "/opt/oz/dispatch.sh" {
+		t.Errorf("DispatchCommand = %q, want %q", wc.Command.DispatchCommand, "/opt/oz/dispatch.sh")
+	}
+	if wc.Command.CancelCommand != "/opt/oz/cancel.sh" {
+		t.Errorf("CancelCommand = %q, want %q", wc.Command.CancelCommand, "/opt/oz/cancel.sh")
+	}
+	if wc.Command.DispatchTimeout != 30*time.Second {
+		t.Errorf("DispatchTimeout = %v, want 30s", wc.Command.DispatchTimeout)
+	}
+	if wc.Command.ServerRootURL != "https://app.warp.dev" {
+		t.Errorf("ServerRootURL = %q, want %q", wc.Command.ServerRootURL, "https://app.warp.dev")
+	}
+	if wc.Command.WorkerID != "command-worker" {
+		t.Errorf("WorkerID = %q, want %q", wc.Command.WorkerID, "command-worker")
+	}
+	if wc.Command.Env["CLI_ONLY"] != "1" {
+		t.Errorf("Env[CLI_ONLY] = %q, want %q", wc.Command.Env["CLI_ONLY"], "1")
+	}
+}
+
+func TestMergeConfigCommandInvalidDispatchTimeout(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "command-worker",
+		Backend: config.BackendConfig{
+			Command: &config.CommandConfig{
+				DispatchCommand: "/opt/oz/dispatch.sh",
+				DispatchTimeout: "nope",
+			},
+		},
+	}
+
+	if _, err := mergeConfig(fileConfig); err == nil {
+		t.Fatal("expected error for invalid dispatch_timeout")
+	}
+}
+
 func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	resetCLIForTest()
 	t.Cleanup(resetCLIForTest)
@@ -194,6 +309,114 @@ func TestMergeConfigKubernetesAllowsZeroUnschedulableTimeout(t *testing.T) {
 	}
 	if wc.Kubernetes.UnschedulableTimeout == nil || *wc.Kubernetes.UnschedulableTimeout != 0 {
 		t.Fatalf("UnschedulableTimeout = %v, want 0", wc.Kubernetes.UnschedulableTimeout)
+	}
+}
+
+func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				ImagePullPolicy: "Never",
+				Volumes:         []string{"/data:/data"},
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "Never" {
+		t.Errorf("ImagePullPolicy = %q, want %q", wc.Docker.ImagePullPolicy, "Never")
+	}
+	if len(wc.Docker.Volumes) != 1 || wc.Docker.Volumes[0] != "/data:/data" {
+		t.Errorf("Volumes = %v, want [/data:/data]", wc.Docker.Volumes)
+	}
+}
+
+func TestMergeConfigDockerSidecarImageFromFile(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{
+				SidecarImage: "my-registry.io/warpdotdev/warp-agent:latest",
+			},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if wc.BackendType != "docker" {
+		t.Fatalf("BackendType = %q, want %q", wc.BackendType, "docker")
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "my-registry.io/warpdotdev/warp-agent:latest" {
+		t.Errorf("SidecarImage = %q, want %q", wc.Docker.SidecarImage, "my-registry.io/warpdotdev/warp-agent:latest")
+	}
+}
+
+func TestMergeConfigDockerSidecarImageOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.SidecarImage != "" {
+		t.Errorf("SidecarImage = %q, want empty", wc.Docker.SidecarImage)
+	}
+}
+
+func TestMergeConfigDockerImagePullPolicyOmitted(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+
+	fileConfig := &config.FileConfig{
+		WorkerID: "docker-worker",
+		Backend: config.BackendConfig{
+			Docker: &config.DockerConfig{},
+		},
+	}
+
+	wc, err := mergeConfig(fileConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.Docker == nil {
+		t.Fatal("expected docker backend config")
+	}
+	if wc.Docker.ImagePullPolicy != "" {
+		t.Errorf("ImagePullPolicy = %q, want empty (defaulting happens at the worker layer)", wc.Docker.ImagePullPolicy)
 	}
 }
 

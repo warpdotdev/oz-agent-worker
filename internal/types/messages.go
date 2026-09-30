@@ -24,6 +24,71 @@ type WebSocketMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// FailureDetails contains backend-specific structured diagnostics.
+type FailureDetails struct {
+	Kubernetes *KubernetesFailureDetails `json:"kubernetes,omitempty"`
+}
+
+// KubernetesFailureDetails contains bounded Kubernetes metadata captured when a task fails.
+type KubernetesFailureDetails struct {
+	SchemaVersion     int                                `json:"schema_version"`
+	ObservationSource string                             `json:"observation_source,omitempty"`
+	ObservedAt        time.Time                          `json:"observed_at"`
+	Job               *KubernetesJobFailureDetails       `json:"job,omitempty"`
+	Pod               *KubernetesPodFailureDetails       `json:"pod,omitempty"`
+	Container         *KubernetesContainerFailureDetails `json:"container,omitempty"`
+	Events            []KubernetesEventDetails           `json:"events,omitempty"`
+	Truncated         bool                               `json:"truncated,omitempty"`
+}
+
+// KubernetesJobFailureDetails identifies a worker-created Job and its terminal conditions.
+type KubernetesJobFailureDetails struct {
+	Name       string                       `json:"name,omitempty"`
+	UID        string                       `json:"uid,omitempty"`
+	Conditions []KubernetesConditionDetails `json:"conditions,omitempty"`
+}
+
+// KubernetesPodFailureDetails identifies a task Pod and its structured status.
+type KubernetesPodFailureDetails struct {
+	Name              string                       `json:"name,omitempty"`
+	UID               string                       `json:"uid,omitempty"`
+	Phase             string                       `json:"phase,omitempty"`
+	Reason            string                       `json:"reason,omitempty"`
+	DeletionTimestamp *time.Time                   `json:"deletion_timestamp,omitempty"`
+	Conditions        []KubernetesConditionDetails `json:"conditions,omitempty"`
+}
+
+// KubernetesConditionDetails contains condition fields that Kubernetes represents structurally.
+type KubernetesConditionDetails struct {
+	Type               string     `json:"type,omitempty"`
+	Status             string     `json:"status,omitempty"`
+	Reason             string     `json:"reason,omitempty"`
+	LastTransitionTime *time.Time `json:"last_transition_time,omitempty"`
+}
+
+// KubernetesContainerFailureDetails identifies the failing container and its current state.
+type KubernetesContainerFailureDetails struct {
+	Kind               string     `json:"kind,omitempty"`
+	Name               string     `json:"name,omitempty"`
+	State              string     `json:"state,omitempty"`
+	WaitingReason      string     `json:"waiting_reason,omitempty"`
+	TerminationReason  string     `json:"termination_reason,omitempty"`
+	RawExitCode        *int32     `json:"raw_exit_code,omitempty"`
+	NormalizedExitCode *int       `json:"normalized_exit_code,omitempty"`
+	Signal             *int32     `json:"signal,omitempty"`
+	StartedAt          *time.Time `json:"started_at,omitempty"`
+	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+}
+
+// KubernetesEventDetails contains privacy-filtered Event metadata.
+type KubernetesEventDetails struct {
+	Type            string     `json:"type,omitempty"`
+	Reason          string     `json:"reason,omitempty"`
+	Count           int32      `json:"count,omitempty"`
+	FirstObservedAt *time.Time `json:"first_observed_at,omitempty"`
+	LastObservedAt  *time.Time `json:"last_observed_at,omitempty"`
+}
+
 // SidecarMount describes an additional sidecar image to mount into the task container.
 type SidecarMount struct {
 	Image     string `json:"image"`      // Docker image to pull.
@@ -72,16 +137,24 @@ type TaskClaimedMessage struct {
 
 // TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
 type TaskCompletedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID      string     `json:"task_id"`
+	ExecutionID string     `json:"execution_id,omitempty"`
+	Message     string     `json:"message"`
+	TaskState   *TaskState `json:"task_state,omitempty"`
 }
 
-// TaskFailedMessage is sent from worker to server if task launch fails
+// TaskFailedMessage is sent from worker to server if task launch fails.
+// FailureReason is the worker-classified failure reason (a
+// metrics.TaskFailureReason value) and ExitCode is the failing process's
+// exit status normalized to 128+signal.
 type TaskFailedMessage struct {
-	TaskID    string     `json:"task_id"`
-	Message   string     `json:"message"`
-	TaskState *TaskState `json:"task_state,omitempty"`
+	TaskID         string          `json:"task_id"`
+	ExecutionID    string          `json:"execution_id,omitempty"`
+	Message        string          `json:"message"`
+	TaskState      *TaskState      `json:"task_state,omitempty"`
+	FailureReason  string          `json:"failure_reason,omitempty"`
+	ExitCode       int             `json:"exit_code,omitempty"`
+	FailureDetails *FailureDetails `json:"failure_details,omitempty"`
 }
 
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
@@ -113,11 +186,54 @@ type Harness struct {
 	Type *string `json:"type,omitempty"`
 }
 
+// IsOz returns true when the harness is the built-in Oz harness (nil, empty,
+// or explicitly "oz"). Third-party harnesses (claude, codex, gemini, …) carry
+// their own model on the harness config, so the top-level model_id should not
+// be forwarded to them as --model.
+func (h *Harness) IsOz() bool {
+	return h == nil || h.Type == nil || *h.Type == "" || *h.Type == "oz"
+}
+
 // HarnessAuthSecrets holds authentication secrets for third-party harnesses.
 // Only the secret for the harness specified gets injected into the environment.
 type HarnessAuthSecrets struct {
 	// ClaudeAuthSecretName is the name of a managed secret for Claude Code harness authentication.
 	ClaudeAuthSecretName *string `json:"claude_auth_secret_name,omitempty"`
+}
+
+// RepositoryHeadType identifies how a prepared repository HEAD is resolved.
+type RepositoryHeadType string
+
+const (
+	RepositoryHeadTypeCommitSHA RepositoryHeadType = "COMMIT_SHA"
+	RepositoryHeadTypeBranch    RepositoryHeadType = "BRANCH"
+)
+
+// RepositoryHeadRef identifies a repository HEAD by type and value.
+type RepositoryHeadRef struct {
+	Type  RepositoryHeadType `json:"type"`
+	Value string             `json:"value"`
+}
+
+// RepositoryIdentity identifies one repository independently of checkout path spelling.
+type RepositoryIdentity struct {
+	CodeForge string `json:"code_forge"`
+	Owner     string `json:"owner"`
+	Repo      string `json:"repo"`
+}
+
+// RepositoryHeadOverride describes a server-computed repository checkout override.
+// The server has already validated and frozen these values (e.g. for benchmark
+// trials); the worker forwards them to the CLI as-is via --repository-head-override-json.
+type RepositoryHeadOverride struct {
+	CodeForge string            `json:"code_forge"`
+	RepoOwner string            `json:"repo_owner"`
+	RepoName  string            `json:"repo_name"`
+	Head      RepositoryHeadRef `json:"head"`
+	// CloneFrom, when set, identifies a different repository to clone from while
+	// keeping this repository's own name/path for the checkout (substitution).
+	CloneFrom      *RepositoryIdentity `json:"clone_from,omitempty"`
+	PreserveOrigin bool                `json:"preserve_origin,omitempty"`
 }
 
 // AccessLevel is the serialized access-level string used inside SessionSharingConfig.
@@ -147,6 +263,7 @@ type AmbientAgentConfig struct {
 	SkillSpec                 *string                    `json:"skill_spec,omitempty"`
 	MCPServers                map[string]json.RawMessage `json:"mcp_servers,omitempty"`
 	ComputerUseEnabled        *bool                      `json:"computer_use_enabled,omitempty"`
+	ComputerUseModelID        *string                    `json:"computer_use_model_id,omitempty"`
 	IdleTimeoutMinutes        *int                       `json:"idle_timeout_minutes,omitempty"`
 	Harness                   *Harness                   `json:"harness,omitempty"`
 	HarnessAuthSecrets        *HarnessAuthSecrets        `json:"harness_auth_secrets,omitempty"`
@@ -155,6 +272,9 @@ type AmbientAgentConfig struct {
 	SnapshotDisabled          *bool                      `json:"snapshot_disabled,omitempty"`
 	SnapshotUploadTimeoutSecs *int                       `json:"snapshot_upload_timeout_secs,omitempty"`
 	SnapshotScriptTimeoutSecs *int                       `json:"snapshot_script_timeout_secs,omitempty"`
+	// RepositoryHeadOverrides identify repositories and optionally configure alternate
+	// clone remotes and origin retention. Currently only populated for benchmark trials.
+	RepositoryHeadOverrides []RepositoryHeadOverride `json:"repository_head_overrides,omitempty"`
 }
 
 // TaskOwner identifies the ownership scope of a task.

@@ -56,6 +56,61 @@ backend:
 	}
 }
 
+func TestLoadValidDockerImagePullPolicy(t *testing.T) {
+	for _, policy := range []string{"Always", "IfNotPresent", "Never"} {
+		t.Run(policy, func(t *testing.T) {
+			path := writeTestConfig(t, `
+backend:
+  docker:
+    image_pull_policy: "`+policy+`"
+`)
+
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.Backend.Docker == nil {
+				t.Fatal("expected docker backend to be set")
+			}
+			if cfg.Backend.Docker.ImagePullPolicy != policy {
+				t.Errorf("image_pull_policy = %q, want %q", cfg.Backend.Docker.ImagePullPolicy, policy)
+			}
+		})
+	}
+}
+
+func TestLoadDockerImagePullPolicyOmitted(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  docker:
+    volumes: []
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Backend.Docker == nil {
+		t.Fatal("expected docker backend to be set")
+	}
+	if cfg.Backend.Docker.ImagePullPolicy != "" {
+		t.Errorf("image_pull_policy = %q, want empty (defaulting happens at the worker layer)", cfg.Backend.Docker.ImagePullPolicy)
+	}
+}
+
+func TestLoadInvalidDockerPullPolicy(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  docker:
+    image_pull_policy: "Sometimes"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid docker image_pull_policy")
+	}
+}
+
 func TestLoadKubernetesCodingCLISidecars(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "k8s-worker"
@@ -407,6 +462,76 @@ func TestLoadFileNotFound(t *testing.T) {
 	}
 }
 
+func TestLoadValidCommandConfig(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "command-worker"
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+    cancel_command: "/opt/oz/cancel.sh"
+    dispatch_timeout: "30s"
+    environment:
+      - name: MY_VAR
+        value: "hello"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Backend.Command == nil {
+		t.Fatal("expected command backend to be set")
+	}
+	if cfg.Backend.Docker != nil {
+		t.Error("docker backend should be nil")
+	}
+	if cfg.Backend.Command.DispatchCommand != "/opt/oz/dispatch.sh" {
+		t.Errorf("dispatch_command = %q, want %q", cfg.Backend.Command.DispatchCommand, "/opt/oz/dispatch.sh")
+	}
+	if cfg.Backend.Command.CancelCommand != "/opt/oz/cancel.sh" {
+		t.Errorf("cancel_command = %q, want %q", cfg.Backend.Command.CancelCommand, "/opt/oz/cancel.sh")
+	}
+	if cfg.Backend.Command.DispatchTimeout != "30s" {
+		t.Errorf("dispatch_timeout = %q, want %q", cfg.Backend.Command.DispatchTimeout, "30s")
+	}
+	if len(cfg.Backend.Command.Environment) != 1 {
+		t.Errorf("environment count = %d, want 1", len(cfg.Backend.Command.Environment))
+	}
+}
+
+func TestLoadCommandConfigRequiresDispatchCommand(t *testing.T) {
+	path := writeTestConfig(t, `
+worker_id: "command-worker"
+backend:
+  command:
+    cancel_command: "/opt/oz/cancel.sh"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for missing dispatch_command")
+	}
+	if !strings.Contains(err.Error(), "DispatchCommand") && !strings.Contains(err.Error(), "required") {
+		t.Errorf("error = %v, want it to mention the required dispatch command", err)
+	}
+}
+
+func TestLoadCommandAndDockerBackendsError(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+  docker:
+    volumes: []
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error when command and docker backends are both set")
+	}
+}
+
 func TestLoadIdleOnComplete(t *testing.T) {
 	t.Run("parses idle_on_complete when set", func(t *testing.T) {
 		path := writeTestConfig(t, `
@@ -435,6 +560,35 @@ worker_id: "test"
 		}
 		if cfg.IdleOnComplete != nil {
 			t.Errorf("expected idle_on_complete to be nil, got %q", *cfg.IdleOnComplete)
+		}
+	})
+}
+
+func TestLoadOneShot(t *testing.T) {
+	t.Run("parses one_shot when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+one_shot: true
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.OneShot == nil || !*cfg.OneShot {
+			t.Fatalf("one_shot = %v, want true", cfg.OneShot)
+		}
+	})
+
+	t.Run("one_shot is nil when omitted", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.OneShot != nil {
+			t.Fatalf("one_shot = %v, want nil", *cfg.OneShot)
 		}
 	})
 }
@@ -517,6 +671,56 @@ backend:
 		_, err := Load(path)
 		if err == nil {
 			t.Fatal("expected error for default_image with whitespace")
+		}
+	})
+}
+
+func TestLoadDockerSidecarImage(t *testing.T) {
+	t.Run("parses sidecar_image when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "docker-worker"
+backend:
+  docker:
+    sidecar_image: "my-registry.io/warpdotdev/warp-agent:latest"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backend.Docker == nil {
+			t.Fatal("expected docker backend to be set")
+		}
+		if cfg.Backend.Docker.SidecarImage != "my-registry.io/warpdotdev/warp-agent:latest" {
+			t.Errorf("sidecar_image = %q, want %q", cfg.Backend.Docker.SidecarImage, "my-registry.io/warpdotdev/warp-agent:latest")
+		}
+	})
+
+	t.Run("sidecar_image is empty when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "docker-worker"
+backend:
+  docker:
+    volumes: []
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Backend.Docker.SidecarImage != "" {
+			t.Errorf("expected sidecar_image to be empty, got %q", cfg.Backend.Docker.SidecarImage)
+		}
+	})
+
+	t.Run("rejects sidecar_image with whitespace", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "docker-worker"
+backend:
+  docker:
+    sidecar_image: "my image:latest"
+`)
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for sidecar_image with whitespace")
 		}
 	})
 }

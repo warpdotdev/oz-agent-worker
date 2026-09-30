@@ -27,7 +27,9 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	if task.AgentConfigSnapshot != nil {
-		if task.AgentConfigSnapshot.ModelID != nil {
+		// Only emit --model for Oz runs; for third-party harnesses, the client
+		// resolves the model from the task snapshot's harness config.
+		if task.AgentConfigSnapshot.Harness.IsOz() && task.AgentConfigSnapshot.ModelID != nil {
 			if modelID := strings.TrimSpace(*task.AgentConfigSnapshot.ModelID); modelID != "" {
 				args = append(args, "--model", modelID)
 			}
@@ -52,12 +54,22 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			}
 		}
 
-		// Pass computer use setting if explicitly configured.
+		// Pass the computer use setting. An explicit value wins; if not set,
+		// defaults to true.
+		computerUseEnabled := true
 		if task.AgentConfigSnapshot.ComputerUseEnabled != nil {
-			if *task.AgentConfigSnapshot.ComputerUseEnabled {
-				args = append(args, "--computer-use")
-			} else {
-				args = append(args, "--no-computer-use")
+			computerUseEnabled = *task.AgentConfigSnapshot.ComputerUseEnabled
+		}
+		if computerUseEnabled {
+			args = append(args, "--computer-use")
+		} else {
+			args = append(args, "--no-computer-use")
+		}
+
+		// Pin the model for the computer use subagent, which is distinct from --model.
+		if computerUseEnabled && task.AgentConfigSnapshot.Harness.IsOz() && task.AgentConfigSnapshot.ComputerUseModelID != nil {
+			if computerUseModel := strings.TrimSpace(*task.AgentConfigSnapshot.ComputerUseModelID); computerUseModel != "" {
+				args = append(args, "--computer-use-model", computerUseModel)
 			}
 		}
 
@@ -112,6 +124,7 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 			args = append(args, "--environment", env)
 		}
 	}
+	args = append(args, repositoryHeadOverrideArgsForTask(task)...)
 
 	args = append(args, opts.AdditionalOzArgs...)
 
@@ -125,6 +138,31 @@ func AugmentArgsForTask(task *types.Task, args []string, opts TaskAugmentOptions
 	}
 
 	return args
+}
+
+// repositoryHeadOverrideArgsForTask forwards server-computed repository checkout
+// overrides to the CLI as one --repository-head-override-json flag per repository,
+// followed by --remove-repository-origins when any override is present. The server
+// has already validated and frozen these values (currently only for benchmark
+// trials), so this only re-marshals them into the wire shape the CLI expects.
+func repositoryHeadOverrideArgsForTask(task *types.Task) []string {
+	if task == nil || task.AgentConfigSnapshot == nil {
+		return nil
+	}
+	overrides := task.AgentConfigSnapshot.RepositoryHeadOverrides
+	if len(overrides) == 0 {
+		return nil
+	}
+
+	args := make([]string, 0, 2*len(overrides)+1)
+	for _, override := range overrides {
+		jsonValue, err := json.Marshal(override)
+		if err != nil {
+			continue
+		}
+		args = append(args, "--repository-head-override-json", string(jsonValue))
+	}
+	return append(args, "--remove-repository-origins")
 }
 
 // shareAccessLevelForEmission maps an internal AccessLevel to the string

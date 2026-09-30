@@ -110,7 +110,7 @@ func TestDirectBackendSetupCommandDoesNotReadHostGlobalGitConfig(t *testing.T) {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
 
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-unseeded"}); err == nil {
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-unseeded"}); result.Error == nil {
 		t.Fatal("expected setup git command to fail because host global git config is hidden")
 	}
 
@@ -130,8 +130,8 @@ func TestDirectBackendSetupCommandDoesNotReadHostGlobalGitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create seeded direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-seeded"}); err != nil {
-		t.Fatalf("expected setup git command to succeed after seeding isolated git config: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-seeded"}); result.Error != nil {
+		t.Fatalf("expected setup git command to succeed after seeding isolated git config: %v", result.Error)
 	}
 }
 
@@ -164,8 +164,8 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-setup"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-setup"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-setup", ".gitconfig")
@@ -183,6 +183,70 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(hostHome, ".gitconfig")); !os.IsNotExist(err) {
 		t.Fatalf("host ~/.gitconfig should not exist; stat err = %v", err)
+	}
+}
+
+// The operator's setup and teardown hooks see every well-known variable under both its OZ_
+// and its WARP_ name, carrying the identical value.
+func TestDirectBackendHooksReceiveBothNames(t *testing.T) {
+	testDir := t.TempDir()
+	setupCapture := filepath.Join(testDir, "setup_env.txt")
+	teardownCapture := filepath.Join(testDir, "teardown_env.txt")
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+		WorkspaceRoot:   filepath.Join(testDir, "workspaces"),
+		OzPath:          ozPath,
+		SetupCommand:    "env > " + setupCapture,
+		TeardownCommand: "env > " + teardownCapture,
+	})
+	if err != nil {
+		t.Fatalf("failed to create direct backend: %v", err)
+	}
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-run-id"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
+	}
+
+	hooks := []struct {
+		name        string
+		capturePath string
+		ozVars      []string
+	}{
+		{
+			name:        "setup",
+			capturePath: setupCapture,
+			ozVars:      []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT", "OZ_ENVIRONMENT_FILE"},
+		},
+		{
+			name:        "teardown",
+			capturePath: teardownCapture,
+			ozVars:      []string{"OZ_RUN_ID", "OZ_WORKER_BACKEND", "OZ_WORKSPACE_ROOT"},
+		},
+	}
+	for _, hook := range hooks {
+		t.Run(hook.name, func(t *testing.T) {
+			data, err := os.ReadFile(hook.capturePath) // #nosec G304 -- test-controlled temp path.
+			if err != nil {
+				t.Fatalf("failed to read captured env: %v", err)
+			}
+			env := envMap(strings.Split(strings.TrimSpace(string(data)), "\n"))
+			if env["OZ_RUN_ID"] != "task-run-id" {
+				t.Errorf("OZ_RUN_ID = %q, want %q", env["OZ_RUN_ID"], "task-run-id")
+			}
+			for _, name := range hook.ozVars {
+				if env[name] == "" {
+					t.Errorf("%s is unset, so its alias proves nothing", name)
+					continue
+				}
+				alias := "WARP_" + strings.TrimPrefix(name, "OZ_")
+				if env[alias] != env[name] {
+					t.Errorf("%s = %q, want it to mirror %s = %q", alias, env[alias], name, env[name])
+				}
+			}
+		})
 	}
 }
 
@@ -214,8 +278,8 @@ git config --global user.email main@example.com
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-envfile"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-envfile"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-envfile", ".gitconfig")
@@ -271,8 +335,8 @@ git ls-remote "$TEST_REWRITE_URL"
 	if err != nil {
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-smoke"}); err != nil {
-		t.Fatalf("expected main oz git command to use setup-seeded isolated git config: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-smoke"}); result.Error != nil {
+		t.Fatalf("expected main oz git command to use setup-seeded isolated git config: %v", result.Error)
 	}
 
 	wantCfg := filepath.Join(workspaceRoot, "task-smoke", ".gitconfig")
@@ -323,8 +387,8 @@ git config --global --add url."https://x-access-token:tok@github.com/".insteadOf
 		t.Fatalf("failed to create direct backend: %v", err)
 	}
 
-	if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-1"}); err != nil {
-		t.Fatalf("failed to execute task: %v", err)
+	if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: "task-1"}); result.Error != nil {
+		t.Fatalf("failed to execute task: %v", result.Error)
 	}
 
 	if got, err := os.ReadFile(homeCapture); err != nil {
@@ -372,7 +436,7 @@ func TestDirectBackendRejectsUnsafeTaskID(t *testing.T) {
 	}
 
 	for _, badID := range []string{"../escape", "a/../../escape", "/abs/path", "..", ""} {
-		if err := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: badID}); err == nil {
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{TaskID: badID}); result.Error == nil {
 			t.Fatalf("expected error for unsafe task ID %q, got nil", badID)
 		}
 	}

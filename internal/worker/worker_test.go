@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +20,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/semaphore"
 )
 
 type shutdownRecordingBackend struct {
@@ -23,9 +28,11 @@ type shutdownRecordingBackend struct {
 	shutdownCtxErr error
 }
 
-func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) error {
-	return nil
+func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
+	return executeCompleted()
 }
+
+func (b *shutdownRecordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
@@ -47,21 +54,151 @@ type recordingBackend struct {
 	err error
 }
 
-func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) error {
-	return b.err
+func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
+	if b.err != nil {
+		return executeError(b.err)
+	}
+	return executeCompleted()
 }
+
+func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
 
+type blockingBackend struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingBackend) ExecuteTask(ctx context.Context, _ *TaskParams) ExecuteResult {
+	close(b.started)
+	select {
+	case <-b.release:
+		return executeCompleted()
+	case <-ctx.Done():
+		return executeError(ctx.Err())
+	}
+}
+
+func (b *blockingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+func (b *blockingBackend) Shutdown(context.Context)                        {}
+func (b *blockingBackend) PreservesTasksOnShutdown() bool                  { return false }
+
+func TestNewValidatesOneShotBackendCapabilityBeforeConstruction(t *testing.T) {
+	for _, backendType := range []string{"", "docker", "kubernetes", "command"} {
+		t.Run(backendType, func(t *testing.T) {
+			_, err := New(context.Background(), Config{
+				BackendType: backendType,
+				OneShot:     true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "does not support one-shot mode") {
+				t.Fatalf("New() error = %v, want unsupported one-shot error", err)
+			}
+		})
+	}
+}
+
+func TestNewAcceptsOneShotDirectBackend(t *testing.T) {
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+
+	w, err := New(context.Background(), Config{
+		BackendType: "direct",
+		OneShot:     true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, ok := w.backend.(*DirectBackend); !ok {
+		t.Fatalf("backend = %T, want *DirectBackend", w.backend)
+	}
+	if w.config.MaxConcurrentTasks != 1 || w.taskSemaphore == nil {
+		t.Fatalf("one-shot concurrency = %d, semaphore=%v; want 1 with semaphore", w.config.MaxConcurrentTasks, w.taskSemaphore)
+	}
+	w.shutdownBackend()
+}
+
+func TestOneShotAcceptsOnlyOneTaskAndWaitsForCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend := &blockingBackend{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	w := &Worker{
+		config: Config{
+			BackendType:        "direct",
+			MaxConcurrentTasks: 1,
+			OneShot:            true,
+		},
+		ctx:           ctx,
+		outbound:      newOutboundQueue(8),
+		activeTasks:   make(map[string]activeTask),
+		oneShot:       newOneShotState(),
+		backend:       backend,
+		taskSemaphore: semaphore.NewWeighted(1),
+	}
+	assignment := func(taskID string) *types.TaskAssignmentMessage {
+		return &types.TaskAssignmentMessage{
+			TaskID:      taskID,
+			ExecutionID: "execution-" + taskID,
+			Task:        &types.Task{ID: taskID, Title: taskID},
+		}
+	}
+
+	w.handleTaskAssignment(assignment("task-1"))
+	select {
+	case <-backend.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first task did not start")
+	}
+	w.handleTaskAssignment(assignment("task-2"))
+
+	select {
+	case <-w.oneShot.doneChannel():
+		t.Fatal("one-shot worker completed before the accepted task")
+	default:
+	}
+
+	close(backend.release)
+	select {
+	case <-w.oneShot.doneChannel():
+	case <-time.After(2 * time.Second):
+		t.Fatal("one-shot worker did not complete after the accepted task")
+	}
+
+	var claimed, rejected, completed int
+	for _, msg := range drainMessages(t, w.outbound.messages) {
+		switch msg.Type {
+		case types.MessageTypeTaskClaimed:
+			claimed++
+		case types.MessageTypeTaskRejected:
+			rejected++
+		case types.MessageTypeTaskCompleted:
+			completed++
+		}
+	}
+	if claimed != 1 || rejected != 1 || completed != 1 {
+		t.Fatalf("message counts = claimed:%d rejected:%d completed:%d, want 1 each", claimed, rejected, completed)
+	}
+}
+
 func TestTaskFailureLabels(t *testing.T) {
 	tests := []struct {
 		name       string
 		err        error
-		wantPhase  string
-		wantReason string
+		wantPhase  metrics.TaskFailurePhase
+		wantReason metrics.TaskFailureReason
 	}{
 		{
 			name:       "deadline exceeded",
@@ -103,13 +240,141 @@ func TestTaskFailureLabels(t *testing.T) {
 	}
 }
 
+func TestFailureExitCode(t *testing.T) {
+	t.Run("recorded exit status", func(t *testing.T) {
+		err := exec.Command("sh", "-c", "exit 143").Run()
+		code, ok := agentExitCode(err)
+		if !ok || code != 143 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (143, true)", code, ok)
+		}
+		failure := newBackendFailureWithExitCode(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonAgentInvocation, fmt.Errorf("oz agent exited with error: %w", err), code)
+		if got := failureExitCode(fmt.Errorf("wrapped: %w", failure)); got != 143 {
+			t.Fatalf("failureExitCode() = %d, want 143", got)
+		}
+	})
+
+	t.Run("no exit status", func(t *testing.T) {
+		if got := failureExitCode(errors.New("boom")); got != 0 {
+			t.Fatalf("failureExitCode() = %d, want 0", got)
+		}
+	})
+}
+
+func TestAgentExitCode(t *testing.T) {
+	t.Run("signal termination normalizes to 128+signal", func(t *testing.T) {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to start subprocess: %v", err)
+		}
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("failed to signal subprocess: %v", err)
+		}
+		err := cmd.Wait()
+		code, ok := agentExitCode(err)
+		if !ok || code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("agentExitCode() = (%d, %t), want (%d, true)", code, ok, 128+int(syscall.SIGTERM))
+		}
+	})
+
+	t.Run("plain exit code passes through", func(t *testing.T) {
+		err := exec.Command("sh", "-c", "exit 2").Run()
+		code, ok := agentExitCode(err)
+		if !ok || code != 2 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (2, true)", code, ok)
+		}
+	})
+
+	t.Run("non-exit error", func(t *testing.T) {
+		if code, ok := agentExitCode(errors.New("boom")); ok || code != 0 {
+			t.Fatalf("agentExitCode() = (%d, %t), want (0, false)", code, ok)
+		}
+	})
+}
+
+func TestTaskFailedMessageIncludesFailureFacts(t *testing.T) {
+	w := &Worker{ctx: context.Background(), outbound: newOutboundQueue(1)}
+	failureDetails := &types.FailureDetails{
+		Kubernetes: &types.KubernetesFailureDetails{SchemaVersion: 1},
+	}
+	if err := w.sendTaskFailed("task-1", "execution-1", "terminated", metrics.TaskFailureReasonAgentInvocation, 143, failureDetails); err != nil {
+		t.Fatalf("sendTaskFailed returned error: %v", err)
+	}
+	msg := readWebSocketMessage(t, w.outbound.messages)
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to decode task_failed: %v", err)
+	}
+	if failed.FailureReason != string(metrics.TaskFailureReasonAgentInvocation) {
+		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonAgentInvocation)
+	}
+	if failed.ExitCode != 143 {
+		t.Fatalf("exit_code = %d, want 143", failed.ExitCode)
+	}
+	if failed.ExecutionID != "execution-1" {
+		t.Fatalf("execution_id = %q, want execution-1", failed.ExecutionID)
+	}
+	if failed.FailureDetails == nil || failed.FailureDetails.Kubernetes == nil {
+		t.Fatal("expected Kubernetes failure details")
+	}
+}
+
+func TestTerminalMessageOptionalFieldsAreOmitted(t *testing.T) {
+	for name, message := range map[string]any{
+		"failed":    types.TaskFailedMessage{TaskID: "task-1", Message: "failed"},
+		"completed": types.TaskCompletedMessage{TaskID: "task-1", Message: "completed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(message)
+			if err != nil {
+				t.Fatalf("failed to marshal terminal message: %v", err)
+			}
+			for _, field := range []string{"execution_id", "failure_details"} {
+				if strings.Contains(string(encoded), field) {
+					t.Fatalf("optional field %q was not omitted: %s", field, encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
+	w := &Worker{
+		ctx:      context.Background(),
+		config:   Config{},
+		outbound: newOutboundQueue(1),
+		activeTasks: map[string]activeTask{"task-1": {
+			cancel:             func() {},
+			cancellationSource: taskCancellationSourceShutdown,
+		}},
+		backend: &recordingBackend{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, context.Canceled)},
+	}
+	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
+	}, time.Now())
+
+	msg := readWebSocketMessage(t, w.outbound.messages)
+	if msg.Type != types.MessageTypeTaskFailed {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
+	}
+	var failed types.TaskFailedMessage
+	if err := json.Unmarshal(msg.Data, &failed); err != nil {
+		t.Fatalf("failed to unmarshal task failed message: %v", err)
+	}
+	if failed.FailureReason != string(metrics.TaskFailureReasonGracefulShutdown) {
+		t.Fatalf("failure_reason = %q, want %q", failed.FailureReason, metrics.TaskFailureReasonGracefulShutdown)
+	}
+}
+
 func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	taskCtx, taskCancel := context.WithCancel(context.Background())
 	taskCancel()
 	w := &Worker{
 		ctx:      context.Background(),
-		config:   Config{},
-		sendChan: make(chan []byte, 1),
+		config:   Config{OneShot: true},
+		outbound: newOutboundQueue(1),
+		oneShot:  newOneShotState(),
 		activeTasks: map[string]activeTask{"task-1": {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceUser,
@@ -117,11 +382,12 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		backend: &recordingBackend{err: context.Canceled},
 	}
 	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskCompleted {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
 	}
@@ -133,6 +399,9 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	if completed.TaskID != "task-1" {
 		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
 	}
+	if completed.ExecutionID != "execution-1" {
+		t.Errorf("execution ID = %q, want %q", completed.ExecutionID, "execution-1")
+	}
 	if completed.TaskState == nil || *completed.TaskState != types.TaskStateCancelled {
 		t.Fatalf("task state = %v, want %q", completed.TaskState, types.TaskStateCancelled)
 	}
@@ -142,23 +411,25 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -170,13 +441,14 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 
 	w := &Worker{
 		ctx:      context.Background(),
-		sendChan: make(chan []byte, 1),
+		outbound: newOutboundQueue(1),
 		activeTasks: map[string]activeTask{
 			"task-1": {
 				ctx:    taskCtx,
 				cancel: taskCancel,
 			},
 		},
+		backend: &recordingBackend{},
 	}
 
 	data, err := json.Marshal(types.TaskCancellationMessage{TaskID: "task-1"})
@@ -204,18 +476,20 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		config:      Config{OneShot: true},
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{},
 	}
 
 	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
-		TaskID: "task-1",
-		Task:   &types.Task{ID: "task-1", Title: "test task"},
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task:        &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskCompleted {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskCompleted)
 	}
@@ -227,20 +501,25 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	if completed.TaskID != "task-1" {
 		t.Errorf("task ID = %q, want %q", completed.TaskID, "task-1")
 	}
+	if completed.ExecutionID != "execution-1" {
+		t.Errorf("execution ID = %q, want %q", completed.ExecutionID, "execution-1")
+	}
 	if completed.Message != "Task completed successfully" {
 		t.Errorf("message = %q, want %q", completed.Message, "Task completed successfully")
 	}
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
-		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		config:      Config{OneShot: true},
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
@@ -249,7 +528,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -267,13 +546,14 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	if _, ok := w.activeTasks["task-1"]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
+	assertOneShotDone(t, w)
 }
 
 func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
@@ -283,7 +563,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
 
-	msg := readWebSocketMessage(t, w.sendChan)
+	msg := readWebSocketMessage(t, w.outbound.messages)
 	if msg.Type != types.MessageTypeTaskFailed {
 		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskFailed)
 	}
@@ -352,6 +632,346 @@ func readWebSocketMessage(t *testing.T, messages <-chan []byte) types.WebSocketM
 	return types.WebSocketMessage{}
 }
 
+func assertOneShotDone(t *testing.T, w *Worker) {
+	t.Helper()
+	select {
+	case <-w.oneShot.doneChannel():
+	default:
+		t.Fatal("one-shot worker did not signal completion")
+	}
+}
+
+func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	connected := make(chan struct{})
+	closeCode := make(chan int, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+		close(connected)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					closeCode <- closeErr.Code
+				}
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	backend := &shutdownRecordingBackend{}
+	w := &Worker{
+		config: Config{
+			WorkerID:     "test-worker",
+			WebSocketURL: "ws" + strings.TrimPrefix(srv.URL, "http"),
+		},
+		ctx:               serverCtx,
+		outbound:          newOutboundQueue(8),
+		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
+		backend:           backend,
+		heartbeatInterval: HeartbeatInterval,
+	}
+
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- w.Run()
+	}()
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not connect")
+	}
+	cancelServer()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after server cancellation")
+	}
+	if !backend.shutdownCalled {
+		t.Fatal("Run() returned without shutting down the backend")
+	}
+	select {
+	case code := <-closeCode:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("WebSocket close code = %d, want %d", code, websocket.CloseNormalClosure)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol did not send a normal WebSocket close frame")
+	}
+}
+
+func TestOneShotRunDrainsAndClosesProtocolBeforeReturning(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	serverConn := make(chan *websocket.Conn, 1)
+	received := make(chan types.WebSocketMessage, 8)
+	closeCode := make(chan int, 1)
+	serverClosed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		defer close(serverClosed)
+		defer func() {
+			_ = conn.Close()
+		}()
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					closeCode <- closeErr.Code
+				}
+				return
+			}
+			var msg types.WebSocketMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				return
+			}
+			received <- msg
+		}
+	}))
+	defer srv.Close()
+
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := New(ctx, Config{
+		APIKey:        "test-api-key",
+		WorkerID:      "one-shot-worker",
+		WebSocketURL:  "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ServerRootURL: "https://app.warp.dev",
+		BackendType:   "direct",
+		OneShot:       true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- w.Run()
+	}()
+
+	var conn *websocket.Conn
+	select {
+	case conn = <-serverConn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not connect")
+	}
+	assignmentData, err := json.Marshal(types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task: &types.Task{
+			ID:    "task-1",
+			Title: "one-shot task",
+			Owner: &types.TaskOwner{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal task assignment: %v", err)
+	}
+	assignmentMessage, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeTaskAssignment,
+		Data: assignmentData,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal WebSocket assignment: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, assignmentMessage); err != nil {
+		t.Fatalf("failed to send assignment: %v", err)
+	}
+
+	select {
+	case err := <-startResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after one-shot completion")
+	}
+
+	select {
+	case <-serverClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("protocol did not close the worker connection before Run returned")
+	}
+	select {
+	case code := <-closeCode:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("WebSocket close code = %d, want %d", code, websocket.CloseNormalClosure)
+		}
+	default:
+		t.Fatal("server did not receive a WebSocket close frame")
+	}
+
+	var claimed, completed bool
+	for {
+		select {
+		case msg := <-received:
+			switch msg.Type {
+			case types.MessageTypeTaskClaimed:
+				claimed = true
+			case types.MessageTypeTaskCompleted:
+				completed = true
+			}
+		default:
+			if !claimed || !completed {
+				t.Fatalf("received claimed=%t completed=%t, want both before close", claimed, completed)
+			}
+			return
+		}
+	}
+}
+
+func TestOneShotReconnectsBeforeTaskCompletion(t *testing.T) {
+	assignmentData, err := json.Marshal(types.TaskAssignmentMessage{
+		TaskID:      "task-1",
+		ExecutionID: "execution-1",
+		Task: &types.Task{
+			ID:    "task-1",
+			Title: "one-shot reconnect task",
+			Owner: &types.TaskOwner{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal task assignment: %v", err)
+	}
+	assignmentMessage, err := json.Marshal(types.WebSocketMessage{
+		Type: types.MessageTypeTaskAssignment,
+		Data: assignmentData,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal WebSocket assignment: %v", err)
+	}
+
+	upgrader := websocket.Upgrader{}
+	var connectionCount atomic.Int64
+	secondConnection := make(chan struct{})
+	terminalReceived := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+		connectionNumber := connectionCount.Add(1)
+		switch connectionNumber {
+		case 1:
+			if err := conn.WriteMessage(websocket.TextMessage, assignmentMessage); err != nil {
+				return
+			}
+		case 2:
+			close(secondConnection)
+		}
+
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg types.WebSocketMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				return
+			}
+			if connectionNumber == 1 && msg.Type == types.MessageTypeTaskClaimed {
+				return
+			}
+			if connectionNumber == 2 &&
+				(msg.Type == types.MessageTypeTaskCompleted || msg.Type == types.MessageTypeTaskFailed) {
+				select {
+				case terminalReceived <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	testDir := t.TempDir()
+	releaseFile := filepath.Join(testDir, "release")
+	ozPath := filepath.Join(testDir, "oz")
+	script := "#!/bin/sh\nwhile [ ! -f \"$RELEASE_FILE\" ]; do sleep 0.01; done\n"
+	if err := os.WriteFile(ozPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz executable: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := New(ctx, Config{
+		APIKey:        "test-api-key",
+		WorkerID:      "one-shot-worker",
+		WebSocketURL:  "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ServerRootURL: "https://app.warp.dev",
+		BackendType:   "direct",
+		OneShot:       true,
+		Direct: &DirectBackendConfig{
+			OzPath:        ozPath,
+			WorkspaceRoot: filepath.Join(testDir, "workspaces"),
+			Env:           map[string]string{"RELEASE_FILE": releaseFile},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- w.Run()
+	}()
+
+	select {
+	case <-secondConnection:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not reconnect after the first connection closed")
+	}
+	select {
+	case err := <-startResult:
+		t.Fatalf("Run() returned before task completion: %v", err)
+	default:
+	}
+	if err := os.WriteFile(releaseFile, nil, 0o600); err != nil {
+		t.Fatalf("failed to release fake oz executable: %v", err)
+	}
+	select {
+	case err := <-startResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after task completion")
+	}
+
+	select {
+	case <-terminalReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement connection did not receive terminal task status")
+	}
+	if got := connectionCount.Load(); got < 2 {
+		t.Fatalf("connection count = %d, want at least 2", got)
+	}
+}
+
 // TestRunHeartbeatAndWritesAreConcurrencySafe is a regression test for the
 // "concurrent write to websocket connection" panic: the heartbeat loop used
 // to send pings via WriteMessage, racing writeLoop's data writes on the same
@@ -370,7 +990,9 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 			return
 		}
 		defer close(serverConnClosed)
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 		conn.SetPingHandler(func(string) error {
 			pingsReceived.Add(1)
 			return nil
@@ -390,29 +1012,26 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		t.Fatalf("failed to dial test server: %v", err)
 	}
 	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	protocolCtx, cancelProtocol := context.WithCancel(context.Background())
 	w := &Worker{
 		config:            Config{},
-		conn:              conn,
-		ctx:               ctx,
-		cancel:            cancel,
-		sendChan:          make(chan []byte, 256),
+		ctx:               context.Background(),
+		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[string]activeTask),
+		oneShot:           newOneShotState(),
+		backend:           &recordingBackend{},
 		heartbeatInterval: time.Millisecond,
 	}
 
 	runDone := make(chan struct{})
 	go func() {
-		w.run()
+		w.serveConnection(protocolCtx, conn)
 		close(runDone)
 	}()
 
-	// Flood data writes while heartbeats fire so the two write paths overlap
-	// constantly for the duration of the test window.
 	message := []byte(`{"type":"task_claimed","data":{"task_id":"task-1"}}`)
 	deadline := time.After(500 * time.Millisecond)
 flood:
@@ -420,18 +1039,15 @@ flood:
 		select {
 		case <-deadline:
 			break flood
-		case w.sendChan <- message:
+		case w.outbound.messages <- message:
 		}
 	}
 
-	// Tear down: cancelling the context stops writeLoop/heartbeatLoop, and
-	// closing the connection unblocks readLoop so run() returns.
-	cancel()
-	conn.Close()
+	cancelProtocol()
 	select {
 	case <-runDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("run() did not return after context cancellation and connection close")
+		t.Fatal("connection run did not return after protocol cancellation")
 	}
 	select {
 	case <-serverConnClosed:
@@ -514,61 +1130,98 @@ func TestDefaultImageForTask(t *testing.T) {
 }
 
 func TestPrepareTaskParamsSidecarImageOverride(t *testing.T) {
-	newWorker := func(sidecarImage string) *Worker {
-		ctx := context.Background()
-		var k8sConfig *KubernetesBackendConfig
-		if sidecarImage != "" {
-			k8sConfig = &KubernetesBackendConfig{SidecarImage: sidecarImage}
-		} else {
-			k8sConfig = &KubernetesBackendConfig{}
-		}
+	const (
+		serverImage   = "docker.io/warpdotdev/warp-agent:latest"
+		overrideImage = "my-registry.io/warpdotdev/warp-agent:latest"
+	)
+
+	newK8sWorker := func(sidecarImage string) *Worker {
 		return &Worker{
-			ctx: ctx,
+			ctx: context.Background(),
 			config: Config{
-				Kubernetes: k8sConfig,
+				Kubernetes: &KubernetesBackendConfig{SidecarImage: sidecarImage},
 			},
 		}
 	}
+	newDockerWorker := func(sidecarImage string) *Worker {
+		return &Worker{
+			ctx: context.Background(),
+			config: Config{
+				Docker: &DockerBackendConfig{SidecarImage: sidecarImage},
+			},
+		}
+	}
+	assignment := func(sidecarImage string, extra ...types.SidecarMount) *types.TaskAssignmentMessage {
+		return &types.TaskAssignmentMessage{
+			TaskID:             "task-1",
+			Task:               &types.Task{ID: "task-1"},
+			SidecarImage:       sidecarImage,
+			AdditionalSidecars: extra,
+		}
+	}
 
-	t.Run("config sidecar_image overrides server-provided image", func(t *testing.T) {
-		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
+	assertAgentSidecar := func(t *testing.T, params *TaskParams, wantImage string) {
+		t.Helper()
 		if len(params.Sidecars) == 0 {
 			t.Fatal("expected at least one sidecar")
 		}
-		if params.Sidecars[0].Image != "my-registry.io/warpdotdev/warp-agent:latest" {
-			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "my-registry.io/warpdotdev/warp-agent:latest")
+		if params.Sidecars[0].Image != wantImage {
+			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, wantImage)
 		}
+		if params.Sidecars[0].MountPath != "/agent" {
+			t.Errorf("sidecar mount path = %q, want /agent", params.Sidecars[0].MountPath)
+		}
+	}
+
+	t.Run("kubernetes config sidecar_image overrides server-provided image", func(t *testing.T) {
+		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, overrideImage)
 	})
 
-	t.Run("server-provided image used when config sidecar_image empty", func(t *testing.T) {
-		w := newWorker("")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "docker.io/warpdotdev/warp-agent:latest",
-		})
-		if len(params.Sidecars) == 0 {
-			t.Fatal("expected at least one sidecar")
-		}
-		if params.Sidecars[0].Image != "docker.io/warpdotdev/warp-agent:latest" {
-			t.Errorf("sidecar image = %q, want %q", params.Sidecars[0].Image, "docker.io/warpdotdev/warp-agent:latest")
-		}
+	t.Run("docker config sidecar_image overrides server-provided image", func(t *testing.T) {
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, overrideImage)
 	})
 
-	t.Run("no sidecar when server provides empty sidecar image", func(t *testing.T) {
-		w := newWorker("my-registry.io/warpdotdev/warp-agent:latest")
-		params := w.prepareTaskParams(&types.TaskAssignmentMessage{
-			TaskID:       "task-1",
-			Task:         &types.Task{ID: "task-1"},
-			SidecarImage: "",
-		})
+	t.Run("server-provided image used when kubernetes config sidecar_image empty", func(t *testing.T) {
+		params := newK8sWorker("").prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("server-provided image used when docker config sidecar_image empty", func(t *testing.T) {
+		params := newDockerWorker("").prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("server-provided image used when docker config is nil", func(t *testing.T) {
+		w := &Worker{ctx: context.Background(), config: Config{}}
+		params := w.prepareTaskParams(assignment(serverImage))
+		assertAgentSidecar(t, params, serverImage)
+	})
+
+	t.Run("no sidecar when server provides empty sidecar image with kubernetes override", func(t *testing.T) {
+		params := newK8sWorker(overrideImage).prepareTaskParams(assignment(""))
 		if len(params.Sidecars) != 0 {
 			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
+		}
+	})
+
+	t.Run("no sidecar when server provides empty sidecar image with docker override", func(t *testing.T) {
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(""))
+		if len(params.Sidecars) != 0 {
+			t.Errorf("expected no sidecars when server sidecar image is empty, got %d", len(params.Sidecars))
+		}
+	})
+
+	t.Run("docker override does not rewrite additional sidecars", func(t *testing.T) {
+		extra := types.SidecarMount{Image: "docker.io/warpdotdev/extra:latest", MountPath: "/mnt/extra"}
+		params := newDockerWorker(overrideImage).prepareTaskParams(assignment(serverImage, extra))
+		if len(params.Sidecars) != 2 {
+			t.Fatalf("sidecar count = %d, want 2: %+v", len(params.Sidecars), params.Sidecars)
+		}
+		assertAgentSidecar(t, params, overrideImage)
+		if params.Sidecars[1] != extra {
+			t.Errorf("additional sidecar = %+v, want %+v", params.Sidecars[1], extra)
 		}
 	})
 }
@@ -864,17 +1517,14 @@ func TestPrepareTaskParamsAdditionalOzArgs(t *testing.T) {
 	})
 }
 
-func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
-	workerCtx, cancel := context.WithCancel(context.Background())
+func TestShutdownBackendUsesFreshContextForCleanup(t *testing.T) {
 	backend := &shutdownRecordingBackend{}
 	w := &Worker{
-		ctx:         workerCtx,
-		cancel:      cancel,
+		ctx:         context.Background(),
 		activeTasks: make(map[string]activeTask),
 		backend:     backend,
 	}
-
-	w.Shutdown()
+	w.shutdownBackend()
 
 	if !backend.shutdownCalled {
 		t.Fatal("expected backend shutdown to be called")
@@ -885,12 +1535,10 @@ func TestWorkerShutdownUsesFreshContextForBackendCleanup(t *testing.T) {
 }
 
 func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
-	workerCtx, cancel := context.WithCancel(context.Background())
 	backend := &preservingShutdownRecordingBackend{}
 	cancelledTask := false
 	w := &Worker{
-		ctx:    workerCtx,
-		cancel: cancel,
+		ctx: context.Background(),
 		activeTasks: map[string]activeTask{
 			"task-1": {cancel: func() {
 				cancelledTask = true
@@ -899,7 +1547,8 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 		backend: backend,
 	}
 
-	w.Shutdown()
+	w.shutdownTasks()
+	w.shutdownBackend()
 
 	if cancelledTask {
 		t.Fatal("expected active task to be preserved, but cancel function was called")
@@ -914,9 +1563,8 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 	cancel()
 	w := &Worker{
 		ctx:         workerCtx,
-		cancel:      cancel,
 		config:      Config{},
-		sendChan:    make(chan []byte, 1),
+		outbound:    newOutboundQueue(1),
 		activeTasks: make(map[string]activeTask),
 		backend:     &preservingShutdownRecordingBackend{},
 	}
@@ -928,5 +1576,29 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 
 	if len(w.activeTasks) != 0 {
 		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
+	}
+}
+
+func TestHandleTaskAssignmentRejectsAfterShutdownStarts(t *testing.T) {
+	w := &Worker{
+		ctx:          context.Background(),
+		config:       Config{},
+		outbound:     newOutboundQueue(1),
+		activeTasks:  make(map[string]activeTask),
+		shuttingDown: true,
+		backend:      &recordingBackend{},
+	}
+
+	w.handleTaskAssignment(&types.TaskAssignmentMessage{
+		TaskID: "task-1",
+		Task:   &types.Task{ID: "task-1", Title: "test task"},
+	})
+
+	if len(w.activeTasks) != 0 {
+		t.Fatalf("expected no active tasks after shutdown started, got %d", len(w.activeTasks))
+	}
+	msg := readWebSocketMessage(t, w.outbound.messages)
+	if msg.Type != types.MessageTypeTaskRejected {
+		t.Fatalf("message type = %q, want %q", msg.Type, types.MessageTypeTaskRejected)
 	}
 }

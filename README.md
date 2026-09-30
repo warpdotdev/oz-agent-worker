@@ -16,6 +16,7 @@ Self-hosted worker for Oz cloud agents.
   - Docker daemon access for the Docker backend
   - Local `oz` CLI access plus a writable workspace root for the Direct backend
   - Kubernetes API access plus cluster credentials for the Kubernetes backend
+  - An operator-provided dispatch command for the Command backend (dispatch to any runtime over any transport)
 
 ## Usage
 
@@ -30,6 +31,32 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock \
 ```
 
 > **Note:** Mounting the Docker socket gives the container access to the host's Docker daemon. This is required for the worker to create and manage task containers.
+
+#### Docker backend configuration
+
+`backend.docker.image_pull_policy` controls how the Docker backend gets the task image and each Warp/additional sidecar image before it starts a container. The accepted values match the Kubernetes backend's `image_pull_policy`:
+
+- `Always` (the default for this backend when you omit the key): pull the image from the registry, then use the pulled image.
+- `IfNotPresent`: use the image if it is already stored locally. Pull the image only when it is not present locally.
+- `Never`: do not contact the registry. Use the image if it is already stored locally. If the image is not present locally, the task setup fails with a clear error.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    image_pull_policy: "IfNotPresent"
+```
+
+This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
+
+`backend.docker.sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when the worker host cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    sidecar_image: "my-registry.io/warpdotdev/warp-agent:latest"
+```
 
 ### Image releases and pinning
 
@@ -64,6 +91,94 @@ backend:
     oz_path: "/usr/local/bin/oz"
 ```
 
+The Direct backend also supports one-shot workers that accept one task and exit
+after that task succeeds, fails, or is cancelled:
+
+```bash
+oz-agent-worker --worker-id "my-worker" --backend direct --one-shot
+```
+
+The equivalent config-file setting is top-level:
+
+```yaml
+worker_id: "my-worker"
+one_shot: true
+backend:
+  direct:
+    workspace_root: "/var/lib/oz/workspaces"
+```
+
+One-shot mode forces `max_concurrent_tasks` to `1` and permanently stops the
+worker from claiming another task after its first accepted assignment. The
+worker flushes queued task status messages through the WebSocket writer before
+closing its connection and exiting. If no task is assigned, it remains
+connected until it receives a shutdown signal. Docker, Kubernetes, and Command
+backends reject one-shot mode during worker startup.
+
+The `setup_command` and `teardown_command` hooks run with these variables set, each under both
+its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
+
+- `OZ_RUN_ID` — the run being executed.
+- `OZ_WORKER_BACKEND` — always `direct` here.
+- `OZ_WORKSPACE_ROOT` — the per-task workspace directory, which is also the hook's working directory.
+- `OZ_ENVIRONMENT_FILE` — setup only. Write `KEY=VALUE` lines here to add variables to the agent's environment.
+
+The teardown hook additionally gets `GIT_CONFIG_GLOBAL`, pointing at the task's isolated git config.
+These names are worker-owned: the worker writes them last, so an entry with one of these names in
+the backend's `environment` is overwritten rather than honoured.
+
+### Command
+
+The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
+
+Example config:
+
+```yaml
+worker_id: "my-worker"
+backend:
+  command:
+    dispatch_command: "/opt/oz/dispatch.sh"
+    cancel_command: "/opt/oz/cancel.sh"
+    dispatch_timeout: "60s"
+    environment:
+      - name: MY_RUNTIME_TOKEN
+```
+
+Config keys:
+
+- `dispatch_command` (required): shell command (run via `/bin/sh -c`) invoked once per task to dispatch it.
+- `cancel_command` (optional): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation.
+- `dispatch_timeout` (optional): how long the dispatch command may run before it is considered failed (humantime format, e.g. `60s`). Defaults to `60s`.
+- `environment`: extra environment variables exposed to the dispatch/cancel commands (same `name`/`value` semantics as the other backends; omit `value` to inherit from the host).
+
+The dispatch contract:
+
+- The dispatch command receives the task payload as JSON on **stdin**. This is the only place task environment variables and secrets appear — they are deliberately kept out of the subprocess environment and argv.
+- The following variables are also set in the command's environment for convenience: `OZ_RUN_ID`, `OZ_EXECUTION_ID`, `OZ_WORKER_BACKEND=command`, `OZ_SERVER_ROOT_URL`, `OZ_DOCKER_IMAGE`. Each is also set under a `WARP_`-prefixed alias carrying the identical value (`WARP_RUN_ID`, `WARP_EXECUTION_ID`, `WARP_WORKER_BACKEND`, `WARP_SERVER_ROOT_URL`, `WARP_DOCKER_IMAGE`); read whichever name you prefer. One exception to "just an alias": `WARP_SERVER_ROOT_URL` is also the Warp CLI's own server-root-URL override, so inside the dispatch and cancel subprocesses it points any `oz`/`warp` invocation at that server. The value is the same one the worker already uses, so this changes nothing in practice — but do not treat that one name as inert.
+- The JSON payload looks like:
+
+  ```json
+  {
+    "version": 1,
+    "run_id": "...",
+    "execution_id": "...",
+    "server_root_url": "https://app.warp.dev",
+    "worker_id": "my-worker",
+    "docker_image": "ubuntu:22.04",
+    "base_args": ["agent", "run", "--task-id", "...", "--server-root-url", "..."],
+    "env": { "GITHUB_ACCESS_TOKEN": "...", "...": "..." },
+    "sidecars": [ { "image": "...", "mount_path": "/agent", "read_write": false } ],
+    "task": { "id": "...", "title": "...", "task_definition": { "prompt": "..." } }
+  }
+  ```
+
+  `base_args` is the `oz agent run …` argument vector your runtime should launch the agent with, inside an environment built from `docker_image` and `sidecars`.
+- Exit code `0` means the task was dispatched successfully; the worker will not finalize it (the remote agent reports terminal state to Warp itself). A non-zero exit or a dispatch that exceeds `dispatch_timeout` marks the task failed.
+- The cancel command (when configured) receives `OZ_RUN_ID`, `OZ_EXECUTION_ID`, and `OZ_WORKER_BACKEND=command` in its environment, each with its `WARP_`-prefixed alias.
+
+Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
+The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
+
 ### Kubernetes
 
 The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
@@ -97,8 +212,9 @@ Notes:
 
 - `default_image` sets the Docker image for task Jobs when no Warp environment is configured on the run; this lets you skip creating a Warp environment entirely if all your tasks use the same base image (precedence: Warp environment image > `default_image` > `ubuntu:22.04`)
 - `namespace` selects the namespace inside the chosen cluster; it does not choose the cluster itself, and defaults to `default` when omitted
-- `unschedulable_timeout` controls how long a Pod may remain unschedulable before the task is failed early; it defaults to `30s`, and `0s` disables that fail-fast behavior
+- `unschedulable_timeout` controls the Pod-age threshold for failing an unschedulable task; it defaults to `10m` to allow node autoscaling, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
+- the worker owns a set of names in the task container's environment and writes them last, so an entry with one of these names in `task_env` or `pod_template` is overwritten rather than honoured: `OZ_RUN_ID`, `OZ_WORKER_BACKEND`, `OZ_WORKSPACE_ROOT`, `OZ_ENVIRONMENT_FILE`, and the `WARP_`-prefixed name of each (`WARP_RUN_ID` and so on). Pick different names for operator-supplied variables. Warp reserves the `WARP_` names against managed secrets too, but a worker's own config is yours, so nothing stops you setting them — they just will not survive
 - `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
 - `coding_cli_sidecars` maps a harness config name (e.g. `claude`, `codex`) to a custom Docker image that will be mounted as the coding CLI sidecar for runs using that harness. When set, the worker replaces the server-provided sidecar image (or injects a new entry if the server did not send one) at the standard mount path `/mnt/{harness}-cli-sidecar`. Use this when your cluster uses a custom or internal Claude Code binary wrapper instead of the Warp-provided image. Example:
 
@@ -118,6 +234,7 @@ backend:
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
 - when a run's runner specifies an instance shape, the worker sets the `task` container's CPU and memory **requests and limits** from that shape on a per-run basis, overriding any matching `resources` set on the `task` container in `pod_template` (other resource entries are preserved). Runs whose runner has no instance shape keep your `pod_template`/cluster defaults unchanged. The Docker backend applies the same shape as container CPU/memory limits; the Direct backend runs on the host and does not enforce shapes
+- to run services (databases, brokers, caches, etc.) alongside the task container, declare them in `pod_template.initContainers` with `restartPolicy: Always` (native sidecar containers). Matching Kubernetes Job semantics, the worker ignores their exit codes when detecting task failure: the kubelet stops sidecars with SIGTERM after the task container finishes, so services that exit non-zero on SIGTERM (e.g. JVM-based services exiting 143) do not fail the task. Init containers without `restartPolicy` remain run-to-completion setup steps whose non-zero exit fails the task
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
 
 ```yaml
@@ -184,15 +301,31 @@ task pods independently (for example with separate node pools, selectors,
 tolerations, or disruption budgets) so worker rotation does not imply task pod
 eviction.
 
-When cleanup is enabled, completed task Jobs are still cleaned up by normal
-worker cleanup when observed, with Kubernetes Job TTL as a fallback.
+`cleanup` controls retention of **finished** task resources:
+- `true`: delete successful Jobs immediately; retain failed Jobs until their
+  configured TTL expires (`kubernetesBackend.ttlSecondsAfterFinished`, default 24h).
+  The TTL also removes Jobs that finish after worker disruption.
+- `false`: retain finished Jobs and Pods indefinitely, with no TTL.
+
+On task failure, the worker retains stopped executions for debugging. If execution
+is still possible or unknown, it expires the Job instead of deleting it.
+Kubernetes stops active Pods and marks the Job failed; the Job keeps its existing
+TTL policy. Expiration can delete active Pods, so available diagnostics are
+captured first. Unsuccessful expiration is reported and may require intervention.
+Explicit cancellation still deletes Jobs; worker shutdown preserves active Jobs.
+
+Transient Kubernetes API observation errors are retried with bounded backoff.
+
 
 Recommended namespace-scoped permissions for the worker are:
 
-- create, get, list, watch, delete `jobs`
+- create, get, list, watch, patch, delete `jobs`
 - get, list, watch `pods`
 - get `pods/log`
 - list `events`
+
+When upgrading an existing installation, update its Role to grant `patch` on Jobs
+before deploying the worker; this permission is required to expire abandoned Jobs.
 
 The worker Deployment's `ServiceAccount` is separate from the task Job `serviceAccountName` you may set inside `backend.kubernetes.pod_template` / `kubernetesBackend.podTemplate`. The worker `Deployment` defaults to non-root. By default, task Jobs still materialize sidecars with root init containers; set `kubernetesBackend.useImageVolumes=true` to opt into native image volumes instead. Kubernetes `1.35+` is the recommended and tested target for that opt-in path, while Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes. If your cluster restricts image sources for admission or policy reasons, set `kubernetesBackend.preflightImage` in the chart to an allowlisted image for the startup preflight Job, and configure task `imagePullSecrets` inside `podTemplate` when needed.
 
