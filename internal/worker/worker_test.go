@@ -643,15 +643,17 @@ func assertOneShotDone(t *testing.T, w *Worker) {
 
 func TestConnectReportsRunnerShapeCapability(t *testing.T) {
 	for _, tc := range []struct {
+		name        string
 		backendType string
 		want        string
 	}{
-		{backendType: "direct", want: "false"},
-		{backendType: "docker", want: "true"},
-		{backendType: "kubernetes", want: "true"},
-		{backendType: "command"},
+		{name: "default Docker", want: "true"},
+		{name: "direct", backendType: "direct", want: "false"},
+		{name: "Docker", backendType: "docker", want: "true"},
+		{name: "Kubernetes", backendType: "kubernetes", want: "true"},
+		{name: "command", backendType: "command"},
 	} {
-		t.Run(tc.backendType, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			reported := make(chan string, 1)
 			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 				reported <- r.URL.Query().Get("runner_shape_supported")
