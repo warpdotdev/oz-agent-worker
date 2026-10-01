@@ -641,6 +641,51 @@ func assertOneShotDone(t *testing.T, w *Worker) {
 	}
 }
 
+func TestConnectReportsRunnerShapeCapability(t *testing.T) {
+	for _, tc := range []struct {
+		backendType string
+		want        string
+	}{
+		{backendType: "direct", want: "false"},
+		{backendType: "docker", want: "true"},
+		{backendType: "kubernetes", want: "true"},
+		{backendType: "command"},
+	} {
+		t.Run(tc.backendType, func(t *testing.T) {
+			reported := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				reported <- r.URL.Query().Get("runner_shape_supported")
+				conn, err := (&websocket.Upgrader{}).Upgrade(rw, r, nil)
+				if err == nil {
+					defer func() {
+						_ = conn.Close()
+					}()
+				}
+			}))
+			defer srv.Close()
+
+			w := &Worker{
+				ctx: context.Background(),
+				config: Config{
+					WorkerID:     "worker-a",
+					WebSocketURL: "ws" + strings.TrimPrefix(srv.URL, "http"),
+					BackendType:  tc.backendType,
+				},
+			}
+			conn, err := w.connect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = conn.Close()
+			}()
+			if got := <-reported; got != tc.want {
+				t.Errorf("runner_shape_supported = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	connected := make(chan struct{})

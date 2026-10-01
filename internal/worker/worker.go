@@ -288,6 +288,12 @@ func (w *Worker) connect() (*websocket.Conn, error) {
 
 	query := u.Query()
 	query.Set("worker_id", w.config.WorkerID)
+	switch w.config.BackendType {
+	case "direct":
+		query.Set("runner_shape_supported", "false")
+	case "docker", "", "kubernetes":
+		query.Set("runner_shape_supported", "true")
+	}
 	u.RawQuery = query.Encode()
 
 	headers := make(map[string][]string)
