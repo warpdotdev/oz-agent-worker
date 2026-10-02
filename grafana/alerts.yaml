@@ -1,0 +1,153 @@
+# Prometheus alerting rules for self-hosted Oz agent workers.
+#
+# Usage:
+#   - Vanilla Prometheus: place this file in your Prometheus rules directory
+#     and reference it from prometheus.yml under `rule_files:`.
+#   - Prometheus Operator: wrap the `groups` block in a PrometheusRule CRD
+#     (apiVersion: monitoring.coreos.com/v1, kind: PrometheusRule).
+#
+# All thresholds are conservative starting points. Tune them for your fleet
+# size, task volume, and SLOs before enabling in production.
+
+groups:
+  - name: oz_agent_worker
+    interval: 60s
+    rules:
+
+      # ── Connectivity ──────────────────────────────────────────────────────
+
+      - alert: OzWorkerDisconnected
+        expr: |
+          oz_worker_connected == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker {{ $labels.instance }} has lost its connection to Oz"
+          description: >
+            Worker {{ $labels.instance }} has reported oz_worker_connected=0 for
+            more than 2 minutes. The worker is no longer accepting tasks.
+            Check network egress to oz.warp.dev and review worker logs.
+
+      - alert: OzWorkerReconnectStorm
+        expr: |
+          sum by (instance) (rate(oz_worker_websocket_reconnects_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker {{ $labels.instance }} is reconnecting frequently"
+          description: >
+            Worker {{ $labels.instance }} is reconnecting to warp-server at a rate
+            of {{ $value | humanize }}/s (threshold: 0.1/s). This may indicate
+            network instability, TLS issues, or server-side disruptions.
+
+      # ── Capacity ──────────────────────────────────────────────────────────
+
+      - alert: OzWorkerFleetSaturated
+        expr: |
+          (
+            sum(oz_worker_tasks_active) /
+            sum(oz_worker_tasks_max_concurrent != 0)
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker fleet is running at high capacity"
+          description: >
+            The fleet is using {{ $value | humanizePercentage }} of configured
+            concurrency capacity (threshold: 90%). Tasks may start experiencing
+            rejections. Consider increasing max_concurrent_tasks or deploying
+            additional worker instances.
+          runbook: |
+            1. Check oz_worker_tasks_rejected_total for recent rejections.
+            2. Review oz_worker_task_duration_seconds to see if tasks are running longer than expected.
+            3. Increase max_concurrent_tasks in worker config, or deploy more worker pods.
+
+      - alert: OzWorkerTasksRejected
+        expr: |
+          sum(rate(oz_worker_tasks_rejected_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz workers are rejecting tasks"
+          description: >
+            Workers are rejecting tasks at {{ $value | humanize }}/s. Rejections
+            occur when a worker is at its concurrency limit (max_concurrent_tasks).
+            Increase capacity or the concurrency limit to stop dropping tasks.
+
+      # ── Task failures ─────────────────────────────────────────────────────
+
+      - alert: OzWorkerHighFailureRate
+        expr: |
+          (
+            sum(rate(oz_worker_tasks_completed_total{result="failed"}[5m])) /
+            sum(rate(oz_worker_tasks_completed_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker task failure rate is elevated"
+          description: >
+            {{ $value | humanizePercentage }} of completed tasks have failed over
+            the last 5 minutes (threshold: 10%). Check
+            oz_worker_task_failures_total{phase,reason} for the root cause.
+
+      - alert: OzWorkerImagePullFailures
+        expr: |
+          sum(rate(oz_worker_task_failures_total{reason="image_pull"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker is failing to pull task images"
+          description: >
+            Workers are failing to pull container images at
+            {{ $value | humanize }}/s. Check image registry access, pull secrets,
+            and image availability. For Kubernetes, confirm imagePullSecrets are
+            configured and the registry is reachable from the cluster.
+
+      - alert: OzWorkerContainerOOM
+        expr: |
+          sum(rate(oz_worker_task_failures_total{reason="container_oom"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker task containers are being OOM-killed"
+          description: >
+            Task containers are being killed due to memory limits at
+            {{ $value | humanize }}/s. Review the memory limits set in
+            pod_template or the instance shape for the runs that are failing,
+            and increase them if tasks require more memory.
+
+      - alert: OzWorkerUnschedulablePods
+        expr: |
+          sum(rate(oz_worker_task_failures_total{reason="unschedulable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oz worker task pods are failing to schedule"
+          description: >
+            Kubernetes task pods are becoming unschedulable at
+            {{ $value | humanize }}/s. Check node capacity, taints, tolerations,
+            resource requests in pod_template, and cluster autoscaler status.
+
+      # ── No workers connected ──────────────────────────────────────────────
+
+      - alert: OzWorkerFleetEmpty
+        expr: |
+          sum(oz_worker_connected) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Oz workers are connected"
+          description: >
+            No workers have an active connection to Oz. Cloud agent tasks cannot
+            be dispatched to self-hosted infrastructure. Check worker pod
+            readiness, API key validity, and network egress to oz.warp.dev.
