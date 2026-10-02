@@ -1,4 +1,5 @@
-{{- if .Values.rbac.create }}
+{{- /* Task Job/Pod RBAC is only needed for the kubernetes backend. */ -}}
+{{- if and .Values.rbac.create (eq (include "oz-agent-worker.backendType" .) "kubernetes") }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
