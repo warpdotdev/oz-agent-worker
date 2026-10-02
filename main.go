@@ -297,12 +297,14 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		}
 
 		var workspaceRoot, targetDir, ozPath, setupCmd, teardownCmd string
+		var harnessConfigDirs map[string]string
 		if fileConfig != nil && fileConfig.Backend.Direct != nil {
 			workspaceRoot = fileConfig.Backend.Direct.WorkspaceRoot
 			targetDir = fileConfig.Backend.Direct.TargetDir
 			ozPath = fileConfig.Backend.Direct.OzPath
 			setupCmd = fileConfig.Backend.Direct.SetupCommand
 			teardownCmd = fileConfig.Backend.Direct.TeardownCommand
+			harnessConfigDirs = copyStringMap(fileConfig.Backend.Direct.HarnessConfigDirs)
 		}
 
 		// CLI --target-dir overrides config file.
@@ -311,13 +313,14 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		}
 
 		wc.Direct = &worker.DirectBackendConfig{
-			WorkspaceRoot:   workspaceRoot,
-			TargetDir:       targetDir,
-			OzPath:          ozPath,
-			SetupCommand:    setupCmd,
-			TeardownCommand: teardownCmd,
-			NoCleanup:       noCleanup,
-			Env:             mergedEnv,
+			WorkspaceRoot:     workspaceRoot,
+			TargetDir:         targetDir,
+			OzPath:            ozPath,
+			SetupCommand:      setupCmd,
+			TeardownCommand:   teardownCmd,
+			NoCleanup:         noCleanup,
+			Env:               mergedEnv,
+			HarnessConfigDirs: harnessConfigDirs,
 		}
 
 	case "command":
