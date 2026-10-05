@@ -37,7 +37,7 @@ func newDispatchWorker(backend Backend) *Worker {
 		ctx:         context.Background(),
 		config:      Config{},
 		outbound:    newOutboundQueue(4),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}, executionID: "exec-1"}},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "exec-1"}: {cancel: func() {}, executionID: "exec-1"}},
 		backend:     backend,
 	}
 }
@@ -61,7 +61,7 @@ func TestExecuteTaskDispatchedSuppressesTerminalMessage(t *testing.T) {
 		t.Fatalf("expected no terminal message after dispatch, got %q", msg.Type)
 	}
 	w.tasksMutex.Lock()
-	task, ok := w.activeTasks["task-1"]
+	task, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "exec-1"}]
 	w.tasksMutex.Unlock()
 	if !ok {
 		t.Fatal("spawned task should remain in activeTasks")
@@ -104,7 +104,7 @@ func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "exec-1"}: spawnedActiveTask("exec-1")},
 		backend:     backend,
 	}
 
@@ -120,10 +120,10 @@ func TestHandleTaskCancellationRoutesToBackendCancelTask(t *testing.T) {
 	}
 
 	w.tasksMutex.Lock()
-	_, ok := w.activeTasks["task-1"]
+	_, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "exec-1"}]
 	w.tasksMutex.Unlock()
-	if ok {
-		t.Error("spawned task should be removed after cancellation is routed")
+	if !ok {
+		t.Error("spawned task should remain tracked until closure is confirmed")
 	}
 }
 
@@ -134,7 +134,7 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 	w := &Worker{
 		ctx:      context.Background(),
 		outbound: newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "exec-1"}: {
 			ctx:         taskCtx,
 			cancel:      taskCancel,
 			executionID: "exec-1",
@@ -156,9 +156,9 @@ func TestHandleTaskCancellationRunningTaskCancelsContextAndBackend(t *testing.T)
 		t.Fatal("CancelTask was not invoked for a running task")
 	}
 
-	// The entry stays until executeTask's deferred cleanup removes it.
+	// An unverified cancellation must stay available for retry.
 	w.tasksMutex.Lock()
-	task, ok := w.activeTasks["task-1"]
+	task, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "exec-1"}]
 	w.tasksMutex.Unlock()
 	if !ok {
 		t.Fatal("running task should remain in activeTasks until executeTask returns")
@@ -172,7 +172,7 @@ func TestHandleTaskCancellationSpawnedNoopCancelEmitsNoMessage(t *testing.T) {
 	w := &Worker{
 		ctx:         context.Background(),
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": spawnedActiveTask("exec-1")},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "exec-1"}: spawnedActiveTask("exec-1")},
 		backend:     &dispatchBackend{},
 	}
 

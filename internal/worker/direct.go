@@ -173,6 +173,16 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	} else {
 		// Create per-task workspace directory.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
+		if params.ExecutionID != "" {
+			if err := validateTaskIDForPath(params.ExecutionID); err != nil {
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid execution ID for workspace path: %w", err)))
+			}
+			var err error
+			workspaceDir, err = os.MkdirTemp(b.config.WorkspaceRoot, taskID+"-"+params.ExecutionID+"-")
+			if err != nil {
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create execution workspace: %w", err)))
+			}
+		}
 		if err := os.MkdirAll(workspaceDir, 0700); err != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err)))
 		}

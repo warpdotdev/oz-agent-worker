@@ -525,12 +525,56 @@ func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams
 	if params == nil {
 		return fmt.Errorf("cancel params are required")
 	}
-	jobName := kubernetesTaskJobName(params.TaskID, executionIDOrTaskID(params.TaskID, params.ExecutionID))
+	executionID := executionIDOrTaskID(params.TaskID, params.ExecutionID)
+	jobName := kubernetesTaskJobName(params.TaskID, executionID)
+	job, err := b.getTaskJob(ctx, jobName)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if job.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash(executionID) ||
+		job.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash(params.TaskID) {
+		return fmt.Errorf("job %s belongs to another execution", jobName)
+	}
 	log.Infof(ctx, "Deleting Kubernetes Job %s after task cancellation", jobName)
-	if err := b.deleteJob(ctx, jobName); err != nil {
+	if err := b.deleteTaskJob(ctx, jobName, &job.UID); err != nil {
 		return fmt.Errorf("failed to delete Kubernetes Job %s: %w", jobName, err)
 	}
 	return nil
+}
+
+// ConfirmTaskClosed waits for both the Job and its Pods to disappear.
+func (b *KubernetesBackend) ConfirmTaskClosed(ctx context.Context, params *CancelParams) (bool, error) {
+	executionID := executionIDOrTaskID(params.TaskID, params.ExecutionID)
+	jobName := kubernetesTaskJobName(params.TaskID, executionID)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		job, err := b.getTaskJob(ctx, jobName)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		if err == nil && (job.Labels[kubernetesExecutionHashLabel] != kubernetesLabelHash(executionID) ||
+			job.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash(params.TaskID)) {
+			return false, fmt.Errorf("job %s belongs to another execution", jobName)
+		}
+		if apierrors.IsNotFound(err) {
+			pods, err := b.listTaskPods(ctx, executionID)
+			if err != nil {
+				return false, err
+			}
+			if len(pods) == 0 {
+				return true, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // Shutdown intentionally does not delete task Jobs.

@@ -94,7 +94,7 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 	waitFor(t, 5*time.Second, func() bool {
 		w.tasksMutex.Lock()
 		defer w.tasksMutex.Unlock()
-		task, ok := w.activeTasks["task-1"]
+		task, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "exec-1"}]
 		return ok && task.spawned
 	})
 
