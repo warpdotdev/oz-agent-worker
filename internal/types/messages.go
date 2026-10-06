@@ -104,6 +104,17 @@ type InstanceShape struct {
 	Vcpus    int `json:"vcpus,omitempty"`
 	MemoryGb int `json:"memory_gb,omitempty"`
 }
+type TelemetryCollectionConfig struct {
+	Endpoint       string                   `json:"endpoint"`
+	TracingEnabled bool                     `json:"tracing_enabled"`
+	LoggingEnabled bool                     `json:"logging_enabled"`
+	BootstrapToken *TelemetryBootstrapToken `json:"bootstrap_token,omitempty"`
+}
+
+type TelemetryBootstrapToken struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
 
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
@@ -118,6 +129,7 @@ type TaskAssignmentMessage struct {
 	SidecarImage string `json:"sidecar_image,omitempty"`
 	// EnvVars contains environment variables to set in the container (e.g. WARP_API_KEY, GITHUB_ACCESS_TOKEN)
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+	TelemetryCollection *TelemetryCollectionConfig `json:"telemetry_collection,omitempty"`
 	// AdditionalSidecars is a list of extra sidecar images to mount into the task container.
 	AdditionalSidecars []SidecarMount `json:"additional_sidecars,omitempty"`
 	// AdditionalOzArgs are server-resolved supplemental arguments for the oz

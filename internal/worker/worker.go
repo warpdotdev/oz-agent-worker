@@ -13,6 +13,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -55,6 +56,7 @@ type Config struct {
 	IdleOnComplete string
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
+	DisableTaskLogs bool
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -145,6 +147,7 @@ type activeTask struct {
 	// longer executes locally, but the entry is kept so a later cancellation
 	// can be routed to the backend's CancelTask.
 	spawned bool
+	logs *tasklogs.Reporter
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -403,7 +406,6 @@ func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
 			}
 			return fmt.Errorf("WebSocket read failed: %w", err)
 		}
-		log.Debugf(w.ctx, "WebSocket received: %s", string(message))
 		w.handleMessage(message)
 	}
 }
@@ -456,7 +458,6 @@ func (w *Worker) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error 
 }
 
 func (w *Worker) handleMessage(message []byte) {
-	log.Debugf(w.ctx, "Received message: %s", string(message))
 
 	var msg types.WebSocketMessage
 	if err := json.Unmarshal(message, &msg); err != nil {
@@ -802,6 +803,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		// routed to the backend's CancelTask; everything else is done.
 		if task, tracked := w.activeTasks[assignment.TaskID]; !tracked || !task.spawned {
 			delete(w.activeTasks, assignment.TaskID)
+		} else {
+			task.logs = nil
+			w.activeTasks[assignment.TaskID] = task
 		}
 		w.tasksMutex.Unlock()
 
@@ -814,10 +818,41 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	}()
 
 	taskID := assignment.TaskID
+	params := w.prepareTaskParams(assignment)
+	if !w.config.DisableTaskLogs {
+		reporter, err := tasklogs.New(w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
+		if err != nil {
+			log.Warnf(ctx, "Task log reporting unavailable for task %s: %v", taskID, err)
+		}
+		if reporter != nil {
+			params.Logs = reporter
+			ctx = log.WithSink(ctx, reporter.Log)
+			if params.SetupEvents == nil {
+				params.SetupEvents = &setupEventReporter{}
+			}
+			params.SetupEvents.logs = reporter
+			w.tasksMutex.Lock()
+			shuttingDown := w.shuttingDown
+			if task, ok := w.activeTasks[taskID]; ok {
+				task.logs = reporter
+				w.activeTasks[taskID] = task
+			}
+			w.tasksMutex.Unlock()
+			if shuttingDown {
+				flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+				reporter.Shutdown(flushCtx)
+				cancel()
+			}
+			defer func() {
+				flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+				defer cancel()
+				reporter.Shutdown(flushCtx)
+			}()
+		}
+	}
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
 	metrics.AddTaskEvent(ctx, "task.started")
 
-	params := w.prepareTaskParams(assignment)
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
 		attribute.String("docker.image", params.DockerImage),
@@ -1051,6 +1086,12 @@ func (w *Worker) shutdownTasks() {
 	}
 	w.shuttingDown = true
 	activeTaskCount := len(w.activeTasks)
+	var reporters []*tasklogs.Reporter
+	for _, task := range w.activeTasks {
+		if task.logs != nil {
+			reporters = append(reporters, task.logs)
+		}
+	}
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
@@ -1081,6 +1122,21 @@ func (w *Worker) shutdownTasks() {
 		case <-time.After(BackendShutdownTimeout):
 			log.Warnf(w.ctx, "Timed out waiting for active tasks to finish during shutdown")
 		}
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+	defer cancel()
+	var flushWG sync.WaitGroup
+	for _, reporter := range reporters {
+		flushWG.Go(func() { reporter.Shutdown(flushCtx) })
+	}
+	flushed := make(chan struct{})
+	go func() {
+		flushWG.Wait()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-flushCtx.Done():
 	}
 }
 

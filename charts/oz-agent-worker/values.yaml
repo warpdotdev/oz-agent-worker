@@ -36,6 +36,7 @@ worker:
   # Cancellation deletes Jobs; worker shutdown preserves them.
   cleanup: true
   maxConcurrentTasks: 0
+  disableTaskLogs: false
   idleOnComplete: ""
   extraArgs: []
   extraEnv: []

@@ -121,6 +121,11 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	params.Logs.AddEnv(b.config.Env)
+	ctx = context.WithValue(ctx, dockerLabelsKey{}, map[string]string{
+		"oz-task-id": params.TaskID,
+		"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
+	})
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -160,6 +165,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		Cmd:        cmd,
 		Env:        envVars,
 		WorkingDir: "/workspace",
+		Labels: dockerTaskLabels(ctx),
 	}
 
 	// Sidecar binds come first, then user-configured volumes.
@@ -201,6 +207,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	doneContainerStart(false)
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
+	stopLogs := b.followContainerLogs(ctx, containerID, params.Logs)
+	defer stopLogs()
 
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
@@ -211,8 +219,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	case status := <-waitResult.Result:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
-		logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
-		if zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0 {
+		if params.Logs == nil && (zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0) {
+			logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
 			if logErr != nil {
 				log.Warnf(ctx, "Failed to get container logs: %v", logErr)
 			} else if logOutput != "" {
@@ -463,7 +471,7 @@ func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *clie
 		}
 	}()
 
-	logBytes, err := io.ReadAll(out)
+	logBytes, err := io.ReadAll(io.LimitReader(out, maxLogBytes))
 	if err != nil {
 		return "", err
 	}
@@ -480,6 +488,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 	sidecarConfig := &container.Config{
 		Image: sidecarImage,
 		Cmd:   []string{"true"},
+		Labels: dockerTaskLabels(ctx),
 	}
 
 	sidecarHostConfig := &container.HostConfig{
@@ -524,6 +533,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
+		Labels: dockerTaskLabels(ctx),
 	}
 
 	extractHostConfig := &container.HostConfig{

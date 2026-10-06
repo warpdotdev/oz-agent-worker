@@ -187,6 +187,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
+	params.Logs.AddEnv(b.config.TaskEnv)
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
@@ -316,6 +317,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	applyInstanceShapeToContainer(&mainContainer, params.InstanceShape)
 
 	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
+	for _, c := range append(append([]corev1.Container{}, podSpec.InitContainers...), podSpec.Containers...) {
+		literals := make(map[string]string)
+		for _, env := range c.Env {
+			if env.ValueFrom == nil {
+				literals[env.Name] = env.Value
+			}
+		}
+		params.Logs.AddEnv(literals)
+	}
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -379,6 +389,20 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if err := b.deleteTaskJob(cleanupCtx, jobName, &createdJob.UID); err != nil {
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
+	}()
+
+	logStreams := newKubernetesLogStreams(ctx, b, params.Logs)
+	defer func() {
+		if logStreams == nil {
+			return
+		}
+		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		pods, _ := b.listTaskPods(finalCtx, executionID)
+		for i := range pods {
+			logStreams.observePod(&pods[i])
+		}
+		logStreams.finish(finalCtx)
 	}()
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
@@ -472,6 +496,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				continue
 			}
 			setupPhases.observePod(ctx, pod)
+			logStreams.observePod(pod)
 			if failure := b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch); failure != nil {
 				b.refreshFailureJobDetails(ctx, failure, jobName)
 				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
@@ -507,6 +532,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 			for i := range pods {
 				setupPhases.observePod(ctx, &pods[i])
+				logStreams.observePod(&pods[i])
 			}
 			if failure := b.detectPodFailureAt(ctx, pods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
 				return executeError(failure)
