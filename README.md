@@ -415,6 +415,8 @@ refreshed before expiry. Logs are batched every five seconds (or at 128 records)
 with a 1,024-record queue, 16 KiB record bodies, and a five-second final flush.
 Overload and observability failures drop logs rather than block execution.
 Lines over 64 KiB are dropped in full, not split across records.
+Redaction matches only original input and masks records that exceed its allocation
+budget instead of expanding replacement text.
 
 Redaction conservatively covers nonempty environment values provided by the
 assignment and backend configuration, literal Kubernetes pod environment values,
@@ -427,6 +429,11 @@ stdout/stderr. Unknown secrets created inside a task or resolved by Kubernetes
 Docker output is followed as separate stdout/stderr streams. The task container,
 sidecar-export container, and sidecar-extraction container carry `oz-task-id` and
 `oz-execution-id` labels. Direct output includes the agent and setup/teardown hooks.
+Setup output stays in a 64 KiB buffer per stream until environment-file credentials
+are registered. Overflow, failed setup, or environment parse errors discard it.
+Collected subprocess output drains for at most 100 ms after exit or cancellation;
+descendants retaining pipes cannot hold up completion, and drain-only timeouts
+drop logs without failing successful subprocesses.
 Kubernetes follows up to 64 observed task-pod containers, including init containers;
 interrupted streams are best-effort and are not reconnected. Command output is
 collected only while the dispatch command runs, not from the remote runtime.

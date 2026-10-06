@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -64,6 +66,130 @@ func taskLogServer(t *testing.T) (*httptest.Server, <-chan string, *atomic.Int32
 	}))
 	t.Cleanup(server.Close)
 	return server, payloads, calls
+}
+
+func TestSetupOutputWaitsForInjectedCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name, tail         string
+		wantHook, injected bool
+	}{
+		{"short setup", "", true, true},
+		{"setup spanning export interval", "sleep 6", true, true},
+		{"buffer overflow", "printf '%070000d\\n' 0; printf '%070000d\\n' 0 >&2", false, true},
+		{"invalid environment", `printf 'BROKEN="%s\n' "$credential" >"$OZ_ENVIRONMENT_FILE"`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, payloads, _ := taskLogServer(t)
+			dir := t.TempDir()
+			ozPath := filepath.Join(dir, "oz")
+			script := "#!/bin/sh\n"
+			if tc.injected {
+				script += "test \"$CUSTOM_CREDENTIAL\" = generated-credential || exit 2\n"
+			}
+			script += "printf 'agent %s\\n' \"$CUSTOM_CREDENTIAL\"\n"
+			if err := os.WriteFile(ozPath, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			backend := &DirectBackend{ozPath: ozPath, config: DirectBackendConfig{
+				WorkspaceRoot: filepath.Join(dir, "workspaces"),
+				SetupCommand:  `credential="generated-$(printf credential)"; printf 'CUSTOM_CREDENTIAL=%s\n' "$credential" >"$OZ_ENVIRONMENT_FILE"; printf 'setup %s\n' "$credential"; printf 'setup stderr %s\n' "$credential" >&2; ` + tc.tail,
+			}}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			w := &Worker{config: Config{BackendType: "direct", ServerRootURL: server.URL},
+				ctx: ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8)}
+			_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
+			w.executeTask(ctx, cancel, span, logAssignment(server.URL), time.Now())
+			text := logPayloads(payloads)
+			if strings.Contains(text, "generated-credential") || strings.Contains(text, "setup [REDACTED]") != tc.wantHook || !strings.Contains(text, "agent.stdout") {
+				t.Fatalf("setup credential collection mismatch: %s", text)
+			}
+		})
+	}
+}
+
+func TestCollectedSubprocessOutputDoesNotWaitForBackgroundChildren(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *tasklogs.Reporter, string) ExecuteResult
+	}{
+		{"hook", func(ctx context.Context, reporter *tasklogs.Reporter, command string) ExecuteResult {
+			b := &DirectBackend{}
+			if err := b.runCommand(ctx, command, t.TempDir(), nil, reporter); err != nil {
+				return executeError(err)
+			}
+			return executeCompleted()
+		}},
+		{"agent", func(ctx context.Context, reporter *tasklogs.Reporter, command string) ExecuteResult {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "oz")
+			if err := os.WriteFile(path, []byte("#!/bin/sh\n"+command+"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			b := &DirectBackend{ozPath: path, config: DirectBackendConfig{WorkspaceRoot: dir}}
+			return b.ExecuteTask(ctx, &TaskParams{TaskID: "run", Logs: reporter})
+		}},
+		{"dispatch", func(ctx context.Context, reporter *tasklogs.Reporter, command string) ExecuteResult {
+			b := &CommandBackend{config: CommandBackendConfig{DispatchCommand: command, DispatchTimeout: time.Second}}
+			return b.ExecuteTask(ctx, &TaskParams{TaskID: "run", Logs: reporter})
+		}},
+	} {
+		for _, cancelParent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%t", tc.name, cancelParent), func(t *testing.T) {
+				server, _, _ := taskLogServer(t)
+				reporter, err := tasklogs.New(server.URL, "worker", tc.name, logAssignment(server.URL))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reporter.Shutdown(t.Context())
+				start := time.Now()
+				ctx := t.Context()
+				command := "sleep 2 &"
+				if cancelParent {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, 30*time.Millisecond)
+					defer cancel()
+					command += " wait"
+				}
+				result := tc.run(ctx, reporter, command)
+				if (result.Error != nil) != cancelParent || time.Since(start) > 750*time.Millisecond {
+					t.Fatalf("descendant output changed subprocess completion: elapsed=%s error=%v", time.Since(start), result.Error)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
+	server, _, _ := taskLogServer(t)
+	reporter, err := tasklogs.New(server.URL, "worker", "command", logAssignment(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reporter.Shutdown(t.Context())
+	backend := &CommandBackend{config: CommandBackendConfig{
+		DispatchCommand: "sleep 2 & wait", DispatchTimeout: 30 * time.Millisecond,
+	}}
+	start := time.Now()
+	result := backend.ExecuteTask(t.Context(), &TaskParams{TaskID: "run", Logs: reporter})
+	_, reason := taskFailureLabels(result.Error)
+	if reason != metrics.TaskFailureReasonDispatchTimeout || time.Since(start) > 750*time.Millisecond {
+		t.Fatalf("dispatch deadline not preserved: elapsed=%s error=%v", time.Since(start), result.Error)
+	}
+}
+
+func TestSubprocessDrainRetainsExitFailure(t *testing.T) {
+	server, _, _ := taskLogServer(t)
+	reporter, err := tasklogs.New(server.URL, "worker", "direct", logAssignment(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reporter.Shutdown(t.Context())
+	backend := &DirectBackend{}
+	err = backend.runCommand(t.Context(), "sleep 2 & exit 7", t.TempDir(), nil, reporter)
+	if code, ok := agentExitCode(err); !ok || code != 7 {
+		t.Fatalf("output drain discarded subprocess exit error: %v", err)
+	}
 }
 
 func logAssignment(endpoint string) *types.TaskAssignmentMessage {
@@ -139,6 +265,9 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			}
 			if tc.setup == "" && !strings.Contains(text, "agent.stderr") {
 				t.Fatal("stderr was not collected")
+			}
+			if tc.setup != "" && strings.Contains(text, "hook.stdout") {
+				t.Fatal("failed setup output was released without a complete environment")
 			}
 			if len(drainMessages(t, w.outbound.messages)) != 1 {
 				t.Fatal("observability changed terminal task reporting")

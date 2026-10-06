@@ -30,6 +30,19 @@ func assignment(endpoint, runID string) *types.TaskAssignmentMessage {
 	}
 }
 
+func TestRedactionDoesNotRescanReplacementText(t *testing.T) {
+	var r redactor
+	for _, value := range []string{"R", "E", "D", "A", "C", "T", "[", "]"} {
+		r.add(value)
+	}
+	if got := r.redact(strings.Repeat("R", 1024)); got != strings.Repeat("[REDACTED]", 1024) {
+		t.Fatalf("replacement text was rescanned: %d bytes", len(got))
+	}
+	if got := r.redact(strings.Repeat("R", maxLineBytes)); got != "[REDACTED]" {
+		t.Fatalf("expanded redaction exceeded the record budget: %d bytes", len(got))
+	}
+}
+
 func writeToken(w http.ResponseWriter, token string, expiry time.Time) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"issueTaskIdentityToken": map[string]any{
 		"__typename": "IssueTaskIdentityTokenOutput", "token": token, "expiresAt": expiry.UTC().Format(time.RFC3339Nano),

@@ -118,7 +118,7 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	defer flushStderr()
 
 	log.Infof(ctx, "Dispatching task %s via command backend", params.TaskID)
-	if err := cmd.Run(); err != nil {
+	if err := runTaskCommand(cmd, params.Logs); err != nil {
 		// The parent context being cancelled means the worker is cancelling the
 		// task (user/shutdown), not a dispatch failure.
 		if ctx.Err() != nil {

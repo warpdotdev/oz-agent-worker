@@ -2,6 +2,7 @@ package tasklogs
 
 import (
 	"encoding/json"
+	"errors"
 	"net/url"
 	"sort"
 	"strings"
@@ -13,6 +14,22 @@ type redactor struct {
 	secrets  []string
 	bytes    int
 	overflow bool
+	replacer *strings.Replacer
+}
+
+type redactionBuffer struct {
+	strings.Builder
+}
+
+func (b *redactionBuffer) Write(p []byte) (int, error) {
+	return b.WriteString(string(p))
+}
+
+func (b *redactionBuffer) WriteString(s string) (int, error) {
+	if len(s) > maxRecordBytes-b.Len() {
+		return 0, errors.New("redacted log exceeds record budget")
+	}
+	return b.Builder.WriteString(s)
 }
 
 func (r *redactor) add(value string) {
@@ -53,16 +70,26 @@ func (r *redactor) add(value string) {
 		r.secrets = append(r.secrets, secret)
 	}
 	sort.Slice(r.secrets, func(i, j int) bool { return len(r.secrets[i]) > len(r.secrets[j]) })
+	pairs := make([]string, 0, len(r.secrets)*2)
+	for _, secret := range r.secrets {
+		pairs = append(pairs, secret, "[REDACTED]")
+	}
+	r.replacer = strings.NewReplacer(pairs...)
 }
 
 func (r *redactor) redact(message string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.overflow {
+	if r.overflow || len(message) > maxLineBytes {
 		return "[REDACTED]"
 	}
-	for _, secret := range r.secrets {
-		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+	var output redactionBuffer
+	if r.replacer == nil {
+		if _, err := output.WriteString(message); err != nil {
+			return "[REDACTED]"
+		}
+	} else if _, err := r.replacer.WriteString(&output, message); err != nil {
+		return "[REDACTED]"
 	}
-	return message
+	return output.String()
 }

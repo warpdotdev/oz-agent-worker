@@ -225,28 +225,37 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
 
 	// 4. Run setup command if configured.
+	var setupErr error
+	releaseStdout, releaseStderr := func(bool) {}, func(bool) {}
 	if b.config.SetupCommand != "" {
 		setupEnv := append(envVars, directSetupEnvVars(workspaceDir, taskID, envFilePath)...)
 
-		log.Infof(ctx, "Running setup command: %s", b.config.SetupCommand)
+		log.Infof(ctx, "Running setup command")
 		doneSetup := params.SetupEvents.startPhase(ctx, SetupEventSetupCommand)
-		err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv, params.Logs)
-		doneSetup(err != nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
-			}
-			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err)))
-		}
+		cmd := newHookCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv, params.Logs)
+		cmd.Stdout, releaseStdout = params.Logs.BufferedOutput(ctx, "hook.stdout", os.Stdout)
+		cmd.Stderr, releaseStderr = params.Logs.BufferedOutput(ctx, "hook.stderr", os.Stderr)
+		defer releaseStdout(false)
+		defer releaseStderr(false)
+		setupErr = runTaskCommand(cmd, params.Logs)
+		doneSetup(setupErr != nil)
 	}
 
 	// 5. Parse environment file for KEY=VALUE pairs written by setup script.
 	// Use merge semantics so setup script vars can override YAML config vars.
 	setupScriptEnv, err := parseEnvFile(envFilePath)
 	if err != nil {
-		log.Warnf(ctx, "Failed to parse environment file: %v", err)
+		log.Warnf(ctx, "Failed to parse environment file")
 	}
 	params.Logs.AddEnv(setupScriptEnv)
+	releaseStdout(err == nil && setupErr == nil)
+	releaseStderr(err == nil && setupErr == nil)
+	if setupErr != nil {
+		if ctx.Err() != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+		}
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", setupErr)))
+	}
 	var setupScriptVars []string
 	for key, value := range setupScriptEnv {
 		setupScriptVars = append(setupScriptVars, fmt.Sprintf("%s=%s", key, value))
@@ -269,7 +278,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Infof(ctx, "Running oz agent in workspace %s", workspaceDir)
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
 
-	if err := cmd.Run(); err != nil {
+	if err := runTaskCommand(cmd, params.Logs); err != nil {
 		if ctx.Err() != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
@@ -341,7 +350,7 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 		return
 	}
 	teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
-	log.Infof(ctx, "Running teardown command: %s", b.config.TeardownCommand)
+	log.Infof(ctx, "Running teardown command")
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv, reporter); err != nil {
 		metrics.AddTaskEvent(ctx, "cleanup.failed",
 			attribute.String("operation", "teardown"),
@@ -369,16 +378,21 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitCo
 // Setup/teardown commands inherit the full worker environment so they can access
 // tools and credentials (e.g. aws, docker) needed for workspace provisioning.
 func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) error {
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) // #nosec G204 -- setup/teardown commands are explicit operator configuration.
-	cmd.Dir = dir
-	cmd.Env = mergeEnvVars(os.Environ(), env)
-	reporter.AddEnvList(cmd.Env)
+	cmd := newHookCommand(ctx, command, dir, env, reporter)
 	stdout, flushStdout := reporter.Output(ctx, "hook.stdout", os.Stdout)
 	stderr, flushStderr := reporter.Output(ctx, "hook.stderr", os.Stderr)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	defer flushStdout()
 	defer flushStderr()
-	return cmd.Run()
+	return runTaskCommand(cmd, reporter)
+}
+
+func newHookCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) // #nosec G204 -- setup/teardown commands are explicit operator configuration.
+	cmd.Dir = dir
+	cmd.Env = mergeEnvVars(os.Environ(), env)
+	reporter.AddEnvList(cmd.Env)
+	return cmd
 }
 
 // mergeEnvVars merges base and override env var slices (KEY=VALUE format).

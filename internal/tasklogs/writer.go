@@ -95,3 +95,46 @@ func (r *Reporter) Output(ctx context.Context, source string, local io.Writer) (
 	writer := r.Writer(ctx, source)
 	return io.MultiWriter(local, writer), writer.Flush
 }
+
+// Setup output must not be exported until the environment file's credentials are registered.
+func (r *Reporter) BufferedOutput(ctx context.Context, source string, local io.Writer) (io.Writer, func(bool)) {
+	if r == nil {
+		return local, func(bool) {}
+	}
+	buffer := &deferredOutput{}
+	return io.MultiWriter(local, buffer), func(environmentKnown bool) {
+		buffer.mu.Lock()
+		defer buffer.mu.Unlock()
+		if buffer.closed {
+			return
+		}
+		buffer.closed = true
+		if environmentKnown && !buffer.overflow {
+			writer := r.Writer(ctx, source)
+			_, _ = writer.Write(buffer.bytes)
+			writer.Flush()
+		}
+		buffer.bytes = nil
+	}
+}
+
+type deferredOutput struct {
+	mu       sync.Mutex
+	bytes    []byte
+	overflow bool
+	closed   bool
+}
+
+func (b *deferredOutput) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.closed && !b.overflow {
+		if len(p) > maxLineBytes-len(b.bytes) {
+			b.bytes = nil
+			b.overflow = true
+		} else {
+			b.bytes = append(b.bytes, p...)
+		}
+	}
+	return len(p), nil
+}
