@@ -9,9 +9,9 @@ import (
 )
 
 type redactor struct {
-	mu sync.RWMutex
-	secrets []string
-	bytes int
+	mu       sync.RWMutex
+	secrets  []string
+	bytes    int
 	overflow bool
 }
 
@@ -19,9 +19,15 @@ func (r *redactor) add(value string) {
 	if value == "" {
 		return
 	}
+	if len(value) > 1024*1024 {
+		r.mu.Lock()
+		r.overflow = true
+		r.mu.Unlock()
+		return
+	}
 	variants := []string{value, url.QueryEscape(value)}
 	encoded, _ := json.Marshal(value)
-	variants = append(variants, strings.Trim(string(encoded), `"`))
+	variants = append(variants, string(encoded[1:len(encoded)-1]))
 	variants = append(variants, strings.FieldsFunc(value, func(c rune) bool { return c == '\n' || c == '\r' })...)
 	r.mu.Lock()
 	defer r.mu.Unlock()

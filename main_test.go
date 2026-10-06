@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -21,7 +23,31 @@ func resetCLIForTest() {
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
 	CLI.OneShot = false
+	CLI.DisableTaskLogs = false
 	CLI.IdleOnComplete = ""
+}
+
+func TestTaskLogKillSwitchConfig(t *testing.T) {
+	resetCLIForTest()
+	t.Cleanup(resetCLIForTest)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("worker_id: test-worker\ndisable_task_logs: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc, err := mergeConfig(cfg)
+	if err != nil || !wc.DisableTaskLogs {
+		t.Fatalf("YAML kill switch not applied: %v", err)
+	}
+	CLI.DisableTaskLogs = true
+	cfg.DisableTaskLogs = boolPtr(false)
+	wc, err = mergeConfig(cfg)
+	if err != nil || !wc.DisableTaskLogs {
+		t.Fatalf("CLI kill switch not applied: %v", err)
+	}
 }
 
 func boolPtr(v bool) *bool {

@@ -396,6 +396,46 @@ oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 
 ## Monitoring
 
+### Per-task logs
+
+When a task assignment enables `telemetry_collection.logging_enabled`, the worker
+ships task-scoped worker logs, setup phase events, and task output to the assigned
+OTLP/HTTP collector. Logging does not depend on tracing being enabled and does not
+change the existing tracing environment or rollout.
+
+To disable collection on an installation, set `disable_task_logs: true` at the
+top level of the YAML config, pass `--disable-task-logs`, or set
+`OZ_DISABLE_TASK_LOGS=true`. Helm installs can use
+`--set worker.disableTaskLogs=true`. This does not disable existing metrics,
+tracing, or setup client-events reporting.
+
+The worker obtains log credentials with the task API key and workload identity;
+the tracing bootstrap token is never used for log authentication. Credentials are
+refreshed before expiry. Logs are batched every five seconds (or at 128 records),
+with a 1,024-record queue, 16 KiB record bodies, and a five-second final flush.
+Overload and observability failures drop logs rather than block execution.
+Lines over 64 KiB are dropped in full, not split across records.
+
+Redaction conservatively covers nonempty environment values provided by the
+assignment and backend configuration, literal Kubernetes pod environment values,
+direct setup-generated environment values, inherited hook/dispatch environment,
+and all issued log tokens. Each task has its own redaction state. Redaction occurs
+before truncation and export; it does not scrub the agent's original local
+stdout/stderr. Unknown secrets created inside a task or resolved by Kubernetes
+`valueFrom`/`envFrom` are not visible to the worker and cannot be scrubbed by it.
+
+Docker output is followed as separate stdout/stderr streams. The task container,
+sidecar-export container, and sidecar-extraction container carry `oz-task-id` and
+`oz-execution-id` labels. Direct output includes the agent and setup/teardown hooks.
+Kubernetes follows up to 64 observed task-pod containers, including init containers;
+interrupted streams are best-effort and are not reconnected. Command output is
+collected only while the dispatch command runs, not from the remote runtime.
+Worker shutdown flushes and stops collection without changing the Kubernetes and
+Command backends' task-preservation behavior; it does not resume collection for
+preserved tasks after a worker restart.
+
+### Worker metrics and tracing
+
 The worker can export metrics over OpenTelemetry. Exporter selection is
 driven by the standard
 [OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),

@@ -19,21 +19,23 @@ import (
 )
 
 const (
-	maxRecordBytes = 16 * 1024
-	maxLineBytes = 64 * 1024
-	exportTimeout = 5 * time.Second
+	maxRecordBytes  = 16 * 1024
+	maxLineBytes    = 64 * 1024
+	exportTimeout   = 5 * time.Second
 	ShutdownTimeout = 5 * time.Second
 )
 
 type Reporter struct {
-	provider *sdklog.LoggerProvider
-	logger otellog.Logger
-	redactor redactor
-	ctx context.Context
-	cancel context.CancelFunc
-	closed atomic.Bool
+	provider  *sdklog.LoggerProvider
+	logger    otellog.Logger
+	redactor  redactor
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closed    atomic.Bool
 	closeOnce sync.Once
-	source *tokenSource
+	source    *tokenSource
+	writersMu sync.Mutex
+	writers   []*Writer
 }
 
 func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignmentMessage) (*Reporter, error) {
@@ -61,8 +63,8 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 	}
 	r.source = newTokenSource(serverRootURL, assignment.TaskID, assignment.EnvVars, &r.redactor)
 	client := &http.Client{
-		Timeout: exportTimeout,
-		Transport: &tokenTransport{source: r.source},
+		Timeout:       exportTimeout,
+		Transport:     &tokenTransport{source: r.source},
 		CheckRedirect: noRedirect,
 	}
 	exporter, err := otlploghttp.New(ctx,
@@ -83,7 +85,7 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 			attribute.String("run_id", assignment.TaskID),
 			attribute.String("execution_id", assignment.ExecutionID),
 		)),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter,
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(privateExporter{Exporter: exporter},
 			sdklog.WithExportInterval(5*time.Second),
 			sdklog.WithMaxQueueSize(1024),
 			sdklog.WithExportMaxBatchSize(128),
@@ -97,6 +99,17 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 
 func noRedirect(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
+}
+
+type privateExporter struct {
+	sdklog.Exporter
+}
+
+func (e privateExporter) Export(ctx context.Context, records []sdklog.Record) error {
+	if err := e.Exporter.Export(ctx, records); err != nil {
+		return errors.New("task log export failed")
+	}
+	return nil
 }
 
 func (r *Reporter) Context() context.Context {
@@ -174,8 +187,14 @@ func (r *Reporter) Shutdown(ctx context.Context) {
 		return
 	}
 	r.closeOnce.Do(func() {
-		r.closed.Store(true)
 		r.cancel()
+		r.writersMu.Lock()
+		for _, writer := range r.writers {
+			writer.close()
+		}
+		r.closed.Store(true)
+		r.writers = nil
+		r.writersMu.Unlock()
 		// Export uses its own deadline, not the cancelled task or refresh context.
 		_ = r.provider.Shutdown(ctx)
 		select {

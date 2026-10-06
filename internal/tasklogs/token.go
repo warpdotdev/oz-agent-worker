@@ -21,21 +21,21 @@ const identityMutation = `mutation WorkerLogToken($input: IssueTaskIdentityToken
 }`
 
 type tokenSource struct {
-	client *http.Client
+	client                                 *http.Client
 	endpoint, runID, apiKey, workloadToken string
-	gate *semaphore.Weighted
-	token string
-	expiresAt time.Time
-	refreshAt time.Time
-	redactor *redactor
-	done chan struct{}
+	gate                                   *semaphore.Weighted
+	token                                  string
+	expiresAt                              time.Time
+	refreshAt                              time.Time
+	redactor                               *redactor
+	done                                   chan struct{}
 }
 
 func newTokenSource(serverRootURL, runID string, env map[string]string, redactor *redactor) *tokenSource {
 	return &tokenSource{
-		client: &http.Client{Timeout: exportTimeout, CheckRedirect: noRedirect},
+		client:   &http.Client{Timeout: exportTimeout, CheckRedirect: noRedirect},
 		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
-		runID: runID, apiKey: env["WARP_API_KEY"], workloadToken: env["WARP_WORKLOAD_TOKEN"],
+		runID:    runID, apiKey: env["WARP_API_KEY"], workloadToken: env["WARP_WORKLOAD_TOKEN"],
 		gate: semaphore.NewWeighted(1), redactor: redactor, done: make(chan struct{}),
 	}
 }
@@ -52,7 +52,11 @@ func (s *tokenSource) get(ctx context.Context) (string, time.Time, error) {
 	if err != nil {
 		// A failed proactive refresh must not discard a still-valid credential.
 		if time.Now().Before(s.expiresAt) {
-			return s.token, time.Now().Add(30*time.Second), nil
+			s.refreshAt = s.expiresAt
+			if retryAt := time.Now().Add(30 * time.Second); retryAt.Before(s.refreshAt) {
+				s.refreshAt = retryAt
+			}
+			return s.token, s.refreshAt, nil
 		}
 		return "", time.Time{}, err
 	}
@@ -71,7 +75,7 @@ func (s *tokenSource) run(ctx context.Context) {
 		cancel()
 		delay := time.Until(refreshAt)
 		if err != nil {
-			delay = 30*time.Second
+			delay = 30 * time.Second
 		}
 		timer := time.NewTimer(max(delay, time.Second))
 		select {
@@ -87,7 +91,7 @@ func (s *tokenSource) issue(ctx context.Context) (string, time.Time, error) {
 	body, err := json.Marshal(map[string]any{
 		"query": identityMutation,
 		"variables": map[string]any{"input": map[string]any{
-			"audience": "warp-cloud-agent-otel",
+			"audience":                 "warp-cloud-agent-otel",
 			"requestedDurationSeconds": 10800,
 		}},
 	})
@@ -113,8 +117,8 @@ func (s *tokenSource) issue(ctx context.Context) (string, time.Time, error) {
 	var response struct {
 		Data struct {
 			Result struct {
-				Type string `json:"__typename"`
-				Token string `json:"token"`
+				Type      string    `json:"__typename"`
+				Token     string    `json:"token"`
 				ExpiresAt time.Time `json:"expiresAt"`
 			} `json:"issueTaskIdentityToken"`
 		} `json:"data"`

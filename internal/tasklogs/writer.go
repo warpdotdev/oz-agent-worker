@@ -11,16 +11,25 @@ import (
 )
 
 type Writer struct {
-	mu sync.Mutex
+	mu       sync.Mutex
 	reporter *Reporter
-	ctx context.Context
-	source string
-	line []byte
-	discard bool
+	ctx      context.Context
+	source   string
+	line     []byte
+	discard  bool
+	closed   bool
 }
 
 func (r *Reporter) Writer(ctx context.Context, source string) *Writer {
-	return &Writer{reporter: r, ctx: ctx, source: source}
+	writer := &Writer{reporter: r, ctx: ctx, source: source}
+	r.writersMu.Lock()
+	defer r.writersMu.Unlock()
+	if r.closed.Load() || len(r.writers) >= 128 {
+		writer.closed = true
+	} else {
+		r.writers = append(r.writers, writer)
+	}
+	return writer
 }
 
 func (w *Writer) Write(p []byte) (int, error) {
@@ -30,6 +39,9 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return n, nil
+	}
 	for len(p) > 0 {
 		end := bytes.IndexByte(p, '\n')
 		part := p
@@ -57,6 +69,12 @@ func (w *Writer) Flush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.flush()
+}
+func (w *Writer) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flush()
+	w.closed = true
 }
 
 func (w *Writer) flush() {

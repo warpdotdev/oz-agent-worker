@@ -56,7 +56,7 @@ type Config struct {
 	IdleOnComplete string
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
-	DisableTaskLogs bool
+	DisableTaskLogs         bool
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -147,7 +147,7 @@ type activeTask struct {
 	// longer executes locally, but the entry is kept so a later cancellation
 	// can be routed to the backend's CancelTask.
 	spawned bool
-	logs *tasklogs.Reporter
+	logs    *tasklogs.Reporter
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -819,6 +819,12 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 	taskID := assignment.TaskID
 	params := w.prepareTaskParams(assignment)
+	finishLogs := func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+		defer cancel()
+		params.Logs.Shutdown(flushCtx)
+	}
+	defer finishLogs()
 	if !w.config.DisableTaskLogs {
 		reporter, err := tasklogs.New(w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
 		if err != nil {
@@ -843,11 +849,6 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 				reporter.Shutdown(flushCtx)
 				cancel()
 			}
-			defer func() {
-				flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
-				defer cancel()
-				reporter.Shutdown(flushCtx)
-			}()
 		}
 	}
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
@@ -868,6 +869,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			)
 			span.SetStatus(codes.Ok, "task cancelled by user request")
 			log.Infof(ctx, "Task execution cancelled by user request: taskID=%s", taskID)
+			finishLogs()
 			if statusErr := w.sendTaskCancelled(taskID, assignment.ExecutionID, "Task cancelled by user request."); statusErr != nil {
 				log.Errorf(ctx, "Failed to send task cancelled message: %v", statusErr)
 			}
@@ -893,6 +895,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		span.RecordError(err)
 		span.SetStatus(codes.Error, string(metricsReason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
+		finishLogs()
 		if statusErr := w.sendTaskFailed(taskID, assignment.ExecutionID, userFacingTaskError(err), metricsReason, exitCode, taskFailureDetails(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
@@ -920,6 +923,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
 	metrics.AddTaskEvent(ctx, "task.completed")
 	span.SetStatus(codes.Ok, "task completed")
+	finishLogs()
 	if err := w.sendTaskCompleted(taskID, assignment.ExecutionID, "Task completed successfully"); err != nil {
 		log.Errorf(ctx, "Failed to send task completed message: %v", err)
 	}

@@ -48,7 +48,7 @@ func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID str
 	return func() {
 		defer cancel()
 		defer stop()
-		timer := time.NewTimer(2*time.Second)
+		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		select {
 		case <-done:

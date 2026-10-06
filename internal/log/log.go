@@ -15,6 +15,7 @@ func init() {
 		TimeFormat: "15:04:05.000",
 	})
 }
+
 type sinkKey struct{}
 
 func WithSink(ctx context.Context, sink func(context.Context, string, string) string) context.Context {

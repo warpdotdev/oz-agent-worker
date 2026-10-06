@@ -10,13 +10,13 @@ import (
 )
 
 type kubernetesLogStreams struct {
-	backend *KubernetesBackend
+	backend  *KubernetesBackend
 	reporter *tasklogs.Reporter
-	ctx context.Context
-	cancel context.CancelFunc
-	stop func() bool
-	seen map[string]bool
-	wg sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stop     func() bool
+	seen     map[string]bool
+	wg       sync.WaitGroup
 }
 
 func newKubernetesLogStreams(ctx context.Context, backend *KubernetesBackend, reporter *tasklogs.Reporter) *kubernetesLogStreams {

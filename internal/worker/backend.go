@@ -169,7 +169,7 @@ type TaskParams struct {
 	// SetupEvents reports worker-observed setup phase durations to warp-server.
 	// It may be nil, and all of its methods are safe to call on a nil reporter.
 	SetupEvents *setupEventReporter
-	Logs *tasklogs.Reporter
+	Logs        *tasklogs.Reporter
 }
 
 // Backend defines the interface for task execution backends.

@@ -53,7 +53,7 @@ type setupEventReporter struct {
 	runID         string
 	apiKey        string
 	workloadToken string
-	logs *tasklogs.Reporter
+	logs          *tasklogs.Reporter
 }
 
 // newSetupEventReporter builds a reporter from the worker's server root URL and

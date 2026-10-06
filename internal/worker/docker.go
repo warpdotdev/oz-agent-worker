@@ -123,7 +123,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
 	params.Logs.AddEnv(b.config.Env)
 	ctx = context.WithValue(ctx, dockerLabelsKey{}, map[string]string{
-		"oz-task-id": params.TaskID,
+		"oz-task-id":      params.TaskID,
 		"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
 	})
 	dockerClient := b.dockerClient
@@ -165,7 +165,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		Cmd:        cmd,
 		Env:        envVars,
 		WorkingDir: "/workspace",
-		Labels: dockerTaskLabels(ctx),
+		Labels:     dockerTaskLabels(ctx),
 	}
 
 	// Sidecar binds come first, then user-configured volumes.
@@ -486,8 +486,8 @@ func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *clie
 func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, dockerClient *client.Client, sidecarImage, volumeName string) error {
 	log.Infof(ctx, "Creating temporary container from sidecar image")
 	sidecarConfig := &container.Config{
-		Image: sidecarImage,
-		Cmd:   []string{"true"},
+		Image:  sidecarImage,
+		Cmd:    []string{"true"},
 		Labels: dockerTaskLabels(ctx),
 	}
 
@@ -533,7 +533,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-		Labels: dockerTaskLabels(ctx),
+		Labels:       dockerTaskLabels(ctx),
 	}
 
 	extractHostConfig := &container.HostConfig{
