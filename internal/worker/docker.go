@@ -285,12 +285,6 @@ func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) er
 	return nil
 }
 
-// ConfirmTaskClosed reports whether the execution has no remaining container.
-func (b *DockerBackend) ConfirmTaskClosed(_ context.Context, params *CancelParams) (bool, error) {
-	_, exists := b.taskContainers.Load(taskExecution{params.TaskID, params.ExecutionID})
-	return !exists, nil
-}
-
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
 	if b.dockerClient != nil {

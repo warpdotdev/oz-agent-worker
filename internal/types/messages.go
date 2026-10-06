@@ -15,7 +15,6 @@ const (
 	MessageTypeTaskFailed       MessageType = "task_failed"
 	MessageTypeTaskRejected     MessageType = "task_rejected"
 	MessageTypeTaskCancellation MessageType = "task_cancellation"
-	MessageTypeExecutionClosed  MessageType = "execution_closed"
 	MessageTypeHeartbeat        MessageType = "heartbeat"
 )
 
@@ -170,12 +169,6 @@ type TaskRejectedMessage struct {
 type TaskCancellationMessage struct {
 	TaskID      string `json:"task_id"`
 	ExecutionID string `json:"execution_id,omitempty"`
-}
-
-// ExecutionClosedMessage confirms backend closure without changing the logical run state.
-type ExecutionClosedMessage struct {
-	TaskID      string `json:"task_id"`
-	ExecutionID string `json:"execution_id"`
 }
 
 // TaskState is the serialized terminal task state accepted by warp-server.

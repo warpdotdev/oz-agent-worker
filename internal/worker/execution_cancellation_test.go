@@ -71,10 +71,6 @@ func (b *executionTestBackend) CancelTask(ctx context.Context, params *CancelPar
 	return nil
 }
 
-func (b *executionTestBackend) ConfirmTaskClosed(context.Context, *CancelParams) (bool, error) {
-	return true, nil
-}
-
 func newExecutionTestWorker(t *testing.T) (*Worker, *executionTestBackend) {
 	t.Helper()
 	backend := &executionTestBackend{
@@ -97,7 +93,10 @@ func newExecutionTestWorker(t *testing.T) (*Worker, *executionTestBackend) {
 			}
 		}
 		w.taskWG.Wait()
+		w.shutdownTasks()
+		w.cancellationWG.Wait()
 	})
+
 	return w, backend
 }
 
@@ -117,36 +116,19 @@ func awaitExecutionStarted(t *testing.T, backend *executionTestBackend, id strin
 	}
 }
 
-func awaitExecutionClosed(t *testing.T, w *Worker, id string) {
+func awaitCancellationAccepted(t *testing.T, w *Worker, id string) {
 	t.Helper()
-	timeout := time.NewTimer(2 * time.Second)
-	defer timeout.Stop()
-	for {
-		var msg types.WebSocketMessage
-		select {
-		case data := <-w.outbound.messages:
-			if err := json.Unmarshal(data, &msg); err != nil {
-				t.Fatal(err)
-			}
-		case <-timeout.C:
-			t.Fatal("execution closure was not acknowledged")
-		}
-		if msg.Type != types.MessageTypeExecutionClosed {
-			continue
-		}
-		var closed types.ExecutionClosedMessage
-		if err := json.Unmarshal(msg.Data, &closed); err != nil {
-			t.Fatal(err)
-		}
-		if closed.TaskID != "run" || closed.ExecutionID != id {
-			t.Fatalf("wrong closure identity: %+v", closed)
-		}
-		return
-	}
+	waitFor(t, 2*time.Second, func() bool {
+		w.tasksMutex.Lock()
+		defer w.tasksMutex.Unlock()
+		key := taskExecution{"run", id}
+		_, active := w.activeTasks[key]
+		return !active && w.completedTasks[key]
+	})
 }
 
 func TestExecutionScopedCancellation(t *testing.T) {
-	t.Run("delayed predecessor cancellation leaves successor running and replays closure", func(t *testing.T) {
+	t.Run("delayed predecessor cancellation leaves successor running and is idempotent", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		w.handleTaskAssignment(executionAssignment("old"))
 		awaitExecutionStarted(t, backend, "old")
@@ -154,7 +136,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		awaitExecutionStarted(t, backend, "new")
 		request := &types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"}
 		w.handleTaskCancellation(request)
-		awaitExecutionClosed(t, w, "old")
+		awaitCancellationAccepted(t, w, "old")
 		w.tasksMutex.Lock()
 		newTask, exists := w.activeTasks[taskExecution{"run", "new"}]
 		w.tasksMutex.Unlock()
@@ -165,7 +147,16 @@ func TestExecutionScopedCancellation(t *testing.T) {
 			t.Fatalf("cancelled wrong execution: %+v", params)
 		}
 		w.handleTaskCancellation(request)
-		awaitExecutionClosed(t, w, "old")
+		w.handleTaskAssignment(executionAssignment("old"))
+		w.cancellationWG.Wait()
+		for _, msg := range drainMessages(t, w.outbound.messages) {
+			if msg.Type != types.MessageTypeTaskClaimed && msg.Type != types.MessageTypeTaskCompleted {
+				t.Fatalf("unexpected cancellation message: %s", msg.Type)
+			}
+		}
+		if len(backend.started) != 0 {
+			t.Fatal("accepted cancellation did not suppress duplicate assignment")
+		}
 		select {
 		case params := <-backend.cancelled:
 			t.Fatalf("replay called backend again: %+v", params)
@@ -173,7 +164,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		}
 	})
 
-	t.Run("old completion cannot remove successor and remains closable", func(t *testing.T) {
+	t.Run("old completion cannot remove successor and remains cancellable", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		for _, id := range []string{"old", "new"} {
 			w.handleTaskAssignment(executionAssignment(id))
@@ -190,7 +181,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 			t.Fatalf("active executions = %d, want 1", count)
 		}
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
-		awaitExecutionClosed(t, w, "old")
+		awaitCancellationAccepted(t, w, "old")
 		if count := w.activeTaskCount(); count != 1 {
 			t.Fatalf("cleanup removed successor: active executions = %d", count)
 		}
@@ -226,7 +217,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		}
 	})
 
-	t.Run("queued cleanup is not proof and failed cleanup remains retryable", func(t *testing.T) {
+	t.Run("failed cancellation retries locally without duplicating in-progress or accepted requests", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		backend.cancelGate = make(chan struct{})
 		backend.failCancel.Store(true)
@@ -239,28 +230,37 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("backend cleanup did not start")
 		}
-		for _, msg := range drainMessages(t, w.outbound.messages) {
-			if msg.Type == types.MessageTypeExecutionClosed {
-				t.Fatal("acknowledged queued cleanup")
-			}
-		}
 		w.handleTaskCancellation(request)
 		if len(backend.cancelled) != 0 {
 			t.Fatal("concurrent retry duplicated cleanup")
 		}
 		close(backend.cancelGate)
-		waitFor(t, 2*time.Second, func() bool {
-			w.tasksMutex.Lock()
-			defer w.tasksMutex.Unlock()
-			task, tracked := w.activeTasks[taskExecution{"run", "old"}]
-			return tracked && !task.cancelling
-		})
-		if len(w.outbound.messages) != 0 {
-			t.Fatal("failed cleanup emitted closure")
+		select {
+		case <-backend.cancelled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("failed cancellation did not retry locally")
 		}
+		w.handleTaskAssignment(executionAssignment("new"))
+		awaitExecutionStarted(t, backend, "new")
 		backend.failCancel.Store(false)
+		awaitCancellationAccepted(t, w, "old")
+		w.cancellationWG.Wait()
+		w.tasksMutex.Lock()
+		successor := w.activeTasks[taskExecution{"run", "new"}]
+		w.tasksMutex.Unlock()
+		if successor.ctx.Err() != nil {
+			t.Fatal("retry cancelled successor")
+		}
+		for len(backend.cancelled) > 0 {
+			if params := <-backend.cancelled; params.ExecutionID != "old" {
+				t.Fatalf("retry targeted successor: %+v", params)
+			}
+		}
 		w.handleTaskCancellation(request)
-		awaitExecutionClosed(t, w, "old")
+		w.cancellationWG.Wait()
+		if len(backend.cancelled) != 0 {
+			t.Fatal("accepted request was retried")
+		}
 	})
 
 	t.Run("waits for dispatch before backend cancellation", func(t *testing.T) {
@@ -271,24 +271,83 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		w.activeTasks[key] = activeTask{ctx: ctx, cancel: cancel, done: done}
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
 		if len(backend.cancelled) != 0 || len(w.outbound.messages) != 0 {
-			t.Fatal("cancel acknowledged before dispatch returned")
+			t.Fatal("backend cancellation started before dispatch returned")
 		}
 		close(done)
-		awaitExecutionClosed(t, w, "old")
+		awaitCancellationAccepted(t, w, "old")
 	})
 }
 
-func TestExecutionClosureReplayCacheBounded(t *testing.T) {
+func TestCancellationStopsOnShutdown(t *testing.T) {
+	t.Run("provisioning wait respects worker context", func(t *testing.T) {
+		w, backend := newExecutionTestWorker(t)
+		ctx, stop := context.WithCancel(context.Background())
+		defer stop()
+		w.ctx = ctx
+		w.activeTasks[taskExecution{"run", "old"}] = activeTask{
+			ctx: context.Background(), cancel: func() {}, done: make(chan struct{}),
+		}
+		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
+		stop()
+		w.cancellationWG.Wait()
+		if len(backend.cancelled) != 0 {
+			t.Fatal("cancellation bypassed unfinished provisioning")
+		}
+	})
+	t.Run("in-flight backend request respects worker context", func(t *testing.T) {
+		w, backend := newExecutionTestWorker(t)
+		ctx, stop := context.WithCancel(context.Background())
+		defer stop()
+		w.ctx = ctx
+		backend.cancelGate = make(chan struct{})
+		w.handleTaskAssignment(executionAssignment("old"))
+		awaitExecutionStarted(t, backend, "old")
+		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
+		select {
+		case <-backend.cancelled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancellation did not start")
+		}
+		stop()
+		w.cancellationWG.Wait()
+		if w.completedTasks[taskExecution{"run", "old"}] {
+			t.Fatal("interrupted cancellation was marked accepted")
+		}
+	})
+	t.Run("failed request", func(t *testing.T) {
+		w, backend := newExecutionTestWorker(t)
+		backend.failCancel.Store(true)
+		w.handleTaskAssignment(executionAssignment("old"))
+		awaitExecutionStarted(t, backend, "old")
+		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
+		select {
+		case <-backend.cancelled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancellation did not start")
+		}
+		w.shutdownTasks()
+		w.cancellationWG.Wait()
+		w.tasksMutex.Lock()
+		accepted := w.completedTasks[taskExecution{"run", "old"}]
+		w.tasksMutex.Unlock()
+		if accepted {
+			t.Fatal("failed cancellation was marked accepted")
+		}
+	})
+}
+func TestCompletedExecutionCacheBounded(t *testing.T) {
 	w := &Worker{}
 	w.rememberCompletedLocked(taskExecution{taskID: "legacy-run"}, true)
 	if len(w.completedTasks) != 0 {
 		t.Fatal("legacy completion must not suppress a later run-only assignment")
 	}
 	for i := 0; i < 5000; i++ {
-		w.rememberCompletedLocked(taskExecution{taskID: "run", executionID: time.Unix(int64(i), 0).String()}, true)
+		key := taskExecution{taskID: "run", executionID: time.Unix(int64(i), 0).String()}
+		w.rememberCompletedLocked(key, false)
+		w.rememberCompletedLocked(key, true)
 	}
-	if len(w.completedTasks) != 4096 || len(w.closedExecutions) != 4096 {
-		t.Fatalf("cache unbounded: %d records, %d keys", len(w.completedTasks), len(w.closedExecutions))
+	if len(w.completedTasks) != 4096 || len(w.completedExecutions) != 4096 {
+		t.Fatalf("cache unbounded: %d records, %d keys", len(w.completedTasks), len(w.completedExecutions))
 	}
 }
 

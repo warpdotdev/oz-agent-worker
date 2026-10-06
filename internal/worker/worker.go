@@ -26,10 +26,12 @@ const (
 	MaxReconnectDelay     = 60 * time.Second
 	ReconnectBackoffRate  = 2.0
 
-	HeartbeatInterval      = 30 * time.Second
-	PongWait               = 60 * time.Second
-	WriteWait              = 10 * time.Second
-	BackendShutdownTimeout = 10 * time.Second
+	HeartbeatInterval             = 30 * time.Second
+	PongWait                      = 60 * time.Second
+	WriteWait                     = 10 * time.Second
+	BackendShutdownTimeout        = 10 * time.Second
+	initialCancellationRetryDelay = 100 * time.Millisecond
+	maxCancellationRetryDelay     = 10 * time.Second
 
 	warpServerRootURLEnv            = "WARP_SERVER_ROOT_URL"
 	executionCancellationCapability = "execution-scoped-cancellation-v1"
@@ -69,18 +71,21 @@ type taskExecution struct {
 }
 
 type Worker struct {
-	config           Config
-	ctx              context.Context
-	outbound         *outboundQueue
-	activeTasks      map[taskExecution]activeTask
-	completedTasks   map[taskExecution]bool
-	closedExecutions []taskExecution
-	tasksMutex       sync.Mutex
-	taskWG           sync.WaitGroup
-	shuttingDown     bool
-	oneShot          oneShotState
-	backend          Backend
-	taskSemaphore    *semaphore.Weighted // nil when unlimited
+	config      Config
+	ctx         context.Context
+	outbound    *outboundQueue
+	activeTasks map[taskExecution]activeTask
+	// The value distinguishes accepted cancellation from ordinary completion,
+	// which may still need backend cleanup after a failed execution or watch.
+	completedTasks      map[taskExecution]bool
+	completedExecutions []taskExecution
+	tasksMutex          sync.Mutex
+	taskWG              sync.WaitGroup
+	cancellationWG      sync.WaitGroup
+	shuttingDown        bool
+	oneShot             oneShotState
+	backend             Backend
+	taskSemaphore       *semaphore.Weighted // nil when unlimited
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
@@ -151,9 +156,9 @@ type activeTask struct {
 	// spawned marks a task whose backend returned ExecuteOutcomeSpawned: it no
 	// longer executes locally, but the entry is kept so a later cancellation
 	// can be routed to the backend's CancelTask.
-	spawned    bool
-	done       chan struct{}
-	cancelling bool
+	spawned          bool
+	done             chan struct{}
+	stopCancellation context.CancelFunc
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -499,6 +504,10 @@ func (w *Worker) handleMessage(message []byte) {
 
 func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMessage) {
 	w.tasksMutex.Lock()
+	if w.shuttingDown || w.ctx.Err() != nil {
+		w.tasksMutex.Unlock()
+		return
+	}
 	key := taskExecution{cancellation.TaskID, cancellation.ExecutionID}
 	if cancellation.ExecutionID == "" {
 		// A task-only request is explicitly legacy run-wide cancellation.
@@ -510,12 +519,9 @@ func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMess
 		w.tasksMutex.Unlock()
 		return
 	}
-	if closed, known := w.completedTasks[key]; known {
-		if closed {
+	if cancellationAccepted, known := w.completedTasks[key]; known {
+		if cancellationAccepted {
 			w.tasksMutex.Unlock()
-			if err := w.sendExecutionClosed(key); err != nil {
-				log.Warnf(w.ctx, "Failed to replay execution closure: %v", err)
-			}
 			return
 		}
 		if _, active := w.activeTasks[key]; !active {
@@ -530,102 +536,76 @@ func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMess
 
 func (w *Worker) startTaskCancellationLocked(key taskExecution) {
 	task, ok := w.activeTasks[key]
-	if !ok || task.cancelling {
+	if !ok || task.stopCancellation != nil {
 		return
 	}
 	task.cancellationSource = taskCancellationSourceUser
-	task.cancelling = true
+	ctx, cancel := context.WithCancel(w.ctx)
+	task.stopCancellation = cancel
 	w.activeTasks[key] = task
 	metrics.AddTaskEvent(task.ctx, "task.cancellation_requested",
 		attribute.String("source", "server"),
 		attribute.String("task.id", key.taskID),
 	)
 	task.cancel()
-	go w.cancelTaskOnBackend(key, task.done)
+	w.cancellationWG.Add(1)
+	go func() {
+		defer w.cancellationWG.Done()
+		defer cancel()
+		w.cancelTaskOnBackend(ctx, key, task.done)
+	}()
 }
 
-func (w *Worker) cancelTaskOnBackend(key taskExecution, done <-chan struct{}) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), BackendShutdownTimeout)
-	defer cancel()
-	closed, err := w.closeExecution(ctx, key, done)
-	w.tasksMutex.Lock()
-	task, tracked := w.activeTasks[key]
-	if !tracked {
-		w.tasksMutex.Unlock()
-		return
-	}
-	task.cancelling = false
-	w.activeTasks[key] = task
-	if err != nil {
-		w.tasksMutex.Unlock()
-		log.Warnf(w.ctx, "Backend cancellation failed for task %s execution %s: %v", key.taskID, key.executionID, err)
-		return
-	}
-	if closed {
-		w.rememberCompletedLocked(key, true)
-		delete(w.activeTasks, key)
-	}
-	w.tasksMutex.Unlock()
-	if closed && key.executionID != "" {
-		if err := w.sendExecutionClosed(key); err != nil {
-			log.Warnf(w.ctx, "Failed to send execution closure: %v", err)
-		}
-	}
-}
-
-func (w *Worker) closeExecution(ctx context.Context, key taskExecution, done <-chan struct{}) (bool, error) {
-	// A cancel racing provisioning must not confirm absence before creation finishes.
+func (w *Worker) cancelTaskOnBackend(ctx context.Context, key taskExecution, done <-chan struct{}) {
+	// Cancelling before provisioning returns can miss resources still being created.
 	if done != nil {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return
 		}
 	}
 	params := &CancelParams{TaskID: key.taskID, ExecutionID: key.executionID}
-	if err := w.backend.CancelTask(ctx, params); err != nil {
-		return false, err
-	}
-	if verifier, ok := w.backend.(executionClosureVerifier); ok {
-		closed, err := verifier.ConfirmTaskClosed(ctx, params)
-		if err != nil {
-			return false, err
+	delay := initialCancellationRetryDelay
+	for ctx.Err() == nil {
+		attemptCtx, cancel := context.WithTimeout(ctx, BackendShutdownTimeout)
+		err := w.backend.CancelTask(attemptCtx, params)
+		cancel()
+		if err == nil {
+			w.tasksMutex.Lock()
+			w.rememberCompletedLocked(key, true)
+			delete(w.activeTasks, key)
+			w.tasksMutex.Unlock()
+			return
 		}
-		if closed {
-			return true, nil
+		log.Warnf(w.ctx, "Backend cancellation failed for task %s execution %s; retrying in %v: %v", key.taskID, key.executionID, delay, err)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
+		delay = min(delay*2, maxCancellationRetryDelay)
 	}
-	return false, fmt.Errorf("backend has not confirmed execution closure")
 }
 
-func (w *Worker) rememberCompletedLocked(key taskExecution, closed bool) {
+func (w *Worker) rememberCompletedLocked(key taskExecution, cancellationAccepted bool) {
 	if key.executionID == "" {
 		return
 	}
 	if w.completedTasks == nil {
 		w.completedTasks = make(map[taskExecution]bool)
 	}
-	w.completedTasks[key] = closed
-	if closed {
-		w.closedExecutions = append(w.closedExecutions, key)
-		const closedExecutionCacheSize = 4096
-		if len(w.closedExecutions) > closedExecutionCacheSize {
-			delete(w.completedTasks, w.closedExecutions[0])
-			w.closedExecutions = w.closedExecutions[1:]
+	if _, known := w.completedTasks[key]; !known {
+		w.completedExecutions = append(w.completedExecutions, key)
+		const completedExecutionCacheSize = 4096
+		if len(w.completedExecutions) > completedExecutionCacheSize {
+			delete(w.completedTasks, w.completedExecutions[0])
+			w.completedExecutions = w.completedExecutions[1:]
 		}
 	}
-}
-
-func (w *Worker) sendExecutionClosed(key taskExecution) error {
-	data, err := json.Marshal(types.ExecutionClosedMessage{TaskID: key.taskID, ExecutionID: key.executionID})
-	if err != nil {
-		return err
-	}
-	message, err := json.Marshal(types.WebSocketMessage{Type: types.MessageTypeExecutionClosed, Data: data})
-	if err != nil {
-		return err
-	}
-	return w.sendMessage(message)
+	w.completedTasks[key] = cancellationAccepted
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
@@ -1168,6 +1148,11 @@ func (w *Worker) shutdownTasks() {
 		return
 	}
 	w.shuttingDown = true
+	for _, task := range w.activeTasks {
+		if task.stopCancellation != nil {
+			task.stopCancellation()
+		}
+	}
 	activeTaskCount := len(w.activeTasks)
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
@@ -1203,6 +1188,8 @@ func (w *Worker) shutdownTasks() {
 }
 
 func (w *Worker) shutdownBackend() {
+	w.shutdownTasks()
+	w.cancellationWG.Wait()
 
 	backendShutdownCtx, backendShutdownCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
 	defer backendShutdownCancel()

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/moby/moby/client"
 	batchv1 "k8s.io/api/batch/v1"
@@ -58,17 +57,17 @@ func TestDirectExecutionWorkspaceIsolation(t *testing.T) {
 	}
 }
 
-type closureDockerTransport func(*http.Request) (*http.Response, error)
+type cancellationDockerTransport func(*http.Request) (*http.Response, error)
 
-func (f closureDockerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+func (f cancellationDockerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
 
-func TestDockerExecutionClosure(t *testing.T) {
+func TestDockerExecutionCancellation(t *testing.T) {
 	t.Run("failed removal retains exact resource for retry", func(t *testing.T) {
 		fail := true
 		var removed []string
-		transport := closureDockerTransport(func(r *http.Request) (*http.Response, error) {
+		transport := cancellationDockerTransport(func(r *http.Request) (*http.Response, error) {
 			if r.URL.Path == "/_ping" {
 				return mockEngineResponse(r, http.StatusOK, "text/plain", "OK"), nil
 			}
@@ -95,15 +94,15 @@ func TestDockerExecutionClosure(t *testing.T) {
 		if err := backend.CancelTask(context.Background(), params); err == nil {
 			t.Fatal("expected retryable removal failure")
 		}
-		if closed, _ := backend.ConfirmTaskClosed(context.Background(), params); closed {
-			t.Fatal("failed removal reported closure")
+		if id, found := backend.taskContainers.Load(old); !found || id != "old-container" {
+			t.Fatal("failed removal lost resource tracking")
 		}
 		fail = false
 		if err := backend.CancelTask(context.Background(), params); err != nil {
 			t.Fatal(err)
 		}
-		if closed, err := backend.ConfirmTaskClosed(context.Background(), params); !closed || err != nil {
-			t.Fatalf("closed=%v, error=%v", closed, err)
+		if err := backend.CancelTask(context.Background(), params); err != nil {
+			t.Fatal(err)
 		}
 		if _, found := backend.taskContainers.Load(successor); !found {
 			t.Fatal("successor tracking removed")
@@ -113,38 +112,36 @@ func TestDockerExecutionClosure(t *testing.T) {
 		}
 	})
 
-	t.Run("unknown create outcome cannot acknowledge absence", func(t *testing.T) {
+	t.Run("unknown create outcome remains an observable failure", func(t *testing.T) {
 		backend := &DockerBackend{}
 		backend.taskContainers.Store(taskExecution{"run", "old"}, "")
 		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "run", ExecutionID: "old"}); err == nil {
-			t.Fatal("ambiguous creation treated as closure")
+			t.Fatal("ambiguous creation treated as accepted cancellation")
 		}
 	})
 }
 
-func TestKubernetesExecutionClosure(t *testing.T) {
-	t.Run("deleting job is insufficient while pods remain", func(t *testing.T) {
+func TestKubernetesExecutionCancellation(t *testing.T) {
+	t.Run("accepted deletion succeeds even while job and pods remain", func(t *testing.T) {
 		backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}}
 		params := &CancelParams{TaskID: "run", ExecutionID: "old"}
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Name: "old-pod", Namespace: "agents", Labels: backend.baseLabels("run", "old"),
 		}}
-		clientset := fake.NewSimpleClientset(pod)
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+			Name: kubernetesTaskJobName("run", "old"), Namespace: "agents", Labels: backend.baseLabels("run", "old"),
+		}}
+		clientset := fake.NewSimpleClientset(job, pod)
 		backend.clientset = clientset
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		clientset.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
-			cancel()
-			return false, nil, nil
+		clientset.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, nil
 		})
-		if closed, err := backend.ConfirmTaskClosed(ctx, params); closed || !errors.Is(err, context.Canceled) {
-			t.Fatalf("remaining pod yielded closed=%v, err=%v", closed, err)
-		}
-		if err := clientset.CoreV1().Pods("agents").Delete(context.Background(), pod.Name, metav1.DeleteOptions{}); err != nil {
+		if err := backend.CancelTask(context.Background(), params); err != nil {
 			t.Fatal(err)
 		}
-		if closed, err := backend.ConfirmTaskClosed(context.Background(), params); !closed || err != nil {
-			t.Fatalf("removed pod yielded closed=%v, err=%v", closed, err)
+		actions := clientset.Actions()
+		if len(actions) != 2 || actions[0].GetVerb() != "get" || actions[1].GetVerb() != "delete" {
+			t.Fatalf("cancellation should only get and delete the job: %v", actions)
 		}
 	})
 
@@ -154,8 +151,8 @@ func TestKubernetesExecutionClosure(t *testing.T) {
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "jobs"}, "job", errors.New("denied"))
 		})
 		backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}, clientset: clientset}
-		if closed, err := backend.ConfirmTaskClosed(context.Background(), &CancelParams{TaskID: "run", ExecutionID: "old"}); closed || err == nil {
-			t.Fatalf("API failure yielded closed=%v, err=%v", closed, err)
+		if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "run", ExecutionID: "old"}); err == nil {
+			t.Fatal("API failure treated as accepted cancellation")
 		}
 	})
 
@@ -178,16 +175,13 @@ func TestKubernetesExecutionClosure(t *testing.T) {
 		}
 	})
 
-	t.Run("existing job cannot be acknowledged closed", func(t *testing.T) {
+	t.Run("missing job cancellation is idempotent", func(t *testing.T) {
 		backend := &KubernetesBackend{config: KubernetesBackendConfig{Namespace: "agents"}}
-		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-			Name: kubernetesTaskJobName("run", "old"), Namespace: "agents", Labels: backend.baseLabels("run", "old"),
-		}}
-		backend.clientset = fake.NewSimpleClientset(job)
-		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-		defer cancel()
-		if closed, err := backend.ConfirmTaskClosed(ctx, &CancelParams{TaskID: "run", ExecutionID: "old"}); closed || err == nil {
-			t.Fatalf("live Job yielded closed=%v, err=%v", closed, err)
+		backend.clientset = fake.NewSimpleClientset()
+		for i := 0; i < 2; i++ {
+			if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: "run", ExecutionID: "old"}); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 }

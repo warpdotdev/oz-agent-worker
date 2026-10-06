@@ -176,9 +176,9 @@ type Backend interface {
 	// failures are surfaced as ExecuteOutcomeError with an error that is (or
 	// wraps) *TaskFailure.
 	ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult
-	// CancelTask makes a best-effort attempt to cancel a task after the
-	// ExecuteTask context is cancelled and ExecuteTask returns. A nil error
-	// is not proof that asynchronous backend resources have stopped.
+	// CancelTask requests cancellation after ExecuteTask returns. A nil error
+	// means the request was accepted, not that asynchronous resources stopped.
+	// Failed requests may be retried and must be execution-scoped and idempotent.
 	CancelTask(ctx context.Context, params *CancelParams) error
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
@@ -193,11 +193,6 @@ type Backend interface {
 type CancelParams struct {
 	TaskID      string
 	ExecutionID string
-}
-
-// executionClosureVerifier confirms closure after ExecuteTask and CancelTask have returned.
-type executionClosureVerifier interface {
-	ConfirmTaskClosed(ctx context.Context, params *CancelParams) (bool, error)
 }
 
 // TaskFailure is the structured error backends return from ExecuteTask when
