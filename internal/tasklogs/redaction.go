@@ -70,7 +70,7 @@ func (r *redactor) add(value string) {
 		r.secrets = append(r.secrets, secret)
 	}
 	sort.Slice(r.secrets, func(i, j int) bool { return len(r.secrets[i]) > len(r.secrets[j]) })
-	pairs := make([]string, 0, len(r.secrets)*2)
+	var pairs []string
 	for _, secret := range r.secrets {
 		pairs = append(pairs, secret, "[REDACTED]")
 	}
