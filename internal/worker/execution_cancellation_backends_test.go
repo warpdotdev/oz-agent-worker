@@ -63,6 +63,78 @@ func (f cancellationDockerTransport) RoundTrip(r *http.Request) (*http.Response,
 	return f(r)
 }
 
+func TestDockerCreateFailureTracking(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		status          int
+		body            string
+		transportError  error
+		expectedTracked bool
+	}{
+		{name: "invalid configuration", status: http.StatusBadRequest},
+		{name: "missing image", status: http.StatusNotFound},
+		{name: "name conflict", status: http.StatusConflict},
+		{name: "server failure", status: http.StatusInternalServerError, expectedTracked: true},
+		{name: "lost response", transportError: errors.New("response lost"), expectedTracked: true},
+		{name: "cancelled request", transportError: context.Canceled, expectedTracked: true},
+		{name: "malformed success response", status: http.StatusCreated, body: "{", expectedTracked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOCKER_CONFIG", t.TempDir())
+			createCalled := false
+			transport := cancellationDockerTransport(func(r *http.Request) (*http.Response, error) {
+				switch {
+				case r.URL.Path == "/_ping":
+					return mockEngineResponse(r, http.StatusOK, "text/plain", "OK"), nil
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/images/task-image/json"):
+					return mockImageInspectResponse(t, r, "linux", "amd64", ""), nil
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/containers/create"):
+					createCalled = true
+					if tc.transportError != nil {
+						return nil, tc.transportError
+					}
+					if tc.body != "" {
+						return mockEngineResponse(r, tc.status, "application/json", tc.body), nil
+					}
+					return mockEngineErrorResponse(t, r, tc.status, tc.name), nil
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					return nil, nil
+				}
+			})
+			dockerClient, err := client.New(client.WithHTTPClient(&http.Client{Transport: transport}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = dockerClient.Close() }()
+			backend := &DockerBackend{
+				dockerClient: dockerClient,
+				config:       DockerBackendConfig{ImagePullPolicy: PullPolicyNever},
+				platform:     "linux/amd64",
+			}
+			key := taskExecution{"run", "old"}
+			successor := taskExecution{"run", "new"}
+			backend.taskContainers.Store(successor, "successor-container")
+			result := backend.ExecuteTask(context.Background(), &TaskParams{
+				TaskID: key.taskID, ExecutionID: key.executionID, DockerImage: "task-image",
+			})
+			if !createCalled || result.Error == nil {
+				t.Fatalf("expected create failure: create called = %t, result = %+v", createCalled, result)
+			}
+			if value, tracked := backend.taskContainers.Load(key); tracked != tc.expectedTracked || (tracked && value != "") {
+				t.Fatalf("create tracking = (%v, %t), expected tracked = %t", value, tracked, tc.expectedTracked)
+			}
+			err = backend.CancelTask(context.Background(), &CancelParams{TaskID: key.taskID, ExecutionID: key.executionID})
+			if (err != nil) != tc.expectedTracked {
+				t.Fatalf("cancellation error = %v, expected uncertain outcome = %t", err, tc.expectedTracked)
+			}
+			if value, tracked := backend.taskContainers.Load(successor); !tracked || value != "successor-container" {
+				t.Fatal("create failure affected successor tracking")
+			}
+		})
+	}
+}
+
 func TestDockerExecutionCancellation(t *testing.T) {
 	t.Run("failed removal retains exact resource for retry", func(t *testing.T) {
 		fail := true
