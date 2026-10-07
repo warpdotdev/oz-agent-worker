@@ -143,7 +143,7 @@ func TestOneShotAcceptsOnlyOneTaskAndWaitsForCompletion(t *testing.T) {
 		},
 		ctx:           ctx,
 		outbound:      newOutboundQueue(8),
-		activeTasks:   make(map[string]activeTask),
+		activeTasks:   make(map[taskExecution]activeTask),
 		oneShot:       newOneShotState(),
 		backend:       backend,
 		taskSemaphore: semaphore.NewWeighted(1),
@@ -342,7 +342,7 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 		ctx:      context.Background(),
 		config:   Config{},
 		outbound: newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "execution-1"}: {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceShutdown,
 		}},
@@ -375,7 +375,7 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		config:   Config{OneShot: true},
 		outbound: newOutboundQueue(1),
 		oneShot:  newOneShotState(),
-		activeTasks: map[string]activeTask{"task-1": {
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "execution-1"}: {
 			cancel:             func() {},
 			cancellationSource: taskCancellationSourceUser,
 		}},
@@ -408,8 +408,8 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 	if completed.Message != "Task cancelled by user request." {
 		t.Errorf("message = %q, want %q", completed.Message, "Task cancelled by user request.")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
-		t.Fatal("task should be removed from active tasks")
+	if _, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "execution-1"}]; !ok {
+		t.Fatal("cancelled task must remain tracked until backend closure is confirmed")
 	}
 	assertOneShotDone(t, w)
 }
@@ -419,7 +419,7 @@ func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *test
 		ctx:         context.Background(),
 		config:      Config{},
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "execution-1"}: {cancel: func() {}}},
 		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
 	}
 
@@ -442,8 +442,8 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 	w := &Worker{
 		ctx:      context.Background(),
 		outbound: newOutboundQueue(1),
-		activeTasks: map[string]activeTask{
-			"task-1": {
+		activeTasks: map[taskExecution]activeTask{
+			{taskID: "task-1", executionID: ""}: {
 				ctx:    taskCtx,
 				cancel: taskCancel,
 			},
@@ -468,7 +468,10 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 	if taskCtx.Err() != context.Canceled {
 		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
 	}
-	if task := w.activeTasks["task-1"]; task.cancellationSource != taskCancellationSourceUser {
+	w.tasksMutex.Lock()
+	task := w.activeTasks[taskExecution{taskID: "task-1", executionID: ""}]
+	w.tasksMutex.Unlock()
+	if task.cancellationSource != taskCancellationSourceUser {
 		t.Fatalf("task cancellation source = %q, want %q", task.cancellationSource, taskCancellationSourceUser)
 	}
 }
@@ -478,7 +481,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 		ctx:         context.Background(),
 		config:      Config{OneShot: true},
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: "execution-1"}: {cancel: func() {}}},
 		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{},
 	}
@@ -507,7 +510,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 	if completed.Message != "Task completed successfully" {
 		t.Errorf("message = %q, want %q", completed.Message, "Task completed successfully")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
+	if _, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: "execution-1"}]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
 	assertOneShotDone(t, w)
@@ -518,7 +521,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		ctx:         context.Background(),
 		config:      Config{OneShot: true},
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: ""}: {cancel: func() {}}},
 		oneShot:     newOneShotState(),
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
@@ -543,7 +546,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 	if failed.Message != "Failed to execute task: boom" {
 		t.Errorf("message = %q, want %q", failed.Message, "Failed to execute task: boom")
 	}
-	if _, ok := w.activeTasks["task-1"]; ok {
+	if _, ok := w.activeTasks[taskExecution{taskID: "task-1", executionID: ""}]; ok {
 		t.Fatal("task should be removed from active tasks")
 	}
 	assertOneShotDone(t, w)
@@ -554,7 +557,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 		ctx:         context.Background(),
 		config:      Config{},
 		outbound:    newOutboundQueue(1),
-		activeTasks: map[string]activeTask{"task-1": {cancel: func() {}}},
+		activeTasks: map[taskExecution]activeTask{{taskID: "task-1", executionID: ""}: {cancel: func() {}}},
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
 
@@ -674,7 +677,7 @@ func TestRunServerCancellationClosesProtocolAndBackend(t *testing.T) {
 		},
 		ctx:               serverCtx,
 		outbound:          newOutboundQueue(8),
-		activeTasks:       make(map[string]activeTask),
+		activeTasks:       make(map[taskExecution]activeTask),
 		oneShot:           newOneShotState(),
 		backend:           backend,
 		heartbeatInterval: HeartbeatInterval,
@@ -1020,7 +1023,7 @@ func TestRunHeartbeatAndWritesAreConcurrencySafe(t *testing.T) {
 		config:            Config{},
 		ctx:               context.Background(),
 		outbound:          newOutboundQueue(256),
-		activeTasks:       make(map[string]activeTask),
+		activeTasks:       make(map[taskExecution]activeTask),
 		oneShot:           newOneShotState(),
 		backend:           &recordingBackend{},
 		heartbeatInterval: time.Millisecond,
@@ -1521,7 +1524,7 @@ func TestShutdownBackendUsesFreshContextForCleanup(t *testing.T) {
 	backend := &shutdownRecordingBackend{}
 	w := &Worker{
 		ctx:         context.Background(),
-		activeTasks: make(map[string]activeTask),
+		activeTasks: make(map[taskExecution]activeTask),
 		backend:     backend,
 	}
 	w.shutdownBackend()
@@ -1539,8 +1542,8 @@ func TestWorkerShutdownPreservesActiveTasksForPreservingBackend(t *testing.T) {
 	cancelledTask := false
 	w := &Worker{
 		ctx: context.Background(),
-		activeTasks: map[string]activeTask{
-			"task-1": {cancel: func() {
+		activeTasks: map[taskExecution]activeTask{
+			{taskID: "task-1", executionID: ""}: {cancel: func() {
 				cancelledTask = true
 			}},
 		},
@@ -1565,7 +1568,7 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 		ctx:         workerCtx,
 		config:      Config{},
 		outbound:    newOutboundQueue(1),
-		activeTasks: make(map[string]activeTask),
+		activeTasks: make(map[taskExecution]activeTask),
 		backend:     &preservingShutdownRecordingBackend{},
 	}
 
@@ -1584,7 +1587,7 @@ func TestHandleTaskAssignmentRejectsAfterShutdownStarts(t *testing.T) {
 		ctx:          context.Background(),
 		config:       Config{},
 		outbound:     newOutboundQueue(1),
-		activeTasks:  make(map[string]activeTask),
+		activeTasks:  make(map[taskExecution]activeTask),
 		shuttingDown: true,
 		backend:      &recordingBackend{},
 	}

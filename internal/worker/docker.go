@@ -67,6 +67,7 @@ type DockerBackend struct {
 	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
 	platformSpec   ocispec.Platform
 	sidecarVolumes sync.Map // volume name -> *sidecarVolumeState
+	taskContainers sync.Map // taskExecution -> container ID; retained after cleanup failures
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
@@ -172,24 +173,33 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	}
 
 	doneContainerStart := params.SetupEvents.startPhase(ctx, SetupEventContainerStart)
+	key := taskExecution{params.TaskID, params.ExecutionID}
+	// Transport and server failures cannot prove that the daemon created no container.
+	b.taskContainers.Store(key, "")
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
 	if err != nil {
+		if cerrdefs.IsInvalidArgument(err) || cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err) {
+			b.taskContainers.Delete(key)
+		}
 		doneContainerStart(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, fmt.Errorf("failed to create container: %w", err)))
 	}
 
 	containerID := resp.ID
+	b.taskContainers.Store(key, containerID)
 	log.Debugf(ctx, "Created Docker container: %s", containerID)
 
 	defer func() {
 		if containerID != "" && !b.config.NoCleanup {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
 			defer cleanupCancel()
-			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
+			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !cerrdefs.IsNotFound(removeErr) {
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
+			} else {
+				b.taskContainers.Delete(key)
 			}
 		}
 	}()
@@ -261,9 +271,22 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	return res
 }
 
-// CancelTask is a no-op: cancelling the ExecuteTask context fully stops a
-// Docker-backend task.
-func (b *DockerBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+// CancelTask removes the captured execution container, including when normal cleanup failed.
+func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	key := taskExecution{params.TaskID, params.ExecutionID}
+	containerID, ok := b.taskContainers.Load(key)
+	if !ok {
+		return nil
+	}
+	if containerID == "" {
+		return fmt.Errorf("container creation outcome is unknown for execution %s", params.ExecutionID)
+	}
+	if _, err := b.dockerClient.ContainerRemove(ctx, containerID.(string), client.ContainerRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+		return err
+	}
+	b.taskContainers.Delete(key)
+	return nil
+}
 
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {

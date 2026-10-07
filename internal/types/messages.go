@@ -131,8 +131,9 @@ type TaskAssignmentMessage struct {
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
 type TaskClaimedMessage struct {
-	TaskID   string `json:"task_id"`
-	WorkerID string `json:"worker_id"`
+	TaskID      string `json:"task_id"`
+	WorkerID    string `json:"worker_id"`
+	ExecutionID string `json:"execution_id,omitempty"`
 }
 
 // TaskCompletedMessage tells the server to end the active run execution after a successful agent process exit.
@@ -166,7 +167,8 @@ type TaskRejectedMessage struct {
 
 // TaskCancellationMessage is sent from server to worker to cancel an active task.
 type TaskCancellationMessage struct {
-	TaskID string `json:"task_id"`
+	TaskID      string `json:"task_id"`
+	ExecutionID string `json:"execution_id,omitempty"`
 }
 
 // TaskState is the serialized terminal task state accepted by warp-server.
