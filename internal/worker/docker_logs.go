@@ -12,13 +12,6 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 )
 
-type dockerLabelsKey struct{}
-
-func dockerTaskLabels(ctx context.Context) map[string]string {
-	labels, _ := ctx.Value(dockerLabelsKey{}).(map[string]string)
-	return labels
-}
-
 func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID string, reporter *tasklogs.Reporter) func() {
 	if reporter == nil {
 		return func() {}

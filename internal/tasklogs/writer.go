@@ -10,6 +10,9 @@ import (
 	otellog "go.opentelemetry.io/otel/log"
 )
 
+// Writer buffers one task-output stream across arbitrary write boundaries.
+// It emits complete lines, redacts registered environment values, and drops lines
+// over 64 KiB in full so partial credentials cannot survive truncation.
 type Writer struct {
 	mu       sync.Mutex
 	reporter *Reporter
@@ -20,6 +23,7 @@ type Writer struct {
 	closed   bool
 }
 
+// Writer labels each record with source and flushes pending bytes at reporter shutdown.
 func (r *Reporter) Writer(ctx context.Context, source string) *Writer {
 	writer := &Writer{reporter: r, ctx: ctx, source: source}
 	r.writersMu.Lock()
@@ -32,6 +36,7 @@ func (r *Reporter) Writer(ctx context.Context, source string) *Writer {
 	return writer
 }
 
+// Write accepts all bytes without propagating collector failures to the producer.
 func (w *Writer) Write(p []byte) (int, error) {
 	n := len(p)
 	if w.reporter == nil {
@@ -65,6 +70,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// Flush emits the final unterminated line unless it exceeded the line limit.
 func (w *Writer) Flush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -88,53 +94,13 @@ func (w *Writer) flush() {
 	w.discard = false
 }
 
+// Output copies original bytes locally and redacted lines to OTLP.
+// The returned function flushes a final unterminated line when the producer exits.
+// A nil reporter leaves local output unchanged.
 func (r *Reporter) Output(ctx context.Context, source string, local io.Writer) (io.Writer, func()) {
 	if r == nil {
 		return local, func() {}
 	}
 	writer := r.Writer(ctx, source)
 	return io.MultiWriter(local, writer), writer.Flush
-}
-
-// Setup output must not be exported until the environment file's credentials are registered.
-func (r *Reporter) BufferedOutput(ctx context.Context, source string, local io.Writer) (io.Writer, func(bool)) {
-	if r == nil {
-		return local, func(bool) {}
-	}
-	buffer := &deferredOutput{}
-	return io.MultiWriter(local, buffer), func(environmentKnown bool) {
-		buffer.mu.Lock()
-		defer buffer.mu.Unlock()
-		if buffer.closed {
-			return
-		}
-		buffer.closed = true
-		if environmentKnown && !buffer.overflow {
-			writer := r.Writer(ctx, source)
-			_, _ = writer.Write(buffer.bytes)
-			writer.Flush()
-		}
-		buffer.bytes = nil
-	}
-}
-
-type deferredOutput struct {
-	mu       sync.Mutex
-	bytes    []byte
-	overflow bool
-	closed   bool
-}
-
-func (b *deferredOutput) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.closed && !b.overflow {
-		if len(p) > maxLineBytes-len(b.bytes) {
-			b.bytes = nil
-			b.overflow = true
-		} else {
-			b.bytes = append(b.bytes, p...)
-		}
-	}
-	return len(p), nil
 }

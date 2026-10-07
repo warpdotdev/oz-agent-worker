@@ -38,7 +38,7 @@ var CLI struct {
 	Env                     []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks      int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
 	OneShot                 bool     `help:"Exit after running one task (direct backend only)"`
-	DisableTaskLogs         bool     `help:"Disable per-task log collection requested by the server" env:"OZ_DISABLE_TASK_LOGS"`
+	CollectTaskLogs         *bool    `help:"Collect per-task logs requested by the server (default: true)" env:"OZ_COLLECT_TASK_LOGS"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 	SessionSharingServerURL string   `help:"Session sharing server WebSocket URL to pass through to the oz CLI (e.g. ws://127.0.0.1:8081)" hidden:""`
 }
@@ -167,9 +167,11 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if oneShot {
 		maxConcurrentTasks = 1
 	}
-	disableTaskLogs := CLI.DisableTaskLogs
-	if !disableTaskLogs && fileConfig != nil && fileConfig.DisableTaskLogs != nil {
-		disableTaskLogs = *fileConfig.DisableTaskLogs
+	collectTaskLogs := true
+	if CLI.CollectTaskLogs != nil {
+		collectTaskLogs = *CLI.CollectTaskLogs
+	} else if fileConfig != nil && fileConfig.CollectTaskLogs != nil {
+		collectTaskLogs = *fileConfig.CollectTaskLogs
 	}
 
 	// Resolve idle_on_complete: CLI (non-empty) > config file > "" (oz CLI default = 45m).
@@ -187,7 +189,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		BackendType:             backendType,
 		MaxConcurrentTasks:      maxConcurrentTasks,
 		OneShot:                 oneShot,
-		DisableTaskLogs:         disableTaskLogs,
+		CollectTaskLogs:         collectTaskLogs,
 		IdleOnComplete:          idleOnComplete,
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}

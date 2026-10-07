@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -23,30 +24,53 @@ func resetCLIForTest() {
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
 	CLI.OneShot = false
-	CLI.DisableTaskLogs = false
+	CLI.CollectTaskLogs = nil
 	CLI.IdleOnComplete = ""
 }
 
-func TestTaskLogKillSwitchConfig(t *testing.T) {
-	resetCLIForTest()
-	t.Cleanup(resetCLIForTest)
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("worker_id: test-worker\ndisable_task_logs: true\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wc, err := mergeConfig(cfg)
-	if err != nil || !wc.DisableTaskLogs {
-		t.Fatalf("YAML kill switch not applied: %v", err)
-	}
-	CLI.DisableTaskLogs = true
-	cfg.DisableTaskLogs = boolPtr(false)
-	wc, err = mergeConfig(cfg)
-	if err != nil || !wc.DisableTaskLogs {
-		t.Fatalf("CLI kill switch not applied: %v", err)
+func TestCollectTaskLogsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env string
+		args            []string
+		want            bool
+	}{
+		{name: "default enabled", want: true},
+		{name: "YAML disabled", yaml: "collect_task_logs: false\n"},
+		{name: "CLI disabled overrides YAML", yaml: "collect_task_logs: true\n", args: []string{"--collect-task-logs=false"}},
+		{name: "CLI enabled overrides YAML", yaml: "collect_task_logs: false\n", args: []string{"--collect-task-logs"}, want: true},
+		{name: "environment disabled overrides YAML", yaml: "collect_task_logs: true\n", env: "false"},
+		{name: "CLI enabled overrides environment", env: "false", args: []string{"--collect-task-logs=true"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			t.Setenv("WARP_API_KEY", "test-api-key")
+			t.Setenv("OZ_COLLECT_TASK_LOGS", tc.env)
+			if tc.env == "" {
+				if err := os.Unsetenv("OZ_COLLECT_TASK_LOGS"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			parser, err := kong.New(&CLI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parser.Parse(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("worker_id: test-worker\n"+tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc, err := mergeConfig(cfg)
+			if err != nil || wc.CollectTaskLogs != tc.want {
+				t.Fatalf("CollectTaskLogs = %t, want %t: %v", wc.CollectTaskLogs, tc.want, err)
+			}
+		})
 	}
 }
 

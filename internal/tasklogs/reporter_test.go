@@ -13,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,6 +29,28 @@ func assignment(endpoint, runID string) *types.TaskAssignmentMessage {
 			Endpoint: endpoint + "/agent/otlp/", LoggingEnabled: true,
 			BootstrapToken: &types.TelemetryBootstrapToken{Token: "trace-bootstrap"},
 		},
+	}
+}
+
+func TestCollectorErrorDoesNotExposeAuthorization(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/graphql/v2" {
+			writeToken(w, "private-log-token", time.Now().Add(time.Hour))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, req.Header.Get("Authorization"))
+	}))
+	defer server.Close()
+	r, err := New(server.URL, "worker", "direct", assignment(server.URL, "run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(t, r)
+	r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
+	err = r.provider.ForceFlush(t.Context())
+	if err == nil || err.Error() != "task log export failed" {
+		t.Fatalf("collector error was not sanitized: %v", err)
 	}
 }
 
@@ -120,11 +144,11 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 		if runID == "beta" && r.redactor.redact("key-alpha") != "key-alpha" {
 			t.Error("redaction state crossed task boundaries")
 		}
-		if _, _, err := r.source.get(t.Context()); err != nil {
-			t.Fatal(err)
-		}
 		r.AddEnv(map[string]string{"CUSTOM_CREDENTIAL": "overlap-secret", "OTHER": "secret"})
-		r.Log(t.Context(), "warn", "worker key-"+runID+" log-token-"+runID+" trace-bootstrap")
+		ctx := log.WithOutput(t.Context(), r.ZerologWriter(t.Context()))
+		log.Warnf(ctx, "worker %s key-%s", runID, runID)
+		oversized, _ := json.Marshal(map[string]string{"message": strings.Repeat("x", maxLineBytes) + "key-" + runID})
+		_, _ = r.ZerologWriter(ctx).Write(oversized)
 		writer := r.Writer(t.Context(), "agent.stdout")
 		_, _ = writer.Write([]byte("output overlap-"))
 		_, _ = writer.Write([]byte("secret key-" + runID + "\n"))
@@ -153,18 +177,22 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 			for _, scope := range resource.ScopeLogs {
 				for _, record := range scope.LogRecords {
 					bodies = append(bodies, record.Body.GetStringValue())
+					if strings.HasPrefix(record.Body.GetStringValue(), "worker ") &&
+						(record.Body.GetStringValue() != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
+						t.Error("task logger context or warning severity was lost")
+					}
 					if record.Body.GetStringValue() == "setup_worker_image_pull" && !attributes(record.Attributes)["is_error"].GetBoolValue() {
 						t.Error("setup failure attribute missing")
 					}
 				}
 			}
 			text := strings.Join(bodies, "\n")
-			for _, secret := range []string{"key-" + runID, "log-token-" + runID, "trace-bootstrap", "overlap-secret"} {
+			for _, secret := range []string{"key-" + runID, "overlap-secret"} {
 				if strings.Contains(text, secret) {
 					t.Errorf("credential leaked for %s", runID)
 				}
 			}
-			if !strings.Contains(text, "after-overlong") || !strings.Contains(text, "last") || strings.Contains(text, strings.Repeat("x", 100)) {
+			if !strings.Contains(text, "worker "+runID+" [REDACTED]") || !strings.Contains(text, "after-overlong") || !strings.Contains(text, "last") || strings.Contains(text, strings.Repeat("x", 100)) {
 				t.Error("line bounds or unterminated-line flush broken")
 			}
 		}
@@ -208,45 +236,49 @@ func TestNewLoggingGateAndCredentials(t *testing.T) {
 }
 
 func TestSlowCollectorDoesNotBlockOutputAndShutdownHasDeadline(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/graphql/v2" {
-			writeToken(w, "issued-token", time.Now().Add(time.Hour))
-			return
-		}
-		once.Do(func() { close(started) })
-		<-release
-	}))
-	defer server.Close()
-	defer close(release)
-	r, err := New(server.URL, "worker", "docker", assignment(server.URL, "run"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := r.Writer(t.Context(), "output")
-	for range 128 {
-		_, _ = writer.Write([]byte("line\n"))
-	}
-	select {
-	case <-started:
-	case <-time.After(3 * time.Second):
-		t.Fatal("collector export did not start")
-	}
-	begin := time.Now()
-	for range 4096 {
-		_, _ = writer.Write([]byte("line\n"))
-	}
-	if time.Since(begin) > time.Second {
-		t.Error("collector backpressure blocked task output")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	begin = time.Now()
-	r.Shutdown(ctx)
-	if time.Since(begin) > time.Second || r.Context().Err() == nil {
-		t.Error("shutdown ignored deadline or failed to stop refresh")
+	for _, stallIdentity := range []bool{false, true} {
+		t.Run(map[bool]string{false: "collector", true: "identity"}[stallIdentity], func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == "/graphql/v2" && !stallIdentity {
+					writeToken(w, "issued-token", time.Now().Add(time.Hour))
+					return
+				}
+				once.Do(func() { close(started) })
+				<-release
+			}))
+			defer server.Close()
+			defer close(release)
+			r, err := New(server.URL, "worker", "docker", assignment(server.URL, "run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := r.Writer(t.Context(), "output")
+			for range 128 {
+				_, _ = writer.Write([]byte("line\n"))
+			}
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("collector export did not start")
+			}
+			begin := time.Now()
+			for range 4096 {
+				_, _ = writer.Write([]byte("line\n"))
+			}
+			if time.Since(begin) > time.Second {
+				t.Error("collector backpressure blocked task output")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			begin = time.Now()
+			r.Shutdown(ctx)
+			if time.Since(begin) > time.Second || r.Context().Err() == nil {
+				t.Error("shutdown ignored deadline or failed to cancel streams")
+			}
+		})
 	}
 }
 
@@ -265,70 +297,38 @@ func TestRedactionVariantsAndOverflow(t *testing.T) {
 	}
 }
 
-func TestIdentityRefreshAndExpiredToken(t *testing.T) {
+func TestIdentityLazyRefreshAndConcurrentReuse(t *testing.T) {
 	var calls atomic.Int32
-	var reject atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		n := calls.Add(1)
-		if reject.Load() {
-			w.WriteHeader(http.StatusForbidden)
-			return
+		expiry := time.Now().Add(time.Hour)
+		if n == 1 {
+			expiry = time.Now().Add(30 * time.Second)
 		}
-		writeToken(w, fmt.Sprintf("issued-%d", n), time.Now().Add(time.Hour))
+		writeToken(w, fmt.Sprintf("issued-%d", n), expiry)
 	}))
 	defer server.Close()
-	var redactor redactor
-	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars, &redactor)
-	first, _, err := s.get(t.Context())
-	if err != nil {
-		t.Fatal(err)
+	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+	if calls.Load() != 0 {
+		t.Fatal("token requested before export")
 	}
-	s.refreshAt = time.Now().Add(-time.Second)
-	second, _, err := s.get(t.Context())
-	if err != nil || first == second || redactor.redact(first+" "+second) != "[REDACTED] [REDACTED]" {
-		t.Fatal("refresh or retained-token redaction failed")
+	first, err := s.Token()
+	if err != nil || first.AccessToken != "issued-1" {
+		t.Fatalf("initial token unavailable: %v", err)
 	}
-	reject.Store(true)
-	s.refreshAt = time.Now().Add(-time.Second)
-	if token, _, err := s.get(t.Context()); err != nil || token != second {
-		t.Fatal("failed refresh discarded valid token")
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			token, err := s.Token()
+			if err != nil || token.AccessToken != "issued-2" {
+				t.Errorf("concurrent token refresh failed: %v", err)
+			}
+		})
 	}
-	s.expiresAt, s.refreshAt = time.Now().Add(-time.Second), time.Now().Add(-time.Second)
-	if _, _, err := s.get(t.Context()); err == nil {
-		t.Fatal("expired token was reused")
+	wg.Wait()
+	if calls.Load() != 2 {
+		t.Fatalf("made %d requests, want one initial request and one refresh", calls.Load())
 	}
-}
-
-func TestProactiveIdentityRefresh(t *testing.T) {
-	renewed := make(chan bool, 1)
-	var expiry atomic.Int64
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if calls.Add(1) == 1 {
-			firstExpiry := time.Now().Add(1500 * time.Millisecond)
-			expiry.Store(firstExpiry.UnixNano())
-			writeToken(w, "first", firstExpiry)
-			return
-		}
-		renewed <- time.Now().UnixNano() < expiry.Load()
-		writeToken(w, "second", time.Now().Add(time.Hour))
-	}))
-	defer server.Close()
-	var redactor redactor
-	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars, &redactor)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go s.run(ctx)
-	select {
-	case beforeExpiry := <-renewed:
-		if !beforeExpiry {
-			t.Error("refresh occurred after token expiry")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("idle reporter did not refresh")
-	}
-	cancel()
-	<-s.done
 }
 
 func TestIdentityRedirectDoesNotForwardCredentials(t *testing.T) {
@@ -339,8 +339,8 @@ func TestIdentityRedirectDoesNotForwardCredentials(t *testing.T) {
 		http.Redirect(w, req, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars, &redactor{})
-	if _, _, err := s.get(t.Context()); err == nil || redirected.Load() != 0 {
+	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+	if _, err := s.Token(); err == nil || redirected.Load() != 0 {
 		t.Fatal("identity credentials were forwarded through a redirect")
 	}
 }
@@ -355,8 +355,8 @@ func TestIdentityResponseValidation(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			defer server.Close()
-			s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars, &redactor{})
-			if _, _, err := s.get(t.Context()); err == nil || strings.Contains(err.Error(), "private credential") {
+			s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+			if _, err := s.Token(); err == nil || strings.Contains(err.Error(), "private credential") {
 				t.Fatal("identity error response accepted or exposed")
 			}
 		})

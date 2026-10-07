@@ -3,31 +3,24 @@ package log
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
+var consoleOutput = zerolog.ConsoleWriter{
+	Out:        os.Stderr,
+	TimeFormat: "15:04:05.000",
+}
+
 func init() {
-	log.Logger = log.Output(zerolog.ConsoleWriter{
-		Out:        os.Stderr,
-		TimeFormat: "15:04:05.000",
-	})
+	log.Logger = log.Output(consoleOutput)
+	zerolog.DefaultContextLogger = &log.Logger
 }
-
-type sinkKey struct{}
-
-func WithSink(ctx context.Context, sink func(context.Context, string, string) string) context.Context {
-	return context.WithValue(ctx, sinkKey{}, sink)
-}
-
-func message(ctx context.Context, level, format string, args ...any) string {
-	text := fmt.Sprintf(format, args...)
-	if sink, ok := ctx.Value(sinkKey{}).(func(context.Context, string, string) string); ok {
-		text = sink(ctx, level, text)
-	}
-	return text
+func WithOutput(ctx context.Context, output io.Writer) context.Context {
+	return log.Ctx(ctx).Output(zerolog.MultiLevelWriter(consoleOutput, output)).WithContext(ctx)
 }
 
 // SetLevel configures the global log level
@@ -49,24 +42,22 @@ func SetLevel(level string) {
 }
 
 func Debugf(ctx context.Context, format string, args ...any) {
-	if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-		log.Debug().Msg(message(ctx, "debug", format, args...))
-	}
+	log.Ctx(ctx).Debug().Msgf(format, args...)
 }
 
 func Infof(ctx context.Context, format string, args ...any) {
-	log.Info().Msg(message(ctx, "info", format, args...))
+	log.Ctx(ctx).Info().Msgf(format, args...)
 }
 
 func Warnf(ctx context.Context, format string, args ...any) {
-	log.Warn().Msg(message(ctx, "warn", format, args...))
+	log.Ctx(ctx).Warn().Msgf(format, args...)
 }
 
 func Errorf(ctx context.Context, format string, args ...any) {
-	log.Error().Msg(message(ctx, "error", format, args...))
+	log.Ctx(ctx).Error().Msgf(format, args...)
 }
 
 func Fatalf(ctx context.Context, format string, args ...any) {
-	log.Fatal().Msgf(format, args...)
+	log.Ctx(ctx).Fatal().Msgf(format, args...)
 	panic(fmt.Sprintf(format, args...))
 }

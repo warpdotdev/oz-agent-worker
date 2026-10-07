@@ -56,7 +56,7 @@ type Config struct {
 	IdleOnComplete string
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
-	DisableTaskLogs         bool
+	CollectTaskLogs         bool
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -825,14 +825,14 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		params.Logs.Shutdown(flushCtx)
 	}
 	defer finishLogs()
-	if !w.config.DisableTaskLogs {
+	if w.config.CollectTaskLogs {
 		reporter, err := tasklogs.New(w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
 		if err != nil {
 			log.Warnf(ctx, "Task log reporting unavailable for task %s: %v", taskID, err)
 		}
 		if reporter != nil {
 			params.Logs = reporter
-			ctx = log.WithSink(ctx, reporter.Log)
+			ctx = log.WithOutput(ctx, reporter.ZerologWriter(ctx))
 			if params.SetupEvents == nil {
 				params.SetupEvents = &setupEventReporter{}
 			}

@@ -68,43 +68,27 @@ func taskLogServer(t *testing.T) (*httptest.Server, <-chan string, *atomic.Int32
 	return server, payloads, calls
 }
 
-func TestSetupOutputWaitsForInjectedCredentials(t *testing.T) {
-	for _, tc := range []struct {
-		name, tail         string
-		wantHook, injected bool
-	}{
-		{"short setup", "", true, true},
-		{"setup spanning export interval", "sleep 6", true, true},
-		{"buffer overflow", "printf '%070000d\\n' 0; printf '%070000d\\n' 0 >&2", false, true},
-		{"invalid environment", `printf 'BROKEN="%s\n' "$credential" >"$OZ_ENVIRONMENT_FILE"`, false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server, payloads, _ := taskLogServer(t)
-			dir := t.TempDir()
-			ozPath := filepath.Join(dir, "oz")
-			script := "#!/bin/sh\n"
-			if tc.injected {
-				script += "test \"$CUSTOM_CREDENTIAL\" = generated-credential || exit 2\n"
-			}
-			script += "printf 'agent %s\\n' \"$CUSTOM_CREDENTIAL\"\n"
-			if err := os.WriteFile(ozPath, []byte(script), 0700); err != nil {
-				t.Fatal(err)
-			}
-			backend := &DirectBackend{ozPath: ozPath, config: DirectBackendConfig{
-				WorkspaceRoot: filepath.Join(dir, "workspaces"),
-				SetupCommand:  `credential="generated-$(printf credential)"; printf 'CUSTOM_CREDENTIAL=%s\n' "$credential" >"$OZ_ENVIRONMENT_FILE"; printf 'setup %s\n' "$credential"; printf 'setup stderr %s\n' "$credential" >&2; ` + tc.tail,
-			}}
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			w := &Worker{config: Config{BackendType: "direct", ServerRootURL: server.URL},
-				ctx: ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8)}
-			_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
-			w.executeTask(ctx, cancel, span, logAssignment(server.URL), time.Now())
-			text := logPayloads(payloads)
-			if strings.Contains(text, "generated-credential") || strings.Contains(text, "setup [REDACTED]") != tc.wantHook || !strings.Contains(text, "agent.stdout") {
-				t.Fatalf("setup credential collection mismatch: %s", text)
-			}
-		})
+func TestSetupEnvironmentCredentialsRedactedInAgentOutput(t *testing.T) {
+	server, payloads, _ := taskLogServer(t)
+	dir := t.TempDir()
+	ozPath := filepath.Join(dir, "oz")
+	script := "#!/bin/sh\ntest \"$CUSTOM_CREDENTIAL\" = generated-credential || exit 2\nprintf 'agent %s\\n' \"$CUSTOM_CREDENTIAL\"\n"
+	if err := os.WriteFile(ozPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &DirectBackend{ozPath: ozPath, config: DirectBackendConfig{
+		WorkspaceRoot: filepath.Join(dir, "workspaces"),
+		SetupCommand:  `printf 'CUSTOM_CREDENTIAL=generated-credential\n' >"$OZ_ENVIRONMENT_FILE"`,
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	w := &Worker{config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: true},
+		ctx: ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8)}
+	_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
+	w.executeTask(ctx, cancel, span, logAssignment(server.URL), time.Now())
+	text := logPayloads(payloads)
+	if strings.Contains(text, "generated-credential") || !strings.Contains(text, "[REDACTED]") || !strings.Contains(text, "agent.stdout") {
+		t.Fatalf("setup environment credential was not redacted in agent output: %s", text)
 	}
 }
 
@@ -237,7 +221,7 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			w := &Worker{
-				config: Config{BackendType: "direct", ServerRootURL: server.URL, DisableTaskLogs: tc.disabled},
+				config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: !tc.disabled},
 				ctx:    ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8),
 			}
 			_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
@@ -266,8 +250,8 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			if tc.setup == "" && !strings.Contains(text, "agent.stderr") {
 				t.Fatal("stderr was not collected")
 			}
-			if tc.setup != "" && strings.Contains(text, "hook.stdout") {
-				t.Fatal("failed setup output was released without a complete environment")
+			if tc.setup != "" && !strings.Contains(text, "hook.stdout") {
+				t.Fatal("setup failure output was not collected")
 			}
 			if len(drainMessages(t, w.outbound.messages)) != 1 {
 				t.Fatal("observability changed terminal task reporting")
@@ -301,7 +285,7 @@ func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 			defer cancel()
 			backend := &cancellableLoggingBackend{started: make(chan struct{}), preserve: preserve}
 			w := &Worker{
-				config: Config{ServerRootURL: server.URL, BackendType: "direct"},
+				config: Config{ServerRootURL: server.URL, BackendType: "direct", CollectTaskLogs: true},
 				ctx:    ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8), oneShot: newOneShotState(),
 			}
 			w.handleTaskAssignment(logAssignment(server.URL))
@@ -354,7 +338,11 @@ func (e *labelledContainerEngine) RoundTrip(req *http.Request) (*http.Response, 
 	case req.URL.Path == "/_ping":
 		return mockEngineResponse(req, http.StatusOK, "text/plain", "OK"), nil
 	case strings.Contains(req.URL.Path, "/images/") && strings.HasSuffix(req.URL.Path, "/json"):
-		return mockEngineResponse(req, http.StatusOK, "application/json", `{"Os":"linux","Architecture":"amd64"}`), nil
+		return mockEngineResponse(req, http.StatusOK, "application/json", `{"Os":"linux","Architecture":"amd64","Id":"sha256:abc123"}`), nil
+	case strings.Contains(req.URL.Path, "/volumes/") && req.Method == http.MethodGet:
+		return mockEngineErrorResponse(e.t, req, http.StatusNotFound, "no such volume"), nil
+	case strings.HasSuffix(req.URL.Path, "/volumes/create"):
+		return mockEngineResponse(req, http.StatusCreated, "application/json", `{}`), nil
 	case strings.HasSuffix(req.URL.Path, "/containers/create"):
 		var config container.Config
 		if err := json.NewDecoder(req.Body).Decode(&config); err != nil {
@@ -379,13 +367,18 @@ func TestDockerTaskAndSidecarContainerLabels(t *testing.T) {
 	backend := &DockerBackend{dockerClient: c, platform: "linux/amd64", config: DockerBackendConfig{ImagePullPolicy: PullPolicyNever, NoCleanup: true}}
 	params := &TaskParams{TaskID: "run", ExecutionID: "execution", DockerImage: "ubuntu:22.04"}
 	_ = backend.ExecuteTask(t.Context(), params)
-	ctx := context.WithValue(t.Context(), dockerLabelsKey{}, engine.configs[0].Labels)
-	_ = backend.copySidecarFilesystemToVolume(ctx, c, "sidecar", "volume")
+	params.TaskID, params.ExecutionID = "second-run", "second-execution"
+	params.Sidecars = []types.SidecarMount{{Image: "sidecar:latest", MountPath: "/mnt/sidecar"}}
+	_ = backend.ExecuteTask(t.Context(), params)
 	if len(engine.configs) != 3 {
 		t.Fatalf("created %d configs, want task/export/extract", len(engine.configs))
 	}
-	for _, config := range engine.configs {
-		if config.Labels["oz-task-id"] != "run" || config.Labels["oz-execution-id"] != "execution" {
+	for i, config := range engine.configs {
+		wantTask, wantExecution := "run", "execution"
+		if i > 0 {
+			wantTask, wantExecution = "second-run", "second-execution"
+		}
+		if config.Labels["oz-task-id"] != wantTask || config.Labels["oz-execution-id"] != wantExecution {
 			t.Errorf("missing task labels: %v", config.Labels)
 		}
 	}

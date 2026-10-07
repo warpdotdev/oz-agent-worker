@@ -225,20 +225,19 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
 
 	// 4. Run setup command if configured.
-	var setupErr error
-	releaseStdout, releaseStderr := func(bool) {}, func(bool) {}
 	if b.config.SetupCommand != "" {
 		setupEnv := append(envVars, directSetupEnvVars(workspaceDir, taskID, envFilePath)...)
 
 		log.Infof(ctx, "Running setup command")
 		doneSetup := params.SetupEvents.startPhase(ctx, SetupEventSetupCommand)
-		cmd := newHookCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv, params.Logs)
-		cmd.Stdout, releaseStdout = params.Logs.BufferedOutput(ctx, "hook.stdout", os.Stdout)
-		cmd.Stderr, releaseStderr = params.Logs.BufferedOutput(ctx, "hook.stderr", os.Stderr)
-		defer releaseStdout(false)
-		defer releaseStderr(false)
-		setupErr = runTaskCommand(cmd, params.Logs)
-		doneSetup(setupErr != nil)
+		err := b.runCommand(ctx, b.config.SetupCommand, workspaceDir, setupEnv, params.Logs)
+		doneSetup(err != nil)
+		if err != nil {
+			if ctx.Err() != nil {
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+			}
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", err)))
+		}
 	}
 
 	// 5. Parse environment file for KEY=VALUE pairs written by setup script.
@@ -248,14 +247,6 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		log.Warnf(ctx, "Failed to parse environment file")
 	}
 	params.Logs.AddEnv(setupScriptEnv)
-	releaseStdout(err == nil && setupErr == nil)
-	releaseStderr(err == nil && setupErr == nil)
-	if setupErr != nil {
-		if ctx.Err() != nil {
-			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
-		}
-		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, fmt.Errorf("setup command failed: %w", setupErr)))
-	}
 	var setupScriptVars []string
 	for key, value := range setupScriptEnv {
 		setupScriptVars = append(setupScriptVars, fmt.Sprintf("%s=%s", key, value))

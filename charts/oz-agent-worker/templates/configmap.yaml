@@ -10,7 +10,7 @@ data:
     worker_id: {{ required "worker.workerId is required" .Values.worker.workerId | quote }}
     cleanup: {{ .Values.worker.cleanup }}
     max_concurrent_tasks: {{ .Values.worker.maxConcurrentTasks }}
-    disable_task_logs: {{ .Values.worker.disableTaskLogs }}
+    collect_task_logs: {{ .Values.worker.collectTaskLogs }}
     {{- if .Values.worker.idleOnComplete }}
     idle_on_complete: {{ .Values.worker.idleOnComplete | quote }}
     {{- end }}

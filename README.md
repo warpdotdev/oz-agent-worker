@@ -403,16 +403,18 @@ ships task-scoped worker logs, setup phase events, and task output to the assign
 OTLP/HTTP collector. Logging does not depend on tracing being enabled and does not
 change the existing tracing environment or rollout.
 
-To disable collection on an installation, set `disable_task_logs: true` at the
-top level of the YAML config, pass `--disable-task-logs`, or set
-`OZ_DISABLE_TASK_LOGS=true`. Helm installs can use
-`--set worker.disableTaskLogs=true`. This does not disable existing metrics,
-tracing, or setup client-events reporting.
+Collection defaults to enabled when requested by the server. To disable it on an
+installation, set `collect_task_logs: false` at the top level of the YAML config,
+pass `--collect-task-logs=false`, or set `OZ_COLLECT_TASK_LOGS=false`. CLI flags
+override the environment variable, which overrides YAML, including explicit false
+values. Helm installs can use `--set worker.collectTaskLogs=false`.
+This does not disable existing metrics, tracing, or setup client-events reporting.
 
 The worker obtains log credentials with the task API key and workload identity;
 the tracing bootstrap token is never used for log authentication. Credentials are
-refreshed before expiry. Logs are batched every five seconds (or at 128 records),
-with a 1,024-record queue, 16 KiB record bodies, and a five-second final flush.
+refreshed lazily on export, with a one-minute expiry margin. Logs are batched every
+five seconds (or at 128 records), with a 1,024-record queue, 16 KiB record bodies,
+and a five-second final flush.
 Overload and observability failures drop logs rather than block execution.
 Lines over 64 KiB are dropped in full, not split across records.
 Redaction matches only original input and masks records that exceed its allocation
@@ -420,17 +422,21 @@ budget instead of expanding replacement text.
 
 Redaction conservatively covers nonempty environment values provided by the
 assignment and backend configuration, literal Kubernetes pod environment values,
-direct setup-generated environment values, inherited hook/dispatch environment,
-and all issued log tokens. Each task has its own redaction state. Redaction occurs
-before truncation and export; it does not scrub the agent's original local
+direct setup-generated environment values, and inherited hook/dispatch environment.
+Each task has its own redaction state. Log authentication tokens stay inside the
+exporter and are not passed to tasks. Redaction occurs before truncation and export;
+it does not scrub original local
 stdout/stderr. Unknown secrets created inside a task or resolved by Kubernetes
 `valueFrom`/`envFrom` are not visible to the worker and cannot be scrubbed by it.
 
 Docker output is followed as separate stdout/stderr streams. The task container,
 sidecar-export container, and sidecar-extraction container carry `oz-task-id` and
 `oz-execution-id` labels. Direct output includes the agent and setup/teardown hooks.
-Setup output stays in a 64 KiB buffer per stream until environment-file credentials
-are registered. Overflow, failed setup, or environment parse errors discard it.
+Setup hooks must write generated credentials to the environment file, not
+stdout/stderr. Known injected values are redacted from setup output immediately;
+new environment-file values can only be redacted after parsing, in later agent
+and teardown output. Unknown credentials printed during setup cannot be scrubbed
+before that file is parsed.
 Collected subprocess output drains for at most 100 ms after exit or cancellation;
 descendants retaining pipes cannot hold up completion, and drain-only timeouts
 drop logs without failing successful subprocesses.

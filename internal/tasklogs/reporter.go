@@ -16,6 +16,7 @@ import (
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -33,7 +34,6 @@ type Reporter struct {
 	cancel    context.CancelFunc
 	closed    atomic.Bool
 	closeOnce sync.Once
-	source    *tokenSource
 	writersMu sync.Mutex
 	writers   []*Writer
 }
@@ -58,15 +58,12 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Reporter{ctx: ctx, cancel: cancel}
 	r.AddEnv(assignment.EnvVars)
-	if config.BootstrapToken != nil {
-		r.redactor.add(config.BootstrapToken.Token)
-	}
-	r.source = newTokenSource(serverRootURL, assignment.TaskID, assignment.EnvVars, &r.redactor)
-	client := &http.Client{
+	base := &http.Client{
 		Timeout:       exportTimeout,
-		Transport:     &tokenTransport{source: r.source},
 		CheckRedirect: noRedirect,
 	}
+	client := oauth2.NewClient(context.WithValue(ctx, oauth2.HTTPClient, base),
+		newTokenSource(serverRootURL, assignment.TaskID, assignment.EnvVars))
 	exporter, err := otlploghttp.New(ctx,
 		otlploghttp.WithEndpointURL(endpoint.String()),
 		otlploghttp.WithHTTPClient(client),
@@ -93,7 +90,6 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 		)),
 	)
 	r.logger = r.provider.Logger("oz-agent-worker.task")
-	go r.source.run(ctx)
 	return r, nil
 }
 
@@ -106,6 +102,7 @@ type privateExporter struct {
 }
 
 func (e privateExporter) Export(ctx context.Context, records []sdklog.Record) error {
+	// Collector response bodies reach OTel's global error handler without task redaction.
 	if err := e.Exporter.Export(ctx, records); err != nil {
 		return errors.New("task log export failed")
 	}
@@ -135,22 +132,22 @@ func (r *Reporter) AddEnvList(env []string) {
 	}
 }
 
-func (r *Reporter) Log(ctx context.Context, level, message string) string {
-	if r == nil {
-		return message
-	}
+func (r *Reporter) log(ctx context.Context, level, message string) {
 	message = r.redactor.redact(message)
 	severity := otellog.SeverityInfo
 	switch level {
+	case "trace":
+		severity = otellog.SeverityTrace
 	case "debug":
 		severity = otellog.SeverityDebug
 	case "warn":
 		severity = otellog.SeverityWarn
 	case "error":
 		severity = otellog.SeverityError
+	case "fatal", "panic":
+		severity = otellog.SeverityFatal
 	}
 	r.emit(ctx, severity, level, message)
-	return message
 }
 
 func (r *Reporter) Event(ctx context.Context, name string, start, finish time.Time, isError bool) {
@@ -195,11 +192,7 @@ func (r *Reporter) Shutdown(ctx context.Context) {
 		r.closed.Store(true)
 		r.writers = nil
 		r.writersMu.Unlock()
-		// Export uses its own deadline, not the cancelled task or refresh context.
+		// Export uses its own deadline, not the cancelled task context.
 		_ = r.provider.Shutdown(ctx)
-		select {
-		case <-r.source.done:
-		case <-ctx.Done():
-		}
 	})
 }
