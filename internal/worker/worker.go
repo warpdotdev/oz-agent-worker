@@ -750,6 +750,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage:   dockerImage,
 		Sidecars:      sidecars,
 		InstanceShape: assignment.InstanceShape,
+		Platform:      assignment.Platform,
 		SetupEvents:   setupEvents,
 	}
 }

@@ -166,6 +166,10 @@ type TaskParams struct {
 	// requests/limits (Kubernetes). Backends that cannot enforce a shape (direct) ignore it.
 	InstanceShape *types.InstanceShape
 
+	// Platform, when non-nil, is the runner's configured OS/architecture. The Kubernetes
+	// backend uses it as a scheduling preference; other backends ignore it.
+	Platform *types.Platform
+
 	// SetupEvents reports worker-observed setup phase durations to warp-server.
 	// It may be nil, and all of its methods are safe to call on a nil reporter.
 	SetupEvents *setupEventReporter
