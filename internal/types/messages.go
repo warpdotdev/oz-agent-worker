@@ -116,6 +116,14 @@ type TelemetryBootstrapToken struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+// Platform is the runner's explicitly configured OS and CPU architecture. It mirrors the
+// OCI image platform JSON ("linux"/"amd64", "linux"/"arm64", ...), the vocabulary
+// container runtimes and Kubernetes node labels share.
+type Platform struct {
+	OS           string `json:"os,omitempty"`
+	Architecture string `json:"architecture,omitempty"`
+}
+
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
 	TaskID string `json:"task_id"`
@@ -139,6 +147,8 @@ type TaskAssignmentMessage struct {
 	// backends size the task container/pod from it; omitted when the run has no explicit
 	// runner instance shape, in which case the worker keeps its default sizing.
 	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
+	// Platform, when set, is the runner's explicitly configured OS/architecture.
+	Platform *Platform `json:"platform,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
