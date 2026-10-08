@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
@@ -214,7 +215,9 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 		log.Warnf(ctx, "worker %s key-%s", runID, runID)
 		oversized, _ := json.Marshal(map[string]string{"message": strings.Repeat("x", maxLineBytes) + "key-" + runID})
 		_, _ = r.ZerologWriter(ctx).Write(oversized)
-		writer := r.Writer(t.Context(), "agent.stdout")
+		writerAttrs := []attribute.KeyValue{attribute.String("test.stream", runID)}
+		writer := r.Writer(t.Context(), "agent.stdout", writerAttrs...)
+		writerAttrs[0] = attribute.String("test.stream", "changed")
 		_, _ = writer.Write([]byte("output overlap-"))
 		_, _ = writer.Write([]byte("secret key-" + runID + "\n"))
 		_, _ = writer.Write([]byte(strings.Repeat("x", maxLineBytes) + "key-" + runID))
@@ -242,6 +245,14 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 			for _, scope := range resource.ScopeLogs {
 				for _, record := range scope.LogRecords {
 					bodies = append(bodies, record.Body.GetStringValue())
+					recordAttrs := attributes(record.Attributes)
+					if recordAttrs["log.source"].GetStringValue() == "agent.stdout" {
+						if recordAttrs["test.stream"].GetStringValue() != runID {
+							t.Error("writer record attributes missing or changed after writer creation")
+						}
+					} else if recordAttrs["test.stream"] != nil {
+						t.Error("writer attributes leaked to other streams")
+					}
 					if strings.HasPrefix(record.Body.GetStringValue(), "worker ") &&
 						(record.Body.GetStringValue() != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
 						t.Error("task logger context or warning severity was lost")

@@ -17,15 +17,18 @@ type Writer struct {
 	mu       sync.Mutex
 	reporter *Reporter
 	ctx      context.Context
-	source   string
+	attrs    []attribute.KeyValue
 	line     []byte
 	discard  bool
 	closed   bool
 }
 
 // Writer labels each record with source and flushes pending bytes at reporter shutdown.
-func (r *Reporter) Writer(ctx context.Context, source string) *Writer {
-	writer := &Writer{reporter: r, ctx: ctx, source: source}
+func (r *Reporter) Writer(ctx context.Context, source string, attrs ...attribute.KeyValue) *Writer {
+	recordAttrs := make([]attribute.KeyValue, len(attrs)+1)
+	copy(recordAttrs, attrs)
+	recordAttrs[len(attrs)] = attribute.String("log.source", source)
+	writer := &Writer{reporter: r, ctx: ctx, attrs: recordAttrs}
 	r.writersMu.Lock()
 	defer r.writersMu.Unlock()
 	if r.closed.Load() || len(r.writers) >= 128 {
@@ -87,7 +90,7 @@ func (w *Writer) flush() {
 	if !w.discard && len(w.line) > 0 {
 		w.reporter.emit(w.ctx, otellog.SeverityInfo,
 			w.reporter.redactor.redactLine(string(w.line)),
-			attribute.String("log.source", w.source),
+			w.attrs...,
 		)
 	}
 	w.line = w.line[:0]

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +24,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/trace/noop"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
@@ -145,14 +145,14 @@ func TestCollectedSubprocessOutputDoesNotWaitForBackgroundChildren(t *testing.T)
 }
 
 func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
-	server, _, _ := taskLogServer(t)
+	server, payloads, _ := taskLogServer(t)
 	reporter, err := tasklogs.New(t.Context(), server.URL, "worker", "command", logAssignment(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reporter.Shutdown(t.Context())
 	backend := &CommandBackend{config: CommandBackendConfig{
-		DispatchCommand: "sleep 2 & wait", DispatchTimeout: 30 * time.Millisecond,
+		DispatchCommand: "printf 'dispatch output\\n'; sleep 2 & wait", DispatchTimeout: 30 * time.Millisecond,
 	}}
 	start := time.Now()
 	result := backend.ExecuteTask(t.Context(), &TaskParams{TaskID: "run", Logs: reporter})
@@ -160,6 +160,8 @@ func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
 	if reason != metrics.TaskFailureReasonDispatchTimeout || time.Since(start) > 750*time.Millisecond {
 		t.Fatalf("dispatch deadline not preserved: elapsed=%s error=%v", time.Since(start), result.Error)
 	}
+	reporter.Shutdown(t.Context())
+	assertNoContainerLogAttributes(t, logPayloads(payloads))
 }
 
 func TestSubprocessDrainRetainsExitFailure(t *testing.T) {
@@ -192,6 +194,50 @@ func logPayloads(ch <-chan string) string {
 			result = append(result, text)
 		default:
 			return strings.Join(result, "\n")
+		}
+	}
+}
+
+func taskLogRecords(t *testing.T, text string) []*logspb.LogRecord {
+	t.Helper()
+	var records []*logspb.LogRecord
+	for _, data := range strings.Split(text, "\n") {
+		if data == "" {
+			continue
+		}
+		var payload collector.ExportLogsServiceRequest
+		if err := protojson.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, resource := range payload.ResourceLogs {
+			for _, scope := range resource.ScopeLogs {
+				records = append(records, scope.LogRecords...)
+			}
+		}
+	}
+	return records
+}
+
+func taskLogAttributes(record *logspb.LogRecord) map[string]string {
+	attrs := make(map[string]string)
+	for _, attr := range record.Attributes {
+		attrs[attr.Key] = attr.Value.GetStringValue()
+	}
+	return attrs
+}
+
+func assertNoContainerLogAttributes(t *testing.T, text string) {
+	t.Helper()
+	records := taskLogRecords(t, text)
+	if len(records) == 0 {
+		t.Fatal("no non-container logs exported")
+	}
+	for _, record := range records {
+		attrs := taskLogAttributes(record)
+		for _, key := range []string{"container.name", "log.iostream", "k8s.container.name", "k8s.pod.name"} {
+			if _, ok := attrs[key]; ok {
+				t.Errorf("non-container record has %s: %v", key, attrs)
+			}
 		}
 	}
 }
@@ -247,6 +293,7 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			if !strings.Contains(text, tc.want) || strings.Contains(text, "private-backend-value") {
 				t.Fatalf("task output or privacy mismatch: %s", text)
 			}
+			assertNoContainerLogAttributes(t, text)
 			if tc.setup == "" && !strings.Contains(text, "agent.stderr") {
 				t.Fatal("stderr was not collected")
 			}
@@ -309,22 +356,74 @@ func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 }
 
 func TestDockerLogFrameDecoding(t *testing.T) {
-	var framed bytes.Buffer
-	for _, frame := range []struct {
-		stream byte
-		text   string
-	}{{1, "first"}, {2, "error\n"}, {1, "-second\n"}} {
-		header := [8]byte{frame.stream}
-		binary.BigEndian.PutUint32(header[4:], uint32(len(frame.text)))
-		framed.Write(header[:])
-		framed.WriteString(frame.text)
-	}
-	var stdout, stderr bytes.Buffer
-	if err := copyDockerLogFrames(&framed, &stdout, &stderr); !errors.Is(err, io.EOF) {
-		t.Fatal(err)
-	}
-	if stdout.String() != "first-second\n" || stderr.String() != "error\n" {
-		t.Fatal("Docker multiplexed streams were mixed or included frame headers")
+	for _, inspectFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "named container", true: "inspection failure"}[inspectFails], func(t *testing.T) {
+			collectorServer, payloads, _ := taskLogServer(t)
+			reporter, err := tasklogs.New(t.Context(), collectorServer.URL, "worker", "docker", logAssignment(collectorServer.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reporter.Shutdown(t.Context())
+			var framed bytes.Buffer
+			for _, frame := range []struct {
+				stream byte
+				text   string
+			}{{1, "first"}, {2, "error\n"}, {1, "-second\n"}} {
+				header := [8]byte{frame.stream}
+				binary.BigEndian.PutUint32(header[4:], uint32(len(frame.text)))
+				framed.Write(header[:])
+				framed.WriteString(frame.text)
+			}
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				switch {
+				case strings.HasSuffix(req.URL.Path, "/containers/task-id/json"):
+					if inspectFails {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					_, _ = io.WriteString(w, `{"Name":"/friendly-task"}`)
+				case strings.HasSuffix(req.URL.Path, "/containers/task-id/logs"):
+					if req.URL.Query().Get("stdout") != "1" || req.URL.Query().Get("stderr") != "1" || req.URL.Query().Get("follow") != "1" {
+						t.Error("Docker stdout/stderr logs were not followed")
+					}
+					_, _ = w.Write(framed.Bytes())
+				default:
+					t.Errorf("unexpected Docker request: %s", req.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer api.Close()
+			dockerClient, err := client.New(client.WithHost("tcp://"+strings.TrimPrefix(api.URL, "http://")), client.WithAPIVersion("1.54"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = dockerClient.Close() }()
+			backend := &DockerBackend{dockerClient: dockerClient}
+			stopLogs := backend.followContainerLogs(t.Context(), "task-id", reporter)
+			stopLogs()
+			reporter.Shutdown(t.Context())
+			records := taskLogRecords(t, logPayloads(payloads))
+			if len(records) != 2 {
+				t.Fatalf("exported %d records, want stdout and stderr", len(records))
+			}
+			wantStreams := map[string]string{"first-second": "stdout", "error": "stderr"}
+			for _, record := range records {
+				attrs := taskLogAttributes(record)
+				wantStream := wantStreams[record.Body.GetStringValue()]
+				delete(wantStreams, record.Body.GetStringValue())
+				if wantStream == "" || attrs["log.source"] != "container."+wantStream ||
+					attrs["log.iostream"] != wantStream {
+					t.Errorf("Docker output or record attributes mismatch: %v", record)
+				}
+				if inspectFails {
+					if _, ok := attrs["container.name"]; ok {
+						t.Errorf("Docker name present after inspection failure: %v", attrs)
+					}
+				} else if attrs["container.name"] != "friendly-task" {
+					t.Errorf("Docker name was not normalized: %v", attrs)
+				}
+			}
+		})
 	}
 }
 
@@ -399,7 +498,7 @@ func TestKubernetesLogStreamsDeduplicateObservedContainers(t *testing.T) {
 		if req.URL.Query().Get("follow") != "true" {
 			t.Error("pod logs were not followed")
 		}
-		_, _ = io.WriteString(w, "pod task-api-key\n")
+		_, _ = fmt.Fprintf(w, "%s task-api-key\n", req.URL.Query().Get("container"))
 	}))
 	defer api.Close()
 	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: api.URL})
@@ -421,5 +520,19 @@ func TestKubernetesLogStreamsDeduplicateObservedContainers(t *testing.T) {
 	text := logPayloads(payloads)
 	if requests.Load() != 2 || !strings.Contains(text, "pod.setup") || !strings.Contains(text, "pod.task") || strings.Contains(text, "task-api-key") {
 		t.Fatalf("pod stream duplication or redaction failed: requests=%d logs=%s", requests.Load(), text)
+	}
+	records := taskLogRecords(t, text)
+	if len(records) != 2 {
+		t.Fatalf("exported %d records, want init and main container", len(records))
+	}
+	seen := make(map[string]bool)
+	for _, record := range records {
+		attrs := taskLogAttributes(record)
+		name := attrs["k8s.container.name"]
+		if (name != "setup" && name != "task") || seen[name] || attrs["k8s.pod.name"] != pod.Name ||
+			attrs["log.source"] != "pod."+name || record.Body.GetStringValue() != name+" [REDACTED]" {
+			t.Errorf("Kubernetes container record attributes mismatch: %v", record)
+		}
+		seen[name] = true
 	}
 }
