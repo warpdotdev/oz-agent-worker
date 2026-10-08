@@ -924,6 +924,44 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 	}
 }
 
+func TestApplyPlatformNodeAffinity(t *testing.T) {
+	t.Run("architecture-only platform yields a soft arch preference", func(t *testing.T) {
+		podSpec := corev1.PodSpec{}
+		applyPlatformNodeAffinity(&podSpec, &types.Platform{Architecture: "arm64"})
+		terms := podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+		if len(terms) != 1 || terms[0].Weight != platformAffinityWeight {
+			t.Fatalf("expected one preferred term with weight %d, got %+v", platformAffinityWeight, terms)
+		}
+		exprs := terms[0].Preference.MatchExpressions
+		if len(exprs) != 1 || exprs[0].Key != corev1.LabelArchStable || exprs[0].Values[0] != "arm64" {
+			t.Fatalf("expected only arch=arm64 expression, got %+v", exprs)
+		}
+		if podSpec.NodeSelector != nil || podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+			t.Fatal("platform must never become a hard constraint")
+		}
+	})
+
+	t.Run("appends to operator affinity", func(t *testing.T) {
+		operatorRequired := &corev1.NodeSelector{}
+		podSpec := corev1.PodSpec{
+			NodeSelector: map[string]string{"disktype": "ssd"},
+			Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution:  operatorRequired,
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 10}},
+			}},
+		}
+		applyPlatformNodeAffinity(&podSpec, &types.Platform{OS: "linux", Architecture: "amd64"})
+
+		terms := podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+		if len(terms) != 2 || terms[0].Weight != 10 {
+			t.Fatalf("expected operator term preserved before platform term, got %+v", terms)
+		}
+		if podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != operatorRequired || podSpec.NodeSelector["disktype"] != "ssd" {
+			t.Fatal("operator required affinity and nodeSelector must be left untouched")
+		}
+	})
+}
+
 func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
 	err := validateTaskSidecars([]types.SidecarMount{
 		{
@@ -1330,6 +1368,7 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 		DockerImage:   "ubuntu:22.04",
 		BaseArgs:      []string{"run"},
 		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
+		Platform:      &types.Platform{OS: "linux", Architecture: "arm64"},
 	})
 	if result.Error != nil {
 		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
@@ -1350,6 +1389,20 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 	}
 	if got := taskContainer.Resources.Limits[corev1.ResourceMemory]; got.Value() != int64(16)<<30 {
 		t.Fatalf("memory limit = %d, want %d", got.Value(), int64(16)<<30)
+	}
+
+	affinity := createdJob.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil || len(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 1 {
+		t.Fatalf("expected one preferred node-affinity term from the platform, got %+v", affinity)
+	}
+	var archValues []string
+	for _, expr := range affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].Preference.MatchExpressions {
+		if expr.Key == corev1.LabelArchStable {
+			archValues = expr.Values
+		}
+	}
+	if len(archValues) != 1 || archValues[0] != "arm64" {
+		t.Fatalf("arch preference = %v, want [arm64]", archValues)
 	}
 }
 
