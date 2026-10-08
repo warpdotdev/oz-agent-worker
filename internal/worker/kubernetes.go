@@ -70,6 +70,10 @@ const (
 	maxKubernetesFailureConditions        = 16
 	maxKubernetesFailureEvents            = 10
 	maxFailureDetailsBytes                = 32 * 1024
+
+	// platformAffinityWeight is the maximum node-affinity weight, so the runner's
+	// platform outranks other soft scheduling signals without becoming a requirement.
+	platformAffinityWeight = int32(100)
 )
 
 // kubernetesTaskOwnedEnvVars returns exactly the worker-owned variables this backend puts on
@@ -316,6 +320,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	applyInstanceShapeToContainer(&mainContainer, params.InstanceShape)
 
 	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
+	applyPlatformNodeAffinity(&podSpec, params.Platform)
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -713,6 +718,41 @@ func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceSha
 	if shape.MemoryGb > 0 {
 		setResource(corev1.ResourceMemory, *resource.NewQuantity(int64(shape.MemoryGb)<<30, resource.BinarySI))
 	}
+}
+
+// applyPlatformNodeAffinity appends a preferred (never required) node-affinity term for
+// the runner's OS/architecture, so a cluster with no matching node schedules the pod
+// exactly as it would without the hint. OCI platform tokens are the same values the
+// kubernetes.io/os and kubernetes.io/arch node labels carry, so they are used verbatim.
+func applyPlatformNodeAffinity(podSpec *corev1.PodSpec, platform *types.Platform) {
+	if platform == nil {
+		return
+	}
+	var expressions []corev1.NodeSelectorRequirement
+	if os := strings.TrimSpace(platform.OS); os != "" {
+		expressions = append(expressions, corev1.NodeSelectorRequirement{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{os}})
+	}
+	if arch := strings.TrimSpace(platform.Architecture); arch != "" {
+		expressions = append(expressions, corev1.NodeSelectorRequirement{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{arch}})
+	}
+	if len(expressions) == 0 {
+		return
+	}
+
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &corev1.Affinity{}
+	}
+	if podSpec.Affinity.NodeAffinity == nil {
+		podSpec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	nodeAffinity := podSpec.Affinity.NodeAffinity
+	nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
+		nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
+		corev1.PreferredSchedulingTerm{
+			Weight:     platformAffinityWeight,
+			Preference: corev1.NodeSelectorTerm{MatchExpressions: expressions},
+		},
+	)
 }
 
 // mergeResourceRequirements overlays override's requests/limits onto base per resource
