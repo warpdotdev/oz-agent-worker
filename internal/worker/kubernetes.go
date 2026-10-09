@@ -187,6 +187,19 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
+	configuredEnv := envSliceFromMap(b.config.TaskEnv)
+	if b.config.PodTemplate != nil {
+		for _, container := range b.config.PodTemplate.Containers {
+			if container.Name == kubernetesTaskContainerName {
+				for _, env := range container.Env {
+					configuredEnv = append(configuredEnv, env.Name+"=")
+				}
+			}
+		}
+	}
+	if err := validateMetadataEnvConflicts(params.EnvVars, configuredEnv); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
+	}
 	params.Logs.AddEnv(b.config.TaskEnv)
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
@@ -1385,6 +1398,9 @@ func executionIDOrTaskID(taskID, executionID string) string {
 
 func kubernetesTaskWrapperScript() string {
 	return strings.Join([]string{
+		`for metadata_name in $(env | sed -n 's/^\(WARP_METADATA_[A-Z0-9_]*\)=.*/\1/p'); do`,
+		`  readonly "$metadata_name"`,
+		`done`,
 		"if [ -f \"$OZ_ENVIRONMENT_FILE\" ]; then",
 		"  set -a",
 		"  . \"$OZ_ENVIRONMENT_FILE\"",

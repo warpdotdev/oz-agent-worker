@@ -160,6 +160,9 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 
 // ExecuteTask runs the agent directly on the host.
 func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	if err := validateMetadataEnvConflicts(params.EnvVars, append(envSliceFromMap(b.config.Env), os.Environ()...)); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, err))
+	}
 	params.Logs.AddEnv(b.config.Env)
 	taskID := params.TaskID
 	if err := validateTaskIDForPath(taskID); err != nil {
@@ -247,6 +250,9 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		log.Warnf(ctx, "Failed to parse environment file")
 	}
 	params.Logs.AddEnv(setupScriptEnv)
+	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(setupScriptEnv)); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, err))
+	}
 	var setupScriptVars []string
 	for key, value := range setupScriptEnv {
 		setupScriptVars = append(setupScriptVars, fmt.Sprintf("%s=%s", key, value))

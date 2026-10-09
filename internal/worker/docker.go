@@ -121,6 +121,9 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(b.config.Env)); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
+	}
 	params.Logs.AddEnv(b.config.Env)
 	labels := map[string]string{
 		"oz-task-id":      params.TaskID,
