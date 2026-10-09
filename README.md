@@ -396,6 +396,39 @@ oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 
 ## Monitoring
 
+### Per-task logs
+
+When a task assignment enables `telemetry_collection.logging_enabled`, the worker
+sends task-scoped worker logs, setup phase events, and task stdout/stderr to the
+assigned OTLP/HTTP collector. This includes Docker task output, Kubernetes
+task-pod output (including init containers), and Direct agent and hook output.
+The Command backend collects dispatch-command output, not remote-runtime output.
+
+Collection is enabled by default when requested by the server. To opt out, use
+one of these installation settings:
+- YAML: top-level `collect_task_logs: false`
+- CLI: `--collect-task-logs=false`
+- Environment: `OZ_COLLECT_TASK_LOGS=false`
+- Helm: `--set worker.collectTaskLogs=false`
+
+CLI overrides environment, which overrides YAML. Disabling task logs does not
+disable metrics, tracing, or setup client-events reporting. Task logging works
+independently of tracing.
+
+Delivery is best-effort: overload, oversized output, or collector failures can
+drop logs without failing or blocking tasks. Interrupted Kubernetes log streams
+are not reconnected. Collection does not resume for preserved tasks after a
+worker restart.
+
+Before export, the worker redacts known environment values supplied to the task
+or its hooks. Local stdout/stderr is not scrubbed. Secrets created inside tasks
+or resolved through Kubernetes `valueFrom`/`envFrom` are not known to the worker
+and cannot be redacted. Setup hooks must write generated credentials to the
+environment file, not stdout/stderr; those values are only protected in output
+collected after the file is parsed.
+
+### Worker metrics and tracing
+
 The worker can export metrics over OpenTelemetry. Exporter selection is
 driven by the standard
 [OpenTelemetry environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/),

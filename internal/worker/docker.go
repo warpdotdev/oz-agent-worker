@@ -121,6 +121,11 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	params.Logs.AddEnv(b.config.Env)
+	labels := map[string]string{
+		"oz-task-id":      params.TaskID,
+		"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
+	}
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -136,7 +141,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	// backend; zero-sidecar tasks would otherwise emit ~0ms samples that skew
 	// the phase percentiles.
 	doneSidecarPrep := params.SetupEvents.startPhaseIf(ctx, SetupEventSidecarPrep, len(params.Sidecars) > 0)
-	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars)
+	sidecarBinds, err := b.prepareSidecars(ctx, dockerClient, params.Sidecars, labels)
 	if err != nil {
 		doneSidecarPrep(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
@@ -160,6 +165,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		Cmd:        cmd,
 		Env:        envVars,
 		WorkingDir: "/workspace",
+		Labels:     labels,
 	}
 
 	// Sidecar binds come first, then user-configured volumes.
@@ -201,6 +207,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	doneContainerStart(false)
 
 	log.Debugf(ctx, "Started Docker container: %s", containerID)
+	stopLogs := b.followContainerLogs(ctx, containerID, params.Logs)
+	defer stopLogs()
 
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
@@ -211,8 +219,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	case status := <-waitResult.Result:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
 
-		logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
-		if zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0 {
+		if params.Logs == nil && (zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0) {
+			logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
 			if logErr != nil {
 				log.Warnf(ctx, "Failed to get container logs: %v", logErr)
 			} else if logOutput != "" {
@@ -463,7 +471,7 @@ func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *clie
 		}
 	}()
 
-	logBytes, err := io.ReadAll(out)
+	logBytes, err := io.ReadAll(io.LimitReader(out, maxLogBytes))
 	if err != nil {
 		return "", err
 	}
@@ -475,11 +483,12 @@ func (b *DockerBackend) getContainerLogs(ctx context.Context, dockerClient *clie
 // We mount this volume into the image for each task as a means of predictably injecting dependencies.
 // This is basically the `sidecar_volume` concept in `namespace.so`:
 // https://buf.build/namespace/cloud/docs/main:namespace.cloud.compute.v1beta#namespace.cloud.compute.v1beta.ContainerRequest
-func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, dockerClient *client.Client, sidecarImage, volumeName string) error {
+func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, dockerClient *client.Client, sidecarImage, volumeName string, labels map[string]string) error {
 	log.Infof(ctx, "Creating temporary container from sidecar image")
 	sidecarConfig := &container.Config{
-		Image: sidecarImage,
-		Cmd:   []string{"true"},
+		Image:  sidecarImage,
+		Cmd:    []string{"true"},
+		Labels: labels,
 	}
 
 	sidecarHostConfig := &container.HostConfig{
@@ -524,6 +533,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
+		Labels:       labels,
 	}
 
 	extractHostConfig := &container.HostConfig{
@@ -589,7 +599,7 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 // prepareSidecars resolves each sidecar image according to the configured image pull policy,
 // creates a Docker volume from its filesystem, and returns the list of bind mount strings to
 // add to the container.
-func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount) ([]string, error) {
+func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount, labels map[string]string) ([]string, error) {
 	var binds []string
 	seenMountPaths := make(map[string]bool)
 
@@ -621,7 +631,7 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
 
 		if err := b.prepareSidecarVolume(ctx, dockerClient, volumeName, func(ctx context.Context) error {
-			return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName)
+			return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName, labels)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", sidecar.Image, err)
 		}

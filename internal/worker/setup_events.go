@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -52,6 +53,7 @@ type setupEventReporter struct {
 	runID         string
 	apiKey        string
 	workloadToken string
+	logs          *tasklogs.Reporter
 }
 
 // newSetupEventReporter builds a reporter from the worker's server root URL and
@@ -100,6 +102,10 @@ func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string,
 // call on a nil reporter and never blocks task execution.
 func (r *setupEventReporter) reportPhase(ctx context.Context, eventName string, start, finish time.Time, isError bool) {
 	if r == nil {
+		return
+	}
+	r.logs.Event(ctx, eventName, start, finish, isError)
+	if r.httpClient == nil {
 		return
 	}
 	// Detach from the task context so cancellation of the task (including the
