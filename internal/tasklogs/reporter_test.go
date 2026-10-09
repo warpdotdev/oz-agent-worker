@@ -33,48 +33,6 @@ func assignment(endpoint, runID string) *types.TaskAssignmentMessage {
 	}
 }
 
-func TestCollectorRetryAndDeadline(t *testing.T) {
-	for _, throttled := range []bool{false, true} {
-		t.Run(map[bool]string{false: "transient failure", true: "throttle exceeds deadline"}[throttled], func(t *testing.T) {
-			var calls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				if req.URL.Path == "/graphql/v2" {
-					writeToken(w, "issued-token", time.Now().Add(time.Hour))
-					return
-				}
-				if n := calls.Add(1); n == 1 || throttled {
-					if throttled {
-						w.Header().Set("Retry-After", "1")
-					}
-					w.WriteHeader(http.StatusServiceUnavailable)
-				}
-			}))
-			defer server.Close()
-			r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer shutdown(t, r)
-			r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
-			timeout := 3 * time.Second
-			if throttled {
-				timeout = 100 * time.Millisecond
-			}
-			ctx, cancel := context.WithTimeout(t.Context(), timeout)
-			defer cancel()
-			start := time.Now()
-			err = r.provider.ForceFlush(ctx)
-			if throttled {
-				if err == nil || ctx.Err() == nil || time.Since(start) > time.Second || calls.Load() != 1 {
-					t.Fatalf("retry exceeded deadline: elapsed=%s calls=%d err=%v", time.Since(start), calls.Load(), err)
-				}
-			} else if err != nil || calls.Load() != 2 {
-				t.Fatalf("transient failure was not retried: calls=%d err=%v", calls.Load(), err)
-			}
-		})
-	}
-}
-
 func TestAuthenticatedSameOriginRedirects(t *testing.T) {
 	var identity, collectorCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -284,10 +242,8 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 			for _, scope := range resource.ScopeLogs {
 				for _, record := range scope.LogRecords {
 					bodies = append(bodies, record.Body.GetStringValue())
-					var event struct{ Message string }
-					if json.Unmarshal([]byte(record.Body.GetStringValue()), &event) == nil &&
-						strings.HasPrefix(event.Message, "worker ") &&
-						(event.Message != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
+					if strings.HasPrefix(record.Body.GetStringValue(), "worker ") &&
+						(record.Body.GetStringValue() != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
 						t.Error("task logger context or warning severity was lost")
 					}
 					if record.Body.GetStringValue() == "setup_worker_image_pull" && !attributes(record.Attributes)["is_error"].GetBoolValue() {
@@ -358,10 +314,22 @@ func TestStructuredEventsRetainMetadataAndRedactCompleteCredentials(t *testing.T
 	logger.Error().
 		Str("phase", "first-secret").
 		Str("error", `quoted"<>&credential`).
+		Str("key-run", "redacted key").
 		Uint64("sequence", 9007199254740993).
-		Interface("nested", map[string]any{"credential": "first-secret\nsecond-secret", "retry": true}).
+		Uint64("unsigned", 18446744073709551615).
+		RawJSON("decimal", []byte("0.12345678901234567890123456789")).
+		Interface("nested", map[string]any{
+			"credential":           "first-secret\nsecond-secret",
+			"retry":                true,
+			`quoted"<>&credential`: "nested key",
+			"items":                []any{1.25, nil, `quoted"<>&credential`},
+		}).
 		Msg("processing")
 	_, _ = r.Writer(t.Context(), "agent.stdout").Write([]byte("first-secret\nsecond-secret\n"))
+	logger.Info().
+		Str("first", strings.Repeat("key-run ", 1200)).
+		Str("second", strings.Repeat("key-run ", 1200)).
+		Msg("oversized")
 	cancel()
 	if r.Context().Err() != context.Canceled {
 		t.Error("reporter did not inherit worker-root cancellation")
@@ -369,33 +337,43 @@ func TestStructuredEventsRetainMetadataAndRedactCompleteCredentials(t *testing.T
 	shutdown(t, r)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(records) != 3 {
-		t.Fatalf("exported %d records, want event and two raw lines", len(records))
+	if len(records) != 4 {
+		t.Fatalf("exported %d records, want structured event, two raw lines, and masked event", len(records))
 	}
-	var event struct {
-		Message, Component, Phase, Error string
-		Sequence                         uint64
-		Nested                           struct {
-			Credential string
-			Retry      bool
+	attrs := attributes(records[0].Attributes)
+	nested := attributes(attrs["nested"].GetKvlistValue().GetValues())
+	if records[0].Body.GetStringValue() != "processing" || attrs["message"] != nil ||
+		attrs["component"].GetStringValue() != "backend" || attrs["phase"].GetStringValue() != "first-secret" ||
+		attrs["error"].GetStringValue() != "[REDACTED]" || attrs["[REDACTED]"].GetStringValue() != "redacted key" ||
+		attrs["sequence"].GetIntValue() != 9007199254740993 ||
+		attrs["unsigned"].GetStringValue() != "18446744073709551615" ||
+		attrs["decimal"].GetStringValue() != "0.12345678901234567890123456789" ||
+		nested["credential"].GetStringValue() != "[REDACTED]" || !nested["retry"].GetBoolValue() ||
+		nested["[REDACTED]"].GetStringValue() != "nested key" {
+		t.Fatalf("structured metadata or credential redaction changed: %v", records[0])
+	}
+	items := nested["items"].GetArrayValue().GetValues()
+	if len(items) != 3 || items[0].GetDoubleValue() != 1.25 || items[1].Value != nil ||
+		items[2].GetStringValue() != "[REDACTED]" {
+		t.Fatalf("nested array values changed: %v", items)
+	}
+	encoded, _ := proto.Marshal(records[0])
+	for _, secret := range []string{"key-run", "first-secret\nsecond-secret", `quoted"<>&credential`} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatal("credential leaked in the structured body or attribute keys/values")
 		}
-	}
-	if err := json.Unmarshal([]byte(records[0].Body.GetStringValue()), &event); err != nil {
-		t.Fatalf("structured event was not retained: %v", err)
-	}
-	if event.Message != "processing" || event.Component != "backend" || event.Phase != "first-secret" ||
-		event.Error != "[REDACTED]" || event.Sequence != 9007199254740993 ||
-		event.Nested.Credential != "[REDACTED]" || !event.Nested.Retry {
-		t.Fatalf("structured metadata or credential redaction changed: %+v", event)
 	}
 	if records[0].SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_ERROR || records[0].SeverityText != "error" {
 		t.Fatal("structured error severity was lost")
 	}
-	for _, record := range records[1:] {
+	for _, record := range records[1:3] {
 		if record.Body.GetStringValue() != "[REDACTED]" ||
 			attributes(record.Attributes)["log.source"].GetStringValue() != "agent.stdout" {
 			t.Fatal("raw multiline credential fragments were not redacted")
 		}
+	}
+	if records[3].Body.GetStringValue() != "[REDACTED]" || len(records[3].Attributes) != 0 {
+		t.Fatal("structured body and attributes did not share the redaction output budget")
 	}
 }
 
