@@ -399,55 +399,33 @@ oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 ### Per-task logs
 
 When a task assignment enables `telemetry_collection.logging_enabled`, the worker
-ships task-scoped worker logs, setup phase events, and task output to the assigned
-OTLP/HTTP collector. Logging does not depend on tracing being enabled and does not
-change the existing tracing environment or rollout.
+sends task-scoped worker logs, setup phase events, and task stdout/stderr to the
+assigned OTLP/HTTP collector. This includes Docker task output, Kubernetes
+task-pod output (including init containers), and Direct agent and hook output.
+The Command backend collects dispatch-command output, not remote-runtime output.
 
-Collection defaults to enabled when requested by the server. To disable it on an
-installation, set `collect_task_logs: false` at the top level of the YAML config,
-pass `--collect-task-logs=false`, or set `OZ_COLLECT_TASK_LOGS=false`. CLI flags
-override the environment variable, which overrides YAML, including explicit false
-values. Helm installs can use `--set worker.collectTaskLogs=false`.
-This does not disable existing metrics, tracing, or setup client-events reporting.
+Collection is enabled by default when requested by the server. To opt out, use
+one of these installation settings:
+- YAML: top-level `collect_task_logs: false`
+- CLI: `--collect-task-logs=false`
+- Environment: `OZ_COLLECT_TASK_LOGS=false`
+- Helm: `--set worker.collectTaskLogs=false`
 
-The worker obtains log credentials with the task API key and workload identity;
-the tracing bootstrap token is never used for log authentication. Credentials are
-refreshed lazily on export, with a one-minute expiry margin. Logs are batched every
-five seconds (or at 128 records), with a 1,024-record queue, 16 KiB record bodies,
-and a five-second final flush.
-Overload and observability failures drop logs rather than block execution.
-Lines over 64 KiB are dropped in full, not split across records.
-Redaction matches only original input and masks records that exceed its allocation
-budget instead of expanding replacement text.
+CLI overrides environment, which overrides YAML. Disabling task logs does not
+disable metrics, tracing, or setup client-events reporting. Task logging works
+independently of tracing.
 
-Redaction conservatively covers nonempty environment values provided by the
-assignment and backend configuration, literal Kubernetes pod environment values,
-direct setup-generated environment values, and inherited hook/dispatch environment.
-Each task has its own redaction state. Structured worker events retain the full JSON
-payload and match complete credential values (including JSON/URL variants). Only raw
-output lines also match newline fragments of multiline credentials.
-Log authentication tokens stay inside the exporter and are not passed to tasks.
-Redaction occurs before truncation and export; it does not scrub original local
-stdout/stderr. Unknown secrets created inside a task or resolved by Kubernetes
-`valueFrom`/`envFrom` are not visible to the worker and cannot be scrubbed by it.
+Delivery is best-effort: overload, oversized output, or collector failures can
+drop logs without failing or blocking tasks. Interrupted Kubernetes log streams
+are not reconnected. Collection does not resume for preserved tasks after a
+worker restart.
 
-Docker output is followed as separate stdout/stderr streams. The task container,
-sidecar-export container, and sidecar-extraction container carry `oz-task-id` and
-`oz-execution-id` labels. Direct output includes the agent and setup/teardown hooks.
-Setup hooks must write generated credentials to the environment file, not
-stdout/stderr. Known injected values are redacted from setup output immediately;
-new environment-file values can only be redacted after parsing, in later agent
-and teardown output. Unknown credentials printed during setup cannot be scrubbed
-before that file is parsed.
-Collected subprocess output drains for at most 100 ms after exit or cancellation;
-descendants retaining pipes cannot hold up completion, and drain-only timeouts
-drop logs without failing successful subprocesses.
-Kubernetes follows up to 64 observed task-pod containers, including init containers;
-interrupted streams are best-effort and are not reconnected. Command output is
-collected only while the dispatch command runs, not from the remote runtime.
-Worker shutdown flushes and stops collection without changing the Kubernetes and
-Command backends' task-preservation behavior; it does not resume collection for
-preserved tasks after a worker restart.
+Before export, the worker redacts known environment values supplied to the task
+or its hooks. Local stdout/stderr is not scrubbed. Secrets created inside tasks
+or resolved through Kubernetes `valueFrom`/`envFrom` are not known to the worker
+and cannot be redacted. Setup hooks must write generated credentials to the
+environment file, not stdout/stderr; those values are only protected in output
+collected after the file is parsed.
 
 ### Worker metrics and tracing
 
