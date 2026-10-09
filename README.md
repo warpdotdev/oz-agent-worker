@@ -423,9 +423,11 @@ budget instead of expanding replacement text.
 Redaction conservatively covers nonempty environment values provided by the
 assignment and backend configuration, literal Kubernetes pod environment values,
 direct setup-generated environment values, and inherited hook/dispatch environment.
-Each task has its own redaction state. Log authentication tokens stay inside the
-exporter and are not passed to tasks. Redaction occurs before truncation and export;
-it does not scrub original local
+Each task has its own redaction state. Structured worker events retain the full JSON
+payload and match complete credential values (including JSON/URL variants). Only raw
+output lines also match newline fragments of multiline credentials.
+Log authentication tokens stay inside the exporter and are not passed to tasks.
+Redaction occurs before truncation and export; it does not scrub original local
 stdout/stderr. Unknown secrets created inside a task or resolved by Kubernetes
 `valueFrom`/`envFrom` are not visible to the worker and cannot be scrubbed by it.
 

@@ -52,6 +52,7 @@ func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID str
 }
 
 func copyDockerLogFrames(reader io.Reader, stdout, stderr io.Writer) error {
+	// Non-TTY streams use Docker's multiplexed framing; unframed TTY logs are unsupported.
 	var header [8]byte
 	for {
 		if _, err := io.ReadFull(reader, header[:]); err != nil {

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -32,6 +33,112 @@ func assignment(endpoint, runID string) *types.TaskAssignmentMessage {
 	}
 }
 
+func TestCollectorRetryAndDeadline(t *testing.T) {
+	for _, throttled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "transient failure", true: "throttle exceeds deadline"}[throttled], func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == "/graphql/v2" {
+					writeToken(w, "issued-token", time.Now().Add(time.Hour))
+					return
+				}
+				if n := calls.Add(1); n == 1 || throttled {
+					if throttled {
+						w.Header().Set("Retry-After", "1")
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}
+			}))
+			defer server.Close()
+			r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shutdown(t, r)
+			r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
+			timeout := 3 * time.Second
+			if throttled {
+				timeout = 100 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
+			start := time.Now()
+			err = r.provider.ForceFlush(ctx)
+			if throttled {
+				if err == nil || ctx.Err() == nil || time.Since(start) > time.Second || calls.Load() != 1 {
+					t.Fatalf("retry exceeded deadline: elapsed=%s calls=%d err=%v", time.Since(start), calls.Load(), err)
+				}
+			} else if err != nil || calls.Load() != 2 {
+				t.Fatalf("transient failure was not retried: calls=%d err=%v", calls.Load(), err)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedSameOriginRedirects(t *testing.T) {
+	var identity, collectorCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/graphql/v2":
+			http.Redirect(w, req, "/identity", http.StatusTemporaryRedirect)
+		case "/identity":
+			identity.Add(1)
+			if req.Method != http.MethodPost || req.Header.Get("Authorization") != "Bearer key-run" ||
+				req.Header.Get("X-Warp-Ambient-Workload-Token") != "workload-run" {
+				t.Error("redirected identity request lost its method or credentials")
+			}
+			writeToken(w, "issued-token", time.Now().Add(time.Hour))
+		case "/agent/otlp/v1/logs":
+			http.Redirect(w, req, "/logs", http.StatusPermanentRedirect)
+		case "/logs":
+			collectorCalls.Add(1)
+			if req.Method != http.MethodPost || req.Header.Get("Authorization") != "Bearer issued-token" {
+				t.Error("redirected collector request lost its method or authorization")
+			}
+			var payload collector.ExportLogsServiceRequest
+			data, _ := io.ReadAll(req.Body)
+			if proto.Unmarshal(data, &payload) != nil || len(payload.ResourceLogs) != 1 {
+				t.Error("redirected collector request lost its payload")
+			}
+		default:
+			t.Errorf("unexpected redirected path: %s", req.URL.Path)
+		}
+	}))
+	defer server.Close()
+	r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(t, r)
+	r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
+	if err := r.provider.ForceFlush(t.Context()); err != nil || identity.Load() != 1 || collectorCalls.Load() != 1 {
+		t.Fatalf("same-origin redirect failed: identity=%d collector=%d err=%v", identity.Load(), collectorCalls.Load(), err)
+	}
+}
+
+func TestCollectorRedirectDoesNotForwardBearer(t *testing.T) {
+	var redirected atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { redirected.Add(1) }))
+	defer destination.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/graphql/v2" {
+			writeToken(w, "issued-token", time.Now().Add(time.Hour))
+			return
+		}
+		http.Redirect(w, req, destination.URL, http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(t, r)
+	r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
+	if err := r.provider.ForceFlush(t.Context()); err == nil || redirected.Load() != 0 {
+		t.Fatal("collector bearer credential was forwarded across origins")
+	}
+}
+
 func TestCollectorErrorDoesNotExposeAuthorization(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/graphql/v2" {
@@ -42,7 +149,7 @@ func TestCollectorErrorDoesNotExposeAuthorization(t *testing.T) {
 		_, _ = io.WriteString(w, req.Header.Get("Authorization"))
 	}))
 	defer server.Close()
-	r, err := New(server.URL, "worker", "direct", assignment(server.URL, "run"))
+	r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +243,7 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 	defer server.Close()
 	reporters := make([]*Reporter, 2)
 	for i, runID := range []string{"alpha", "beta"} {
-		r, err := New(server.URL, "worker", "direct", assignment(server.URL, runID))
+		r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, runID))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,8 +284,10 @@ func TestOTLPTaskIsolationRedactionAndFinalFlush(t *testing.T) {
 			for _, scope := range resource.ScopeLogs {
 				for _, record := range scope.LogRecords {
 					bodies = append(bodies, record.Body.GetStringValue())
-					if strings.HasPrefix(record.Body.GetStringValue(), "worker ") &&
-						(record.Body.GetStringValue() != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
+					var event struct{ Message string }
+					if json.Unmarshal([]byte(record.Body.GetStringValue()), &event) == nil &&
+						strings.HasPrefix(event.Message, "worker ") &&
+						(event.Message != "worker "+runID+" [REDACTED]" || record.SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_WARN || record.SeverityText != "warn") {
 						t.Error("task logger context or warning severity was lost")
 					}
 					if record.Body.GetStringValue() == "setup_worker_image_pull" && !attributes(record.Attributes)["is_error"].GetBoolValue() {
@@ -210,6 +319,101 @@ func attributes(values []*commonpb.KeyValue) map[string]*commonpb.AnyValue {
 	return result
 }
 
+func TestStructuredEventsRetainMetadataAndRedactCompleteCredentials(t *testing.T) {
+	var mu sync.Mutex
+	var records []*logspb.LogRecord
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/graphql/v2" {
+			writeToken(w, "issued-token", time.Now().Add(time.Hour))
+			return
+		}
+		data, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		var payload collector.ExportLogsServiceRequest
+		if err := proto.Unmarshal(data, &payload); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, resource := range payload.ResourceLogs {
+			for _, scope := range resource.ScopeLogs {
+				records = append(records, scope.LogRecords...)
+			}
+		}
+	}))
+	defer server.Close()
+	root, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r, err := New(root, server.URL, "worker", "direct", assignment(server.URL, "run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.AddEnv(map[string]string{
+		"MULTILINE": "first-secret\nsecond-secret",
+		"QUOTED":    `quoted"<>&credential`,
+	})
+	logger := zerolog.New(r.ZerologWriter(t.Context())).With().Str("component", "backend").Logger()
+	logger.Error().
+		Str("phase", "first-secret").
+		Str("error", `quoted"<>&credential`).
+		Uint64("sequence", 9007199254740993).
+		Interface("nested", map[string]any{"credential": "first-secret\nsecond-secret", "retry": true}).
+		Msg("processing")
+	_, _ = r.Writer(t.Context(), "agent.stdout").Write([]byte("first-secret\nsecond-secret\n"))
+	cancel()
+	if r.Context().Err() != context.Canceled {
+		t.Error("reporter did not inherit worker-root cancellation")
+	}
+	shutdown(t, r)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(records) != 3 {
+		t.Fatalf("exported %d records, want event and two raw lines", len(records))
+	}
+	var event struct {
+		Message, Component, Phase, Error string
+		Sequence                         uint64
+		Nested                           struct {
+			Credential string
+			Retry      bool
+		}
+	}
+	if err := json.Unmarshal([]byte(records[0].Body.GetStringValue()), &event); err != nil {
+		t.Fatalf("structured event was not retained: %v", err)
+	}
+	if event.Message != "processing" || event.Component != "backend" || event.Phase != "first-secret" ||
+		event.Error != "[REDACTED]" || event.Sequence != 9007199254740993 ||
+		event.Nested.Credential != "[REDACTED]" || !event.Nested.Retry {
+		t.Fatalf("structured metadata or credential redaction changed: %+v", event)
+	}
+	if records[0].SeverityNumber != logspb.SeverityNumber_SEVERITY_NUMBER_ERROR || records[0].SeverityText != "error" {
+		t.Fatal("structured error severity was lost")
+	}
+	for _, record := range records[1:] {
+		if record.Body.GetStringValue() != "[REDACTED]" ||
+			attributes(record.Attributes)["log.source"].GetStringValue() != "agent.stdout" {
+			t.Fatal("raw multiline credential fragments were not redacted")
+		}
+	}
+}
+
+func TestRedactionFragmentAlsoRegisteredAsCompleteValue(t *testing.T) {
+	for _, values := range [][]string{
+		{"first-secret\nsecond-secret", "first-secret"},
+		{"first-secret", "first-secret\nsecond-secret"},
+	} {
+		var r redactor
+		for _, value := range values {
+			r.add(value)
+		}
+		if got := r.redact("first-secret"); got != "[REDACTED]" {
+			t.Fatalf("complete credential was treated as a raw-only fragment: %q", got)
+		}
+	}
+}
+
 func TestNewLoggingGateAndCredentials(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -227,7 +431,7 @@ func TestNewLoggingGateAndCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			a := assignment("https://collector.example", "run")
 			tc.edit(a)
-			r, err := New("https://server.example", "worker", "docker", a)
+			r, err := New(t.Context(), "https://server.example", "worker", "docker", a)
 			if r != nil || (err != nil) != tc.wantError {
 				t.Fatalf("New = %v, %v", r, err)
 			}
@@ -251,7 +455,7 @@ func TestSlowCollectorDoesNotBlockOutputAndShutdownHasDeadline(t *testing.T) {
 			}))
 			defer server.Close()
 			defer close(release)
-			r, err := New(server.URL, "worker", "docker", assignment(server.URL, "run"))
+			r, err := New(t.Context(), server.URL, "worker", "docker", assignment(server.URL, "run"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -286,7 +490,7 @@ func TestRedactionVariantsAndOverflow(t *testing.T) {
 	var r redactor
 	r.add("first-secret\nsecond-secret")
 	r.add(`quote"secret`)
-	for _, text := range []string{"first-secret", `quote\"secret`, "quote%22secret"} {
+	for _, text := range []string{"first-secret\nsecond-secret", `quote\"secret`, "quote%22secret"} {
 		if got := r.redact(text); got != "[REDACTED]" {
 			t.Errorf("redaction variant was not removed: %q", got)
 		}
@@ -308,7 +512,7 @@ func TestIdentityLazyRefreshAndConcurrentReuse(t *testing.T) {
 		writeToken(w, fmt.Sprintf("issued-%d", n), expiry)
 	}))
 	defer server.Close()
-	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 	if calls.Load() != 0 {
 		t.Fatal("token requested before export")
 	}
@@ -339,7 +543,7 @@ func TestIdentityRedirectDoesNotForwardCredentials(t *testing.T) {
 		http.Redirect(w, req, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 	if _, err := s.Token(); err == nil || redirected.Load() != 0 {
 		t.Fatal("identity credentials were forwarded through a redirect")
 	}
@@ -355,7 +559,7 @@ func TestIdentityResponseValidation(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			defer server.Close()
-			s := newTokenSource(server.URL, "run", assignment(server.URL, "run").EnvVars)
+			s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 			if _, err := s.Token(); err == nil || strings.Contains(err.Error(), "private credential") {
 				t.Fatal("identity error response accepted or exposed")
 			}

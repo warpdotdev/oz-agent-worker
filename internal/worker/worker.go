@@ -826,7 +826,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	}
 	defer finishLogs()
 	if w.config.CollectTaskLogs {
-		reporter, err := tasklogs.New(w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
+		reporter, err := tasklogs.New(w.ctx, w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
 		if err != nil {
 			log.Warnf(ctx, "Task log reporting unavailable for task %s: %v", taskID, err)
 		}

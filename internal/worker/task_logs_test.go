@@ -121,7 +121,7 @@ func TestCollectedSubprocessOutputDoesNotWaitForBackgroundChildren(t *testing.T)
 		for _, cancelParent := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/cancel=%t", tc.name, cancelParent), func(t *testing.T) {
 				server, _, _ := taskLogServer(t)
-				reporter, err := tasklogs.New(server.URL, "worker", tc.name, logAssignment(server.URL))
+				reporter, err := tasklogs.New(t.Context(), server.URL, "worker", tc.name, logAssignment(server.URL))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -146,7 +146,7 @@ func TestCollectedSubprocessOutputDoesNotWaitForBackgroundChildren(t *testing.T)
 
 func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
 	server, _, _ := taskLogServer(t)
-	reporter, err := tasklogs.New(server.URL, "worker", "command", logAssignment(server.URL))
+	reporter, err := tasklogs.New(t.Context(), server.URL, "worker", "command", logAssignment(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
 
 func TestSubprocessDrainRetainsExitFailure(t *testing.T) {
 	server, _, _ := taskLogServer(t)
-	reporter, err := tasklogs.New(server.URL, "worker", "direct", logAssignment(server.URL))
+	reporter, err := tasklogs.New(t.Context(), server.URL, "worker", "direct", logAssignment(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,12 +381,15 @@ func TestDockerTaskAndSidecarContainerLabels(t *testing.T) {
 		if config.Labels["oz-task-id"] != wantTask || config.Labels["oz-execution-id"] != wantExecution {
 			t.Errorf("missing task labels: %v", config.Labels)
 		}
+		if config.Tty {
+			t.Error("TTY containers cannot provide multiplexed stdout/stderr logs")
+		}
 	}
 }
 
 func TestKubernetesLogStreamsDeduplicateObservedContainers(t *testing.T) {
 	collectorServer, payloads, _ := taskLogServer(t)
-	reporter, err := tasklogs.New(collectorServer.URL, "worker", "kubernetes", logAssignment(collectorServer.URL))
+	reporter, err := tasklogs.New(t.Context(), collectorServer.URL, "worker", "kubernetes", logAssignment(collectorServer.URL))
 	if err != nil {
 		t.Fatal(err)
 	}

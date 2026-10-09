@@ -21,20 +21,23 @@ const identityMutation = `mutation WorkerLogToken($input: IssueTaskIdentityToken
 }`
 
 type taskIdentitySource struct {
+	ctx                                    context.Context
 	client                                 *http.Client
 	endpoint, runID, apiKey, workloadToken string
 }
 
-func newTokenSource(serverRootURL, runID string, env map[string]string) oauth2.TokenSource {
+func newTokenSource(ctx context.Context, serverRootURL, runID string, env map[string]string) oauth2.TokenSource {
 	return oauth2.ReuseTokenSourceWithExpiry(nil, &taskIdentitySource{
-		client:   &http.Client{Timeout: exportTimeout, CheckRedirect: noRedirect},
+		// Final flush may need a fresh token after the reporter context is cancelled.
+		ctx:      context.WithoutCancel(ctx),
+		client:   &http.Client{Timeout: exportTimeout, CheckRedirect: sameOriginRedirect},
 		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
 		runID:    runID, apiKey: env["WARP_API_KEY"], workloadToken: env["WARP_WORKLOAD_TOKEN"],
 	}, time.Minute)
 }
 
 func (s *taskIdentitySource) Token() (*oauth2.Token, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, exportTimeout)
 	defer cancel()
 	token, expiry, err := s.issue(ctx)
 	if err != nil {

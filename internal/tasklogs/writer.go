@@ -85,8 +85,8 @@ func (w *Writer) close() {
 
 func (w *Writer) flush() {
 	if !w.discard && len(w.line) > 0 {
-		w.reporter.emit(w.ctx, otellog.SeverityInfo, "info",
-			w.reporter.redactor.redact(string(w.line)),
+		w.reporter.emit(w.ctx, otellog.SeverityInfo,
+			w.reporter.redactor.redactLine(string(w.line)),
 			attribute.String("log.source", w.source),
 		)
 	}

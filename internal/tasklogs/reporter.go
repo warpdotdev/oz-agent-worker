@@ -38,7 +38,7 @@ type Reporter struct {
 	writers   []*Writer
 }
 
-func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignmentMessage) (*Reporter, error) {
+func New(parent context.Context, serverRootURL, workerID, backend string, assignment *types.TaskAssignmentMessage) (*Reporter, error) {
 	if assignment == nil || assignment.TelemetryCollection == nil || !assignment.TelemetryCollection.LoggingEnabled {
 		return nil, nil
 	}
@@ -55,20 +55,25 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 		return nil, errors.New("task log reporting requires task API key and workload token")
 	}
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/logs"
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	r := &Reporter{ctx: ctx, cancel: cancel}
 	r.AddEnv(assignment.EnvVars)
 	base := &http.Client{
 		Timeout:       exportTimeout,
-		CheckRedirect: noRedirect,
+		CheckRedirect: sameOriginRedirect,
 	}
 	client := oauth2.NewClient(context.WithValue(ctx, oauth2.HTTPClient, base),
-		newTokenSource(serverRootURL, assignment.TaskID, assignment.EnvVars))
+		newTokenSource(ctx, serverRootURL, assignment.TaskID, assignment.EnvVars))
 	exporter, err := otlploghttp.New(ctx,
 		otlploghttp.WithEndpointURL(endpoint.String()),
 		otlploghttp.WithHTTPClient(client),
 		otlploghttp.WithHeaders(map[string]string{}),
-		otlploghttp.WithRetry(otlploghttp.RetryConfig{Enabled: false}),
+		otlploghttp.WithRetry(otlploghttp.RetryConfig{
+			Enabled:         true,
+			InitialInterval: 500 * time.Millisecond,
+			MaxInterval:     time.Second,
+			MaxElapsedTime:  exportTimeout,
+		}),
 	)
 	if err != nil {
 		cancel()
@@ -93,8 +98,16 @@ func New(serverRootURL, workerID, backend string, assignment *types.TaskAssignme
 	return r, nil
 }
 
-func noRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
+func sameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	// OAuth2 reattaches bearer credentials on every hop, even across origins.
+	origin := via[0].URL
+	if req.URL.Scheme != origin.Scheme || !strings.EqualFold(req.URL.Host, origin.Host) {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }
 
 type privateExporter struct {
@@ -102,7 +115,8 @@ type privateExporter struct {
 }
 
 func (e privateExporter) Export(ctx context.Context, records []sdklog.Record) error {
-	// Collector response bodies reach OTel's global error handler without task redaction.
+	// A collector can reflect Authorization: Bearer <token> in its response body.
+	// OTel reports export errors globally, bypassing this task's credential redaction.
 	if err := e.Exporter.Export(ctx, records); err != nil {
 		return errors.New("task log export failed")
 	}
@@ -113,6 +127,8 @@ func (r *Reporter) Context() context.Context {
 	return r.ctx
 }
 
+// AddEnv registers nonempty environment values for task-local credential redaction.
+// Structured events match complete values; raw lines also match newline fragments.
 func (r *Reporter) AddEnv(env map[string]string) {
 	if r == nil {
 		return
@@ -132,29 +148,11 @@ func (r *Reporter) AddEnvList(env []string) {
 	}
 }
 
-func (r *Reporter) log(ctx context.Context, level, message string) {
-	message = r.redactor.redact(message)
-	severity := otellog.SeverityInfo
-	switch level {
-	case "trace":
-		severity = otellog.SeverityTrace
-	case "debug":
-		severity = otellog.SeverityDebug
-	case "warn":
-		severity = otellog.SeverityWarn
-	case "error":
-		severity = otellog.SeverityError
-	case "fatal", "panic":
-		severity = otellog.SeverityFatal
-	}
-	r.emit(ctx, severity, level, message)
-}
-
 func (r *Reporter) Event(ctx context.Context, name string, start, finish time.Time, isError bool) {
 	if r == nil {
 		return
 	}
-	r.emit(ctx, otellog.SeverityInfo, "info", name,
+	r.emit(ctx, otellog.SeverityInfo, name,
 		attribute.String("event.name", name),
 		attribute.String("start_ts", start.UTC().Format(time.RFC3339Nano)),
 		attribute.String("finish_ts", finish.UTC().Format(time.RFC3339Nano)),
@@ -163,7 +161,7 @@ func (r *Reporter) Event(ctx context.Context, name string, start, finish time.Ti
 	)
 }
 
-func (r *Reporter) emit(ctx context.Context, severity otellog.Severity, level, message string, attrs ...attribute.KeyValue) {
+func (r *Reporter) emit(ctx context.Context, severity otellog.Severity, message string, attrs ...attribute.KeyValue) {
 	if r.closed.Load() {
 		return
 	}
@@ -173,7 +171,7 @@ func (r *Reporter) emit(ctx context.Context, severity otellog.Severity, level, m
 	var record otellog.Record
 	record.SetTimestamp(time.Now())
 	record.SetSeverity(severity)
-	record.SetSeverityText(level)
+	record.SetSeverityText(strings.ToLower(severity.String()))
 	record.SetBody(attribute.StringValue(message))
 	record.AddAttributes(attrs...)
 	r.logger.Emit(ctx, record)

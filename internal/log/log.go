@@ -19,6 +19,7 @@ func init() {
 	log.Logger = log.Output(consoleOutput)
 	zerolog.DefaultContextLogger = &log.Logger
 }
+
 func WithOutput(ctx context.Context, output io.Writer) context.Context {
 	return log.Ctx(ctx).Output(zerolog.MultiLevelWriter(consoleOutput, output)).WithContext(ctx)
 }
