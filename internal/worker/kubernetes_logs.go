@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	"go.opentelemetry.io/otel/semconv/v1.43.0"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -54,7 +55,10 @@ func (s *kubernetesLogStreams) observePod(pod *corev1.Pod) {
 			defer func() { _ = stream.Close() }()
 			closeOnCancel := context.AfterFunc(s.ctx, func() { _ = stream.Close() })
 			defer closeOnCancel()
-			writer := s.reporter.Writer(s.ctx, "pod."+status.Name)
+			writer := s.reporter.Writer(s.ctx, "pod."+status.Name,
+				semconv.K8SContainerName(status.Name),
+				semconv.K8SPodName(pod.Name),
+			)
 			defer writer.Flush()
 			_, _ = io.Copy(writer, stream)
 		})
