@@ -214,7 +214,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
 	backendEnv := append(envSliceFromMap(b.config.TaskEnv), kubernetesTaskOwnedEnvVars(params.TaskID)...)
-	mainEnv := mergeEnvVars(params.EnvVars, backendEnv)
+	taskEnv := append([]string(nil), params.EnvVars...)
+	for i, entry := range taskEnv {
+		name, value, hasEquals := strings.Cut(entry, "=")
+		if hasEquals && strings.HasPrefix(name, metadataEnvPrefix) {
+			// Kubernetes expands $(NAME) and $$ in EnvVar.Value; metadata must remain literal.
+			taskEnv[i] = name + "=" + strings.ReplaceAll(value, "$", "$$")
+		}
+	}
+	mainEnv := mergeEnvVars(taskEnv, backendEnv)
 
 	volumes := []corev1.Volume{
 		workspaceVolume(b.config.WorkspaceSizeLimit),
@@ -306,7 +314,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		Command: []string{
 			"/bin/sh",
 			"-c",
-			kubernetesTaskWrapperScript(),
+			kubernetesTaskWrapperScript(params.EnvVars),
 			"oz-task",
 		},
 		Args:         params.BaseArgs,
@@ -1396,11 +1404,15 @@ func executionIDOrTaskID(taskID, executionID string) string {
 	return taskID
 }
 
-func kubernetesTaskWrapperScript() string {
-	return strings.Join([]string{
-		`for metadata_name in $(env | sed -n 's/^\(WARP_METADATA_[A-Z0-9_]*\)=.*/\1/p'); do`,
-		`  readonly "$metadata_name"`,
-		`done`,
+func kubernetesTaskWrapperScript(taskEnv []string) string {
+	var lines []string
+	for _, entry := range taskEnv {
+		name, _, hasEquals := strings.Cut(entry, "=")
+		if hasEquals && strings.HasPrefix(name, metadataEnvPrefix) {
+			lines = append(lines, "readonly '"+strings.ReplaceAll(name, "'", "'\\''")+"'")
+		}
+	}
+	return strings.Join(append(lines, []string{
 		"if [ -f \"$OZ_ENVIRONMENT_FILE\" ]; then",
 		"  set -a",
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
@@ -1408,7 +1420,7 @@ func kubernetesTaskWrapperScript() string {
 		"fi",
 		"",
 		"exec /agent/entrypoint.sh \"$@\"",
-	}, "\n")
+	}...), "\n")
 }
 
 func kubernetesSidecarMaterializationScript() string {
