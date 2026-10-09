@@ -12,6 +12,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID string, reporter *tasklogs.Reporter) func() {
@@ -28,7 +29,7 @@ func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID str
 		if err != nil {
 			log.Warnf(ctx, "Could not inspect Docker task log container")
 		} else {
-			attrs = append(attrs, attribute.String("container.name", strings.TrimPrefix(inspect.Container.Name, "/")))
+			attrs = append(attrs, semconv.ContainerName(strings.TrimPrefix(inspect.Container.Name, "/")))
 		}
 		stream, err := b.dockerClient.ContainerLogs(streamCtx, containerID, client.ContainerLogsOptions{
 			ShowStdout: true, ShowStderr: true, Follow: true,

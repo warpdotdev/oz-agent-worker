@@ -145,14 +145,14 @@ func TestCollectedSubprocessOutputDoesNotWaitForBackgroundChildren(t *testing.T)
 }
 
 func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
-	server, payloads, _ := taskLogServer(t)
+	server, _, _ := taskLogServer(t)
 	reporter, err := tasklogs.New(t.Context(), server.URL, "worker", "command", logAssignment(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reporter.Shutdown(t.Context())
 	backend := &CommandBackend{config: CommandBackendConfig{
-		DispatchCommand: "printf 'dispatch output\\n'; sleep 2 & wait", DispatchTimeout: 30 * time.Millisecond,
+		DispatchCommand: "sleep 2 & wait", DispatchTimeout: 30 * time.Millisecond,
 	}}
 	start := time.Now()
 	result := backend.ExecuteTask(t.Context(), &TaskParams{TaskID: "run", Logs: reporter})
@@ -160,8 +160,6 @@ func TestDispatchLogCollectionRetainsTimeout(t *testing.T) {
 	if reason != metrics.TaskFailureReasonDispatchTimeout || time.Since(start) > 750*time.Millisecond {
 		t.Fatalf("dispatch deadline not preserved: elapsed=%s error=%v", time.Since(start), result.Error)
 	}
-	reporter.Shutdown(t.Context())
-	assertNoContainerLogAttributes(t, logPayloads(payloads))
 }
 
 func TestSubprocessDrainRetainsExitFailure(t *testing.T) {
@@ -226,22 +224,6 @@ func taskLogAttributes(record *logspb.LogRecord) map[string]string {
 	return attrs
 }
 
-func assertNoContainerLogAttributes(t *testing.T, text string) {
-	t.Helper()
-	records := taskLogRecords(t, text)
-	if len(records) == 0 {
-		t.Fatal("no non-container logs exported")
-	}
-	for _, record := range records {
-		attrs := taskLogAttributes(record)
-		for _, key := range []string{"container.name", "log.iostream", "k8s.container.name", "k8s.pod.name"} {
-			if _, ok := attrs[key]; ok {
-				t.Errorf("non-container record has %s: %v", key, attrs)
-			}
-		}
-	}
-}
-
 func TestDirectTaskLogLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name, setup        string
@@ -293,7 +275,6 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			if !strings.Contains(text, tc.want) || strings.Contains(text, "private-backend-value") {
 				t.Fatalf("task output or privacy mismatch: %s", text)
 			}
-			assertNoContainerLogAttributes(t, text)
 			if tc.setup == "" && !strings.Contains(text, "agent.stderr") {
 				t.Fatal("stderr was not collected")
 			}

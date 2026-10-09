@@ -420,11 +420,10 @@ drop logs without failing or blocking tasks. Interrupted Kubernetes log streams
 are not reconnected. Collection does not resume for preserved tasks after a
 worker restart.
 
-Output records keep their existing `log.source` labels. Docker records also carry
-`container.name` (the Docker name without its leading slash) and `log.iostream`
-(`stdout` or `stderr`); Kubernetes records carry `k8s.container.name` and
-`k8s.pod.name`, including init containers. Direct, command, hook, and worker logs
-do not carry container attributes.
+Docker output records carry `container.name` (the Docker name without its leading
+slash) and `log.iostream` (`stdout` or `stderr`). Kubernetes records carry
+`k8s.container.name` and `k8s.pod.name`, including init containers. Direct, command,
+hook, and worker logs do not carry container attributes.
 
 Before export, the worker redacts known environment values supplied to the task
 or its hooks. Local stdout/stderr is not scrubbed. Secrets created inside tasks
