@@ -122,6 +122,9 @@ type TelemetryBootstrapToken struct {
 type Platform struct {
 	OS           string `json:"os,omitempty"`
 	Architecture string `json:"architecture,omitempty"`
+	// Strict, when true, means the task must run on this OS/architecture. Backends that
+	// control placement treat it as a hard requirement; others ignore it.
+	Strict bool `json:"strict,omitempty"`
 }
 
 // TaskAssignmentMessage is sent from server to worker when a task is available

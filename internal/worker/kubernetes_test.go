@@ -924,10 +924,10 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 	}
 }
 
-func TestApplyPlatformNodeAffinity(t *testing.T) {
+func TestApplyPlatformScheduling(t *testing.T) {
 	t.Run("architecture-only platform yields a soft arch preference", func(t *testing.T) {
 		podSpec := corev1.PodSpec{}
-		applyPlatformNodeAffinity(&podSpec, &types.Platform{Architecture: "arm64"})
+		applyPlatformScheduling(&podSpec, &types.Platform{Architecture: "arm64"})
 		terms := podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 		if len(terms) != 1 || terms[0].Weight != platformAffinityWeight {
 			t.Fatalf("expected one preferred term with weight %d, got %+v", platformAffinityWeight, terms)
@@ -937,7 +937,7 @@ func TestApplyPlatformNodeAffinity(t *testing.T) {
 			t.Fatalf("expected only arch=arm64 expression, got %+v", exprs)
 		}
 		if podSpec.NodeSelector != nil || podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
-			t.Fatal("platform must never become a hard constraint")
+			t.Fatal("non-strict platform must not become a hard constraint")
 		}
 	})
 
@@ -950,7 +950,7 @@ func TestApplyPlatformNodeAffinity(t *testing.T) {
 				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 10}},
 			}},
 		}
-		applyPlatformNodeAffinity(&podSpec, &types.Platform{OS: "linux", Architecture: "amd64"})
+		applyPlatformScheduling(&podSpec, &types.Platform{OS: "linux", Architecture: "amd64"})
 
 		terms := podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 		if len(terms) != 2 || terms[0].Weight != 10 {
@@ -958,6 +958,62 @@ func TestApplyPlatformNodeAffinity(t *testing.T) {
 		}
 		if podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != operatorRequired || podSpec.NodeSelector["disktype"] != "ssd" {
 			t.Fatal("operator required affinity and nodeSelector must be left untouched")
+		}
+	})
+
+	t.Run("strict platform yields a single required term", func(t *testing.T) {
+		podSpec := corev1.PodSpec{}
+		applyPlatformScheduling(&podSpec, &types.Platform{OS: "linux", Architecture: "arm64", Strict: true})
+
+		nodeAffinity := podSpec.Affinity.NodeAffinity
+		if len(nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 0 {
+			t.Fatalf("strict platform must not add a preferred term, got %+v", nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+		}
+		required := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		if required == nil || len(required.NodeSelectorTerms) != 1 {
+			t.Fatalf("expected one required term, got %+v", required)
+		}
+		exprs := required.NodeSelectorTerms[0].MatchExpressions
+		if len(exprs) != 2 || exprs[0].Key != corev1.LabelOSStable || exprs[0].Values[0] != "linux" ||
+			exprs[1].Key != corev1.LabelArchStable || exprs[1].Values[0] != "arm64" {
+			t.Fatalf("expected os=linux and arch=arm64 expressions, got %+v", exprs)
+		}
+	})
+
+	t.Run("strict platform constrains every operator required term", func(t *testing.T) {
+		zoneA := corev1.NodeSelectorRequirement{Key: "topology.kubernetes.io/zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}
+		poolGPU := corev1.NodeSelectorRequirement{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu"}}
+		podSpec := corev1.PodSpec{
+			NodeSelector: map[string]string{"disktype": "ssd"},
+			Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{MatchExpressions: []corev1.NodeSelectorRequirement{zoneA}},
+						{MatchExpressions: []corev1.NodeSelectorRequirement{poolGPU}},
+					},
+				},
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 10}},
+			}},
+		}
+		applyPlatformScheduling(&podSpec, &types.Platform{Architecture: "arm64", Strict: true})
+
+		nodeAffinity := podSpec.Affinity.NodeAffinity
+		terms := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) != 2 {
+			t.Fatalf("expected operator required terms to be kept, got %+v", terms)
+		}
+		for i, operatorExpr := range []corev1.NodeSelectorRequirement{zoneA, poolGPU} {
+			exprs := terms[i].MatchExpressions
+			if len(exprs) != 2 || exprs[0].Key != operatorExpr.Key || exprs[1].Key != corev1.LabelArchStable || exprs[1].Values[0] != "arm64" {
+				t.Fatalf("term %d: expected operator expression followed by arch=arm64, got %+v", i, exprs)
+			}
+		}
+		preferred := nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+		if len(preferred) != 1 || preferred[0].Weight != 10 {
+			t.Fatalf("expected only the operator preferred term, got %+v", preferred)
+		}
+		if podSpec.NodeSelector["disktype"] != "ssd" {
+			t.Fatal("operator nodeSelector must be left untouched")
 		}
 	})
 }
@@ -1315,9 +1371,11 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 	}
 }
 
-// End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the
-// created Job's task container as requests and limits (else-branch, no pod_template).
-func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
+// executeTaskAndCaptureJob runs params through a KubernetesBackend with no pod_template
+// against a fake clientset that completes the Job immediately, and returns the Job the
+// backend created.
+func executeTaskAndCaptureJob(t *testing.T, params *TaskParams) *batchv1.Job {
+	t.Helper()
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1363,19 +1421,26 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	result := backend.ExecuteTask(context.Background(), &TaskParams{
-		TaskID:        "task-1",
-		DockerImage:   "ubuntu:22.04",
-		BaseArgs:      []string{"run"},
-		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
-		Platform:      &types.Platform{OS: "linux", Architecture: "arm64"},
-	})
+	result := backend.ExecuteTask(context.Background(), params)
 	if result.Error != nil {
 		t.Fatalf("unexpected ExecuteTask error: %v", result.Error)
 	}
 	if createdJob == nil {
 		t.Fatal("expected task job to be created")
 	}
+	return createdJob
+}
+
+// End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the
+// created Job's task container as requests and limits (else-branch, no pod_template).
+func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
+	createdJob := executeTaskAndCaptureJob(t, &TaskParams{
+		TaskID:        "task-1",
+		DockerImage:   "ubuntu:22.04",
+		BaseArgs:      []string{"run"},
+		InstanceShape: &types.InstanceShape{Vcpus: 4, MemoryGb: 16},
+		Platform:      &types.Platform{OS: "linux", Architecture: "arm64"},
+	})
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
 	if got := taskContainer.Resources.Requests[corev1.ResourceCPU]; got.Value() != 4 {
@@ -1403,6 +1468,27 @@ func TestExecuteTaskAppliesInstanceShape(t *testing.T) {
 	}
 	if len(archValues) != 1 || archValues[0] != "arm64" {
 		t.Fatalf("arch preference = %v, want [arm64]", archValues)
+	}
+}
+
+func TestExecuteTaskAppliesStrictPlatform(t *testing.T) {
+	createdJob := executeTaskAndCaptureJob(t, &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+		Platform:    &types.Platform{OS: "linux", Architecture: "arm64", Strict: true},
+	})
+
+	affinity := createdJob.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil {
+		t.Fatalf("expected node affinity from the strict platform, got %+v", affinity)
+	}
+	required := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) != 1 || len(required.NodeSelectorTerms[0].MatchExpressions) != 2 {
+		t.Fatalf("expected one required term with os and arch expressions, got %+v", required)
+	}
+	if len(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 0 {
+		t.Fatalf("strict platform must not add a preferred term, got %+v", affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
 	}
 }
 

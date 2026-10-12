@@ -167,7 +167,8 @@ type TaskParams struct {
 	InstanceShape *types.InstanceShape
 
 	// Platform, when non-nil, is the runner's configured OS/architecture. The Kubernetes
-	// backend uses it as a scheduling preference; other backends ignore it.
+	// backend treats it as a scheduling preference, or as a requirement when Strict is set;
+	// other backends ignore it.
 	Platform *types.Platform
 
 	// SetupEvents reports worker-observed setup phase durations to warp-server.

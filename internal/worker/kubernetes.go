@@ -71,7 +71,7 @@ const (
 	maxKubernetesFailureEvents            = 10
 	maxFailureDetailsBytes                = 32 * 1024
 
-	// platformAffinityWeight is the maximum node-affinity weight, so the runner's
+	// platformAffinityWeight is the maximum node-affinity weight, so a non-strict runner
 	// platform outranks other soft scheduling signals without becoming a requirement.
 	platformAffinityWeight = int32(100)
 )
@@ -351,7 +351,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 		params.Logs.AddEnv(literals)
 	}
-	applyPlatformNodeAffinity(&podSpec, params.Platform)
+	applyPlatformScheduling(&podSpec, params.Platform)
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -767,11 +767,13 @@ func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceSha
 	}
 }
 
-// applyPlatformNodeAffinity appends a preferred (never required) node-affinity term for
-// the runner's OS/architecture, so a cluster with no matching node schedules the pod
-// exactly as it would without the hint. OCI platform tokens are the same values the
-// kubernetes.io/os and kubernetes.io/arch node labels carry, so they are used verbatim.
-func applyPlatformNodeAffinity(podSpec *corev1.PodSpec, platform *types.Platform) {
+// applyPlatformScheduling steers the task pod toward nodes matching the runner's
+// OS/architecture. A non-strict platform becomes a preferred node-affinity term, so a
+// cluster with no matching node still schedules the pod. A strict platform becomes a
+// required node-affinity constraint, so an unsatisfiable platform leaves the pod Pending.
+// OCI platform tokens are the same values the kubernetes.io/os and kubernetes.io/arch
+// node labels carry, so they are used verbatim.
+func applyPlatformScheduling(podSpec *corev1.PodSpec, platform *types.Platform) {
 	if platform == nil {
 		return
 	}
@@ -793,6 +795,24 @@ func applyPlatformNodeAffinity(podSpec *corev1.PodSpec, platform *types.Platform
 		podSpec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
 	}
 	nodeAffinity := podSpec.Affinity.NodeAffinity
+
+	if platform.Strict {
+		required := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		if required == nil || len(required.NodeSelectorTerms) == 0 {
+			nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: expressions}},
+			}
+			return
+		}
+		// Required terms are OR-ed and expressions within a term are AND-ed, so the platform
+		// must be added to every operator term to constrain each alternative.
+		for i := range required.NodeSelectorTerms {
+			term := &required.NodeSelectorTerms[i]
+			term.MatchExpressions = append(term.MatchExpressions, expressions...)
+		}
+		return
+	}
+
 	nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
 		nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
 		corev1.PreferredSchedulingTerm{
