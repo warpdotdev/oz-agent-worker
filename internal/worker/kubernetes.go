@@ -70,6 +70,10 @@ const (
 	maxKubernetesFailureConditions        = 16
 	maxKubernetesFailureEvents            = 10
 	maxFailureDetailsBytes                = 32 * 1024
+
+	// platformAffinityWeight is the maximum node-affinity weight, so a non-strict runner
+	// platform outranks other soft scheduling signals without becoming a requirement.
+	platformAffinityWeight = int32(100)
 )
 
 // kubernetesTaskOwnedEnvVars returns exactly the worker-owned variables this backend puts on
@@ -347,6 +351,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 		params.Logs.AddEnv(literals)
 	}
+	applyPlatformScheduling(&podSpec, params.Platform)
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -760,6 +765,61 @@ func applyInstanceShapeToContainer(c *corev1.Container, shape *types.InstanceSha
 	if shape.MemoryGb > 0 {
 		setResource(corev1.ResourceMemory, *resource.NewQuantity(int64(shape.MemoryGb)<<30, resource.BinarySI))
 	}
+}
+
+// applyPlatformScheduling steers the task pod toward nodes matching the runner's
+// OS/architecture. A non-strict platform becomes a preferred node-affinity term, so a
+// cluster with no matching node still schedules the pod. A strict platform becomes a
+// required node-affinity constraint, so an unsatisfiable platform leaves the pod Pending.
+// OCI platform tokens are the same values the kubernetes.io/os and kubernetes.io/arch
+// node labels carry, so they are used verbatim.
+func applyPlatformScheduling(podSpec *corev1.PodSpec, platform *types.Platform) {
+	if platform == nil {
+		return
+	}
+	var expressions []corev1.NodeSelectorRequirement
+	if os := strings.TrimSpace(platform.OS); os != "" {
+		expressions = append(expressions, corev1.NodeSelectorRequirement{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{os}})
+	}
+	if arch := strings.TrimSpace(platform.Architecture); arch != "" {
+		expressions = append(expressions, corev1.NodeSelectorRequirement{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{arch}})
+	}
+	if len(expressions) == 0 {
+		return
+	}
+
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &corev1.Affinity{}
+	}
+	if podSpec.Affinity.NodeAffinity == nil {
+		podSpec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	nodeAffinity := podSpec.Affinity.NodeAffinity
+
+	if platform.Strict {
+		required := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		if required == nil || len(required.NodeSelectorTerms) == 0 {
+			nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: expressions}},
+			}
+			return
+		}
+		// Required terms are OR-ed and expressions within a term are AND-ed, so the platform
+		// must be added to every operator term to constrain each alternative.
+		for i := range required.NodeSelectorTerms {
+			term := &required.NodeSelectorTerms[i]
+			term.MatchExpressions = append(term.MatchExpressions, expressions...)
+		}
+		return
+	}
+
+	nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
+		nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
+		corev1.PreferredSchedulingTerm{
+			Weight:     platformAffinityWeight,
+			Preference: corev1.NodeSelectorTerm{MatchExpressions: expressions},
+		},
+	)
 }
 
 // mergeResourceRequirements overlays override's requests/limits onto base per resource
