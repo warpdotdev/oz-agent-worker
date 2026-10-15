@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -219,20 +220,76 @@ func TestRecordTaskRejectedTagsReason(t *testing.T) {
 	}
 }
 
-// TestInitNoneIsDisabled covers the explicit opt-out path. With
-// OTEL_METRICS_EXPORTER=none, Init must return a no-op shutdown without
-// installing the SDK MeterProvider.
-func TestInitNoneIsDisabled(t *testing.T) {
-	t.Setenv("OTEL_METRICS_EXPORTER", "none")
-	shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
+func TestInitMetricsDisabledWithoutExporter(t *testing.T) {
+	originalExporter, hadOriginalExporter := os.LookupEnv("OTEL_METRICS_EXPORTER")
+	t.Cleanup(func() {
+		if hadOriginalExporter {
+			_ = os.Setenv("OTEL_METRICS_EXPORTER", originalExporter)
+		} else {
+			_ = os.Unsetenv("OTEL_METRICS_EXPORTER")
+		}
+	})
+	t.Setenv("OTEL_TRACES_EXPORTER", "")
+
+	tests := []struct {
+		name     string
+		exporter string
+		unset    bool
+	}{
+		{name: "unset", unset: true},
+		{name: "empty"},
+		{name: "whitespace", exporter: " \t "},
+		{name: "none", exporter: " NoNe "},
 	}
-	if shutdown == nil {
-		t.Fatalf("Init returned nil shutdown")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.unset {
+				if err := os.Unsetenv("OTEL_METRICS_EXPORTER"); err != nil {
+					t.Fatalf("unset OTEL_METRICS_EXPORTER: %v", err)
+				}
+			} else {
+				t.Setenv("OTEL_METRICS_EXPORTER", tt.exporter)
+			}
+
+			before := activeInstruments.Load()
+			shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
+			if err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			if shutdown == nil {
+				t.Fatal("Init returned nil shutdown")
+			}
+			if got := activeInstruments.Load(); got != before {
+				t.Error("Init replaced no-op instruments with metrics export disabled")
+			}
+			if err := shutdown(context.Background()); err != nil {
+				t.Errorf("shutdown: %v", err)
+			}
+		})
 	}
-	if err := shutdown(context.Background()); err != nil {
-		t.Errorf("shutdown: %v", err)
+}
+
+func TestShouldInitMetricsRequiresExporter(t *testing.T) {
+	tests := []struct {
+		name     string
+		exporter string
+		want     bool
+	}{
+		{name: "empty", exporter: "", want: false},
+		{name: "whitespace", exporter: " \t ", want: false},
+		{name: "none", exporter: "none", want: false},
+		{name: "none case insensitive", exporter: " NoNe ", want: false},
+		{name: "prometheus", exporter: "prometheus", want: true},
+		{name: "otlp", exporter: "otlp", want: true},
+		{name: "console", exporter: "console", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OTEL_METRICS_EXPORTER", tt.exporter)
+			if got := shouldInitMetrics(); got != tt.want {
+				t.Errorf("shouldInitMetrics() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -83,8 +83,8 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
             {{- else }}
-            # The worker defaults an unset exporter to OTLP, so disabling
-            # chart-managed metrics must explicitly disable metric export.
+            # Keep metrics explicitly disabled even if the worker's default
+            # changes or another environment source supplies an exporter.
             - name: OTEL_METRICS_EXPORTER
               value: "none"
             {{- end }}
