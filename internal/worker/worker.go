@@ -512,6 +512,8 @@ func (w *Worker) handleTaskCancellation(cancellation *types.TaskCancellationMess
 	key := taskExecution{cancellation.TaskID, cancellation.ExecutionID}
 	if cancellation.ExecutionID == "" {
 		// A task-only request is explicitly legacy run-wide cancellation.
+		// TODO: Remove this legacy branch once execution-scoped cancellation is
+		// fully rolled out on the server and pre-rollout messages have drained.
 		for candidate := range w.activeTasks {
 			if candidate.taskID == cancellation.TaskID {
 				w.startTaskCancellationLocked(candidate)

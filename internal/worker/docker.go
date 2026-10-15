@@ -231,6 +231,11 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		}
 	case status := <-waitResult.Result:
 		log.Debugf(ctx, "Container exited with status code: %d", status.StatusCode)
+		if b.config.NoCleanup && status.Error == nil {
+			// Preserve the exited container for debugging, but not its tracking.
+			// Later cancellation intentionally leaves this stopped container alone.
+			b.taskContainers.Delete(key)
+		}
 
 		if params.Logs == nil && (zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0) {
 			logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)

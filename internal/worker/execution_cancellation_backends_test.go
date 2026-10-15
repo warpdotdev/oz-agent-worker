@@ -135,6 +135,78 @@ func TestDockerCreateFailureTracking(t *testing.T) {
 	}
 }
 
+func TestDockerNoCleanupTracking(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		waitBody        string
+		waitFails       bool
+		expectedError   bool
+		expectedTracked bool
+	}{
+		{name: "successful exit", waitBody: `{"StatusCode":0}`},
+		{name: "failed exit", waitBody: `{"StatusCode":1}`, expectedError: true},
+		{name: "wait failure", waitFails: true, expectedError: true, expectedTracked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOCKER_CONFIG", t.TempDir())
+			transport := cancellationDockerTransport(func(r *http.Request) (*http.Response, error) {
+				switch {
+				case r.URL.Path == "/_ping":
+					return mockEngineResponse(r, http.StatusOK, "text/plain", "OK"), nil
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/images/task-image/json"):
+					return mockImageInspectResponse(t, r, "linux", "amd64", ""), nil
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/containers/create"):
+					return mockEngineResponse(r, http.StatusCreated, "application/json", `{"Id":"task-container"}`), nil
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/containers/task-container/start"):
+					return mockEngineResponse(r, http.StatusNoContent, "application/json", ""), nil
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/containers/task-container/wait"):
+					if tc.waitFails {
+						return mockEngineErrorResponse(t, r, http.StatusInternalServerError, "unavailable"), nil
+					}
+					return mockEngineResponse(r, http.StatusOK, "application/json", tc.waitBody), nil
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/task-container/logs"):
+					return mockEngineResponse(r, http.StatusOK, "application/octet-stream", ""), nil
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/task-container/json"):
+					return mockEngineResponse(r, http.StatusOK, "application/json", `{"State":{"OOMKilled":false}}`), nil
+				default:
+					t.Errorf("unexpected request (NoCleanup must preserve the container): %s %s", r.Method, r.URL.Path)
+					return mockEngineErrorResponse(t, r, http.StatusInternalServerError, "unexpected request"), nil
+				}
+			})
+			dockerClient, err := client.New(client.WithHTTPClient(&http.Client{Transport: transport}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = dockerClient.Close() }()
+			backend := &DockerBackend{
+				dockerClient: dockerClient,
+				config:       DockerBackendConfig{NoCleanup: true, ImagePullPolicy: PullPolicyNever},
+				platform:     "linux/amd64",
+			}
+			key := taskExecution{"run", "old"}
+			successor := taskExecution{"run", "new"}
+			backend.taskContainers.Store(successor, "successor-container")
+			result := backend.ExecuteTask(context.Background(), &TaskParams{
+				TaskID: key.taskID, ExecutionID: key.executionID, DockerImage: "task-image",
+			})
+			if (result.Error != nil) != tc.expectedError {
+				t.Fatalf("execution error = %v, expected error = %t", result.Error, tc.expectedError)
+			}
+			if id, tracked := backend.taskContainers.Load(key); tracked != tc.expectedTracked || (tracked && id != "task-container") {
+				t.Fatalf("container tracking = (%v, %t), expected tracked = %t", id, tracked, tc.expectedTracked)
+			}
+			if id, tracked := backend.taskContainers.Load(successor); !tracked || id != "successor-container" {
+				t.Fatal("execution affected successor tracking")
+			}
+			if !tc.expectedTracked {
+				if err := backend.CancelTask(context.Background(), &CancelParams{TaskID: key.taskID, ExecutionID: key.executionID}); err != nil {
+					t.Fatalf("late cancellation of preserved exited container: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestDockerExecutionCancellation(t *testing.T) {
 	t.Run("failed removal retains exact resource for retry", func(t *testing.T) {
 		fail := true
