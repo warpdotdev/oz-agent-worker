@@ -532,7 +532,7 @@ func TestPrepareSidecarsAppliesImagePullPolicy(t *testing.T) {
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyIfNotPresent)
 
-		binds, err := backend.prepareSidecars(context.Background(), backend.dockerClient, sidecars)
+		binds, err := backend.prepareSidecars(context.Background(), backend.dockerClient, sidecars, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -558,7 +558,7 @@ func TestPrepareSidecarsAppliesImagePullPolicy(t *testing.T) {
 		}
 		backend := newTestDockerBackend(t, engine, PullPolicyNever)
 
-		_, err := backend.prepareSidecars(context.Background(), backend.dockerClient, sidecars)
+		_, err := backend.prepareSidecars(context.Background(), backend.dockerClient, sidecars, nil)
 		if err == nil || !strings.Contains(err.Error(), "pull policy is Never") {
 			t.Fatalf("error = %v, want a message naming pull policy Never", err)
 		}

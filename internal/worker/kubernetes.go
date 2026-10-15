@@ -187,6 +187,20 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
+	configuredEnv := envSliceFromMap(b.config.TaskEnv)
+	if b.config.PodTemplate != nil {
+		for _, container := range b.config.PodTemplate.Containers {
+			if container.Name == kubernetesTaskContainerName {
+				for _, env := range container.Env {
+					configuredEnv = append(configuredEnv, env.Name+"=")
+				}
+			}
+		}
+	}
+	if err := validateMetadataEnvConflicts(params.EnvVars, configuredEnv); err != nil {
+		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
+	}
+	params.Logs.AddEnv(b.config.TaskEnv)
 	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
@@ -200,7 +214,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	log.Debugf(ctx, "Using Kubernetes task image: %s", params.DockerImage)
 
 	backendEnv := append(envSliceFromMap(b.config.TaskEnv), kubernetesTaskOwnedEnvVars(params.TaskID)...)
-	mainEnv := mergeEnvVars(params.EnvVars, backendEnv)
+	taskEnv := append([]string(nil), params.EnvVars...)
+	for i, entry := range taskEnv {
+		name, value, hasEquals := strings.Cut(entry, "=")
+		if hasEquals && strings.HasPrefix(name, metadataEnvPrefix) {
+			// Kubernetes expands $(NAME) and $$ in EnvVar.Value; metadata must remain literal.
+			taskEnv[i] = name + "=" + strings.ReplaceAll(value, "$", "$$")
+		}
+	}
+	mainEnv := mergeEnvVars(taskEnv, backendEnv)
 
 	volumes := []corev1.Volume{
 		workspaceVolume(b.config.WorkspaceSizeLimit),
@@ -292,7 +314,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		Command: []string{
 			"/bin/sh",
 			"-c",
-			kubernetesTaskWrapperScript(),
+			kubernetesTaskWrapperScript(params.EnvVars),
 			"oz-task",
 		},
 		Args:         params.BaseArgs,
@@ -316,6 +338,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	applyInstanceShapeToContainer(&mainContainer, params.InstanceShape)
 
 	podSpec := b.buildTaskPodSpec(initContainers, volumes, mainContainer)
+	for _, c := range append(append([]corev1.Container{}, podSpec.InitContainers...), podSpec.Containers...) {
+		literals := make(map[string]string)
+		for _, env := range c.Env {
+			if env.ValueFrom == nil {
+				literals[env.Name] = env.Value
+			}
+		}
+		params.Logs.AddEnv(literals)
+	}
 
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -379,6 +410,20 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if err := b.deleteTaskJob(cleanupCtx, jobName, &createdJob.UID); err != nil {
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		}
+	}()
+
+	logStreams := newKubernetesLogStreams(ctx, b, params.Logs)
+	defer func() {
+		if logStreams == nil {
+			return
+		}
+		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		pods, _ := b.listTaskPods(finalCtx, executionID)
+		for i := range pods {
+			logStreams.observePod(&pods[i])
+		}
+		logStreams.finish(finalCtx)
 	}()
 
 	jobWatcher, err := b.watchJob(ctx, jobName)
@@ -472,6 +517,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				continue
 			}
 			setupPhases.observePod(ctx, pod)
+			logStreams.observePod(pod)
 			if failure := b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch); failure != nil {
 				b.refreshFailureJobDetails(ctx, failure, jobName)
 				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
@@ -507,6 +553,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			}
 			for i := range pods {
 				setupPhases.observePod(ctx, &pods[i])
+				logStreams.observePod(&pods[i])
 			}
 			if failure := b.detectPodFailureAt(ctx, pods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
 				return executeError(failure)
@@ -1369,8 +1416,15 @@ func executionIDOrTaskID(taskID, executionID string) string {
 	return taskID
 }
 
-func kubernetesTaskWrapperScript() string {
-	return strings.Join([]string{
+func kubernetesTaskWrapperScript(taskEnv []string) string {
+	var lines []string
+	for _, entry := range taskEnv {
+		name, _, hasEquals := strings.Cut(entry, "=")
+		if hasEquals && strings.HasPrefix(name, metadataEnvPrefix) {
+			lines = append(lines, "readonly '"+strings.ReplaceAll(name, "'", "'\\''")+"'")
+		}
+	}
+	return strings.Join(append(lines, []string{
 		"if [ -f \"$OZ_ENVIRONMENT_FILE\" ]; then",
 		"  set -a",
 		"  . \"$OZ_ENVIRONMENT_FILE\"",
@@ -1378,7 +1432,7 @@ func kubernetesTaskWrapperScript() string {
 		"fi",
 		"",
 		"exec /agent/entrypoint.sh \"$@\"",
-	}, "\n")
+	}...), "\n")
 }
 
 func kubernetesSidecarMaterializationScript() string {

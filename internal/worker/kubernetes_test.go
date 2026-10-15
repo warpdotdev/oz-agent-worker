@@ -123,7 +123,7 @@ func TestKubernetesSidecarMaterializationScriptMatchesExpectedShell(t *testing.T
 }
 
 func TestKubernetesTaskWrapperScriptDelegatesToEntrypoint(t *testing.T) {
-	script := kubernetesTaskWrapperScript()
+	script := kubernetesTaskWrapperScript(nil)
 	requiredSnippets := []string{
 		". \"$OZ_ENVIRONMENT_FILE\"",
 		"exec /agent/entrypoint.sh \"$@\"",

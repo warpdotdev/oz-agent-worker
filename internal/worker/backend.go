@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -168,6 +169,7 @@ type TaskParams struct {
 	// SetupEvents reports worker-observed setup phase durations to warp-server.
 	// It may be nil, and all of its methods are safe to call on a nil reporter.
 	SetupEvents *setupEventReporter
+	Logs        *tasklogs.Reporter
 }
 
 // Backend defines the interface for task execution backends.

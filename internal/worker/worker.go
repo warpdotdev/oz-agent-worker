@@ -13,6 +13,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -58,6 +59,7 @@ type Config struct {
 	IdleOnComplete string
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
+	CollectTaskLogs         bool
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -159,6 +161,7 @@ type activeTask struct {
 	spawned          bool
 	done             chan struct{}
 	stopCancellation context.CancelFunc
+	logs             *tasklogs.Reporter
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -418,7 +421,6 @@ func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
 			}
 			return fmt.Errorf("WebSocket read failed: %w", err)
 		}
-		log.Debugf(w.ctx, "WebSocket received: %s", string(message))
 		w.handleMessage(message)
 	}
 }
@@ -471,7 +473,6 @@ func (w *Worker) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error 
 }
 
 func (w *Worker) handleMessage(message []byte) {
-	log.Debugf(w.ctx, "Received message: %s", string(message))
 
 	var msg types.WebSocketMessage
 	if err := json.Unmarshal(message, &msg); err != nil {
@@ -898,6 +899,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			if !task.spawned && task.cancellationSource != taskCancellationSourceUser {
 				w.rememberCompletedLocked(key, false)
 				delete(w.activeTasks, key)
+			} else {
+				task.logs = nil
+				w.activeTasks[key] = task
 			}
 		}
 		w.tasksMutex.Unlock()
@@ -911,10 +915,42 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	}()
 
 	taskID := assignment.TaskID
+	params := w.prepareTaskParams(assignment)
+	finishLogs := func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+		defer cancel()
+		params.Logs.Shutdown(flushCtx)
+	}
+	defer finishLogs()
+	if w.config.CollectTaskLogs {
+		reporter, err := tasklogs.New(w.ctx, w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment)
+		if err != nil {
+			log.Warnf(ctx, "Task log reporting unavailable for task %s: %v", taskID, err)
+		}
+		if reporter != nil {
+			params.Logs = reporter
+			ctx = log.WithOutput(ctx, reporter.ZerologWriter(ctx))
+			if params.SetupEvents == nil {
+				params.SetupEvents = &setupEventReporter{}
+			}
+			params.SetupEvents.logs = reporter
+			w.tasksMutex.Lock()
+			shuttingDown := w.shuttingDown
+			if task, ok := w.activeTasks[key]; ok {
+				task.logs = reporter
+				w.activeTasks[key] = task
+			}
+			w.tasksMutex.Unlock()
+			if shuttingDown {
+				flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+				reporter.Shutdown(flushCtx)
+				cancel()
+			}
+		}
+	}
 	log.Infof(ctx, "Starting task execution: taskID=%s, title=%s", taskID, assignment.Task.Title)
 	metrics.AddTaskEvent(ctx, "task.started")
 
-	params := w.prepareTaskParams(assignment)
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
 		attribute.String("docker.image", params.DockerImage),
@@ -930,6 +966,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			)
 			span.SetStatus(codes.Ok, "task cancelled by user request")
 			log.Infof(ctx, "Task execution cancelled by user request: taskID=%s", taskID)
+			finishLogs()
 			if statusErr := w.sendTaskCancelled(taskID, assignment.ExecutionID, "Task cancelled by user request."); statusErr != nil {
 				log.Errorf(ctx, "Failed to send task cancelled message: %v", statusErr)
 			}
@@ -955,6 +992,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		span.RecordError(err)
 		span.SetStatus(codes.Error, string(metricsReason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
+		finishLogs()
 		if statusErr := w.sendTaskFailed(taskID, assignment.ExecutionID, userFacingTaskError(err), metricsReason, exitCode, taskFailureDetails(err)); statusErr != nil {
 			log.Errorf(ctx, "Failed to send task failed message: %v", statusErr)
 		}
@@ -982,6 +1020,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	log.Infof(ctx, "Task execution completed successfully: taskID=%s", taskID)
 	metrics.AddTaskEvent(ctx, "task.completed")
 	span.SetStatus(codes.Ok, "task completed")
+	finishLogs()
 	if err := w.sendTaskCompleted(taskID, assignment.ExecutionID, "Task completed successfully"); err != nil {
 		log.Errorf(ctx, "Failed to send task completed message: %v", err)
 	}
@@ -1154,6 +1193,12 @@ func (w *Worker) shutdownTasks() {
 		}
 	}
 	activeTaskCount := len(w.activeTasks)
+	var reporters []*tasklogs.Reporter
+	for _, task := range w.activeTasks {
+		if task.logs != nil {
+			reporters = append(reporters, task.logs)
+		}
+	}
 	if activeTaskCount > 0 && preserveActiveTasks {
 		log.Infof(w.ctx, "Preserving %d active tasks during worker shutdown", activeTaskCount)
 	} else if activeTaskCount > 0 {
@@ -1184,6 +1229,21 @@ func (w *Worker) shutdownTasks() {
 		case <-time.After(BackendShutdownTimeout):
 			log.Warnf(w.ctx, "Timed out waiting for active tasks to finish during shutdown")
 		}
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
+	defer cancel()
+	var flushWG sync.WaitGroup
+	for _, reporter := range reporters {
+		flushWG.Go(func() { reporter.Shutdown(flushCtx) })
+	}
+	flushed := make(chan struct{})
+	go func() {
+		flushWG.Wait()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-flushCtx.Done():
 	}
 }
 

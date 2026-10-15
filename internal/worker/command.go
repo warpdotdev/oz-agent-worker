@@ -95,6 +95,7 @@ func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*Comma
 // ExecuteTask dispatches the task by invoking the configured dispatch command
 // with the JSON payload on stdin. It returns ExecuteOutcomeSpawned on success.
 func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	params.Logs.AddEnv(b.config.Env)
 	payload := NewDispatchPayload(params, b.config.ServerRootURL, b.config.WorkerID)
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -109,11 +110,15 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) Ex
 	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
 	cmd.Stdin = bytes.NewReader(payloadJSON)
 	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	params.Logs.AddEnvList(env)
+	stdout, flushStdout := params.Logs.Output(ctx, "dispatch.stdout", os.Stdout)
+	stderr, flushStderr := params.Logs.Output(ctx, "dispatch.stderr", os.Stderr)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	defer flushStdout()
+	defer flushStderr()
 
 	log.Infof(ctx, "Dispatching task %s via command backend", params.TaskID)
-	if err := cmd.Run(); err != nil {
+	if err := runTaskCommand(cmd, params.Logs); err != nil {
 		// The parent context being cancelled means the worker is cancelling the
 		// task (user/shutdown), not a dispatch failure.
 		if ctx.Err() != nil {

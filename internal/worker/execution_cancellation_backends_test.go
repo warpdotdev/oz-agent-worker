@@ -49,7 +49,7 @@ func TestDirectExecutionWorkspaceIsolation(t *testing.T) {
 				}
 				workspaces = append(workspaces, string(workspace))
 			}
-			backend.cleanup(context.Background(), "run", workspaces[0], "")
+			backend.cleanup(context.Background(), "run", workspaces[0], "", nil)
 			if _, err := os.Stat(workspaces[1]); err != nil {
 				t.Fatalf("predecessor cleanup removed successor workspace: %v", err)
 			}
