@@ -76,14 +76,18 @@ func TestSetupEnvironmentCredentialsRedactedInAgentOutput(t *testing.T) {
 	if err := os.WriteFile(ozPath, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
-	backend := &DirectBackend{ozPath: ozPath, config: DirectBackendConfig{
+	backend, err := NewDirectBackend(t.Context(), DirectBackendConfig{
+		OzPath:        ozPath,
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
 		SetupCommand:  `printf 'CUSTOM_CREDENTIAL=generated-credential\n' >"$OZ_ENVIRONMENT_FILE"`,
-	}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	w := &Worker{config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: true},
-		ctx: ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8)}
+		ctx: ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8)}
 	_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
 	w.executeTask(ctx, cancel, span, logAssignment(server.URL), time.Now())
 	text := logPayloads(payloads)
@@ -242,15 +246,17 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 			if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nprintf 'agent credential:%s\\n' \"$CUSTOM_CREDENTIAL\"\nprintf 'error output\\n' >&2\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			backend := &DirectBackend{
-				ozPath: ozPath,
-				config: DirectBackendConfig{WorkspaceRoot: filepath.Join(dir, "workspaces"), SetupCommand: tc.setup, Env: map[string]string{"CUSTOM_CREDENTIAL": "private-backend-value"}},
+			backend, err := NewDirectBackend(t.Context(), DirectBackendConfig{
+				OzPath: ozPath, WorkspaceRoot: filepath.Join(dir, "workspaces"), SetupCommand: tc.setup, Env: map[string]string{"CUSTOM_CREDENTIAL": "private-backend-value"},
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			w := &Worker{
 				config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: !tc.disabled},
-				ctx:    ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8),
+				ctx:    ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8),
 			}
 			_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
 			assignment := logAssignment(server.URL)
@@ -314,16 +320,16 @@ func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 			backend := &cancellableLoggingBackend{started: make(chan struct{}), preserve: preserve}
 			w := &Worker{
 				config: Config{ServerRootURL: server.URL, BackendType: "direct", CollectTaskLogs: true},
-				ctx:    ctx, backend: backend, activeTasks: make(map[string]activeTask), outbound: newOutboundQueue(8), oneShot: newOneShotState(),
+				ctx:    ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8), oneShot: newOneShotState(),
 			}
 			w.handleTaskAssignment(logAssignment(server.URL))
 			<-backend.started
 			if preserve {
 				w.shutdownTasks()
-				if w.activeTasks["run"].ctx.Err() != nil {
+				if w.activeTasks[taskExecution{"run", "execution"}].ctx.Err() != nil {
 					t.Error("reporter shutdown cancelled a preserved task")
 				}
-				w.activeTasks["run"].cancel()
+				w.activeTasks[taskExecution{"run", "execution"}].cancel()
 				w.taskWG.Wait()
 			} else {
 				w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run"})

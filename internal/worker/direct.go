@@ -169,15 +169,27 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))
 	}
 
-	// Determine working directory: shared target dir or per-task workspace.
+	// Determine working directory: shared target dir or isolated workspace.
 	var workspaceDir string
 	usingTargetDir := b.config.TargetDir != ""
 
 	if usingTargetDir {
 		workspaceDir = b.config.TargetDir
 	} else {
-		// Create per-task workspace directory.
+		// Legacy assignments use a per-task workspace.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
+		if params.ExecutionID != "" {
+			if err := validateTaskIDForPath(params.ExecutionID); err != nil {
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid execution ID for workspace path: %w", err)))
+			}
+			var err error
+			// Give each execution a fresh workspace so overlapping executions
+			// cannot share files or remove each other's workspace during cleanup.
+			workspaceDir, err = os.MkdirTemp(b.config.WorkspaceRoot, taskID+"-"+params.ExecutionID+"-")
+			if err != nil {
+				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create execution workspace: %w", err)))
+			}
+		}
 		if err := os.MkdirAll(workspaceDir, 0700); err != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create workspace directory: %w", err)))
 		}
