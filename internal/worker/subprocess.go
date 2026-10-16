@@ -5,7 +5,7 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 )
 
 func runTaskCommand(cmd *exec.Cmd, reporter *tasklogs.Reporter) error {

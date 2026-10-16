@@ -87,9 +87,7 @@ func TestHelpersSafeBeforeInit(t *testing.T) {
 	RecordTaskFailure(TaskFailurePhaseBackend, TaskFailureReasonImagePull)
 	RecordWebsocketReconnect("dial_failed")
 	SetWorkerInfo("v0.0.0", "docker", "test")
-	ctx, span := StartTaskSpan(context.Background(), "task-1", "test task")
-	AddTaskEvent(ctx, "task.test")
-	span.End()
+	AddTaskEvent(context.Background(), "task.test")
 }
 
 func TestRecordTaskCompletedEmitsCounterAndHistogram(t *testing.T) {
@@ -224,7 +222,7 @@ func TestRecordTaskRejectedTagsReason(t *testing.T) {
 // installing the SDK MeterProvider.
 func TestInitNoneIsDisabled(t *testing.T) {
 	t.Setenv("OTEL_METRICS_EXPORTER", "none")
-	shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
+	shutdown, _, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -333,23 +331,6 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 				t.Errorf("oz_worker_task_duration_seconds was emitted at startup; expected to remain absent until first task")
 			}
 		}
-	}
-}
-
-func TestShouldInitTracesRequiresExporter(t *testing.T) {
-	t.Setenv("OTEL_TRACES_EXPORTER", "")
-	if shouldInitTraces() {
-		t.Fatal("expected empty OTEL_TRACES_EXPORTER to disable traces")
-	}
-
-	t.Setenv("OTEL_TRACES_EXPORTER", " none ")
-	if shouldInitTraces() {
-		t.Fatal("expected OTEL_TRACES_EXPORTER=none to disable traces")
-	}
-
-	t.Setenv("OTEL_TRACES_EXPORTER", "otlp")
-	if !shouldInitTraces() {
-		t.Fatal("expected non-none OTEL_TRACES_EXPORTER to enable traces")
 	}
 }
 

@@ -2,21 +2,17 @@ package tasklogs
 
 import (
 	"context"
-	"errors"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -42,42 +38,17 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	if assignment == nil || assignment.TelemetryCollection == nil || !assignment.TelemetryCollection.LoggingEnabled {
 		return nil, nil
 	}
-	config := assignment.TelemetryCollection
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
-		return nil, errors.New("invalid task log collector endpoint")
+	config, err := otlp.NewExportConfig(context.WithoutCancel(parent), serverRootURL, assignment)
+	if err != nil {
+		return nil, err
 	}
-	server, err := url.Parse(serverRootURL)
-	if err != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") || server.User != nil || server.RawQuery != "" || server.Fragment != "" {
-		return nil, errors.New("invalid task identity endpoint")
-	}
-	if assignment.EnvVars["WARP_API_KEY"] == "" || assignment.EnvVars["WARP_WORKLOAD_TOKEN"] == "" {
-		return nil, errors.New("task log reporting requires task API key and workload token")
-	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/logs"
 	ctx, cancel := context.WithCancel(parent)
 	r := &Reporter{ctx: ctx, cancel: cancel}
 	r.AddEnv(assignment.EnvVars)
-	base := &http.Client{
-		Timeout:       exportTimeout,
-		CheckRedirect: sameOriginRedirect,
-	}
-	client := oauth2.NewClient(context.WithValue(ctx, oauth2.HTTPClient, base),
-		newTokenSource(ctx, serverRootURL, assignment.TaskID, assignment.EnvVars))
-	exporter, err := otlploghttp.New(ctx,
-		otlploghttp.WithEndpointURL(endpoint.String()),
-		otlploghttp.WithHTTPClient(client),
-		otlploghttp.WithHeaders(map[string]string{}),
-		otlploghttp.WithRetry(otlploghttp.RetryConfig{
-			Enabled:         true,
-			InitialInterval: 500 * time.Millisecond,
-			MaxInterval:     time.Second,
-			MaxElapsedTime:  exportTimeout,
-		}),
-	)
+	exporter, err := config.LogExporter()
 	if err != nil {
 		cancel()
-		return nil, errors.New("could not initialize task log exporter")
+		return nil, err
 	}
 	r.provider = sdklog.NewLoggerProvider(
 		sdklog.WithResource(resource.NewSchemaless(
@@ -87,7 +58,7 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 			attribute.String("run_id", assignment.TaskID),
 			attribute.String("execution_id", assignment.ExecutionID),
 		)),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(privateExporter{Exporter: exporter},
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter,
 			sdklog.WithExportInterval(5*time.Second),
 			sdklog.WithMaxQueueSize(1024),
 			sdklog.WithExportMaxBatchSize(128),
@@ -96,31 +67,6 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	)
 	r.logger = r.provider.Logger("oz-agent-worker.task")
 	return r, nil
-}
-
-func sameOriginRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	// OAuth2 reattaches bearer credentials on every hop, even across origins.
-	origin := via[0].URL
-	if req.URL.Scheme != origin.Scheme || !strings.EqualFold(req.URL.Host, origin.Host) {
-		return http.ErrUseLastResponse
-	}
-	return nil
-}
-
-type privateExporter struct {
-	sdklog.Exporter
-}
-
-func (e privateExporter) Export(ctx context.Context, records []sdklog.Record) error {
-	// A collector can reflect Authorization: Bearer <token> in its response body.
-	// OTel reports export errors globally, bypassing this task's credential redaction.
-	if err := e.Exporter.Export(ctx, records); err != nil {
-		return errors.New("task log export failed")
-	}
-	return nil
 }
 
 func (r *Reporter) Context() context.Context {

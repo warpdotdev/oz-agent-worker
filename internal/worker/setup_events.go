@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
@@ -56,6 +58,30 @@ type setupEventReporter struct {
 	logs          *tasklogs.Reporter
 }
 
+func setupTracePhase(event string) string {
+	switch event {
+	case SetupEventSidecarPrep:
+		return "sidecar_prepare"
+	case SetupEventContainerStart:
+		return "container_start"
+	case SetupEventJobCreate:
+		return "job_create"
+	case SetupEventPodSchedule:
+		return "pod_schedule"
+	case SetupEventSetupCommand:
+		return "setup"
+	default:
+		return ""
+	}
+}
+
+func setupPhaseError(failed bool) error {
+	if failed {
+		return errors.New("setup phase failed")
+	}
+	return nil
+}
+
 // newSetupEventReporter builds a reporter from the worker's server root URL and
 // the task assignment's credentials. It returns nil (a valid no-op reporter)
 // when the server root URL or the per-task API key is unavailable.
@@ -90,7 +116,12 @@ func (r *setupEventReporter) startPhase(ctx context.Context, eventName string) f
 // call on a nil reporter.
 func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string, shouldReport bool) func(isError bool) {
 	start := time.Now()
+	var phase *tracing.Phase
+	if shouldReport && eventName != SetupEventImagePull {
+		phase = tracing.StartPhaseAt(ctx, setupTracePhase(eventName), start)
+	}
 	return func(isError bool) {
+		phase.End(setupPhaseError(isError))
 		if r == nil || !shouldReport || ctx.Err() != nil {
 			return
 		}

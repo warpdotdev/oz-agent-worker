@@ -32,18 +32,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"go.opentelemetry.io/contrib/exporters/autoexport"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -203,37 +201,29 @@ func init() {
 }
 
 // Init wires up the metrics pipeline based on the OTEL_METRICS_EXPORTER
-// environment variable. When the variable is set to "none", Init is a no-op
-// and returns a no-op shutdown function. Otherwise (including the unset
-// case) it constructs an SDK MeterProvider with a worker-scoped resource
-// and replaces the package instruments with SDK-backed versions, delegating
-// exporter selection to autoexport. Following autoexport's convention, an
-// unset OTEL_METRICS_EXPORTER produces an OTLP exporter targeting the
-// OTEL_EXPORTER_OTLP_* defaults; operators who do not run an OTLP collector
-// should set OTEL_METRICS_EXPORTER=none to avoid periodic push errors.
+// environment variable. Setting it to "none" disables metrics only.
+// Otherwise (including the unset case), it constructs an SDK MeterProvider
+// with a worker-scoped resource and replaces the package instruments with
+// SDK-backed versions, delegating exporter selection to autoexport. Following
+// autoexport's convention, an unset OTEL_METRICS_EXPORTER produces an OTLP
+// exporter targeting the OTEL_EXPORTER_OTLP_* defaults; operators without a
+// collector should set OTEL_METRICS_EXPORTER=none to avoid periodic push errors.
+//
+// Tracing initializes independently. Its process-owned handle is returned
+// for injection into the worker.
 //
 // Init must only be called once. The returned shutdown function flushes and
 // stops the exporter; it is safe to call after Init returns an error.
-func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error) {
-	noop := func(context.Context) error { return nil }
+func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, tracingHandle *tracing.Handle, err error) {
 	var shutdowns []func(context.Context) error
 	var initErr error
-	var res *resource.Resource
-	getResource := func() (*resource.Resource, error) {
-		if res != nil {
-			return res, nil
-		}
-		var err error
-		res, err = newResource(ctx, cfg)
-		return res, err
-	}
 
 	if os.Getenv("OTEL_METRICS_EXPORTER") != "none" {
 		reader, err := autoexport.NewMetricReader(ctx)
 		if err != nil {
 			initErr = errors.Join(initErr, err)
 		} else {
-			res, err := getResource()
+			res, err := newResource(ctx, cfg)
 			if err != nil {
 				initErr = errors.Join(initErr, errors.Join(err, reader.Shutdown(ctx)))
 			} else {
@@ -255,40 +245,16 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		}
 	}
 
-	if shouldInitTraces() {
-		exporter, err := autoexport.NewSpanExporter(ctx)
-		if err != nil {
-			initErr = errors.Join(initErr, err)
-		} else {
-			res, err := getResource()
-			if err != nil {
-				initErr = errors.Join(initErr, errors.Join(err, exporter.Shutdown(ctx)))
-			} else {
-				provider := sdktrace.NewTracerProvider(
-					sdktrace.WithBatcher(exporter),
-					sdktrace.WithResource(res),
-				)
-				otel.SetTracerProvider(provider)
-				shutdowns = append(shutdowns, provider.Shutdown)
-			}
-		}
-	}
-
-	if len(shutdowns) == 0 {
-		return noop, initErr
-	}
+	tracingHandle, err = tracing.New(ctx, cfg.WorkerID, cfg.Backend, cfg.Version)
+	initErr = errors.Join(initErr, err)
+	shutdowns = append(shutdowns, tracingHandle.Shutdown)
 	return func(ctx context.Context) error {
 		var err error
 		for i := len(shutdowns) - 1; i >= 0; i-- {
 			err = errors.Join(err, shutdowns[i](ctx))
 		}
 		return err
-	}, initErr
-}
-
-func shouldInitTraces() bool {
-	exporter := strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
-	return exporter != "" && !strings.EqualFold(exporter, "none")
+	}, tracingHandle, initErr
 }
 
 // primeInstruments records a zero observation against every known
@@ -530,17 +496,6 @@ func SetWorkerInfo(version, backend, workerID string) {
 			attribute.String("version", version),
 			attribute.String("backend", backend),
 			attribute.String("worker_id", workerID),
-		),
-	)
-}
-
-// StartTaskSpan starts a trace span for a single task execution. It is a no-op
-// unless OTEL_TRACES_EXPORTER is configured by the operator.
-func StartTaskSpan(ctx context.Context, taskID, title string) (context.Context, trace.Span) {
-	return otel.Tracer(scopeName).Start(ctx, "oz_worker.task",
-		trace.WithAttributes(
-			attribute.String("task.id", taskID),
-			attribute.String("task.title", title),
 		),
 	)
 }

@@ -5,7 +5,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"go.opentelemetry.io/otel/semconv/v1.43.0"
 	corev1 "k8s.io/api/core/v1"
 )

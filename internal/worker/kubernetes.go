@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -396,9 +397,13 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		if res.Error != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 			defer cancel()
+			phase := tracing.StartPhase(cleanupCtx, "cleanup")
 			if err := b.requestJobExecutionStop(cleanupCtx, job, res.Error); err != nil {
+				phase.End(err)
 				log.Errorf(ctx, "Failed to stop Kubernetes Job %s after terminal task failure; it may still be active: %v", jobName, err)
 				res.Error = fmt.Errorf("%w; failed to stop Kubernetes Job %s: %v", res.Error, jobName, err)
+			} else {
+				phase.End(nil)
 			}
 			return
 		}
@@ -407,12 +412,17 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 		defer cancel()
+		phase := tracing.StartPhase(cleanupCtx, "cleanup")
 		if err := b.deleteTaskJob(cleanupCtx, jobName, &createdJob.UID); err != nil {
+			phase.End(err)
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
+		} else {
+			phase.End(nil)
 		}
 	}()
 
 	logStreams := newKubernetesLogStreams(ctx, b, params.Logs)
+	defer func() { setupPhases.finish(res.Error) }()
 	defer func() {
 		if logStreams == nil {
 			return
