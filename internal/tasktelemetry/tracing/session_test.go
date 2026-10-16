@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,6 +224,14 @@ func attributes(attrs []*commonpb.KeyValue) map[string]string {
 
 func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	certificateServer := httptest.NewTLSServer(nil)
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateServer.Certificate().Raw})
+	certificateServer.Close()
+	certificatePath := filepath.Join(t.TempDir(), "operator-ca.pem")
+	if err := os.WriteFile(certificatePath, certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", certificatePath)
 	for _, tc := range []struct {
 		name             string
 		bootstrap        *types.TelemetryBootstrapToken

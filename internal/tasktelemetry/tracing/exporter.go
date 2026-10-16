@@ -25,6 +25,7 @@ func newWarpProcessor(ctx context.Context, server string, assignment *types.Task
 	exporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpointURL(endpoint),
 		otlptracehttp.WithHTTPClient(otlp.Client(ctx, source)),
+		otlptracehttp.WithTLSClientConfig(nil),
 		otlptracehttp.WithHeaders(map[string]string{}),
 		otlptracehttp.WithTimeout(otlp.ExportTimeout),
 		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{
