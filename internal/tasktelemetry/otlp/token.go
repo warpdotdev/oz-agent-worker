@@ -27,38 +27,49 @@ type taskIdentitySource struct {
 	endpoint, runID, apiKey, workloadToken string
 }
 
-func NewLogTokenSource(ctx context.Context, serverRootURL, runID string, env map[string]string) oauth2.TokenSource {
-	return oauth2.ReuseTokenSourceWithExpiry(nil, &taskIdentitySource{
-		// Final flush may need a fresh token after the reporter context is cancelled.
-		ctx:      context.WithoutCancel(ctx),
-		client:   &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
-		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
-		runID:    runID, apiKey: env["WARP_API_KEY"], workloadToken: env["WARP_WORKLOAD_TOKEN"],
-	}, time.Minute)
+type RefreshConfig struct {
+	ServerRootURL string
+	RunID         string
+	APIKey        string
+	WorkloadToken string
 }
 
-func NewTraceTokenSource(ctx context.Context, serverRootURL string, assignment *types.TaskAssignmentMessage) (oauth2.TokenSource, error) {
-	var seed *oauth2.Token
+func BootstrapToken(assignment *types.TaskAssignmentMessage) *oauth2.Token {
+	if assignment == nil || assignment.TelemetryCollection == nil {
+		return nil
+	}
 	if bootstrap := assignment.TelemetryCollection.BootstrapToken; bootstrap != nil {
 		expiry, err := time.Parse(time.RFC3339Nano, bootstrap.ExpiresAt)
 		if err == nil && bootstrap.Token != "" && expiry.After(time.Now()) {
-			seed = &oauth2.Token{AccessToken: bootstrap.Token, TokenType: "Bearer", Expiry: expiry}
+			return &oauth2.Token{AccessToken: bootstrap.Token, TokenType: "Bearer", Expiry: expiry}
 		}
 	}
-	hasRefresh := assignment.EnvVars["WARP_API_KEY"] != "" && assignment.EnvVars["WARP_WORKLOAD_TOKEN"] != ""
-	if seed == nil && !hasRefresh {
-		return nil, errors.New("task trace authentication unavailable")
+	return nil
+}
+
+func RefreshFromAssignment(serverRootURL string, assignment *types.TaskAssignmentMessage) RefreshConfig {
+	config := RefreshConfig{ServerRootURL: serverRootURL}
+	if assignment != nil {
+		config.RunID = assignment.TaskID
+		config.APIKey = assignment.EnvVars["WARP_API_KEY"]
+		config.WorkloadToken = assignment.EnvVars["WARP_WORKLOAD_TOKEN"]
 	}
-	if hasRefresh {
-		if err := ValidateIdentityEndpoint(serverRootURL); err != nil {
-			return nil, err
+	return config
+}
+
+func NewTokenSource(ctx context.Context, bootstrap *oauth2.Token, refresh RefreshConfig) (oauth2.TokenSource, error) {
+	if refresh.APIKey != "" && refresh.WorkloadToken != "" {
+		if _, err := parseEndpoint(refresh.ServerRootURL); err != nil {
+			return nil, errors.New("invalid task identity endpoint")
 		}
+	} else if bootstrap == nil {
+		return nil, errors.New("task telemetry authentication unavailable")
 	}
-	return oauth2.ReuseTokenSourceWithExpiry(seed, &taskIdentitySource{
+	return oauth2.ReuseTokenSourceWithExpiry(bootstrap, &taskIdentitySource{
 		ctx:      ctx,
-		client:   &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
-		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
-		runID:    assignment.TaskID, apiKey: assignment.EnvVars["WARP_API_KEY"], workloadToken: assignment.EnvVars["WARP_WORKLOAD_TOKEN"],
+		client:   &http.Client{Timeout: ExportTimeout, CheckRedirect: sameOriginRedirect},
+		endpoint: strings.TrimRight(refresh.ServerRootURL, "/") + "/graphql/v2",
+		runID:    refresh.RunID, apiKey: refresh.APIKey, workloadToken: refresh.WorkloadToken,
 	}, time.Minute), nil
 }
 

@@ -31,39 +31,29 @@ type Session struct {
 	closeOnce  sync.Once
 }
 
-func Start(ctx context.Context, server, workerID, backend string, assignment *types.TaskAssignmentMessage, receivedAt time.Time) (context.Context, *Session, error) {
+func (h *Handle) Start(ctx context.Context, server string, assignment *types.TaskAssignmentMessage, receivedAt time.Time) (context.Context, *Session, error) {
 	pipelineCtx, cancel := context.WithCancel(context.Background())
-	attrs := []attribute.KeyValue{
-		attribute.String("service.name", "oz-agent-worker"),
-		attribute.String("worker.id", workerID),
-		attribute.String("worker.backend", backend),
-		attribute.String("run_id", assignment.TaskID),
+	attrs := []attribute.KeyValue{attribute.String("service.name", "oz-agent-worker")}
+	if h != nil {
+		attrs = h.resource.Attributes()
 	}
+	attrs = append(attrs, attribute.String("run_id", assignment.TaskID))
 	if assignment.ExecutionID != "" {
 		attrs = append(attrs, attribute.String("execution_id", assignment.ExecutionID))
 	}
-	op := operator.Load()
-	var opResource *resource.Resource
-	if op != nil {
-		opResource = op.resource
-		if version, ok := opResource.Set().Value("service.version"); ok {
-			attrs = append(attrs, attribute.KeyValue{Key: "service.version", Value: version})
-		}
-	}
-	warpResource := resource.NewSchemaless(attrs...)
-	res, _ := resource.Merge(opResource, warpResource)
+	res := resource.NewSchemaless(attrs...)
 	s := &Session{cancel: cancel, phases: make(map[*Phase]struct{})}
 	var initErr error
 	if config := assignment.TelemetryCollection; config != nil && config.TracingEnabled {
-		processor, err := newWarpProcessor(pipelineCtx, server, assignment, warpResource)
+		processor, err := newWarpProcessor(pipelineCtx, server, assignment)
 		if err != nil {
 			initErr = err
 		} else {
 			s.processors = append(s.processors, processor)
 		}
 	}
-	if op != nil {
-		s.processors = append(s.processors, &borrowedProcessor{SpanProcessor: op.processor})
+	if h != nil && h.processor != nil {
+		s.processors = append(s.processors, &borrowedProcessor{SpanProcessor: h.processor})
 	}
 	if len(s.processors) == 0 {
 		cancel()

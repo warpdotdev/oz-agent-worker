@@ -13,29 +13,26 @@ import (
 
 const ExportTimeout = 5 * time.Second
 
-func Endpoint(raw, signal string) (string, error) {
+func signalEndpoint(endpoint *url.URL, signal string) string {
+	target := *endpoint
+	target.Path = strings.TrimRight(target.Path, "/") + "/v1/" + signal
+	return target.String()
+}
+
+func parseEndpoint(raw string) (*url.URL, error) {
 	endpoint, err := url.Parse(raw)
 	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
-		return "", errors.New("invalid task " + signal + " collector endpoint")
+		return nil, errors.New("invalid task telemetry endpoint")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/" + signal
-	return endpoint.String(), nil
+	return endpoint, nil
 }
 
-func ValidateIdentityEndpoint(raw string) error {
-	server, err := url.Parse(raw)
-	if err != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") || server.User != nil || server.RawQuery != "" || server.Fragment != "" {
-		return errors.New("invalid task identity endpoint")
-	}
-	return nil
-}
-
-func Client(ctx context.Context, source oauth2.TokenSource) *http.Client {
-	base := &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect}
+func client(ctx context.Context, source oauth2.TokenSource) *http.Client {
+	base := &http.Client{Timeout: ExportTimeout, CheckRedirect: sameOriginRedirect}
 	return oauth2.NewClient(context.WithValue(ctx, oauth2.HTTPClient, base), source)
 }
 
-func SameOriginRedirect(req *http.Request, via []*http.Request) error {
+func sameOriginRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
