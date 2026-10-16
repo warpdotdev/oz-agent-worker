@@ -19,8 +19,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"golang.org/x/sync/semaphore"
 )
 

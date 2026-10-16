@@ -27,8 +27,8 @@ import (
 )
 
 type spanExporter struct {
-	mu sync.Mutex
-	spans []sdktrace.ReadOnlySpan
+	mu        sync.Mutex
+	spans     []sdktrace.ReadOnlySpan
 	shutdowns atomic.Int32
 }
 
@@ -70,8 +70,8 @@ func installOperator(t *testing.T, exporter sdktrace.SpanExporter) (*flushProces
 }
 
 type collectorServer struct {
-	server *httptest.Server
-	mu sync.Mutex
+	server   *httptest.Server
+	mu       sync.Mutex
 	payloads []*collector.ExportTraceServiceRequest
 }
 
@@ -98,10 +98,10 @@ func newCollector(t *testing.T, bearer string) *collectorServer {
 
 func traceAssignment(endpoint, run string) *types.TaskAssignmentMessage {
 	return &types.TaskAssignmentMessage{
-		TaskID: run, ExecutionID: "execution-"+run, Task: &types.Task{Title: "private title"},
+		TaskID: run, ExecutionID: "execution-" + run, Task: &types.Task{Title: "private title"},
 		TelemetryCollection: &types.TelemetryCollectionConfig{
-			Endpoint: endpoint+"/otlp", TracingEnabled: true,
-			BootstrapToken: &types.TelemetryBootstrapToken{Token: "token-"+run, ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
+			Endpoint: endpoint + "/otlp", TracingEnabled: true,
+			BootstrapToken: &types.TelemetryBootstrapToken{Token: "token-" + run, ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
 		},
 	}
 }
@@ -222,14 +222,14 @@ func attributes(attrs []*commonpb.KeyValue) map[string]string {
 func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	for _, tc := range []struct {
-		name string
-		bootstrap *types.TelemetryBootstrapToken
-		refresh bool
+		name             string
+		bootstrap        *types.TelemetryBootstrapToken
+		refresh          bool
 		collectorFailure bool
-		identityFailure bool
+		identityFailure  bool
 	}{
 		{name: "bootstrap", bootstrap: &types.TelemetryBootstrapToken{Token: "bootstrap-secret", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)}},
-		{name: "refresh before expiry", bootstrap: &types.TelemetryBootstrapToken{Token: "bootstrap-secret", ExpiresAt: time.Now().Add(30*time.Second).Format(time.RFC3339Nano)}, refresh: true},
+		{name: "refresh before expiry", bootstrap: &types.TelemetryBootstrapToken{Token: "bootstrap-secret", ExpiresAt: time.Now().Add(30 * time.Second).Format(time.RFC3339Nano)}, refresh: true},
 		{name: "missing bootstrap", refresh: true},
 		{name: "invalid bootstrap", bootstrap: &types.TelemetryBootstrapToken{Token: "bootstrap-secret", ExpiresAt: "invalid"}, refresh: true},
 		{name: "identity failure", refresh: true, identityFailure: true},
@@ -255,15 +255,21 @@ func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 					return
 				}
 				want := "Bearer bootstrap-secret"
-				if tc.refresh { want = "Bearer refreshed-secret" }
-				if req.Header.Get("Authorization") != want { t.Error("incorrect task identity bearer") }
+				if tc.refresh {
+					want = "Bearer refreshed-secret"
+				}
+				if req.Header.Get("Authorization") != want {
+					t.Error("incorrect task identity bearer")
+				}
 				if tc.collectorFailure {
 					http.Error(w, "sentinel-secret "+req.Header.Get("Authorization"), http.StatusForbidden)
 					return
 				}
 				data, _ := io.ReadAll(req.Body)
 				var p collector.ExportTraceServiceRequest
-				if err := proto.Unmarshal(data, &p); err != nil { t.Error(err) }
+				if err := proto.Unmarshal(data, &p); err != nil {
+					t.Error(err)
+				}
 				text, _ := protojson.Marshal(&p)
 				mu.Lock()
 				payload += string(text)
@@ -272,25 +278,35 @@ func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 			defer server.Close()
 			a := traceAssignment(server.URL, "run")
 			a.TelemetryCollection.BootstrapToken = tc.bootstrap
-			if tc.refresh { a.EnvVars = map[string]string{"WARP_API_KEY": "task-api-key", "WARP_WORKLOAD_TOKEN": "task-workload-token"} }
+			if tc.refresh {
+				a.EnvVars = map[string]string{"WARP_API_KEY": "task-api-key", "WARP_WORKLOAD_TOKEN": "task-workload-token"}
+			}
 			ctx, session, err := Start(t.Context(), server.URL, "worker", "direct", a, time.Now())
-			if err != nil || session == nil { t.Fatalf("trace auth initialization: %v", err) }
+			if err != nil || session == nil {
+				t.Fatalf("trace auth initialization: %v", err)
+			}
 			rawError := errors.New("raw backend error /task/path")
 			StartPhase(ctx, "execution").End(rawError)
 			session.End("failed", rawError)
 			err = session.ForceFlush(t.Context())
 			session.Shutdown(t.Context())
 			if tc.identityFailure || tc.collectorFailure {
-				if err == nil || err.Error() != "task trace export failed" { t.Fatalf("unsafe exporter/auth error: %v", err) }
+				if err == nil || err.Error() != "task trace export failed" {
+					t.Fatalf("unsafe exporter/auth error: %v", err)
+				}
 			} else {
-				if err != nil { t.Fatal(err) }
+				if err != nil {
+					t.Fatal(err)
+				}
 				mu.Lock()
 				if !strings.Contains(payload, rawError.Error()) || strings.Contains(payload, a.Task.Title) || strings.Contains(payload, "task.title") {
 					t.Error("task error was removed or title was exported")
 				}
 				mu.Unlock()
 			}
-			if tc.refresh != (identities.Load() > 0) { t.Fatal("bootstrap use or refresh timing changed") }
+			if tc.refresh != (identities.Load() > 0) {
+				t.Fatal("bootstrap use or refresh timing changed")
+			}
 		})
 	}
 }
@@ -319,7 +335,9 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 				t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", stalled.URL)
 				prev := otel.GetTracerProvider()
 				shutdown, err := InitOperator(t.Context(), resource.Empty())
-				if err != nil { t.Fatal(err) }
+				if err != nil {
+					t.Fatal(err)
+				}
 				defer otel.SetTracerProvider(prev)
 				defer func() {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -328,32 +346,47 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 				}()
 			}
 			ctx, session := startSession(t, traceAssignment(warpEndpoint, "run"))
-			for range 64 { StartPhase(ctx, "execution").End(nil) }
+			for range 64 {
+				StartPhase(ctx, "execution").End(nil)
+			}
 			flushCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 			defer cancel()
 			flushed := make(chan error, 1)
 			go func() { flushed <- session.ForceFlush(flushCtx) }()
 			select {
 			case <-started:
-			case <-time.After(time.Second): t.Fatal("blocked exporter did not start")
+			case <-time.After(time.Second):
+				t.Fatal("blocked exporter did not start")
 			}
 			begin := time.Now()
-			for range 2048 { StartPhase(ctx, "execution").End(nil) }
-			if time.Since(begin) > time.Second { t.Fatal("queue overflow blocked task instrumentation") }
+			for range 2048 {
+				StartPhase(ctx, "execution").End(nil)
+			}
+			if time.Since(begin) > time.Second {
+				t.Fatal("queue overflow blocked task instrumentation")
+			}
 			<-flushed
 			session.End("interrupted", nil)
 			shutdownCtx, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
 			begin = time.Now()
 			session.Shutdown(shutdownCtx)
 			stop()
-			if time.Since(begin) > time.Second { t.Fatal("task shutdown exceeded its deadline") }
-			if StartPhase(ctx, "cleanup") != nil { t.Fatal("late phase started after task closed") }
-			if blocked == "operator" && len(good.spans()) == 0 { t.Fatal("operator stall prevented Warp export") }
+			if time.Since(begin) > time.Second {
+				t.Fatal("task shutdown exceeded its deadline")
+			}
+			if StartPhase(ctx, "cleanup") != nil {
+				t.Fatal("late phase started after task closed")
+			}
+			if blocked == "operator" && len(good.spans()) == 0 {
+				t.Fatal("operator stall prevented Warp export")
+			}
 			if op != nil {
 				op.mu.Lock()
 				got := len(op.spans)
 				op.mu.Unlock()
-				if got == 0 { t.Fatal("Warp stall prevented operator export") }
+				if got == 0 {
+					t.Fatal("Warp stall prevented operator export")
+				}
 			}
 		})
 	}

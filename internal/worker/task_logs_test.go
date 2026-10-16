@@ -256,7 +256,7 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 				config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: !tc.disabled},
 				ctx:    ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8),
 			}
-					assignment := logAssignment(server.URL)
+			assignment := logAssignment(server.URL)
 			if tc.rejected {
 				assignment.EnvVars[warpAPIKeyEnv] = "rejected-api-key"
 			}

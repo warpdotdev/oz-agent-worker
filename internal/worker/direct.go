@@ -13,8 +13,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"go.opentelemetry.io/otel/attribute"
 )
 

@@ -28,7 +28,7 @@ func newWarpProcessor(ctx context.Context, server string, assignment *types.Task
 		otlptracehttp.WithHeaders(map[string]string{}),
 		otlptracehttp.WithTimeout(otlp.ExportTimeout),
 		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{
-			Enabled: true, InitialInterval: 500*time.Millisecond,
+			Enabled: true, InitialInterval: 500 * time.Millisecond,
 			MaxInterval: time.Second, MaxElapsedTime: otlp.ExportTimeout,
 		}),
 	)
@@ -44,9 +44,9 @@ func newWarpProcessor(ctx context.Context, server string, assignment *types.Task
 }
 
 type privateExporter struct {
-	mu sync.Mutex
+	mu       sync.Mutex
 	exporter sdktrace.SpanExporter
-	ctx context.Context
+	ctx      context.Context
 	resource *resource.Resource
 }
 

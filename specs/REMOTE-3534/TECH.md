@@ -45,6 +45,7 @@ The [server assignment gate](https://github.com/warpdotdev/warp-server/blob/5119
 - Replace Warp exporter/auth errors with fixed messages before they reach global SDK error handling. Collector errors can reflect credentials. Telemetry failures must not change task results or prevent export to the other destination.
 - Configure each Warp SDK `BatchSpanProcessor` for a 256-span queue, 64-span batches, a 5-second interval and a 5-second export/retry budget. Use SDK drop-on-overflow behavior; never block instrumentation. Use a pipeline-lifetime context independent of task cancellation.
 - After ending the root, flush both destinations and shut down the task-owned pipeline within one 5-second budget. At the deadline, cancel its pipeline context to stop in-flight export/auth work and release task credentials and buffers. During worker shutdown, close sessions concurrently under one shared 5-second telemetry deadline, not 5 seconds per task. Keep operator shutdown process-scoped.
+- Stop each task processor explicitly after flushing, including when the deadline has expired: the SDK provider's shutdown skips processors when passed an already-expired context. The non-owning operator adapter still never shuts down the process processor.
 
 ## Decisions
 - **Processor fanout, not synchronous exporter fanout:** both keep identical IDs and centralized routing. Independent batchers prevent destination stalls and unsafe shared-exporter calls. This implements the requester's wrapper/fanout intent.
@@ -60,7 +61,7 @@ The [server assignment gate](https://github.com/warpdotdev/warp-server/blob/5119
 - New logging/metrics behavior, policy controls, UI work, live-cluster deployment or computer-use verification.
 
 ## Validation criteria
-These are required implementation checks, not results claimed by this spec-only PR. Use SDK span recorders and `httptest` collector/identity servers.
+Implementation validation uses SDK span capture and `httptest` collector/identity servers. The focused shutdown checks cover the session pipeline and a worker running two preserved Kubernetes Jobs.
 - `TestTaskTraceDualExport`: both destinations receive identical IDs and parentage exactly once. Assert `ForceFlush` reaches both destinations. Close one task, then export another. Assert the operator exporter stays open and process shutdown closes it once.
 - `TestTaskTraceConcurrentIsolation`: interleave two tasks with distinct endpoints/tokens; assert no cross-routing, credential/resource leakage or data races.
 - `TestTaskTraceAuthAndPrivacy`: cover bootstrap use, expiry refresh, missing/invalid bootstrap, refresh failure and hostile collector errors containing a sentinel secret. Assert raw task errors remain available, task titles are omitted, and exporter/auth errors do not expose credentials.

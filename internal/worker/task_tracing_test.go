@@ -29,7 +29,9 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	operatorCollector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		data, _ := io.ReadAll(req.Body)
 		var payload collector.ExportTraceServiceRequest
-		if err := proto.Unmarshal(data, &payload); err != nil { t.Error(err) }
+		if err := proto.Unmarshal(data, &payload); err != nil {
+			t.Error(err)
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		for _, resource := range payload.ResourceSpans {
@@ -44,7 +46,9 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", operatorCollector.URL+"/v1/traces")
 	previous := otel.GetTracerProvider()
 	shutdown, err := tracing.InitOperator(t.Context(), resource.Empty())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer otel.SetTracerProvider(previous)
 	defer func() { _ = shutdown(t.Context()) }()
 
@@ -71,10 +75,10 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	}
 	for _, run := range []string{"alpha", "beta"} {
 		w.handleTaskAssignment(&types.TaskAssignmentMessage{
-			TaskID: run, ExecutionID: "execution-"+run, Task: &types.Task{ID: run},
+			TaskID: run, ExecutionID: "execution-" + run, Task: &types.Task{ID: run},
 			TelemetryCollection: &types.TelemetryCollectionConfig{
 				Endpoint: blockedCollector.URL, TracingEnabled: true,
-				BootstrapToken: &types.TelemetryBootstrapToken{Token: "token-"+run, ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
+				BootstrapToken: &types.TelemetryBootstrapToken{Token: "token-" + run, ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
 			},
 		}, time.Now())
 		select {
@@ -82,28 +86,35 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			now := time.Now()
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: run, CreationTimestamp: metav1.NewTime(now.Add(-time.Second))},
-				Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: kubernetesSetupContainerName}}},
+				Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: kubernetesSetupContainerName}}},
 				Status: corev1.PodStatus{
-					Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now)}},
+					Conditions:            []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now)}},
 					InitContainerStatuses: []corev1.ContainerStatus{{Name: kubernetesSetupContainerName, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now)}}}},
 				},
 			}
 			watcher.Add(pod)
 			watcher.Modify(pod)
-		case <-time.After(time.Second): t.Fatal("task did not reach the Kubernetes pod watch")
+		case <-time.After(time.Second):
+			t.Fatal("task did not reach the Kubernetes pod watch")
 		}
 	}
 	start := time.Now()
 	w.shutdownTasks()
-	if time.Since(start) > 6*time.Second { t.Fatal("shutdown used a separate timeout per task") }
+	if time.Since(start) > 6*time.Second {
+		t.Fatal("shutdown used a separate timeout per task")
+	}
 	w.tasksMutex.Lock()
 	var cancels []context.CancelFunc
 	for _, task := range w.activeTasks {
-		if task.ctx.Err() != nil { t.Error("trace interruption cancelled a preserved execution") }
+		if task.ctx.Err() != nil {
+			t.Error("trace interruption cancelled a preserved execution")
+		}
 		cancels = append(cancels, task.cancel)
 	}
 	w.tasksMutex.Unlock()
-	for _, cancel := range cancels { cancel() }
+	for _, cancel := range cancels {
+		cancel()
+	}
 	w.taskWG.Wait()
 	backend.Shutdown(t.Context())
 	for _, action := range client.Actions() {
@@ -115,13 +126,25 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	defer mu.Unlock()
 	roots, live := 0, 0
 	for _, span := range spans {
-		if span.Name == "self_hosted_worker.task" { roots++ }
-		if span.Name == "self_hosted_worker.setup" { live++ }
+		if span.Name == "self_hosted_worker.task" {
+			roots++
+		}
+		if span.Name == "self_hosted_worker.setup" {
+			live++
+		}
 		if span.Name == "self_hosted_worker.task" || span.Name == "self_hosted_worker.setup" {
 			outcome := ""
-			for _, attr := range span.Attributes { if attr.Key == "outcome" { outcome = attr.Value.GetStringValue() } }
-			if outcome != "interrupted" { t.Error("remaining observation was not interrupted") }
+			for _, attr := range span.Attributes {
+				if attr.Key == "outcome" {
+					outcome = attr.Value.GetStringValue()
+				}
+			}
+			if outcome != "interrupted" {
+				t.Error("remaining observation was not interrupted")
+			}
 		}
 	}
-	if roots != 2 || live != 2 { t.Fatalf("late finalizers lost or duplicated spans: roots=%d live=%d", roots, live) }
+	if roots != 2 || live != 2 {
+		t.Fatalf("late finalizers lost or duplicated spans: roots=%d live=%d", roots, live)
+	}
 }

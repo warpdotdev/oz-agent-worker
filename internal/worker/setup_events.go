@@ -15,8 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
-	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 )
 
 const (

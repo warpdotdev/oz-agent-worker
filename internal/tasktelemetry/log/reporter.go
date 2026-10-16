@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
@@ -88,7 +88,6 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	r.logger = r.provider.Logger("oz-agent-worker.task")
 	return r, nil
 }
-
 
 type privateExporter struct {
 	sdklog.Exporter

@@ -15,8 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
- "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"go.opentelemetry.io/otel/attribute"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"

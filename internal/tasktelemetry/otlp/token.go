@@ -55,10 +55,10 @@ func NewTraceTokenSource(ctx context.Context, serverRootURL string, assignment *
 		}
 	}
 	return oauth2.ReuseTokenSourceWithExpiry(seed, &taskIdentitySource{
-		ctx: ctx,
-		client: &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
+		ctx:      ctx,
+		client:   &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
 		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
-		runID: assignment.TaskID, apiKey: assignment.EnvVars["WARP_API_KEY"], workloadToken: assignment.EnvVars["WARP_WORKLOAD_TOKEN"],
+		runID:    assignment.TaskID, apiKey: assignment.EnvVars["WARP_API_KEY"], workloadToken: assignment.EnvVars["WARP_WORKLOAD_TOKEN"],
 	}, time.Minute), nil
 }
 

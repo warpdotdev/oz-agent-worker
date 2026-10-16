@@ -12,7 +12,7 @@ import (
 
 type operatorPipeline struct {
 	processor sdktrace.SpanProcessor
-	resource *resource.Resource
+	resource  *resource.Resource
 }
 
 var operator atomic.Pointer[operatorPipeline]

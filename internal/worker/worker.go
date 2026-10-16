@@ -14,11 +14,11 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
- "go.opentelemetry.io/otel/trace"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )

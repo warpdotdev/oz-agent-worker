@@ -36,8 +36,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"

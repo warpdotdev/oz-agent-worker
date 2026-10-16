@@ -14,21 +14,21 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const ShutdownTimeout = 5*time.Second
+const ShutdownTimeout = 5 * time.Second
 const scope = "github.com/warpdotdev/oz-agent-worker"
 
 type sessionKey struct{}
 
 type Session struct {
-	mu sync.Mutex
-	provider *sdktrace.TracerProvider
+	mu         sync.Mutex
+	provider   *sdktrace.TracerProvider
 	processors []sdktrace.SpanProcessor
-	root trace.Span
-	ctx context.Context
-	cancel context.CancelFunc
-	ended bool
-	phases map[*Phase]struct{}
-	closeOnce sync.Once
+	root       trace.Span
+	ctx        context.Context
+	cancel     context.CancelFunc
+	ended      bool
+	phases     map[*Phase]struct{}
+	closeOnce  sync.Once
 }
 
 func Start(ctx context.Context, server, workerID, backend string, assignment *types.TaskAssignmentMessage, receivedAt time.Time) (context.Context, *Session, error) {
@@ -164,7 +164,7 @@ func (s *Session) Shutdown(ctx context.Context) {
 
 type Phase struct {
 	session *Session
-	span trace.Span
+	span    trace.Span
 }
 
 func StartPhase(ctx context.Context, name string) *Phase {
@@ -172,6 +172,9 @@ func StartPhase(ctx context.Context, name string) *Phase {
 }
 
 func StartPhaseAt(ctx context.Context, name string, start time.Time) *Phase {
+	if name == "" || start.IsZero() {
+		return nil
+	}
 	s, _ := ctx.Value(sessionKey{}).(*Session)
 	if s == nil {
 		return nil
