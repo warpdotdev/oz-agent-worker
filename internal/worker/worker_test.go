@@ -19,7 +19,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -156,13 +155,13 @@ func TestOneShotAcceptsOnlyOneTaskAndWaitsForCompletion(t *testing.T) {
 		}
 	}
 
-	w.handleTaskAssignment(assignment("task-1"))
+	w.handleTaskAssignment(assignment("task-1"), time.Now())
 	select {
 	case <-backend.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("first task did not start")
 	}
-	w.handleTaskAssignment(assignment("task-2"))
+	w.handleTaskAssignment(assignment("task-2"), time.Now())
 
 	select {
 	case <-w.oneShot.doneChannel():
@@ -348,7 +347,7 @@ func TestExecuteTaskReportsGracefulShutdownOnWorkerShutdown(t *testing.T) {
 		}},
 		backend: &recordingBackend{err: newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, context.Canceled)},
 	}
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID:      "task-1",
 		ExecutionID: "execution-1",
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
@@ -381,7 +380,7 @@ func TestExecuteTaskReportsTaskCancelledOnUserCancellation(t *testing.T) {
 		}},
 		backend: &recordingBackend{err: context.Canceled},
 	}
-	w.executeTask(taskCtx, func() {}, trace.SpanFromContext(taskCtx), &types.TaskAssignmentMessage{
+	w.executeTask(taskCtx, func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID:      "task-1",
 		ExecutionID: "execution-1",
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
@@ -423,7 +422,7 @@ func TestExecuteTaskDoesNotReportTaskCancelledOnBackendCancellationError(t *test
 		backend:     &recordingBackend{err: fmt.Errorf("backend request failed: %w", context.Canceled)},
 	}
 
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID:      "task-1",
 		ExecutionID: "execution-1",
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
@@ -463,7 +462,7 @@ func TestHandleMessageCancelsActiveTask(t *testing.T) {
 		t.Fatalf("failed to marshal websocket message: %v", err)
 	}
 
-	w.handleMessage(message)
+	w.handleMessage(message, time.Now())
 
 	if taskCtx.Err() != context.Canceled {
 		t.Fatalf("task context error = %v, want %v", taskCtx.Err(), context.Canceled)
@@ -486,7 +485,7 @@ func TestExecuteTaskReportsTaskCompletedOnSuccess(t *testing.T) {
 		backend:     &recordingBackend{},
 	}
 
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID:      "task-1",
 		ExecutionID: "execution-1",
 		Task:        &types.Task{ID: "task-1", Title: "test task"},
@@ -526,7 +525,7 @@ func TestExecuteTaskReportsTaskFailedOnBackendError(t *testing.T) {
 		backend:     &recordingBackend{err: errors.New("boom")},
 	}
 
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -561,7 +560,7 @@ func TestExecuteTaskReportsUserFriendlyMessageOnDeadlineExceeded(t *testing.T) {
 		backend:     &recordingBackend{err: context.DeadlineExceeded},
 	}
 
-	w.executeTask(context.Background(), func() {}, trace.SpanFromContext(context.Background()), &types.TaskAssignmentMessage{
+	w.executeTask(context.Background(), func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
 	}, time.Now())
@@ -1575,7 +1574,7 @@ func TestHandleTaskAssignmentDoesNotStartTaskAfterShutdownDuringClaim(t *testing
 	w.handleTaskAssignment(&types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
-	})
+	}, time.Now())
 
 	if len(w.activeTasks) != 0 {
 		t.Fatalf("expected no active tasks to start after shutdown during claim, got %d", len(w.activeTasks))
@@ -1595,7 +1594,7 @@ func TestHandleTaskAssignmentRejectsAfterShutdownStarts(t *testing.T) {
 	w.handleTaskAssignment(&types.TaskAssignmentMessage{
 		TaskID: "task-1",
 		Task:   &types.Task{ID: "task-1", Title: "test task"},
-	})
+	}, time.Now())
 
 	if len(w.activeTasks) != 0 {
 		t.Fatalf("expected no active tasks after shutdown started, got %d", len(w.activeTasks))

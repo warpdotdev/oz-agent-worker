@@ -20,6 +20,7 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -121,7 +122,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 }
 
 // ExecuteTask runs the agent in a Docker container.
-func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
 	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(b.config.Env)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
@@ -136,7 +137,10 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
-	if err := b.prepareImage(ctx, imageName, authStr, params.SetupEvents); err != nil {
+	imagePhase := tracing.StartPhase(ctx, "image_prepare")
+	imageErr := b.prepareImage(ctx, imageName, authStr, params.SetupEvents)
+	imagePhase.End(imageErr)
+	if err := imageErr; err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
 
@@ -203,11 +207,14 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 
 	defer func() {
 		if containerID != "" && !b.config.NoCleanup {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
 			defer cleanupCancel()
+			phase := tracing.StartPhase(cleanupCtx, "cleanup")
 			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !cerrdefs.IsNotFound(removeErr) {
+				phase.End(removeErr)
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			} else {
+				phase.End(nil)
 				b.taskContainers.Delete(key)
 			}
 		}
@@ -223,6 +230,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	stopLogs := b.followContainerLogs(ctx, containerID, params.Logs)
 	defer stopLogs()
 
+	execution := tracing.StartPhase(ctx, "execution")
+	defer func() { execution.End(result.Error) }()
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
 	case err := <-waitResult.Error:

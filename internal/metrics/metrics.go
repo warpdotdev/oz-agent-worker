@@ -37,13 +37,12 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
-	"go.opentelemetry.io/otel"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -256,20 +255,15 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	}
 
 	if shouldInitTraces() {
-		exporter, err := autoexport.NewSpanExporter(ctx)
+		res, err := getResource()
 		if err != nil {
 			initErr = errors.Join(initErr, err)
 		} else {
-			res, err := getResource()
+			shutdown, err := tracing.InitOperator(ctx, res)
 			if err != nil {
-				initErr = errors.Join(initErr, errors.Join(err, exporter.Shutdown(ctx)))
+				initErr = errors.Join(initErr, err)
 			} else {
-				provider := sdktrace.NewTracerProvider(
-					sdktrace.WithBatcher(exporter),
-					sdktrace.WithResource(res),
-				)
-				otel.SetTracerProvider(provider)
-				shutdowns = append(shutdowns, provider.Shutdown)
+				shutdowns = append(shutdowns, shutdown)
 			}
 		}
 	}
@@ -530,17 +524,6 @@ func SetWorkerInfo(version, backend, workerID string) {
 			attribute.String("version", version),
 			attribute.String("backend", backend),
 			attribute.String("worker_id", workerID),
-		),
-	)
-}
-
-// StartTaskSpan starts a trace span for a single task execution. It is a no-op
-// unless OTEL_TRACES_EXPORTER is configured by the operator.
-func StartTaskSpan(ctx context.Context, taskID, title string) (context.Context, trace.Span) {
-	return otel.Tracer(scopeName).Start(ctx, "oz_worker.task",
-		trace.WithAttributes(
-			attribute.String("task.id", taskID),
-			attribute.String("task.title", title),
 		),
 	)
 }

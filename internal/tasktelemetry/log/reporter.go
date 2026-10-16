@@ -3,20 +3,18 @@ package tasklogs
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -43,29 +41,22 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 		return nil, nil
 	}
 	config := assignment.TelemetryCollection
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+	endpoint, err := otlp.Endpoint(config.Endpoint, "logs")
+	if err != nil {
 		return nil, errors.New("invalid task log collector endpoint")
 	}
-	server, err := url.Parse(serverRootURL)
-	if err != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") || server.User != nil || server.RawQuery != "" || server.Fragment != "" {
-		return nil, errors.New("invalid task identity endpoint")
+	if err := otlp.ValidateIdentityEndpoint(serverRootURL); err != nil {
+		return nil, err
 	}
 	if assignment.EnvVars["WARP_API_KEY"] == "" || assignment.EnvVars["WARP_WORKLOAD_TOKEN"] == "" {
 		return nil, errors.New("task log reporting requires task API key and workload token")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/logs"
 	ctx, cancel := context.WithCancel(parent)
 	r := &Reporter{ctx: ctx, cancel: cancel}
 	r.AddEnv(assignment.EnvVars)
-	base := &http.Client{
-		Timeout:       exportTimeout,
-		CheckRedirect: sameOriginRedirect,
-	}
-	client := oauth2.NewClient(context.WithValue(ctx, oauth2.HTTPClient, base),
-		newTokenSource(ctx, serverRootURL, assignment.TaskID, assignment.EnvVars))
+	client := otlp.Client(ctx, otlp.NewLogTokenSource(ctx, serverRootURL, assignment.TaskID, assignment.EnvVars))
 	exporter, err := otlploghttp.New(ctx,
-		otlploghttp.WithEndpointURL(endpoint.String()),
+		otlploghttp.WithEndpointURL(endpoint),
 		otlploghttp.WithHTTPClient(client),
 		otlploghttp.WithHeaders(map[string]string{}),
 		otlploghttp.WithRetry(otlploghttp.RetryConfig{
@@ -98,17 +89,6 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	return r, nil
 }
 
-func sameOriginRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	// OAuth2 reattaches bearer credentials on every hop, even across origins.
-	origin := via[0].URL
-	if req.URL.Scheme != origin.Scheme || !strings.EqualFold(req.URL.Host, origin.Host) {
-		return http.ErrUseLastResponse
-	}
-	return nil
-}
 
 type privateExporter struct {
 	sdklog.Exporter

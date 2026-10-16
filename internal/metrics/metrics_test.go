@@ -87,9 +87,7 @@ func TestHelpersSafeBeforeInit(t *testing.T) {
 	RecordTaskFailure(TaskFailurePhaseBackend, TaskFailureReasonImagePull)
 	RecordWebsocketReconnect("dial_failed")
 	SetWorkerInfo("v0.0.0", "docker", "test")
-	ctx, span := StartTaskSpan(context.Background(), "task-1", "test task")
-	AddTaskEvent(ctx, "task.test")
-	span.End()
+	AddTaskEvent(context.Background(), "task.test")
 }
 
 func TestRecordTaskCompletedEmitsCounterAndHistogram(t *testing.T) {

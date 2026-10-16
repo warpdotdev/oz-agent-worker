@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -44,7 +43,7 @@ func newDispatchWorker(backend Backend) *Worker {
 
 func runDispatchTask(w *Worker) {
 	ctx := context.Background()
-	w.executeTask(ctx, func() {}, trace.SpanFromContext(ctx), &types.TaskAssignmentMessage{
+	w.executeTask(ctx, func() {}, nil, &types.TaskAssignmentMessage{
 		TaskID:      "task-1",
 		ExecutionID: "exec-1",
 		Task:        &types.Task{ID: "task-1", Title: "test task"},

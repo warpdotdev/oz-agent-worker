@@ -10,7 +10,7 @@ import (
 
 	"github.com/moby/moby/client"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/semconv/v1.43.0"
 )

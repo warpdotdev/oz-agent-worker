@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+ "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"go.opentelemetry.io/otel/attribute"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -501,7 +502,7 @@ func TestIdentityLazyRefreshAndConcurrentReuse(t *testing.T) {
 		writeToken(w, fmt.Sprintf("issued-%d", n), expiry)
 	}))
 	defer server.Close()
-	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s := otlp.NewLogTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 	if calls.Load() != 0 {
 		t.Fatal("token requested before export")
 	}
@@ -532,7 +533,7 @@ func TestIdentityRedirectDoesNotForwardCredentials(t *testing.T) {
 		http.Redirect(w, req, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s := otlp.NewLogTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 	if _, err := s.Token(); err == nil || redirected.Load() != 0 {
 		t.Fatal("identity credentials were forwarded through a redirect")
 	}
@@ -548,7 +549,7 @@ func TestIdentityResponseValidation(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			defer server.Close()
-			s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+			s := otlp.NewLogTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
 			if _, err := s.Token(); err == nil || strings.Contains(err.Error(), "private credential") {
 				t.Fatal("identity error response accepted or exposed")
 			}

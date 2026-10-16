@@ -1,4 +1,4 @@
-package tasklogs
+package otlp
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"golang.org/x/oauth2"
 )
 
@@ -26,18 +27,46 @@ type taskIdentitySource struct {
 	endpoint, runID, apiKey, workloadToken string
 }
 
-func newTokenSource(ctx context.Context, serverRootURL, runID string, env map[string]string) oauth2.TokenSource {
+func NewLogTokenSource(ctx context.Context, serverRootURL, runID string, env map[string]string) oauth2.TokenSource {
 	return oauth2.ReuseTokenSourceWithExpiry(nil, &taskIdentitySource{
 		// Final flush may need a fresh token after the reporter context is cancelled.
 		ctx:      context.WithoutCancel(ctx),
-		client:   &http.Client{Timeout: exportTimeout, CheckRedirect: sameOriginRedirect},
+		client:   &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
 		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
 		runID:    runID, apiKey: env["WARP_API_KEY"], workloadToken: env["WARP_WORKLOAD_TOKEN"],
 	}, time.Minute)
 }
 
+func NewTraceTokenSource(ctx context.Context, serverRootURL string, assignment *types.TaskAssignmentMessage) (oauth2.TokenSource, error) {
+	var seed *oauth2.Token
+	if bootstrap := assignment.TelemetryCollection.BootstrapToken; bootstrap != nil {
+		expiry, err := time.Parse(time.RFC3339Nano, bootstrap.ExpiresAt)
+		if err == nil && bootstrap.Token != "" && expiry.After(time.Now()) {
+			seed = &oauth2.Token{AccessToken: bootstrap.Token, TokenType: "Bearer", Expiry: expiry}
+		}
+	}
+	hasRefresh := assignment.EnvVars["WARP_API_KEY"] != "" && assignment.EnvVars["WARP_WORKLOAD_TOKEN"] != ""
+	if seed == nil && !hasRefresh {
+		return nil, errors.New("task trace authentication unavailable")
+	}
+	if hasRefresh {
+		if err := ValidateIdentityEndpoint(serverRootURL); err != nil {
+			return nil, err
+		}
+	}
+	return oauth2.ReuseTokenSourceWithExpiry(seed, &taskIdentitySource{
+		ctx: ctx,
+		client: &http.Client{Timeout: ExportTimeout, CheckRedirect: SameOriginRedirect},
+		endpoint: strings.TrimRight(serverRootURL, "/") + "/graphql/v2",
+		runID: assignment.TaskID, apiKey: assignment.EnvVars["WARP_API_KEY"], workloadToken: assignment.EnvVars["WARP_WORKLOAD_TOKEN"],
+	}, time.Minute), nil
+}
+
 func (s *taskIdentitySource) Token() (*oauth2.Token, error) {
-	ctx, cancel := context.WithTimeout(s.ctx, exportTimeout)
+	if s.apiKey == "" || s.workloadToken == "" {
+		return nil, errors.New("task identity credentials unavailable")
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, ExportTimeout)
 	defer cancel()
 	token, expiry, err := s.issue(ctx)
 	if err != nil {
