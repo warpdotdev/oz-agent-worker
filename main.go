@@ -74,16 +74,17 @@ func main() {
 	// Set up the metrics pipeline before constructing the worker so that early
 	// reconnect attempts in Run() are observed. Failures here are
 	// non-fatal: the worker must continue even if metrics export breaks.
-	metricsShutdown, err := metrics.Init(ctx, metrics.Config{
+	metricsShutdown, tracingHandle, err := metrics.Init(ctx, metrics.Config{
 		WorkerID: workerConfig.WorkerID,
 		Backend:  workerConfig.BackendType,
 		Version:  Version,
 	})
 	if err != nil {
-		log.Errorf(ctx, "Failed to initialize metrics export: %v (continuing without metrics)", err)
+		log.Errorf(ctx, "Failed to initialize telemetry export: %v (continuing)", err)
 	}
 	metrics.SetMaxConcurrent(workerConfig.MaxConcurrentTasks)
 	metrics.SetWorkerInfo(Version, workerConfig.BackendType, workerConfig.WorkerID)
+	workerConfig.Tracing = tracingHandle
 
 	w, err := worker.New(ctx, workerConfig)
 	if err != nil {

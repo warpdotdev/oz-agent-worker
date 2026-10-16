@@ -12,7 +12,6 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/sdk/resource"
 	collector "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
@@ -45,12 +44,12 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", operatorCollector.URL+"/v1/traces")
 	previous := otel.GetTracerProvider()
-	shutdown, err := tracing.InitOperator(t.Context(), resource.Empty())
+	handle, err := tracing.New(t.Context(), "worker", "kubernetes", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer otel.SetTracerProvider(previous)
-	defer func() { _ = shutdown(t.Context()) }()
+	defer func() { _ = handle.Shutdown(t.Context()) }()
 
 	release := make(chan struct{})
 	blockedCollector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -70,7 +69,7 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	})
 	backend := &KubernetesBackend{clientset: client, config: KubernetesBackendConfig{Namespace: "agents", SetupCommand: "setup"}}
 	w := &Worker{
-		ctx: t.Context(), backend: backend, config: Config{BackendType: "kubernetes"},
+		ctx: t.Context(), backend: backend, config: Config{BackendType: "kubernetes", Tracing: handle},
 		activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8),
 	}
 	for _, run := range []string{"alpha", "beta"} {

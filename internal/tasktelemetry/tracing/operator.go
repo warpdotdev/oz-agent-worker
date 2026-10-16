@@ -2,35 +2,56 @@ package tracing
 
 import (
 	"context"
+	"os"
+	"strings"
 	"sync/atomic"
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-type operatorPipeline struct {
+type Handle struct {
 	processor sdktrace.SpanProcessor
 	resource  *resource.Resource
+	provider  *sdktrace.TracerProvider
 }
 
-var operator atomic.Pointer[operatorPipeline]
-
-func InitOperator(ctx context.Context, res *resource.Resource) (func(context.Context) error, error) {
+func New(ctx context.Context, workerID, backend, version string) (*Handle, error) {
+	attrs := []attribute.KeyValue{
+		attribute.String("service.name", "oz-agent-worker"),
+		attribute.String("worker.id", workerID),
+		attribute.String("worker.backend", backend),
+	}
+	if version != "" {
+		attrs = append(attrs, attribute.String("service.version", version))
+	}
+	h := &Handle{resource: resource.NewSchemaless(attrs...)}
+	if !shouldInitTraces() {
+		return h, nil
+	}
 	exporter, err := autoexport.NewSpanExporter(ctx)
 	if err != nil {
-		return nil, err
+		return h, err
 	}
-	processor := sdktrace.NewBatchSpanProcessor(exporter)
-	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(processor), sdktrace.WithResource(res))
-	pipeline := &operatorPipeline{processor: processor, resource: res}
-	operator.Store(pipeline)
-	otel.SetTracerProvider(provider)
-	return func(ctx context.Context) error {
-		operator.CompareAndSwap(pipeline, nil)
-		return provider.Shutdown(ctx)
-	}, nil
+	h.processor = sdktrace.NewBatchSpanProcessor(exporter)
+	h.provider = sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(h.processor), sdktrace.WithResource(h.resource))
+	otel.SetTracerProvider(h.provider)
+	return h, nil
+}
+
+func shouldInitTraces() bool {
+	exporter := strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
+	return exporter != "" && !strings.EqualFold(exporter, "none")
+}
+
+func (h *Handle) Shutdown(ctx context.Context) error {
+	if h == nil || h.provider == nil {
+		return nil
+	}
+	return h.provider.Shutdown(ctx)
 }
 
 // Each task borrows the operator processor, but only the process owns its shutdown.

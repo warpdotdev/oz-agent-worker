@@ -14,17 +14,28 @@ import (
 const ExportTimeout = 5 * time.Second
 
 func Endpoint(raw, signal string) (string, error) {
-	endpoint, err := url.Parse(raw)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+	endpoint, err := parseEndpoint(raw)
+	if err != nil {
 		return "", errors.New("invalid task " + signal + " collector endpoint")
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/" + signal
-	return endpoint.String(), nil
+	return signalEndpoint(endpoint, signal), nil
+}
+
+func signalEndpoint(endpoint *url.URL, signal string) string {
+	target := *endpoint
+	target.Path = strings.TrimRight(target.Path, "/") + "/v1/" + signal
+	return target.String()
+}
+func parseEndpoint(raw string) (*url.URL, error) {
+	endpoint, err := url.Parse(raw)
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return nil, errors.New("invalid task telemetry endpoint")
+	}
+	return endpoint, nil
 }
 
 func ValidateIdentityEndpoint(raw string) error {
-	server, err := url.Parse(raw)
-	if err != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") || server.User != nil || server.RawQuery != "" || server.Fragment != "" {
+	if _, err := parseEndpoint(raw); err != nil {
 		return errors.New("invalid task identity endpoint")
 	}
 	return nil

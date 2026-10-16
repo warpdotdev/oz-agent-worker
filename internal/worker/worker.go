@@ -61,6 +61,7 @@ type Config struct {
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
 	CollectTaskLogs         bool
+	Tracing                 *tracing.Handle
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -621,7 +622,7 @@ func (w *Worker) rememberCompletedLocked(key taskExecution, cancellationAccepted
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
-	taskCtx, session, err := tracing.Start(w.ctx, w.config.ServerRootURL, w.config.WorkerID, w.config.BackendType, assignment, receivedAt)
+	taskCtx, session, err := w.config.Tracing.Start(w.ctx, w.config.ServerRootURL, assignment, receivedAt)
 	if err != nil {
 		log.Warnf(w.ctx, "Task trace reporting unavailable for task %s: %v", assignment.TaskID, err)
 	}

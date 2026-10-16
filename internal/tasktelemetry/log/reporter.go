@@ -2,7 +2,6 @@ package tasklogs
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,7 +10,6 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -40,35 +38,17 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	if assignment == nil || assignment.TelemetryCollection == nil || !assignment.TelemetryCollection.LoggingEnabled {
 		return nil, nil
 	}
-	config := assignment.TelemetryCollection
-	endpoint, err := otlp.Endpoint(config.Endpoint, "logs")
+	config, err := otlp.NewExportConfig(context.WithoutCancel(parent), serverRootURL, assignment)
 	if err != nil {
-		return nil, errors.New("invalid task log collector endpoint")
-	}
-	if err := otlp.ValidateIdentityEndpoint(serverRootURL); err != nil {
 		return nil, err
-	}
-	if assignment.EnvVars["WARP_API_KEY"] == "" || assignment.EnvVars["WARP_WORKLOAD_TOKEN"] == "" {
-		return nil, errors.New("task log reporting requires task API key and workload token")
 	}
 	ctx, cancel := context.WithCancel(parent)
 	r := &Reporter{ctx: ctx, cancel: cancel}
 	r.AddEnv(assignment.EnvVars)
-	client := otlp.Client(ctx, otlp.NewLogTokenSource(ctx, serverRootURL, assignment.TaskID, assignment.EnvVars))
-	exporter, err := otlploghttp.New(ctx,
-		otlploghttp.WithEndpointURL(endpoint),
-		otlploghttp.WithHTTPClient(client),
-		otlploghttp.WithHeaders(map[string]string{}),
-		otlploghttp.WithRetry(otlploghttp.RetryConfig{
-			Enabled:         true,
-			InitialInterval: 500 * time.Millisecond,
-			MaxInterval:     time.Second,
-			MaxElapsedTime:  exportTimeout,
-		}),
-	)
+	exporter, err := config.LogExporter()
 	if err != nil {
 		cancel()
-		return nil, errors.New("could not initialize task log exporter")
+		return nil, err
 	}
 	r.provider = sdklog.NewLoggerProvider(
 		sdklog.WithResource(resource.NewSchemaless(
@@ -78,7 +58,7 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 			attribute.String("run_id", assignment.TaskID),
 			attribute.String("execution_id", assignment.ExecutionID),
 		)),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(privateExporter{Exporter: exporter},
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter,
 			sdklog.WithExportInterval(5*time.Second),
 			sdklog.WithMaxQueueSize(1024),
 			sdklog.WithExportMaxBatchSize(128),
@@ -89,18 +69,6 @@ func New(parent context.Context, serverRootURL, workerID, backend string, assign
 	return r, nil
 }
 
-type privateExporter struct {
-	sdklog.Exporter
-}
-
-func (e privateExporter) Export(ctx context.Context, records []sdklog.Record) error {
-	// A collector can reflect Authorization: Bearer <token> in its response body.
-	// OTel reports export errors globally, bypassing this task's credential redaction.
-	if err := e.Exporter.Export(ctx, records); err != nil {
-		return errors.New("task log export failed")
-	}
-	return nil
-}
 
 func (r *Reporter) Context() context.Context {
 	return r.ctx

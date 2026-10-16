@@ -57,19 +57,20 @@ func (p *flushProcessor) ForceFlush(ctx context.Context) error {
 	return p.SpanProcessor.ForceFlush(ctx)
 }
 
-func installOperator(t *testing.T, exporter sdktrace.SpanExporter) (*flushProcessor, func(context.Context) error) {
+func installOperator(t *testing.T, exporter sdktrace.SpanExporter) (*Handle, *flushProcessor) {
 	t.Helper()
 	processor := &flushProcessor{SpanProcessor: sdktrace.NewBatchSpanProcessor(exporter)}
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(processor))
-	previous := operator.Swap(&operatorPipeline{processor: processor, resource: resource.NewSchemaless(
+	handle := &Handle{processor: processor, provider: provider, resource: resource.NewSchemaless(
+		attribute.String("service.name", "oz-agent-worker"),
+		attribute.String("worker.id", "worker"),
+		attribute.String("worker.backend", "direct"),
 		attribute.String("service.version", "test-version"),
-		attribute.String("operator.private", "local-only"),
-	)})
+	)}
 	t.Cleanup(func() {
-		operator.Store(previous)
 		_ = provider.Shutdown(context.Background())
 	})
-	return processor, provider.Shutdown
+	return handle, processor
 }
 
 type collectorServer struct {
@@ -109,9 +110,9 @@ func traceAssignment(endpoint, run string) *types.TaskAssignmentMessage {
 	}
 }
 
-func startSession(t *testing.T, assignment *types.TaskAssignmentMessage) (context.Context, *Session) {
+func startSession(t *testing.T, handle *Handle, assignment *types.TaskAssignmentMessage) (context.Context, *Session) {
 	t.Helper()
-	ctx, session, err := Start(t.Context(), "", "worker", "direct", assignment, time.Now())
+	ctx, session, err := handle.Start(t.Context(), "", assignment, time.Now())
 	if err != nil || session == nil {
 		t.Fatalf("start task tracing: %v", err)
 	}
@@ -138,10 +139,10 @@ func (c *collectorServer) spans() []*tracepb.Span {
 
 func TestTaskTraceDualExport(t *testing.T) {
 	exporter := &spanExporter{}
-	processor, shutdown := installOperator(t, exporter)
+	handle, processor := installOperator(t, exporter)
 	warp := newCollector(t, "token-run")
 	for range 2 {
-		ctx, session := startSession(t, traceAssignment(warp.server.URL, "run"))
+		ctx, session := startSession(t, handle, traceAssignment(warp.server.URL, "run"))
 		StartPhase(ctx, "execution").End(nil)
 		session.End("succeeded", nil)
 		if err := session.ForceFlush(t.Context()); err != nil {
@@ -161,6 +162,20 @@ func TestTaskTraceDualExport(t *testing.T) {
 	if len(spans) != 4 || len(exporter.spans) != 4 {
 		t.Fatalf("dual export counts: warp=%d operator=%d", len(spans), len(exporter.spans))
 	}
+	for _, payload := range warp.payloads {
+		for _, res := range payload.ResourceSpans {
+			local := exporter.spans[0].Resource().Set()
+			if len(res.Resource.Attributes) != local.Len() {
+				t.Fatal("destinations received different resource attributes")
+			}
+			for key, value := range attributes(res.Resource.Attributes) {
+				localValue, ok := local.Value(attribute.Key(key))
+				if !ok || localValue.AsString() != value {
+					t.Fatal("destinations received different resource attributes")
+				}
+			}
+		}
+	}
 	for i, span := range spans {
 		local := exporter.spans[i]
 		sc := local.SpanContext()
@@ -173,20 +188,26 @@ func TestTaskTraceDualExport(t *testing.T) {
 			t.Fatal("phase was not attached to the task root")
 		}
 	}
-	if err := shutdown(t.Context()); err != nil || exporter.shutdowns.Load() != 1 {
+	if err := handle.Shutdown(t.Context()); err != nil || exporter.shutdowns.Load() != 1 {
 		t.Fatalf("process shutdown did not close exporter once: %v", err)
 	}
 }
 
 func TestTaskTraceConcurrentIsolation(t *testing.T) {
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "operator.secret=operator-only")
-	installOperator(t, &spanExporter{})
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	handle, err := New(t.Context(), "worker", "direct", "test-version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.processor = sdktrace.NewBatchSpanProcessor(&spanExporter{})
+	t.Cleanup(func() { _ = handle.processor.Shutdown(context.Background()) })
 	var collectors []*collectorServer
 	var wg sync.WaitGroup
 	for _, run := range []string{"alpha", "beta"} {
 		c := newCollector(t, "token-"+run)
 		collectors = append(collectors, c)
-		ctx, session := startSession(t, traceAssignment(c.server.URL, run))
+		ctx, session := startSession(t, handle, traceAssignment(c.server.URL, run))
 		wg.Go(func() {
 			for range 64 {
 				StartPhase(context.WithoutCancel(ctx), "execution").End(nil)
@@ -206,7 +227,7 @@ func TestTaskTraceConcurrentIsolation(t *testing.T) {
 			for _, res := range payload.ResourceSpans {
 				attrs := attributes(res.Resource.Attributes)
 				if attrs["run_id"] != run || attrs["execution_id"] != "execution-"+run || attrs["operator.private"] != "" || attrs["operator.secret"] != "" {
-					t.Error("task resource or operator metadata crossed the Warp boundary")
+					t.Errorf("task resources = %v; want run_id=%q execution_id=%q without operator metadata", attrs, run, "execution-"+run)
 				}
 			}
 		}
@@ -292,7 +313,7 @@ func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 			if tc.refresh {
 				a.EnvVars = map[string]string{"WARP_API_KEY": "task-api-key", "WARP_WORKLOAD_TOKEN": "task-workload-token"}
 			}
-			ctx, session, err := Start(t.Context(), server.URL, "worker", "direct", a, time.Now())
+			ctx, session, err := (*Handle)(nil).Start(t.Context(), server.URL, a, time.Now())
 			if err != nil || session == nil {
 				t.Fatalf("trace auth initialization: %v", err)
 			}
@@ -335,17 +356,19 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			defer close(release)
 			good := newCollector(t, "token-run")
 			var op *spanExporter
+			var handle *Handle
 			warpEndpoint := good.server.URL
 			if blocked == "warp" {
 				op = &spanExporter{}
-				installOperator(t, op)
+				handle, _ = installOperator(t, op)
 				warpEndpoint = stalled.URL
 			} else {
 				t.Setenv("OTEL_TRACES_EXPORTER", "otlp")
 				t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")
 				t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", stalled.URL)
 				prev := otel.GetTracerProvider()
-				shutdown, err := InitOperator(t.Context(), resource.Empty())
+				var err error
+				handle, err = New(t.Context(), "worker", "direct", "test-version")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -353,10 +376,10 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 				defer func() {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 					defer cancel()
-					_ = shutdown(ctx)
+					_ = handle.Shutdown(ctx)
 				}()
 			}
-			ctx, session := startSession(t, traceAssignment(warpEndpoint, "run"))
+			ctx, session := startSession(t, handle, traceAssignment(warpEndpoint, "run"))
 			for range 64 {
 				StartPhase(ctx, "execution").End(nil)
 			}

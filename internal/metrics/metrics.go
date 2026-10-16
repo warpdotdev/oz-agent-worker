@@ -32,7 +32,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -202,8 +201,9 @@ func init() {
 }
 
 // Init wires up the metrics pipeline based on the OTEL_METRICS_EXPORTER
-// environment variable. When the variable is set to "none", Init is a no-op
-// and returns a no-op shutdown function. Otherwise (including the unset
+// environment variable. Setting it to "none" disables metrics only.
+// Tracing initializes independently and its process-owned handle is returned
+// for injection into the worker. Otherwise (including the unset
 // case) it constructs an SDK MeterProvider with a worker-scoped resource
 // and replaces the package instruments with SDK-backed versions, delegating
 // exporter selection to autoexport. Following autoexport's convention, an
@@ -213,26 +213,16 @@ func init() {
 //
 // Init must only be called once. The returned shutdown function flushes and
 // stops the exporter; it is safe to call after Init returns an error.
-func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error) {
-	noop := func(context.Context) error { return nil }
+func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, tracingHandle *tracing.Handle, err error) {
 	var shutdowns []func(context.Context) error
 	var initErr error
-	var res *resource.Resource
-	getResource := func() (*resource.Resource, error) {
-		if res != nil {
-			return res, nil
-		}
-		var err error
-		res, err = newResource(ctx, cfg)
-		return res, err
-	}
 
 	if os.Getenv("OTEL_METRICS_EXPORTER") != "none" {
 		reader, err := autoexport.NewMetricReader(ctx)
 		if err != nil {
 			initErr = errors.Join(initErr, err)
 		} else {
-			res, err := getResource()
+			res, err := newResource(ctx, cfg)
 			if err != nil {
 				initErr = errors.Join(initErr, errors.Join(err, reader.Shutdown(ctx)))
 			} else {
@@ -254,35 +244,16 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		}
 	}
 
-	if shouldInitTraces() {
-		res, err := getResource()
-		if err != nil {
-			initErr = errors.Join(initErr, err)
-		} else {
-			shutdown, err := tracing.InitOperator(ctx, res)
-			if err != nil {
-				initErr = errors.Join(initErr, err)
-			} else {
-				shutdowns = append(shutdowns, shutdown)
-			}
-		}
-	}
-
-	if len(shutdowns) == 0 {
-		return noop, initErr
-	}
+	tracingHandle, err = tracing.New(ctx, cfg.WorkerID, cfg.Backend, cfg.Version)
+	initErr = errors.Join(initErr, err)
+	shutdowns = append(shutdowns, tracingHandle.Shutdown)
 	return func(ctx context.Context) error {
 		var err error
 		for i := len(shutdowns) - 1; i >= 0; i-- {
 			err = errors.Join(err, shutdowns[i](ctx))
 		}
 		return err
-	}, initErr
-}
-
-func shouldInitTraces() bool {
-	exporter := strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
-	return exporter != "" && !strings.EqualFold(exporter, "none")
+	}, tracingHandle, initErr
 }
 
 // primeInstruments records a zero observation against every known

@@ -222,7 +222,7 @@ func TestRecordTaskRejectedTagsReason(t *testing.T) {
 // installing the SDK MeterProvider.
 func TestInitNoneIsDisabled(t *testing.T) {
 	t.Setenv("OTEL_METRICS_EXPORTER", "none")
-	shutdown, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
+	shutdown, _, err := Init(context.Background(), Config{WorkerID: "w1", Backend: "docker"})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -334,22 +334,6 @@ func TestPrimeInstrumentsExposesAllSeriesAtStartup(t *testing.T) {
 	}
 }
 
-func TestShouldInitTracesRequiresExporter(t *testing.T) {
-	t.Setenv("OTEL_TRACES_EXPORTER", "")
-	if shouldInitTraces() {
-		t.Fatal("expected empty OTEL_TRACES_EXPORTER to disable traces")
-	}
-
-	t.Setenv("OTEL_TRACES_EXPORTER", " none ")
-	if shouldInitTraces() {
-		t.Fatal("expected OTEL_TRACES_EXPORTER=none to disable traces")
-	}
-
-	t.Setenv("OTEL_TRACES_EXPORTER", "otlp")
-	if !shouldInitTraces() {
-		t.Fatal("expected non-none OTEL_TRACES_EXPORTER to enable traces")
-	}
-}
 
 func TestNewResourceIncludesWorkerAttrs(t *testing.T) {
 	res, err := newResource(context.Background(), Config{
