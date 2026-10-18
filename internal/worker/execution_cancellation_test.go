@@ -130,9 +130,9 @@ func awaitCancellationAccepted(t *testing.T, w *Worker, id string) {
 func TestExecutionScopedCancellation(t *testing.T) {
 	t.Run("delayed predecessor cancellation leaves successor running and is idempotent", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
-		w.handleTaskAssignment(executionAssignment("old"))
+		w.handleTaskAssignment(executionAssignment("old"), time.Now())
 		awaitExecutionStarted(t, backend, "old")
-		w.handleTaskAssignment(executionAssignment("new"))
+		w.handleTaskAssignment(executionAssignment("new"), time.Now())
 		awaitExecutionStarted(t, backend, "new")
 		request := &types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"}
 		w.handleTaskCancellation(request)
@@ -147,7 +147,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 			t.Fatalf("cancelled wrong execution: %+v", params)
 		}
 		w.handleTaskCancellation(request)
-		w.handleTaskAssignment(executionAssignment("old"))
+		w.handleTaskAssignment(executionAssignment("old"), time.Now())
 		w.cancellationWG.Wait()
 		for _, msg := range drainMessages(t, w.outbound.messages) {
 			if msg.Type != types.MessageTypeTaskClaimed && msg.Type != types.MessageTypeTaskCompleted {
@@ -167,7 +167,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 	t.Run("old completion cannot remove successor and remains cancellable", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		for _, id := range []string{"old", "new"} {
-			w.handleTaskAssignment(executionAssignment(id))
+			w.handleTaskAssignment(executionAssignment(id), time.Now())
 			awaitExecutionStarted(t, backend, id)
 		}
 		close(backend.release["old"])
@@ -189,11 +189,11 @@ func TestExecutionScopedCancellation(t *testing.T) {
 
 	t.Run("unknown execution and duplicate assignment are no-ops", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
-		w.handleTaskAssignment(executionAssignment("new"))
+		w.handleTaskAssignment(executionAssignment("new"), time.Now())
 		awaitExecutionStarted(t, backend, "new")
 		drainMessages(t, w.outbound.messages)
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "unknown"})
-		w.handleTaskAssignment(executionAssignment("new"))
+		w.handleTaskAssignment(executionAssignment("new"), time.Now())
 		if len(w.outbound.messages) != 0 || len(backend.cancelled) != 0 || len(backend.started) != 0 {
 			t.Fatal("unknown cancellation or duplicate assignment produced effects")
 		}
@@ -202,7 +202,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 	t.Run("legacy task-only cancellation cancels all matching executions", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		for _, id := range []string{"old", "new"} {
-			w.handleTaskAssignment(executionAssignment(id))
+			w.handleTaskAssignment(executionAssignment(id), time.Now())
 			awaitExecutionStarted(t, backend, id)
 		}
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run"})
@@ -221,7 +221,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		backend.cancelGate = make(chan struct{})
 		backend.failCancel.Store(true)
-		w.handleTaskAssignment(executionAssignment("old"))
+		w.handleTaskAssignment(executionAssignment("old"), time.Now())
 		awaitExecutionStarted(t, backend, "old")
 		request := &types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"}
 		w.handleTaskCancellation(request)
@@ -240,7 +240,7 @@ func TestExecutionScopedCancellation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("failed cancellation did not retry locally")
 		}
-		w.handleTaskAssignment(executionAssignment("new"))
+		w.handleTaskAssignment(executionAssignment("new"), time.Now())
 		awaitExecutionStarted(t, backend, "new")
 		backend.failCancel.Store(false)
 		awaitCancellationAccepted(t, w, "old")
@@ -300,7 +300,7 @@ func TestCancellationStopsOnShutdown(t *testing.T) {
 		defer stop()
 		w.ctx = ctx
 		backend.cancelGate = make(chan struct{})
-		w.handleTaskAssignment(executionAssignment("old"))
+		w.handleTaskAssignment(executionAssignment("old"), time.Now())
 		awaitExecutionStarted(t, backend, "old")
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
 		select {
@@ -317,7 +317,7 @@ func TestCancellationStopsOnShutdown(t *testing.T) {
 	t.Run("failed request", func(t *testing.T) {
 		w, backend := newExecutionTestWorker(t)
 		backend.failCancel.Store(true)
-		w.handleTaskAssignment(executionAssignment("old"))
+		w.handleTaskAssignment(executionAssignment("old"), time.Now())
 		awaitExecutionStarted(t, backend, "old")
 		w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run", ExecutionID: "old"})
 		select {

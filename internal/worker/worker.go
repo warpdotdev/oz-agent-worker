@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -13,7 +14,8 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -60,6 +62,7 @@ type Config struct {
 	// SessionSharingServerURL, when non-empty, is forwarded to the oz CLI via --session-sharing-server-url.
 	SessionSharingServerURL string
 	CollectTaskLogs         bool
+	Tracing                 *tracing.Handle
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -148,6 +151,8 @@ const (
 	taskCancellationSourceShutdown taskCancellationSource = "shutdown"
 )
 
+var errObservationInterrupted = errors.New("worker observation interrupted")
+
 type activeTask struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -162,6 +167,9 @@ type activeTask struct {
 	done             chan struct{}
 	stopCancellation context.CancelFunc
 	logs             *tasklogs.Reporter
+	tracing          *tracing.Session
+	observationCtx   context.Context
+	stopObservation  context.CancelCauseFunc
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -415,13 +423,14 @@ func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
 		_, message, err := conn.ReadMessage()
+		receivedAt := time.Now()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return fmt.Errorf("WebSocket read failed: %w", err)
 		}
-		w.handleMessage(message)
+		w.handleMessage(message, receivedAt)
 	}
 }
 
@@ -472,7 +481,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error 
 	}
 }
 
-func (w *Worker) handleMessage(message []byte) {
+func (w *Worker) handleMessage(message []byte, receivedAt time.Time) {
 
 	var msg types.WebSocketMessage
 	if err := json.Unmarshal(message, &msg); err != nil {
@@ -488,7 +497,11 @@ func (w *Worker) handleMessage(message []byte) {
 			log.Errorf(w.ctx, "Failed to unmarshal task assignment: %v", err)
 			return
 		}
-		w.handleTaskAssignment(&assignment)
+		if assignment.TaskID == "" || assignment.Task == nil {
+			log.Errorf(w.ctx, "Invalid task assignment")
+			return
+		}
+		w.handleTaskAssignment(&assignment, receivedAt)
 
 	case types.MessageTypeTaskCancellation:
 		var cancellation types.TaskCancellationMessage
@@ -611,11 +624,24 @@ func (w *Worker) rememberCompletedLocked(key taskExecution, cancellationAccepted
 	w.completedTasks[key] = cancellationAccepted
 }
 
-func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
+func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
-	receivedAt := time.Now()
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
-	taskCtx, span := metrics.StartTaskSpan(w.ctx, assignment.TaskID, assignment.Task.Title)
+	taskCtx, session, err := w.config.Tracing.Start(w.ctx, w.config.ServerRootURL, assignment, receivedAt)
+	if err != nil {
+		log.Warnf(w.ctx, "Task trace reporting unavailable for task %s: %v", assignment.TaskID, err)
+	}
+	_, claim := tracing.Tracer(taskCtx).Start(taskCtx, "self_hosted_worker.claim",
+		trace.WithAttributes(attribute.String("phase", "claim")))
+	handedOff := false
+	outcome := "rejected"
+	defer func() {
+		claim.End()
+		if !handedOff {
+			session.End(outcome, nil)
+			go session.Shutdown(context.Background())
+		}
+	}()
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
 		attribute.String("worker.id", w.config.WorkerID),
 		attribute.String("worker.backend", w.config.BackendType),
@@ -627,7 +653,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	_, completed := w.completedTasks[key]
 	if active || completed {
 		w.tasksMutex.Unlock()
-		span.End()
+		outcome = "duplicate"
 		return
 	}
 	rejectionReason := ""
@@ -644,7 +670,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	}
 	w.tasksMutex.Unlock()
 	if rejectionReason != "" {
-		w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, rejectionReason, rejectionMetric)
+		w.rejectTaskAssignment(taskCtx, assignment.TaskID, rejectionReason, rejectionMetric)
 		return
 	}
 
@@ -657,7 +683,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 			}
 			w.tasksMutex.Unlock()
 			w.taskWG.Done()
-			w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
+			w.rejectTaskAssignment(taskCtx, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
 			return
 		}
 	}
@@ -679,7 +705,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 			w.taskSemaphore.Release(1)
 		}
 		w.taskWG.Done()
-		w.rejectTaskAssignment(taskCtx, span, assignment.TaskID, "worker is shutting down", metrics.RejectReasonShuttingDown)
+		w.rejectTaskAssignment(taskCtx, assignment.TaskID, "worker is shutting down", metrics.RejectReasonShuttingDown)
 		return
 	}
 	_, active = w.activeTasks[key]
@@ -687,18 +713,22 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	if active || completed {
 		w.tasksMutex.Unlock()
 		taskCancel()
-		span.End()
+		outcome = "duplicate"
 		if w.taskSemaphore != nil {
 			w.taskSemaphore.Release(1)
 		}
 		w.taskWG.Done()
 		return
 	}
+	observationCtx, stopObservation := context.WithCancelCause(taskCtx)
 	w.activeTasks[key] = activeTask{
-		ctx:         taskCtx,
-		cancel:      taskCancel,
-		executionID: assignment.ExecutionID,
-		done:        make(chan struct{}),
+		ctx:             taskCtx,
+		cancel:          taskCancel,
+		executionID:     assignment.ExecutionID,
+		done:            make(chan struct{}),
+		tracing:         session,
+		observationCtx:  observationCtx,
+		stopObservation: stopObservation,
 	}
 	w.tasksMutex.Unlock()
 
@@ -710,19 +740,20 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage) {
 	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
+	claim.End()
+	handedOff = true
 	go func() {
 		defer w.taskWG.Done()
-		w.executeTask(taskCtx, taskCancel, span, assignment, receivedAt)
+		w.executeTask(taskCtx, taskCancel, session, assignment, receivedAt)
 	}()
 }
 
-func (w *Worker) rejectTaskAssignment(ctx context.Context, span trace.Span, taskID, reason, metricReason string) {
+func (w *Worker) rejectTaskAssignment(ctx context.Context, taskID, reason, metricReason string) {
 	log.Warnf(w.ctx, "Rejecting task %s: %s", taskID, reason)
 	metrics.RecordTaskRejected(metricReason)
 	metrics.AddTaskEvent(ctx, "task.rejected",
 		attribute.String("reason", metricReason),
 	)
-	span.End()
 	if err := w.sendTaskRejected(taskID, reason); err != nil {
 		log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 	}
@@ -881,10 +912,18 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 	return fallback
 }
 
-func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc, span trace.Span, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
+func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc, session *tracing.Session, assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
+	interrupted := false
+	backendCtx := ctx
+	w.tasksMutex.Lock()
+	if task, ok := w.activeTasks[key]; ok && task.observationCtx != nil {
+		backendCtx = task.observationCtx
+	}
+	w.tasksMutex.Unlock()
+	span := trace.SpanFromContext(ctx)
 	// One-shot-capable backends always wait for a terminal outcome. Register
 	// this first so the task bookkeeping defer below runs before completion is
 	// signalled.
@@ -892,17 +931,24 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 	defer func() {
 		taskCancel()
-		span.End()
+		if interrupted {
+			session.End("interrupted", nil)
+		} else {
+			session.End(string(result), nil)
+		}
 		w.tasksMutex.Lock()
 		if task, tracked := w.activeTasks[key]; tracked {
 			if task.done != nil {
 				close(task.done)
 			}
 			if !task.spawned && task.cancellationSource != taskCancellationSourceUser {
-				w.rememberCompletedLocked(key, false)
+				if !interrupted {
+					w.rememberCompletedLocked(key, false)
+				}
 				delete(w.activeTasks, key)
 			} else {
 				task.logs = nil
+				task.tracing = nil
 				w.activeTasks[key] = task
 			}
 		}
@@ -913,7 +959,10 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		}
 
 		metrics.DecTasksActive()
-		metrics.RecordTaskCompleted(result, time.Since(start))
+		if !interrupted {
+			metrics.RecordTaskCompleted(result, time.Since(start))
+		}
+		session.Shutdown(context.Background())
 	}()
 
 	taskID := assignment.TaskID
@@ -932,6 +981,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		if reporter != nil {
 			params.Logs = reporter
 			ctx = log.WithOutput(ctx, reporter.ZerologWriter(ctx))
+			backendCtx = log.WithOutput(backendCtx, reporter.ZerologWriter(backendCtx))
 			if params.SetupEvents == nil {
 				params.SetupEvents = &setupEventReporter{}
 			}
@@ -955,11 +1005,14 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 	metrics.AddTaskEvent(ctx, "backend.started",
 		attribute.String("backend", w.config.BackendType),
-		attribute.String("docker.image", params.DockerImage),
 	)
 
-	executeResult := w.backend.ExecuteTask(ctx, params)
+	executeResult := w.backend.ExecuteTask(backendCtx, params)
 	if executeResult.Error != nil {
+		if errors.Is(context.Cause(backendCtx), errObservationInterrupted) {
+			interrupted = true
+			return
+		}
 		err := executeResult.Error
 		if ctx.Err() == context.Canceled && w.cancellationSource(key) == taskCancellationSourceUser {
 			result = metrics.TaskResultCancelled
@@ -991,6 +1044,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			attribute.String("failure.reason", string(metricsReason)),
 			attribute.String("error.message", err.Error()),
 		)
+		span.SetAttributes(attribute.String("failure.reason", string(metricsReason)), attribute.Int("exit_code", exitCode))
 		span.RecordError(err)
 		span.SetStatus(codes.Error, string(metricsReason))
 		log.Errorf(ctx, "Task execution failed: taskID=%s, error=%v", taskID, err)
@@ -1189,14 +1243,25 @@ func (w *Worker) shutdownTasks() {
 		return
 	}
 	w.shuttingDown = true
+	var observersDone []chan struct{}
 	for _, task := range w.activeTasks {
 		if task.stopCancellation != nil {
 			task.stopCancellation()
 		}
+		if preserveActiveTasks && task.stopObservation != nil {
+			if task.done != nil {
+				observersDone = append(observersDone, task.done)
+			}
+			task.stopObservation(errObservationInterrupted)
+		}
 	}
 	activeTaskCount := len(w.activeTasks)
 	var reporters []*tasklogs.Reporter
+	var sessions []*tracing.Session
 	for _, task := range w.activeTasks {
+		if task.tracing != nil {
+			sessions = append(sessions, task.tracing)
+		}
 		if task.logs != nil {
 			reporters = append(reporters, task.logs)
 		}
@@ -1220,10 +1285,16 @@ func (w *Worker) shutdownTasks() {
 	}
 	w.tasksMutex.Unlock()
 
-	if activeTaskCount > 0 && !preserveActiveTasks {
+	if activeTaskCount > 0 {
 		tasksDone := make(chan struct{})
 		go func() {
-			w.taskWG.Wait()
+			if preserveActiveTasks {
+				for _, done := range observersDone {
+					<-done
+				}
+			} else {
+				w.taskWG.Wait()
+			}
 			close(tasksDone)
 		}()
 		select {
@@ -1235,6 +1306,9 @@ func (w *Worker) shutdownTasks() {
 	flushCtx, cancel := context.WithTimeout(context.Background(), tasklogs.ShutdownTimeout)
 	defer cancel()
 	var flushWG sync.WaitGroup
+	for _, session := range sessions {
+		flushWG.Go(func() { session.Shutdown(flushCtx) })
+	}
 	for _, reporter := range reporters {
 		flushWG.Go(func() { reporter.Shutdown(flushCtx) })
 	}

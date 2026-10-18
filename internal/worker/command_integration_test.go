@@ -83,7 +83,7 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 	outFile := filepath.Join(t.TempDir(), "payload.json")
 	w := newCommandWorker(t, "cat > "+outFile)
 
-	w.handleTaskAssignment(commandTaskAssignment())
+	w.handleTaskAssignment(commandTaskAssignment(), time.Now())
 
 	// The dispatch script writes the captured payload, then executeTask returns
 	// and the deferred cleanup keeps the entry in activeTasks marked spawned.
@@ -139,7 +139,7 @@ func TestIntegrationCommandBackendDispatchSuppressesTerminalMessage(t *testing.T
 func TestIntegrationCommandBackendDispatchFailureReportsTaskFailed(t *testing.T) {
 	w := newCommandWorker(t, "exit 1")
 
-	w.handleTaskAssignment(commandTaskAssignment())
+	w.handleTaskAssignment(commandTaskAssignment(), time.Now())
 
 	waitFor(t, 5*time.Second, func() bool { return w.activeTaskCount() == 0 })
 

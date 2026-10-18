@@ -19,7 +19,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -121,7 +124,7 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 }
 
 // ExecuteTask runs the agent in a Docker container.
-func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
 	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(b.config.Env)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
@@ -136,7 +139,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
-	if err := b.prepareImage(ctx, imageName, authStr, params.SetupEvents); err != nil {
+	_, imagePhase := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.image_prepare",
+		trace.WithAttributes(attribute.String("phase", "image_prepare")))
+	imageErr := b.prepareImage(ctx, imageName, authStr, params.SetupEvents)
+	tracing.RecordError(imagePhase, imageErr)
+	imagePhase.End()
+	if err := imageErr; err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
 
@@ -181,14 +189,18 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 		Resources: dockerResourcesForShape(params.InstanceShape),
 	}
 
-	doneContainerStart := params.SetupEvents.startPhase(ctx, SetupEventContainerStart)
+	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
 	key := taskExecution{params.TaskID, params.ExecutionID}
 	// Transport and server failures cannot prove that the daemon created no container.
 	b.taskContainers.Store(key, "")
+	_, create := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_create",
+		trace.WithAttributes(attribute.String("phase", "container_create")))
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
+	tracing.RecordError(create, err)
+	create.End()
 	if err != nil {
 		if cerrdefs.IsInvalidArgument(err) || cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err) {
 			b.taskContainers.Delete(key)
@@ -203,17 +215,27 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 
 	defer func() {
 		if containerID != "" && !b.config.NoCleanup {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), BackendShutdownTimeout)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
 			defer cleanupCancel()
+			_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
+				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !cerrdefs.IsNotFound(removeErr) {
+				tracing.RecordError(phase, removeErr)
+				phase.End()
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			} else {
+				phase.End()
 				b.taskContainers.Delete(key)
 			}
 		}
 	}()
 
-	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+	_, start := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_start",
+		trace.WithAttributes(attribute.String("phase", "container_start")))
+	_, err = dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
+	tracing.RecordError(start, err)
+	start.End()
+	if err != nil {
 		doneContainerStart(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
 	}
@@ -223,6 +245,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	stopLogs := b.followContainerLogs(ctx, containerID, params.Logs)
 	defer stopLogs()
 
+	_, execution := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.execution",
+		trace.WithAttributes(attribute.String("phase", "execution")))
+	defer func() {
+		tracing.RecordError(execution, result.Error)
+		execution.End()
+	}()
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
 	case err := <-waitResult.Error:

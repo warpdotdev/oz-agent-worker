@@ -2,8 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
+
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -16,25 +21,51 @@ import (
 // init container terminations, and the task container start). Late or
 // repeated watch deliveries therefore do not skew the measurements.
 type kubernetesSetupPhaseTracker struct {
-	reporter *setupEventReporter
-	reported map[string]bool
+	reporter  *setupEventReporter
+	reported  map[string]bool
+	live      map[string]trace.Span
+	execution trace.Span
+}
+
+func taskInitFinished(pod *corev1.Pod) bool {
+	for _, container := range pod.Spec.InitContainers {
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			continue
+		}
+		done := false
+		for _, status := range pod.Status.InitContainerStatuses {
+			if status.Name == container.Name && status.State.Terminated != nil && status.State.Terminated.ExitCode == 0 {
+				done = true
+			}
+		}
+		if !done {
+			return false
+		}
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func newKubernetesSetupPhaseTracker(reporter *setupEventReporter) *kubernetesSetupPhaseTracker {
 	return &kubernetesSetupPhaseTracker{
 		reporter: reporter,
 		reported: make(map[string]bool),
+		live:     make(map[string]trace.Span),
 	}
 }
 
 // observePod inspects a pod status snapshot and reports any newly completed
-// setup phases. It is safe to call repeatedly with successive snapshots and
-// is a no-op when reporting is disabled.
+// setup phases. It is safe to call repeatedly with successive snapshots.
 func (t *kubernetesSetupPhaseTracker) observePod(ctx context.Context, pod *corev1.Pod) {
-	if t == nil || t.reporter == nil || pod == nil {
+	if t == nil || pod == nil {
 		return
 	}
 	t.observeSchedule(ctx, pod)
+	t.observeInitContainers(ctx, pod)
 	t.observeSidecarPrep(ctx, pod)
 	t.observeSetupCommand(ctx, pod)
 	t.observeTaskStart(ctx, pod)
@@ -46,8 +77,50 @@ func (t *kubernetesSetupPhaseTracker) report(ctx context.Context, eventName stri
 	if t.reported[eventName] || start.IsZero() || finish.IsZero() || finish.Before(start) {
 		return
 	}
-	t.reported[eventName] = true
+	t.observeInterval(ctx, eventName, setupTracePhase(eventName), start, finish, setupPhaseError(isError))
 	t.reporter.reportPhase(ctx, eventName, start, finish, isError)
+}
+
+func (t *kubernetesSetupPhaseTracker) start(ctx context.Context, event string, start time.Time) {
+	t.observeInterval(ctx, event, setupTracePhase(event), start, time.Time{}, nil)
+}
+
+func (t *kubernetesSetupPhaseTracker) observeInterval(ctx context.Context, key, phase string, start, finish time.Time, err error, attrs ...attribute.KeyValue) {
+	if t.reported[key] || start.IsZero() || (!finish.IsZero() && finish.Before(start)) {
+		return
+	}
+	if _, exists := t.live[key]; !exists {
+		_, t.live[key] = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker."+phase,
+			trace.WithTimestamp(start), trace.WithAttributes(append(attrs, attribute.String("phase", phase))...))
+	}
+	if !finish.IsZero() {
+		tracing.RecordError(t.live[key], err)
+		t.live[key].End(trace.WithTimestamp(finish))
+		delete(t.live, key)
+		t.reported[key] = true
+	}
+}
+
+func (t *kubernetesSetupPhaseTracker) finish(ctx context.Context, err error) {
+	interrupted := errors.Is(context.Cause(ctx), errObservationInterrupted)
+	spans := make([]trace.Span, 0, len(t.live)+1)
+	for key, span := range t.live {
+		spans = append(spans, span)
+		delete(t.live, key)
+		t.reported[key] = true
+	}
+	if t.execution != nil {
+		spans = append(spans, t.execution)
+		t.execution = nil
+	}
+	for _, span := range spans {
+		if interrupted {
+			span.SetAttributes(attribute.String("outcome", "interrupted"))
+		} else {
+			tracing.RecordError(span, err)
+		}
+		span.End()
+	}
 }
 
 // observeSchedule reports the span from pod creation to a true PodScheduled
@@ -59,11 +132,58 @@ func (t *kubernetesSetupPhaseTracker) observeSchedule(ctx context.Context, pod *
 			return
 		}
 	}
+	if !t.reported[SetupEventPodSchedule] {
+		t.start(ctx, SetupEventPodSchedule, pod.CreationTimestamp.Time)
+	}
+}
+
+// Pod status has no image-pull timestamps. Preparation includes pulling images
+// and other pre-start delays, separately from the init container's runtime.
+func (t *kubernetesSetupPhaseTracker) observeInitContainers(ctx context.Context, pod *corev1.Pod) {
+	var anchor time.Time
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionTrue {
+			anchor = condition.LastTransitionTime.Time
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		var started, finished time.Time
+		var failed bool
+		for _, status := range pod.Status.InitContainerStatuses {
+			if status.Name != container.Name {
+				continue
+			}
+			if status.State.Running != nil {
+				started = status.State.Running.StartedAt.Time
+			} else if status.State.Terminated != nil {
+				started = status.State.Terminated.StartedAt.Time
+				finished = status.State.Terminated.FinishedAt.Time
+				failed = status.State.Terminated.ExitCode != 0
+			}
+		}
+		attrs := []attribute.KeyValue{attribute.String("k8s.container.name", container.Name)}
+		t.observeInterval(ctx, "image_prepare/"+container.Name, "image_prepare", anchor, started, nil, attrs...)
+		if started.IsZero() {
+			return
+		}
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			// Native sidecars stay running while later init containers start.
+			anchor = started
+			continue
+		}
+		if container.Name != kubernetesSetupContainerName && !strings.HasPrefix(container.Name, kubernetesSidecarInitPrefix) {
+			t.observeInterval(ctx, "init_container/"+container.Name, "init_container", started, finished, setupPhaseError(failed), attrs...)
+		}
+		if finished.IsZero() || finished.Before(started) || failed {
+			return
+		}
+		anchor = finished
+	}
 }
 
 // observeSidecarPrep reports one aggregate phase spanning the sequential
 // copy-sidecar-* init containers, from the first start to the last finish.
-// The kubelet's pull of each sidecar image is included in this span. The
+// Image preparation is tracked separately before each init starts. The
 // image-volumes mode creates no copy init containers, so the phase does not
 // fire there. A failed sidecar init reports early with is_error set.
 func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, pod *corev1.Pod) {
@@ -81,7 +201,13 @@ func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, po
 	terminated := 0
 	failed := false
 	for _, status := range pod.Status.InitContainerStatuses {
-		if !strings.HasPrefix(status.Name, kubernetesSidecarInitPrefix) || status.State.Terminated == nil {
+		if !strings.HasPrefix(status.Name, kubernetesSidecarInitPrefix) {
+			continue
+		}
+		if status.State.Running != nil && (start.IsZero() || status.State.Running.StartedAt.Time.Before(start)) {
+			start = status.State.Running.StartedAt.Time
+		}
+		if status.State.Terminated == nil {
 			continue
 		}
 		terminated++
@@ -96,11 +222,10 @@ func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, po
 			failed = true
 		}
 	}
-	if terminated == 0 {
-		return
-	}
 	if failed || terminated == expected {
 		t.report(ctx, SetupEventSidecarPrep, start, finish, failed)
+	} else if !t.reported[SetupEventSidecarPrep] {
+		t.start(ctx, SetupEventSidecarPrep, start)
 	}
 }
 
@@ -108,7 +233,13 @@ func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, po
 // run time once it terminates.
 func (t *kubernetesSetupPhaseTracker) observeSetupCommand(ctx context.Context, pod *corev1.Pod) {
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.Name != kubernetesSetupContainerName || status.State.Terminated == nil {
+		if status.Name != kubernetesSetupContainerName {
+			continue
+		}
+		if status.State.Running != nil && !t.reported[SetupEventSetupCommand] {
+			t.start(ctx, SetupEventSetupCommand, status.State.Running.StartedAt.Time)
+		}
+		if status.State.Terminated == nil {
 			continue
 		}
 		term := status.State.Terminated
@@ -135,9 +266,16 @@ func (t *kubernetesSetupPhaseTracker) observeTaskStart(ctx context.Context, pod 
 		break
 	}
 	if startedAt.IsZero() {
+		if !t.reported[SetupEventContainerStart] && taskInitFinished(pod) {
+			t.start(ctx, SetupEventContainerStart, t.taskStartAnchor(pod))
+		}
 		return
 	}
 	t.report(ctx, SetupEventContainerStart, t.taskStartAnchor(pod), startedAt, false)
+	if t.execution == nil {
+		_, t.execution = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.execution",
+			trace.WithTimestamp(startedAt), trace.WithAttributes(attribute.String("phase", "execution")))
+	}
 }
 
 // taskStartAnchor returns the moment the task container start effectively

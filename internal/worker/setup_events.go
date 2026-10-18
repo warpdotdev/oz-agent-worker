@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,8 +14,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -56,6 +60,30 @@ type setupEventReporter struct {
 	logs          *tasklogs.Reporter
 }
 
+func setupTracePhase(event string) string {
+	switch event {
+	case SetupEventSidecarPrep:
+		return "sidecar_prepare"
+	case SetupEventContainerStart:
+		return "container_start"
+	case SetupEventJobCreate:
+		return "job_create"
+	case SetupEventPodSchedule:
+		return "pod_schedule"
+	case SetupEventSetupCommand:
+		return "setup"
+	default:
+		return ""
+	}
+}
+
+func setupPhaseError(failed bool) error {
+	if failed {
+		return errors.New("setup phase failed")
+	}
+	return nil
+}
+
 // newSetupEventReporter builds a reporter from the worker's server root URL and
 // the task assignment's credentials. It returns nil (a valid no-op reporter)
 // when the server root URL or the per-task API key is unavailable.
@@ -89,9 +117,32 @@ func (r *setupEventReporter) startPhase(ctx context.Context, eventName string) f
 // skew both the duration and the failure-rate metrics. Both funcs are safe to
 // call on a nil reporter.
 func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string, shouldReport bool) func(isError bool) {
+	if !shouldReport {
+		return func(bool) {}
+	}
 	start := time.Now()
+	done := r.startEventAt(ctx, eventName, start)
+	var span trace.Span
+	if phase := setupTracePhase(eventName); phase != "" {
+		_, span = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker."+phase,
+			trace.WithTimestamp(start), trace.WithAttributes(attribute.String("phase", phase)))
+	}
 	return func(isError bool) {
-		if r == nil || !shouldReport || ctx.Err() != nil {
+		if span != nil {
+			if errors.Is(context.Cause(ctx), errObservationInterrupted) {
+				span.SetAttributes(attribute.String("outcome", "interrupted"))
+			} else {
+				tracing.RecordError(span, setupPhaseError(isError))
+			}
+			span.End()
+		}
+		done(isError)
+	}
+}
+
+func (r *setupEventReporter) startEventAt(ctx context.Context, eventName string, start time.Time) func(isError bool) {
+	return func(isError bool) {
+		if r == nil || ctx.Err() != nil {
 			return
 		}
 		r.reportPhase(ctx, eventName, start, time.Now(), isError)

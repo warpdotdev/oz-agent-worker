@@ -15,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -31,6 +32,31 @@ func assignment(endpoint, runID string) *types.TaskAssignmentMessage {
 			Endpoint: endpoint + "/agent/otlp/", LoggingEnabled: true,
 			BootstrapToken: &types.TelemetryBootstrapToken{Token: "trace-bootstrap"},
 		},
+	}
+}
+
+func TestBootstrapAuthentication(t *testing.T) {
+	var exports atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/agent/otlp/v1/logs" || req.Header.Get("Authorization") != "Bearer bootstrap-token" {
+			t.Error("logging did not use the assignment bootstrap token")
+		}
+		exports.Add(1)
+	}))
+	defer server.Close()
+	a := assignment(server.URL, "run")
+	a.EnvVars = nil
+	a.TelemetryCollection.BootstrapToken = &types.TelemetryBootstrapToken{
+		Token: "bootstrap-token", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	}
+	r, err := New(t.Context(), "", "worker", "direct", a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(t, r)
+	r.Event(t.Context(), "setup", time.Now(), time.Now(), false)
+	if err := r.provider.ForceFlush(t.Context()); err != nil || exports.Load() != 1 {
+		t.Fatalf("bootstrap export: calls=%d err=%v", exports.Load(), err)
 	}
 }
 
@@ -64,7 +90,9 @@ func TestAuthenticatedSameOriginRedirects(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	r, err := New(t.Context(), server.URL, "worker", "direct", assignment(server.URL, "run"))
+	a := assignment(server.URL, "run")
+	a.TelemetryCollection.BootstrapToken = nil
+	r, err := New(t.Context(), server.URL, "worker", "direct", a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +529,10 @@ func TestIdentityLazyRefreshAndConcurrentReuse(t *testing.T) {
 		writeToken(w, fmt.Sprintf("issued-%d", n), expiry)
 	}))
 	defer server.Close()
-	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s, err := otlp.NewTokenSource(t.Context(), nil, otlp.RefreshFromAssignment(server.URL, assignment(server.URL, "run")))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if calls.Load() != 0 {
 		t.Fatal("token requested before export")
 	}
@@ -532,7 +563,10 @@ func TestIdentityRedirectDoesNotForwardCredentials(t *testing.T) {
 		http.Redirect(w, req, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+	s, err := otlp.NewTokenSource(t.Context(), nil, otlp.RefreshFromAssignment(server.URL, assignment(server.URL, "run")))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.Token(); err == nil || redirected.Load() != 0 {
 		t.Fatal("identity credentials were forwarded through a redirect")
 	}
@@ -548,7 +582,10 @@ func TestIdentityResponseValidation(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			defer server.Close()
-			s := newTokenSource(t.Context(), server.URL, "run", assignment(server.URL, "run").EnvVars)
+			s, err := otlp.NewTokenSource(t.Context(), nil, otlp.RefreshFromAssignment(server.URL, assignment(server.URL, "run")))
+			if err != nil {
+				t.Fatal(err)
+			}
 			if _, err := s.Token(); err == nil || strings.Contains(err.Error(), "private credential") {
 				t.Fatal("identity error response accepted or exposed")
 			}

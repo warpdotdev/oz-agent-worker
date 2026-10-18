@@ -13,8 +13,10 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
@@ -159,7 +161,13 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 }
 
 // ExecuteTask runs the agent directly on the host.
-func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	_, workspace := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.workspace_prepare",
+		trace.WithAttributes(attribute.String("phase", "workspace_prepare")))
+	defer func() {
+		tracing.RecordError(workspace, result.Error)
+		workspace.End()
+	}()
 	if err := validateMetadataEnvConflicts(params.EnvVars, append(envSliceFromMap(b.config.Env), os.Environ()...)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, err))
 	}
@@ -203,16 +211,21 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
 
 	defer func() {
-		if usingTargetDir {
-			// Don't clean up the shared target directory.
-			b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
-			return
-		}
-		if b.config.NoCleanup {
+		tracing.RecordError(workspace, result.Error)
+		workspace.End()
+		if b.config.NoCleanup && !usingTargetDir {
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
 		}
-		b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
+		if usingTargetDir {
+			_, cleanup := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
+				trace.WithAttributes(attribute.String("phase", "cleanup")))
+			// Don't clean up the shared target directory.
+			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, params.Logs))
+			cleanup.End()
+			return
+		}
+		_ = b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -238,6 +251,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	}
 	envVars = mergeEnvVars(envVars, harnessEnvVars(workspaceDir, params))
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
+	workspace.End()
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
@@ -287,7 +301,12 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) Exe
 	log.Infof(ctx, "Running oz agent in workspace %s", workspaceDir)
 	log.Debugf(ctx, "Command: %s %s", b.ozPath, strings.Join(params.BaseArgs, " "))
 
-	if err := runTaskCommand(cmd, params.Logs); err != nil {
+	_, execution := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.execution",
+		trace.WithAttributes(attribute.String("phase", "execution")))
+	err = runTaskCommand(cmd, params.Logs)
+	tracing.RecordError(execution, err)
+	execution.End()
+	if err != nil {
 		if ctx.Err() != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
 		}
@@ -354,9 +373,9 @@ func (b *DirectBackend) PreservesTasksOnShutdown() bool {
 }
 
 // runTeardownIfConfigured runs the teardown command if one is configured.
-func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) {
+func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) error {
 	if b.config.TeardownCommand == "" {
-		return
+		return nil
 	}
 	teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
 	log.Infof(ctx, "Running teardown command")
@@ -366,12 +385,20 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 			attribute.String("error.message", err.Error()),
 		)
 		log.Warnf(ctx, "Teardown command failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 // cleanup runs the teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) {
-	b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, reporter)
+func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) (err error) {
+	_, phase := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
+		trace.WithAttributes(attribute.String("phase", "cleanup")))
+	defer func() {
+		tracing.RecordError(phase, err)
+		phase.End()
+	}()
+	teardownErr := b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, reporter)
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {
@@ -380,7 +407,9 @@ func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitCo
 			attribute.String("error.message", err.Error()),
 		)
 		log.Warnf(ctx, "Failed to remove workspace %s: %v", workspaceDir, err)
+		return errors.Join(teardownErr, err)
 	}
+	return teardownErr
 }
 
 // runCommand executes a shell command with the given working directory and environment.

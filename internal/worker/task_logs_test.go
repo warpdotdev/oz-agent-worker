@@ -20,9 +20,8 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
-	"github.com/warpdotdev/oz-agent-worker/internal/tasklogs"
+	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
-	"go.opentelemetry.io/otel/trace/noop"
 	collector "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -88,8 +87,7 @@ func TestSetupEnvironmentCredentialsRedactedInAgentOutput(t *testing.T) {
 	defer cancel()
 	w := &Worker{config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: true},
 		ctx: ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8)}
-	_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
-	w.executeTask(ctx, cancel, span, logAssignment(server.URL), time.Now())
+	w.executeTask(ctx, cancel, nil, logAssignment(server.URL), time.Now())
 	text := logPayloads(payloads)
 	if strings.Contains(text, "generated-credential") || !strings.Contains(text, "[REDACTED]") || !strings.Contains(text, "agent.stdout") {
 		t.Fatalf("setup environment credential was not redacted in agent output: %s", text)
@@ -258,12 +256,11 @@ func TestDirectTaskLogLifecycle(t *testing.T) {
 				config: Config{BackendType: "direct", ServerRootURL: server.URL, CollectTaskLogs: !tc.disabled},
 				ctx:    ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8),
 			}
-			_, span := noop.NewTracerProvider().Tracer("test").Start(ctx, "task")
 			assignment := logAssignment(server.URL)
 			if tc.rejected {
 				assignment.EnvVars[warpAPIKeyEnv] = "rejected-api-key"
 			}
-			w.executeTask(ctx, cancel, span, assignment, time.Now())
+			w.executeTask(ctx, cancel, nil, assignment, time.Now())
 			text := logPayloads(payloads)
 			if tc.disabled {
 				if text != "" || calls.Load() != 0 {
@@ -322,14 +319,10 @@ func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 				config: Config{ServerRootURL: server.URL, BackendType: "direct", CollectTaskLogs: true},
 				ctx:    ctx, backend: backend, activeTasks: make(map[taskExecution]activeTask), outbound: newOutboundQueue(8), oneShot: newOneShotState(),
 			}
-			w.handleTaskAssignment(logAssignment(server.URL))
+			w.handleTaskAssignment(logAssignment(server.URL), time.Now())
 			<-backend.started
 			if preserve {
 				w.shutdownTasks()
-				if w.activeTasks[taskExecution{"run", "execution"}].ctx.Err() != nil {
-					t.Error("reporter shutdown cancelled a preserved task")
-				}
-				w.activeTasks[taskExecution{"run", "execution"}].cancel()
 				w.taskWG.Wait()
 			} else {
 				w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run"})
