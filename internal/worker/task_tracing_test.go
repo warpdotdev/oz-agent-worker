@@ -204,24 +204,38 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			t.Fatal("task did not reach the Kubernetes pod watch")
 		}
 	}
+	w.tasksMutex.Lock()
+	var cancels []context.CancelFunc
+	for _, task := range w.activeTasks {
+		cancels = append(cancels, task.cancel)
+	}
+	w.tasksMutex.Unlock()
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+		w.taskWG.Wait()
+	}()
 	start := time.Now()
 	w.shutdownTasks()
 	if time.Since(start) > 6*time.Second {
 		t.Fatal("shutdown used a separate timeout per task")
 	}
-	w.tasksMutex.Lock()
-	var cancels []context.CancelFunc
-	for _, task := range w.activeTasks {
-		if task.ctx.Err() != nil {
-			t.Error("trace interruption cancelled a preserved execution")
+	observersDone := make(chan struct{})
+	go func() {
+		w.taskWG.Wait()
+		close(observersDone)
+	}()
+	select {
+	case <-observersDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown returned before local observers acknowledged interruption")
+	}
+	for _, message := range drainMessages(t, w.outbound.messages) {
+		if message.Type != types.MessageTypeTaskClaimed {
+			t.Fatal("observation interruption reported a remote terminal state")
 		}
-		cancels = append(cancels, task.cancel)
 	}
-	w.tasksMutex.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
-	w.taskWG.Wait()
 	backend.Shutdown(t.Context())
 	for _, action := range client.Actions() {
 		if action.GetResource().Resource == "jobs" && (action.GetVerb() == "delete" || action.GetVerb() == "update") {
@@ -230,8 +244,17 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	rootEnds := make(map[string]uint64)
+	for _, span := range spans {
+		if span.Name == "self_hosted_worker.task" {
+			rootEnds[string(span.SpanId)] = span.EndTimeUnixNano
+		}
+	}
 	roots, live := 0, 0
 	for _, span := range spans {
+		if end, ok := rootEnds[string(span.ParentSpanId)]; ok && span.EndTimeUnixNano > end {
+			t.Error("child ended after its task root")
+		}
 		if span.Name == "self_hosted_worker.task" {
 			roots++
 		}
@@ -247,6 +270,9 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			}
 			if outcome != "interrupted" {
 				t.Error("remaining observation was not interrupted")
+			}
+			if span.Status.GetCode() != tracepb.Status_STATUS_CODE_UNSET {
+				t.Error("observation interruption was classified as a remote result")
 			}
 		}
 	}

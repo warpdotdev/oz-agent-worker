@@ -18,17 +18,13 @@ import (
 const ShutdownTimeout = 5 * time.Second
 const scope = "github.com/warpdotdev/oz-agent-worker"
 
-type sessionKey struct{}
-
 type Session struct {
 	mu         sync.Mutex
 	provider   *sdktrace.TracerProvider
 	processors []sdktrace.SpanProcessor
 	root       trace.Span
-	ctx        context.Context
 	cancel     context.CancelFunc
 	ended      bool
-	phases     map[*Phase]struct{}
 	closeOnce  sync.Once
 }
 
@@ -47,7 +43,7 @@ func (h *Handle) Start(ctx context.Context, server string, assignment *types.Tas
 		attrs = append(attrs, attribute.String("warp.execution_id", assignment.ExecutionID))
 	}
 	res := resource.NewSchemaless(attrs...)
-	s := &Session{cancel: cancel, phases: make(map[*Phase]struct{})}
+	s := &Session{cancel: cancel}
 	var initErr error
 	if config := assignment.TelemetryCollection; config != nil && config.TracingEnabled {
 		processor, err := newWarpProcessor(pipelineCtx, server, assignment)
@@ -76,8 +72,7 @@ func (h *Handle) Start(ctx context.Context, server string, assignment *types.Tas
 		trace.WithNewRoot(), trace.WithTimestamp(receivedAt),
 		trace.WithAttributes(attrs...),
 	)
-	s.ctx = context.WithValue(ctx, sessionKey{}, s)
-	return s.ctx, s, initErr
+	return ctx, s, initErr
 }
 
 func newWarpProcessor(ctx context.Context, server string, assignment *types.TaskAssignmentMessage) (sdktrace.SpanProcessor, error) {
@@ -98,6 +93,7 @@ func newWarpProcessor(ctx context.Context, server string, assignment *types.Task
 	), nil
 }
 
+// End closes only the task root; child-span creators must finish before it is called.
 func (s *Session) End(outcome string, err error, attrs ...attribute.KeyValue) {
 	if s == nil {
 		return
@@ -109,14 +105,8 @@ func (s *Session) End(outcome string, err error, attrs ...attribute.KeyValue) {
 	}
 	s.ended = true
 	now := time.Now()
-	for phase := range s.phases {
-		phase.span.SetAttributes(attribute.String("outcome", outcome))
-		recordResult(phase.span, err)
-		phase.span.End(trace.WithTimestamp(now))
-	}
-	s.phases = nil
 	s.root.SetAttributes(append(attrs, attribute.String("outcome", outcome))...)
-	recordResult(s.root, err)
+	RecordError(s.root, err)
 	switch outcome {
 	case "failed":
 		s.root.SetStatus(codes.Error, outcome)
@@ -126,7 +116,8 @@ func (s *Session) End(outcome string, err error, attrs ...attribute.KeyValue) {
 	s.root.End(trace.WithTimestamp(now))
 }
 
-func recordResult(span trace.Span, err error) {
+// RecordError retains raw task failures on an existing span without ending it.
+func RecordError(span trace.Span, err error) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetAttributes(attribute.String("error.message", err.Error()))
@@ -175,50 +166,8 @@ func (s *Session) Shutdown(ctx context.Context) {
 	})
 }
 
-type Phase struct {
-	session *Session
-	span    trace.Span
-}
-
-func StartPhase(ctx context.Context, name string) *Phase {
-	return StartPhaseAt(ctx, name, time.Now())
-}
-
-func StartPhaseAt(ctx context.Context, name string, start time.Time, attrs ...attribute.KeyValue) *Phase {
-	if name == "" || start.IsZero() {
-		return nil
-	}
-	s, _ := ctx.Value(sessionKey{}).(*Session)
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ended {
-		return nil
-	}
-	_, span := trace.SpanFromContext(s.ctx).TracerProvider().Tracer(scope).Start(s.ctx, "self_hosted_worker."+name,
-		trace.WithTimestamp(start), trace.WithAttributes(append(attrs, attribute.String("phase", name))...))
-	p := &Phase{session: s, span: span}
-	s.phases[p] = struct{}{}
-	return p
-}
-
-func (p *Phase) End(err error) {
-	p.EndAt(time.Now(), err)
-}
-
-func (p *Phase) EndAt(finish time.Time, err error) {
-	if p == nil {
-		return
-	}
-	s := p.session
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, active := s.phases[p]; !active {
-		return
-	}
-	delete(s.phases, p)
-	recordResult(p.span, err)
-	p.span.End(trace.WithTimestamp(finish))
+// Tracer uses the context's provider so task routing never falls back to the
+// process-global provider.
+func Tracer(ctx context.Context) trace.Tracer {
+	return trace.SpanFromContext(ctx).TracerProvider().Tracer(scope)
 }

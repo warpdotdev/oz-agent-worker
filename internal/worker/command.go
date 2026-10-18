@@ -12,6 +12,8 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // defaultDispatchTimeout bounds how long the operator dispatch command may run.
@@ -96,8 +98,12 @@ func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*Comma
 // ExecuteTask dispatches the task by invoking the configured dispatch command
 // with the JSON payload on stdin. It returns ExecuteOutcomeSpawned on success.
 func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
-	prepare := tracing.StartPhase(ctx, "dispatch_prepare")
-	defer func() { prepare.End(result.Error) }()
+	_, prepare := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.dispatch_prepare",
+		trace.WithAttributes(attribute.String("phase", "dispatch_prepare")))
+	defer func() {
+		tracing.RecordError(prepare, result.Error)
+		prepare.End()
+	}()
 	params.Logs.AddEnv(b.config.Env)
 	payload := NewDispatchPayload(params, b.config.ServerRootURL, b.config.WorkerID)
 	payloadJSON, err := json.Marshal(payload)
@@ -119,9 +125,13 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) (r
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	defer flushStdout()
 	defer flushStderr()
-	prepare.End(nil)
-	dispatch := tracing.StartPhase(ctx, "dispatch")
-	defer func() { dispatch.End(result.Error) }()
+	prepare.End()
+	_, dispatch := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.dispatch",
+		trace.WithAttributes(attribute.String("phase", "dispatch")))
+	defer func() {
+		tracing.RecordError(dispatch, result.Error)
+		dispatch.End()
+	}()
 
 	log.Infof(ctx, "Dispatching task %s via command backend", params.TaskID)
 	if err := runTaskCommand(cmd, params.Logs); err != nil {

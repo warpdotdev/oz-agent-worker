@@ -323,10 +323,6 @@ func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 			<-backend.started
 			if preserve {
 				w.shutdownTasks()
-				if w.activeTasks[taskExecution{"run", "execution"}].ctx.Err() != nil {
-					t.Error("reporter shutdown cancelled a preserved task")
-				}
-				w.activeTasks[taskExecution{"run", "execution"}].cancel()
 				w.taskWG.Wait()
 			} else {
 				w.handleTaskCancellation(&types.TaskCancellationMessage{TaskID: "run"})

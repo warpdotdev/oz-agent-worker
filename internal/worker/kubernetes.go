@@ -14,6 +14,8 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -389,21 +391,21 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	defer func() {
 		if ctx.Err() != nil {
-			// Worker shutdown never cancels this context (see PreservesTasksOnShutdown), so
-			// this is a server-requested cancellation, and CancelTask owns the deletion.
-			log.Infof(ctx, "Stopped watching Kubernetes Job %s after task context cancellation; deletion is handled by CancelTask", jobName)
+			log.Infof(ctx, "Stopped observing Kubernetes Job %s; remote cancellation is handled only by CancelTask", jobName)
 			return
 		}
 		if res.Error != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 			defer cancel()
-			phase := tracing.StartPhase(cleanupCtx, "cleanup")
+			_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
+				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			if err := b.requestJobExecutionStop(cleanupCtx, job, res.Error); err != nil {
-				phase.End(err)
+				tracing.RecordError(phase, err)
+				phase.End()
 				log.Errorf(ctx, "Failed to stop Kubernetes Job %s after terminal task failure; it may still be active: %v", jobName, err)
 				res.Error = fmt.Errorf("%w; failed to stop Kubernetes Job %s: %v", res.Error, jobName, err)
 			} else {
-				phase.End(nil)
+				phase.End()
 			}
 			return
 		}
@@ -412,19 +414,25 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 		defer cancel()
-		phase := tracing.StartPhase(cleanupCtx, "cleanup")
+		_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
+			trace.WithAttributes(attribute.String("phase", "cleanup")))
 		if err := b.deleteTaskJob(cleanupCtx, jobName, &createdJob.UID); err != nil {
-			phase.End(err)
+			tracing.RecordError(phase, err)
+			phase.End()
 			log.Warnf(ctx, "Failed to delete Job %s: %v", jobName, err)
 		} else {
-			phase.End(nil)
+			phase.End()
 		}
 	}()
 
 	logStreams := newKubernetesLogStreams(ctx, b, params.Logs)
-	defer func() { setupPhases.finish(res.Error) }()
+	defer func() { setupPhases.finish(ctx, res.Error) }()
 	defer func() {
 		if logStreams == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			logStreams.finish(ctx)
 			return
 		}
 		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)

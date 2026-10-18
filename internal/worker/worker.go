@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -150,6 +151,8 @@ const (
 	taskCancellationSourceShutdown taskCancellationSource = "shutdown"
 )
 
+var errObservationInterrupted = errors.New("worker observation interrupted")
+
 type activeTask struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -165,6 +168,8 @@ type activeTask struct {
 	stopCancellation context.CancelFunc
 	logs             *tasklogs.Reporter
 	tracing          *tracing.Session
+	observationCtx   context.Context
+	stopObservation  context.CancelCauseFunc
 }
 
 func New(ctx context.Context, config Config) (*Worker, error) {
@@ -626,8 +631,17 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 	if err != nil {
 		log.Warnf(w.ctx, "Task trace reporting unavailable for task %s: %v", assignment.TaskID, err)
 	}
-	claim := tracing.StartPhase(taskCtx, "claim")
-	defer claim.End(nil)
+	_, claim := tracing.Tracer(taskCtx).Start(taskCtx, "self_hosted_worker.claim",
+		trace.WithAttributes(attribute.String("phase", "claim")))
+	handedOff := false
+	outcome := "rejected"
+	defer func() {
+		claim.End()
+		if !handedOff {
+			session.End(outcome, nil)
+			go session.Shutdown(context.Background())
+		}
+	}()
 	metrics.AddTaskEvent(taskCtx, "task.assigned",
 		attribute.String("worker.id", w.config.WorkerID),
 		attribute.String("worker.backend", w.config.BackendType),
@@ -639,8 +653,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 	_, completed := w.completedTasks[key]
 	if active || completed {
 		w.tasksMutex.Unlock()
-		session.End("duplicate", nil)
-		go session.Shutdown(context.Background())
+		outcome = "duplicate"
 		return
 	}
 	rejectionReason := ""
@@ -657,7 +670,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 	}
 	w.tasksMutex.Unlock()
 	if rejectionReason != "" {
-		w.rejectTaskAssignment(taskCtx, session, assignment.TaskID, rejectionReason, rejectionMetric)
+		w.rejectTaskAssignment(taskCtx, assignment.TaskID, rejectionReason, rejectionMetric)
 		return
 	}
 
@@ -670,7 +683,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 			}
 			w.tasksMutex.Unlock()
 			w.taskWG.Done()
-			w.rejectTaskAssignment(taskCtx, session, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
+			w.rejectTaskAssignment(taskCtx, assignment.TaskID, "worker at maximum concurrency", metrics.RejectReasonAtCapacity)
 			return
 		}
 	}
@@ -692,7 +705,7 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 			w.taskSemaphore.Release(1)
 		}
 		w.taskWG.Done()
-		w.rejectTaskAssignment(taskCtx, session, assignment.TaskID, "worker is shutting down", metrics.RejectReasonShuttingDown)
+		w.rejectTaskAssignment(taskCtx, assignment.TaskID, "worker is shutting down", metrics.RejectReasonShuttingDown)
 		return
 	}
 	_, active = w.activeTasks[key]
@@ -700,20 +713,22 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 	if active || completed {
 		w.tasksMutex.Unlock()
 		taskCancel()
-		session.End("duplicate", nil)
-		go session.Shutdown(context.Background())
+		outcome = "duplicate"
 		if w.taskSemaphore != nil {
 			w.taskSemaphore.Release(1)
 		}
 		w.taskWG.Done()
 		return
 	}
+	observationCtx, stopObservation := context.WithCancelCause(taskCtx)
 	w.activeTasks[key] = activeTask{
-		ctx:         taskCtx,
-		cancel:      taskCancel,
-		executionID: assignment.ExecutionID,
-		done:        make(chan struct{}),
-		tracing:     session,
+		ctx:             taskCtx,
+		cancel:          taskCancel,
+		executionID:     assignment.ExecutionID,
+		done:            make(chan struct{}),
+		tracing:         session,
+		observationCtx:  observationCtx,
+		stopObservation: stopObservation,
 	}
 	w.tasksMutex.Unlock()
 
@@ -725,23 +740,20 @@ func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, r
 	metrics.RecordTaskClaim()
 	metrics.AddTaskEvent(taskCtx, "task.claimed")
 	metrics.IncTasksActive()
-	claim.End(nil)
+	claim.End()
+	handedOff = true
 	go func() {
 		defer w.taskWG.Done()
 		w.executeTask(taskCtx, taskCancel, session, assignment, receivedAt)
 	}()
 }
 
-func (w *Worker) rejectTaskAssignment(ctx context.Context, session *tracing.Session, taskID, reason, metricReason string) {
+func (w *Worker) rejectTaskAssignment(ctx context.Context, taskID, reason, metricReason string) {
 	log.Warnf(w.ctx, "Rejecting task %s: %s", taskID, reason)
 	metrics.RecordTaskRejected(metricReason)
 	metrics.AddTaskEvent(ctx, "task.rejected",
 		attribute.String("reason", metricReason),
 	)
-	defer func() {
-		session.End("rejected", nil)
-		go session.Shutdown(context.Background())
-	}()
 	if err := w.sendTaskRejected(taskID, reason); err != nil {
 		log.Errorf(w.ctx, "Failed to send task rejected message: %v", err)
 	}
@@ -904,6 +916,13 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
 	start := time.Now()
 	result := metrics.TaskResultSucceeded
+	interrupted := false
+	backendCtx := ctx
+	w.tasksMutex.Lock()
+	if task, ok := w.activeTasks[key]; ok && task.observationCtx != nil {
+		backendCtx = task.observationCtx
+	}
+	w.tasksMutex.Unlock()
 	span := trace.SpanFromContext(ctx)
 	// One-shot-capable backends always wait for a terminal outcome. Register
 	// this first so the task bookkeeping defer below runs before completion is
@@ -912,14 +931,20 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 
 	defer func() {
 		taskCancel()
-		session.End(string(result), nil)
+		if interrupted {
+			session.End("interrupted", nil)
+		} else {
+			session.End(string(result), nil)
+		}
 		w.tasksMutex.Lock()
 		if task, tracked := w.activeTasks[key]; tracked {
 			if task.done != nil {
 				close(task.done)
 			}
 			if !task.spawned && task.cancellationSource != taskCancellationSourceUser {
-				w.rememberCompletedLocked(key, false)
+				if !interrupted {
+					w.rememberCompletedLocked(key, false)
+				}
 				delete(w.activeTasks, key)
 			} else {
 				task.logs = nil
@@ -934,7 +959,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		}
 
 		metrics.DecTasksActive()
-		metrics.RecordTaskCompleted(result, time.Since(start))
+		if !interrupted {
+			metrics.RecordTaskCompleted(result, time.Since(start))
+		}
 		session.Shutdown(context.Background())
 	}()
 
@@ -954,6 +981,7 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		if reporter != nil {
 			params.Logs = reporter
 			ctx = log.WithOutput(ctx, reporter.ZerologWriter(ctx))
+			backendCtx = log.WithOutput(backendCtx, reporter.ZerologWriter(backendCtx))
 			if params.SetupEvents == nil {
 				params.SetupEvents = &setupEventReporter{}
 			}
@@ -979,8 +1007,12 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 		attribute.String("backend", w.config.BackendType),
 	)
 
-	executeResult := w.backend.ExecuteTask(ctx, params)
+	executeResult := w.backend.ExecuteTask(backendCtx, params)
 	if executeResult.Error != nil {
+		if errors.Is(context.Cause(backendCtx), errObservationInterrupted) {
+			interrupted = true
+			return
+		}
 		err := executeResult.Error
 		if ctx.Err() == context.Canceled && w.cancellationSource(key) == taskCancellationSourceUser {
 			result = metrics.TaskResultCancelled
@@ -1211,9 +1243,16 @@ func (w *Worker) shutdownTasks() {
 		return
 	}
 	w.shuttingDown = true
+	var observersDone []chan struct{}
 	for _, task := range w.activeTasks {
 		if task.stopCancellation != nil {
 			task.stopCancellation()
+		}
+		if preserveActiveTasks && task.stopObservation != nil {
+			if task.done != nil {
+				observersDone = append(observersDone, task.done)
+			}
+			task.stopObservation(errObservationInterrupted)
 		}
 	}
 	activeTaskCount := len(w.activeTasks)
@@ -1246,10 +1285,16 @@ func (w *Worker) shutdownTasks() {
 	}
 	w.tasksMutex.Unlock()
 
-	if activeTaskCount > 0 && !preserveActiveTasks {
+	if activeTaskCount > 0 {
 		tasksDone := make(chan struct{})
 		go func() {
-			w.taskWG.Wait()
+			if preserveActiveTasks {
+				for _, done := range observersDone {
+					<-done
+				}
+			} else {
+				w.taskWG.Wait()
+			}
 			close(tasksDone)
 		}()
 		select {
@@ -1262,7 +1307,6 @@ func (w *Worker) shutdownTasks() {
 	defer cancel()
 	var flushWG sync.WaitGroup
 	for _, session := range sessions {
-		session.End("interrupted", nil)
 		flushWG.Go(func() { session.Shutdown(flushCtx) })
 	}
 	for _, reporter := range reporters {

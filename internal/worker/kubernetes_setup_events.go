@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -21,8 +23,8 @@ import (
 type kubernetesSetupPhaseTracker struct {
 	reporter  *setupEventReporter
 	reported  map[string]bool
-	live      map[string]*tracing.Phase
-	execution *tracing.Phase
+	live      map[string]trace.Span
+	execution trace.Span
 }
 
 func taskInitFinished(pod *corev1.Pod) bool {
@@ -52,7 +54,7 @@ func newKubernetesSetupPhaseTracker(reporter *setupEventReporter) *kubernetesSet
 	return &kubernetesSetupPhaseTracker{
 		reporter: reporter,
 		reported: make(map[string]bool),
-		live:     make(map[string]*tracing.Phase),
+		live:     make(map[string]trace.Span),
 	}
 }
 
@@ -88,20 +90,37 @@ func (t *kubernetesSetupPhaseTracker) observeInterval(ctx context.Context, key, 
 		return
 	}
 	if _, exists := t.live[key]; !exists {
-		t.live[key] = tracing.StartPhaseAt(ctx, phase, start, attrs...)
+		_, t.live[key] = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker."+phase,
+			trace.WithTimestamp(start), trace.WithAttributes(append(attrs, attribute.String("phase", phase))...))
 	}
 	if !finish.IsZero() {
-		t.live[key].EndAt(finish, err)
+		tracing.RecordError(t.live[key], err)
+		t.live[key].End(trace.WithTimestamp(finish))
 		delete(t.live, key)
 		t.reported[key] = true
 	}
 }
 
-func (t *kubernetesSetupPhaseTracker) finish(err error) {
-	for _, phase := range t.live {
-		phase.End(err)
+func (t *kubernetesSetupPhaseTracker) finish(ctx context.Context, err error) {
+	interrupted := errors.Is(context.Cause(ctx), errObservationInterrupted)
+	spans := make([]trace.Span, 0, len(t.live)+1)
+	for key, span := range t.live {
+		spans = append(spans, span)
+		delete(t.live, key)
+		t.reported[key] = true
 	}
-	t.execution.End(err)
+	if t.execution != nil {
+		spans = append(spans, t.execution)
+		t.execution = nil
+	}
+	for _, span := range spans {
+		if interrupted {
+			span.SetAttributes(attribute.String("outcome", "interrupted"))
+		} else {
+			tracing.RecordError(span, err)
+		}
+		span.End()
+	}
 }
 
 // observeSchedule reports the span from pod creation to a true PodScheduled
@@ -254,7 +273,8 @@ func (t *kubernetesSetupPhaseTracker) observeTaskStart(ctx context.Context, pod 
 	}
 	t.report(ctx, SetupEventContainerStart, t.taskStartAnchor(pod), startedAt, false)
 	if t.execution == nil {
-		t.execution = tracing.StartPhaseAt(ctx, "execution", startedAt)
+		_, t.execution = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.execution",
+			trace.WithTimestamp(startedAt), trace.WithAttributes(attribute.String("phase", "execution")))
 	}
 }
 

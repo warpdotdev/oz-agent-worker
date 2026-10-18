@@ -143,7 +143,8 @@ func TestTaskTraceDualExport(t *testing.T) {
 	warp := newCollector(t, "token-run")
 	for range 2 {
 		ctx, session := startSession(t, handle, traceAssignment(warp.server.URL, "run"))
-		StartPhase(ctx, "execution").End(nil)
+		_, execution := Tracer(ctx).Start(ctx, "self_hosted_worker.execution")
+		execution.End()
 		session.End("succeeded", nil)
 		if err := session.ForceFlush(t.Context()); err != nil {
 			t.Fatal(err)
@@ -217,7 +218,9 @@ func TestTaskTraceConcurrentIsolation(t *testing.T) {
 		ctx, session := startSession(t, handle, traceAssignment(c.server.URL, run))
 		wg.Go(func() {
 			for range 64 {
-				StartPhase(context.WithoutCancel(ctx), "execution").End(nil)
+				detached := context.WithoutCancel(ctx)
+				_, execution := Tracer(detached).Start(detached, "self_hosted_worker.execution")
+				execution.End()
 			}
 			session.End("succeeded", nil)
 			session.Shutdown(t.Context())
@@ -325,7 +328,9 @@ func TestTaskTraceAuthAndPrivacy(t *testing.T) {
 				t.Fatalf("trace auth initialization: %v", err)
 			}
 			rawError := errors.New("raw backend error /task/path")
-			StartPhase(ctx, "execution").End(rawError)
+			_, execution := Tracer(ctx).Start(ctx, "self_hosted_worker.execution")
+			RecordError(execution, rawError)
+			execution.End()
 			session.End("failed", rawError)
 			err = session.ForceFlush(t.Context())
 			session.Shutdown(t.Context())
@@ -388,7 +393,8 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			}
 			ctx, session := startSession(t, handle, traceAssignment(warpEndpoint, "run"))
 			for range 64 {
-				StartPhase(ctx, "execution").End(nil)
+				_, execution := Tracer(ctx).Start(ctx, "self_hosted_worker.execution")
+				execution.End()
 			}
 			flushCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 			defer cancel()
@@ -401,7 +407,8 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			}
 			begin := time.Now()
 			for range 2048 {
-				StartPhase(ctx, "execution").End(nil)
+				_, execution := Tracer(ctx).Start(ctx, "self_hosted_worker.execution")
+				execution.End()
 			}
 			if time.Since(begin) > time.Second {
 				t.Fatal("queue overflow blocked task instrumentation")
@@ -414,9 +421,6 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			stop()
 			if time.Since(begin) > time.Second {
 				t.Fatal("task shutdown exceeded its deadline")
-			}
-			if StartPhase(ctx, "cleanup") != nil {
-				t.Fatal("late phase started after task closed")
 			}
 			if blocked == "operator" && len(good.spans()) == 0 {
 				t.Fatal("operator stall prevented Warp export")

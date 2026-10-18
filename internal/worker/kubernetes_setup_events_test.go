@@ -304,7 +304,7 @@ func TestKubernetesInitPreparationAndExecution(t *testing.T) {
 	}
 	tracker.observePod(ctx, pod)
 	tracker.observePod(ctx, pod)
-	tracker.finish(nil)
+	tracker.finish(ctx, nil)
 	session.End("succeeded", nil)
 	if err := session.ForceFlush(t.Context()); err != nil {
 		t.Fatal(err)

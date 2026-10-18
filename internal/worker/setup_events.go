@@ -17,6 +17,8 @@ import (
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -120,12 +122,20 @@ func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string,
 	}
 	start := time.Now()
 	done := r.startEventAt(ctx, eventName, start)
-	var phase *tracing.Phase
-	if eventName != SetupEventImagePull {
-		phase = tracing.StartPhaseAt(ctx, setupTracePhase(eventName), start)
+	var span trace.Span
+	if phase := setupTracePhase(eventName); phase != "" {
+		_, span = tracing.Tracer(ctx).Start(ctx, "self_hosted_worker."+phase,
+			trace.WithTimestamp(start), trace.WithAttributes(attribute.String("phase", phase)))
 	}
 	return func(isError bool) {
-		phase.End(setupPhaseError(isError))
+		if span != nil {
+			if errors.Is(context.Cause(ctx), errObservationInterrupted) {
+				span.SetAttributes(attribute.String("outcome", "interrupted"))
+			} else {
+				tracing.RecordError(span, setupPhaseError(isError))
+			}
+			span.End()
+		}
 		done(isError)
 	}
 }

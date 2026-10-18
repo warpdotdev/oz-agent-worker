@@ -21,6 +21,8 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -137,9 +139,11 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	log.Debugf(ctx, "Using Docker image: %s", imageName)
 
 	authStr := b.getRegistryAuth(ctx, imageName)
-	imagePhase := tracing.StartPhase(ctx, "image_prepare")
+	_, imagePhase := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.image_prepare",
+		trace.WithAttributes(attribute.String("phase", "image_prepare")))
 	imageErr := b.prepareImage(ctx, imageName, authStr, params.SetupEvents)
-	imagePhase.End(imageErr)
+	tracing.RecordError(imagePhase, imageErr)
+	imagePhase.End()
 	if err := imageErr; err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonImagePull, err))
 	}
@@ -189,12 +193,14 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	key := taskExecution{params.TaskID, params.ExecutionID}
 	// Transport and server failures cannot prove that the daemon created no container.
 	b.taskContainers.Store(key, "")
-	create := tracing.StartPhase(ctx, "container_create")
+	_, create := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_create",
+		trace.WithAttributes(attribute.String("phase", "container_create")))
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
-	create.End(err)
+	tracing.RecordError(create, err)
+	create.End()
 	if err != nil {
 		if cerrdefs.IsInvalidArgument(err) || cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err) {
 			b.taskContainers.Delete(key)
@@ -211,20 +217,24 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		if containerID != "" && !b.config.NoCleanup {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
 			defer cleanupCancel()
-			phase := tracing.StartPhase(cleanupCtx, "cleanup")
+			_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
+				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !cerrdefs.IsNotFound(removeErr) {
-				phase.End(removeErr)
+				tracing.RecordError(phase, removeErr)
+				phase.End()
 				log.Debugf(ctx, "Container %s already removed or removal failed: %v", containerID, removeErr)
 			} else {
-				phase.End(nil)
+				phase.End()
 				b.taskContainers.Delete(key)
 			}
 		}
 	}()
 
-	start := tracing.StartPhase(ctx, "container_start")
+	_, start := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_start",
+		trace.WithAttributes(attribute.String("phase", "container_start")))
 	_, err = dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
-	start.End(err)
+	tracing.RecordError(start, err)
+	start.End()
 	if err != nil {
 		doneContainerStart(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
@@ -235,8 +245,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	stopLogs := b.followContainerLogs(ctx, containerID, params.Logs)
 	defer stopLogs()
 
-	execution := tracing.StartPhase(ctx, "execution")
-	defer func() { execution.End(result.Error) }()
+	_, execution := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.execution",
+		trace.WithAttributes(attribute.String("phase", "execution")))
+	defer func() {
+		tracing.RecordError(execution, result.Error)
+		execution.End()
+	}()
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
 	case err := <-waitResult.Error:
