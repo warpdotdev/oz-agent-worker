@@ -22,8 +22,8 @@ type ExportConfig struct {
 	client   *http.Client
 }
 
-// NewExportConfig binds export and token-refresh requests to ctx. A missing or
-// unusable bootstrap token falls back to the assignment's refresh credentials.
+// NewExportConfig uses ctx for token refresh and exporter initialization. A
+// missing or unusable bootstrap token falls back to task refresh credentials.
 func NewExportConfig(ctx context.Context, serverRootURL string, assignment *types.TaskAssignmentMessage) (*ExportConfig, error) {
 	if assignment == nil || assignment.TelemetryCollection == nil {
 		return nil, errors.New("task telemetry configuration unavailable")

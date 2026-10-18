@@ -211,13 +211,13 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
 		}
-		cleanup := tracing.StartPhase(ctx, "cleanup")
 		if usingTargetDir {
+			cleanup := tracing.StartPhase(ctx, "cleanup")
 			// Don't clean up the shared target directory.
 			cleanup.End(b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, params.Logs))
 			return
 		}
-		cleanup.End(b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs))
+		_ = b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -381,7 +381,9 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 }
 
 // cleanup runs the teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) error {
+func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) (err error) {
+	phase := tracing.StartPhase(ctx, "cleanup")
+	defer func() { phase.End(err) }()
 	teardownErr := b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, reporter)
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)

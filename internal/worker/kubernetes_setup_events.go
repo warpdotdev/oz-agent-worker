@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
+	"go.opentelemetry.io/otel/attribute"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -62,6 +63,7 @@ func (t *kubernetesSetupPhaseTracker) observePod(ctx context.Context, pod *corev
 		return
 	}
 	t.observeSchedule(ctx, pod)
+	t.observeInitContainers(ctx, pod)
 	t.observeSidecarPrep(ctx, pod)
 	t.observeSetupCommand(ctx, pod)
 	t.observeTaskStart(ctx, pod)
@@ -73,18 +75,26 @@ func (t *kubernetesSetupPhaseTracker) report(ctx context.Context, eventName stri
 	if t.reported[eventName] || start.IsZero() || finish.IsZero() || finish.Before(start) {
 		return
 	}
-	t.reported[eventName] = true
-	t.start(ctx, eventName, start)
-	t.live[eventName].EndAt(finish, setupPhaseError(isError))
-	delete(t.live, eventName)
+	t.observeInterval(ctx, eventName, setupTracePhase(eventName), start, finish, setupPhaseError(isError))
 	t.reporter.reportPhase(ctx, eventName, start, finish, isError)
 }
 
 func (t *kubernetesSetupPhaseTracker) start(ctx context.Context, event string, start time.Time) {
-	if start.IsZero() || t.live[event] != nil {
+	t.observeInterval(ctx, event, setupTracePhase(event), start, time.Time{}, nil)
+}
+
+func (t *kubernetesSetupPhaseTracker) observeInterval(ctx context.Context, key, phase string, start, finish time.Time, err error, attrs ...attribute.KeyValue) {
+	if t.reported[key] || start.IsZero() || (!finish.IsZero() && finish.Before(start)) {
 		return
 	}
-	t.live[event] = tracing.StartPhaseAt(ctx, setupTracePhase(event), start)
+	if _, exists := t.live[key]; !exists {
+		t.live[key] = tracing.StartPhaseAt(ctx, phase, start, attrs...)
+	}
+	if !finish.IsZero() {
+		t.live[key].EndAt(finish, err)
+		delete(t.live, key)
+		t.reported[key] = true
+	}
 }
 
 func (t *kubernetesSetupPhaseTracker) finish(err error) {
@@ -108,9 +118,53 @@ func (t *kubernetesSetupPhaseTracker) observeSchedule(ctx context.Context, pod *
 	}
 }
 
+// Pod status has no image-pull timestamps. Preparation includes pulling images
+// and other pre-start delays, separately from the init container's runtime.
+func (t *kubernetesSetupPhaseTracker) observeInitContainers(ctx context.Context, pod *corev1.Pod) {
+	var anchor time.Time
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionTrue {
+			anchor = condition.LastTransitionTime.Time
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		var started, finished time.Time
+		var failed bool
+		for _, status := range pod.Status.InitContainerStatuses {
+			if status.Name != container.Name {
+				continue
+			}
+			if status.State.Running != nil {
+				started = status.State.Running.StartedAt.Time
+			} else if status.State.Terminated != nil {
+				started = status.State.Terminated.StartedAt.Time
+				finished = status.State.Terminated.FinishedAt.Time
+				failed = status.State.Terminated.ExitCode != 0
+			}
+		}
+		attrs := []attribute.KeyValue{attribute.String("k8s.container.name", container.Name)}
+		t.observeInterval(ctx, "image_prepare/"+container.Name, "image_prepare", anchor, started, nil, attrs...)
+		if started.IsZero() {
+			return
+		}
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			// Native sidecars stay running while later init containers start.
+			anchor = started
+			continue
+		}
+		if container.Name != kubernetesSetupContainerName && !strings.HasPrefix(container.Name, kubernetesSidecarInitPrefix) {
+			t.observeInterval(ctx, "init_container/"+container.Name, "init_container", started, finished, setupPhaseError(failed), attrs...)
+		}
+		if finished.IsZero() || finished.Before(started) || failed {
+			return
+		}
+		anchor = finished
+	}
+}
+
 // observeSidecarPrep reports one aggregate phase spanning the sequential
 // copy-sidecar-* init containers, from the first start to the last finish.
-// The kubelet's pull of each sidecar image is included in this span. The
+// Image preparation is tracked separately before each init starts. The
 // image-volumes mode creates no copy init containers, so the phase does not
 // fire there. A failed sidecar init reports early with is_error set.
 func (t *kubernetesSetupPhaseTracker) observeSidecarPrep(ctx context.Context, pod *corev1.Pod) {

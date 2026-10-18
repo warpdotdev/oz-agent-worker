@@ -185,14 +185,16 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		Resources: dockerResourcesForShape(params.InstanceShape),
 	}
 
-	doneContainerStart := params.SetupEvents.startPhase(ctx, SetupEventContainerStart)
+	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
 	key := taskExecution{params.TaskID, params.ExecutionID}
 	// Transport and server failures cannot prove that the daemon created no container.
 	b.taskContainers.Store(key, "")
+	create := tracing.StartPhase(ctx, "container_create")
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
+	create.End(err)
 	if err != nil {
 		if cerrdefs.IsInvalidArgument(err) || cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err) {
 			b.taskContainers.Delete(key)
@@ -220,7 +222,10 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		}
 	}()
 
-	if _, err := dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+	start := tracing.StartPhase(ctx, "container_start")
+	_, err = dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
+	start.End(err)
+	if err != nil {
 		doneContainerStart(true)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerStart, fmt.Errorf("failed to start container: %w", err)))
 	}

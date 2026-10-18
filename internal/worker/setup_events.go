@@ -115,14 +115,24 @@ func (r *setupEventReporter) startPhase(ctx context.Context, eventName string) f
 // skew both the duration and the failure-rate metrics. Both funcs are safe to
 // call on a nil reporter.
 func (r *setupEventReporter) startPhaseIf(ctx context.Context, eventName string, shouldReport bool) func(isError bool) {
+	if !shouldReport {
+		return func(bool) {}
+	}
 	start := time.Now()
+	done := r.startEventAt(ctx, eventName, start)
 	var phase *tracing.Phase
-	if shouldReport && eventName != SetupEventImagePull {
+	if eventName != SetupEventImagePull {
 		phase = tracing.StartPhaseAt(ctx, setupTracePhase(eventName), start)
 	}
 	return func(isError bool) {
 		phase.End(setupPhaseError(isError))
-		if r == nil || !shouldReport || ctx.Err() != nil {
+		done(isError)
+	}
+}
+
+func (r *setupEventReporter) startEventAt(ctx context.Context, eventName string, start time.Time) func(isError bool) {
+	return func(isError bool) {
+		if r == nil || ctx.Err() != nil {
 			return
 		}
 		r.reportPhase(ctx, eventName, start, time.Now(), isError)

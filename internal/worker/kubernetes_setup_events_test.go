@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -279,4 +281,67 @@ func TestKubernetesSetupPhaseTrackerNilSafe(t *testing.T) {
 
 	var nilTracker *kubernetesSetupPhaseTracker
 	nilTracker.observePod(context.Background(), &corev1.Pod{})
+}
+
+func TestKubernetesInitPreparationAndExecution(t *testing.T) {
+	base := time.Now().Add(-time.Minute)
+	ctx, session, captured := newTaskTraceForTest(t, base)
+	tracker := newKubernetesSetupPhaseTracker(nil)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(base)},
+		Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: "verify"}}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(base.Add(2 * time.Second)),
+		}}},
+	}
+	tracker.observePod(ctx, pod)
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "verify", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(base.Add(8 * time.Second))}},
+	}}
+	tracker.observePod(ctx, pod)
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		terminatedInitStatus("verify", base.Add(8*time.Second), base.Add(20*time.Second), 0),
+	}
+	tracker.observePod(ctx, pod)
+	tracker.observePod(ctx, pod)
+	tracker.finish(nil)
+	session.End("succeeded", nil)
+	if err := session.ForceFlush(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var root *tracepb.Span
+	intervals := make(map[string]*tracepb.Span)
+	for _, span := range captured() {
+		if span.Name == "self_hosted_worker.task" {
+			root = span
+		}
+		if span.Name == "self_hosted_worker.image_prepare" || span.Name == "self_hosted_worker.init_container" {
+			if intervals[span.Name] != nil {
+				t.Fatalf("duplicate init interval %s", span.Name)
+			}
+			intervals[span.Name] = span
+		}
+	}
+	if root == nil || len(intervals) != 2 {
+		t.Fatalf("missing root or init intervals: %v", intervals)
+	}
+	preparation, execution := intervals["self_hosted_worker.image_prepare"], intervals["self_hosted_worker.init_container"]
+	if preparation.StartTimeUnixNano != uint64(base.Add(2*time.Second).UnixNano()) ||
+		preparation.EndTimeUnixNano != uint64(base.Add(8*time.Second).UnixNano()) ||
+		execution.StartTimeUnixNano != preparation.EndTimeUnixNano ||
+		execution.EndTimeUnixNano != uint64(base.Add(20*time.Second).UnixNano()) {
+		t.Fatal("init preparation and execution did not retain pod timestamp boundaries")
+	}
+	for _, span := range intervals {
+		if !bytes.Equal(span.ParentSpanId, root.SpanId) {
+			t.Fatal("init interval is not a task-root child")
+		}
+		found := false
+		for _, attr := range span.Attributes {
+			found = found || attr.Key == "k8s.container.name" && attr.Value.GetStringValue() == "verify"
+		}
+		if !found {
+			t.Fatal("init interval does not identify its container")
+		}
+	}
 }

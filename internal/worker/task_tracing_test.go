@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/moby/moby/client"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel"
@@ -21,6 +23,111 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+func newTaskTraceForTest(t *testing.T, receivedAt time.Time) (context.Context, *tracing.Session, func() []*tracepb.Span) {
+	t.Helper()
+	var mu sync.Mutex
+	var spans []*tracepb.Span
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		data, _ := io.ReadAll(req.Body)
+		var payload collector.ExportTraceServiceRequest
+		if err := proto.Unmarshal(data, &payload); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, resource := range payload.ResourceSpans {
+			for _, scope := range resource.ScopeSpans {
+				spans = append(spans, scope.Spans...)
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	ctx, session, err := (*tracing.Handle)(nil).Start(t.Context(), "", &types.TaskAssignmentMessage{
+		TaskID: "run",
+		TelemetryCollection: &types.TelemetryCollectionConfig{
+			Endpoint: server.URL, TracingEnabled: true,
+			BootstrapToken: &types.TelemetryBootstrapToken{Token: "task-token", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
+		},
+	}, receivedAt)
+	if err != nil || session == nil {
+		t.Fatalf("start trace: %v", err)
+	}
+	t.Cleanup(func() {
+		session.End("interrupted", nil)
+		session.Shutdown(context.Background())
+	})
+	return ctx, session, func() []*tracepb.Span {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]*tracepb.Span(nil), spans...)
+	}
+}
+
+func TestDockerContainerCreationAndStartIntervals(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	ctx, session, captured := newTaskTraceForTest(t, time.Now())
+	var createStarted, createFinished, startStarted, startFinished time.Time
+	transport := cancellationDockerTransport(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Path == "/_ping":
+			return mockEngineResponse(req, http.StatusOK, "text/plain", "OK"), nil
+		case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/images/task-image/json"):
+			return mockImageInspectResponse(t, req, "linux", "amd64", ""), nil
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/containers/create"):
+			createStarted = time.Now()
+			response := mockEngineResponse(req, http.StatusCreated, "application/json", `{"Id":"task-container"}`)
+			createFinished = time.Now()
+			return response, nil
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/containers/task-container/start"):
+			startStarted = time.Now()
+			response := mockEngineErrorResponse(t, req, http.StatusInternalServerError, "start failed")
+			startFinished = time.Now()
+			return response, nil
+		default:
+			t.Errorf("unexpected Docker request: %s %s", req.Method, req.URL.Path)
+			return mockEngineErrorResponse(t, req, http.StatusInternalServerError, "unexpected request"), nil
+		}
+	})
+	dockerClient, err := client.New(client.WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dockerClient.Close() }()
+	backend := &DockerBackend{
+		dockerClient: dockerClient, platform: "linux/amd64",
+		config: DockerBackendConfig{ImagePullPolicy: PullPolicyNever, NoCleanup: true},
+	}
+	result := backend.ExecuteTask(ctx, &TaskParams{TaskID: "run", DockerImage: "task-image"})
+	if result.Error == nil {
+		t.Fatal("expected container start failure")
+	}
+	session.End("failed", result.Error)
+	if err := session.ForceFlush(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	intervals := make(map[string]*tracepb.Span)
+	for _, span := range captured() {
+		if span.Name == "self_hosted_worker.container_create" || span.Name == "self_hosted_worker.container_start" {
+			if intervals[span.Name] != nil {
+				t.Fatalf("duplicate container interval %s", span.Name)
+			}
+			intervals[span.Name] = span
+		}
+	}
+	if len(intervals) != 2 || createStarted.IsZero() || startStarted.IsZero() {
+		t.Fatalf("missing container create/start intervals: %v", intervals)
+	}
+	create, start := intervals["self_hosted_worker.container_create"], intervals["self_hosted_worker.container_start"]
+	if create.StartTimeUnixNano > uint64(createStarted.UnixNano()) || create.EndTimeUnixNano < uint64(createFinished.UnixNano()) ||
+		start.StartTimeUnixNano < create.EndTimeUnixNano || start.StartTimeUnixNano > uint64(startStarted.UnixNano()) ||
+		start.EndTimeUnixNano < uint64(startFinished.UnixNano()) {
+		t.Fatal("container create/start intervals do not bracket their individual calls")
+	}
+	if create.Status.GetCode() == tracepb.Status_STATUS_CODE_ERROR || start.Status.GetCode() != tracepb.Status_STATUS_CODE_ERROR {
+		t.Fatal("container start failure was not isolated to the start span")
+	}
+}
 
 func TestTaskTraceBoundedShutdown(t *testing.T) {
 	var mu sync.Mutex
