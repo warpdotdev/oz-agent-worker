@@ -1,16 +1,21 @@
 package otlp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -19,6 +24,61 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"golang.org/x/oauth2"
 )
+
+func TestLogExportErrorStaysInWorkerLog(t *testing.T) {
+	const diagnostic = "collector rejected the export: diagnostic detail"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests.Add(1)
+		http.Error(w, diagnostic, http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	var workerOutput, taskOutput bytes.Buffer
+	previous := log.Logger
+	log.Logger = zerolog.New(&workerOutput)
+	t.Cleanup(func() { log.Logger = previous })
+	ctx := zerolog.New(&taskOutput).WithContext(t.Context())
+	config, err := NewExportConfig(ctx, "", &types.TaskAssignmentMessage{
+		TelemetryCollection: &types.TelemetryCollectionConfig{
+			Endpoint: server.URL,
+			BootstrapToken: &types.TelemetryBootstrapToken{
+				Token: "task-token", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter, err := config.LogExporter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = exporter.Shutdown(context.Background()) }()
+	var record sdklog.Record
+	record.SetBody(attribute.StringValue("task output"))
+	err = exporter.Export(ctx, []sdklog.Record{record})
+	if err == nil || err.Error() != "task log export failed" {
+		t.Fatalf("exporter returned an unsafe error: %v", err)
+	}
+	if taskOutput.Len() != 0 {
+		t.Fatalf("exporter diagnostic reached the task logger: %s", &taskOutput)
+	}
+	var event struct {
+		Level   string `json:"level"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(workerOutput.Bytes(), &event); err != nil {
+		t.Fatalf("missing worker diagnostic: %v", err)
+	}
+	if event.Level != "error" || !strings.Contains(event.Error, diagnostic) || event.Message != "task log export failed" {
+		t.Fatalf("worker diagnostic lost the original error: %+v", event)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("exporter made %d requests, want one failed export", requests.Load())
+	}
+}
 
 func TestHTTPSExport(t *testing.T) {
 	for _, signal := range []string{"traces", "logs"} {
