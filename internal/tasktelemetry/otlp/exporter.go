@@ -14,12 +14,16 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
+// ExportConfig creates signal exporters with assignment-scoped credentials,
+// independent of operator OTLP routing, headers and TLS configuration.
 type ExportConfig struct {
 	ctx      context.Context
 	endpoint *url.URL
 	client   *http.Client
 }
 
+// NewExportConfig binds export and token-refresh requests to ctx. A missing or
+// unusable bootstrap token falls back to the assignment's refresh credentials.
 func NewExportConfig(ctx context.Context, serverRootURL string, assignment *types.TaskAssignmentMessage) (*ExportConfig, error) {
 	if assignment == nil || assignment.TelemetryCollection == nil {
 		return nil, errors.New("task telemetry configuration unavailable")
@@ -39,6 +43,7 @@ func (c *ExportConfig) TraceExporter() (sdktrace.SpanExporter, error) {
 	exporter, err := otlptracehttp.New(c.ctx,
 		otlptracehttp.WithEndpointURL(signalEndpoint(c.endpoint, "traces")),
 		otlptracehttp.WithHTTPClient(c.client),
+		// Clear inherited custom certificates, not HTTPS or certificate verification.
 		otlptracehttp.WithTLSClientConfig(nil),
 		otlptracehttp.WithHeaders(map[string]string{}),
 		otlptracehttp.WithTimeout(ExportTimeout),
@@ -57,6 +62,7 @@ func (c *ExportConfig) LogExporter() (sdklog.Exporter, error) {
 	exporter, err := otlploghttp.New(c.ctx,
 		otlploghttp.WithEndpointURL(signalEndpoint(c.endpoint, "logs")),
 		otlploghttp.WithHTTPClient(c.client),
+		// Clear inherited custom certificates, not HTTPS or certificate verification.
 		otlploghttp.WithTLSClientConfig(nil),
 		otlploghttp.WithHeaders(map[string]string{}),
 		otlploghttp.WithTimeout(ExportTimeout),

@@ -178,6 +178,13 @@ func TestTaskTraceDualExport(t *testing.T) {
 	}
 	for i, span := range spans {
 		local := exporter.spans[i]
+		attrs := attributes(span.Attributes)
+		if span.Name == "self_hosted_worker.task" && (attrs["warp.run_id"] != "run" || attrs["warp.execution_id"] != "execution-run") {
+			t.Fatal("task spans do not use Warp correlation attributes")
+		}
+		if _, ok := attrs["task.id"]; ok {
+			t.Fatal("task spans duplicate the run ID as task.id")
+		}
 		sc := local.SpanContext()
 		id, traceID, parent := sc.SpanID(), sc.TraceID(), local.Parent().SpanID()
 		if !bytes.Equal(span.SpanId, id[:]) || !bytes.Equal(span.TraceId, traceID[:]) ||
@@ -226,8 +233,8 @@ func TestTaskTraceConcurrentIsolation(t *testing.T) {
 		for _, payload := range c.payloads {
 			for _, res := range payload.ResourceSpans {
 				attrs := attributes(res.Resource.Attributes)
-				if attrs["run_id"] != run || attrs["execution_id"] != "execution-"+run || attrs["deployment.environment.name"] != "test" {
-					t.Errorf("task resources = %v; want run_id=%q execution_id=%q with shared deployment metadata", attrs, run, "execution-"+run)
+				if attrs["warp.run_id"] != run || attrs["warp.execution_id"] != "execution-"+run || attrs["deployment.environment.name"] != "test" {
+					t.Errorf("task resources = %v; want warp.run_id=%q warp.execution_id=%q with shared deployment metadata", attrs, run, "execution-"+run)
 				}
 			}
 		}

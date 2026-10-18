@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/otlp"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -31,15 +32,19 @@ type Session struct {
 	closeOnce  sync.Once
 }
 
+// Start begins a worker-local task trace at receivedAt. A nil session means no
+// destination is usable; a non-nil session can accompany a Warp initialization
+// error when operator tracing remains available. The caller must End and
+// Shutdown the session. A nil handle still permits assignment-driven export.
 func (h *Handle) Start(ctx context.Context, server string, assignment *types.TaskAssignmentMessage, receivedAt time.Time) (context.Context, *Session, error) {
 	pipelineCtx, cancel := context.WithCancel(context.Background())
 	attrs := []attribute.KeyValue{attribute.String("service.name", "oz-agent-worker")}
 	if h != nil {
 		attrs = h.resource.Attributes()
 	}
-	attrs = append(attrs, attribute.String("run_id", assignment.TaskID))
+	attrs = append(attrs, attribute.String("warp.run_id", assignment.TaskID))
 	if assignment.ExecutionID != "" {
-		attrs = append(attrs, attribute.String("execution_id", assignment.ExecutionID))
+		attrs = append(attrs, attribute.String("warp.execution_id", assignment.ExecutionID))
 	}
 	res := resource.NewSchemaless(attrs...)
 	s := &Session{cancel: cancel, phases: make(map[*Phase]struct{})}
@@ -69,10 +74,28 @@ func (h *Handle) Start(ctx context.Context, server string, assignment *types.Tas
 	s.provider = sdktrace.NewTracerProvider(opts...)
 	ctx, s.root = s.provider.Tracer(scope).Start(ctx, "self_hosted_worker.task",
 		trace.WithNewRoot(), trace.WithTimestamp(receivedAt),
-		trace.WithAttributes(append(attrs, attribute.String("task.id", assignment.TaskID))...),
+		trace.WithAttributes(attrs...),
 	)
 	s.ctx = context.WithValue(ctx, sessionKey{}, s)
 	return s.ctx, s, initErr
+}
+
+func newWarpProcessor(ctx context.Context, server string, assignment *types.TaskAssignmentMessage) (sdktrace.SpanProcessor, error) {
+	config, err := otlp.NewExportConfig(ctx, server, assignment)
+	if err != nil {
+		return nil, err
+	}
+
+	exporter, err := config.TraceExporter()
+	if err != nil {
+		return nil, err
+	}
+	return sdktrace.NewBatchSpanProcessor(exporter,
+		sdktrace.WithMaxQueueSize(256),
+		sdktrace.WithMaxExportBatchSize(64),
+		sdktrace.WithBatchTimeout(5*time.Second),
+		sdktrace.WithExportTimeout(otlp.ExportTimeout),
+	), nil
 }
 
 func (s *Session) End(outcome string, err error, attrs ...attribute.KeyValue) {
@@ -161,7 +184,7 @@ func StartPhase(ctx context.Context, name string) *Phase {
 	return StartPhaseAt(ctx, name, time.Now())
 }
 
-func StartPhaseAt(ctx context.Context, name string, start time.Time) *Phase {
+func StartPhaseAt(ctx context.Context, name string, start time.Time, attrs ...attribute.KeyValue) *Phase {
 	if name == "" || start.IsZero() {
 		return nil
 	}
@@ -175,7 +198,7 @@ func StartPhaseAt(ctx context.Context, name string, start time.Time) *Phase {
 		return nil
 	}
 	_, span := trace.SpanFromContext(s.ctx).TracerProvider().Tracer(scope).Start(s.ctx, "self_hosted_worker."+name,
-		trace.WithTimestamp(start), trace.WithAttributes(attribute.String("phase", name)))
+		trace.WithTimestamp(start), trace.WithAttributes(append(attrs, attribute.String("phase", name))...))
 	p := &Phase{session: s, span: span}
 	s.phases[p] = struct{}{}
 	return p
