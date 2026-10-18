@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -108,6 +109,8 @@ type logExporter struct {
 func (e logExporter) Export(ctx context.Context, records []sdklog.Record) error {
 	// OTel reports exporter errors outside the task-local log redactor.
 	if err := e.Exporter.Export(ctx, records); err != nil {
+		// The context logger would send the diagnostic back to the task collector.
+		log.Error().Err(err).Msg("task log export failed")
 		return errors.New("task log export failed")
 	}
 	return nil
