@@ -58,6 +58,52 @@ backend:
     sidecar_image: "my-registry.io/warpdotdev/warp-agent:latest"
 ```
 
+### Remapping sidecar images
+
+Docker and Kubernetes both support `sidecar_image_mappings` under their backend
+configuration. Keys are source **repositories without a tag or digest**; values
+are destination image references. The mapping applies to every assigned sidecar:
+the main agent, coding-agent CLI/ACP images, computer use, and any other additional
+sidecar. It does not remap the task's base image, Kubernetes preflight image, or
+service containers configured in `pod_template`.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker: # Use kubernetes here for the same remapping behavior.
+    sidecar_image_mappings:
+      docker.io/warpdotdev/warp-agent: "registry.internal/warp-agent"
+      docker.io/warpdotdev/warp-claude-cli-sidecar: "registry.internal/claude:approved"
+      docker.io/warpdotdev/warp-xvfb-sidecar: "registry.internal/computer-use@sha256:<digest>"
+```
+
+- When the destination has no tag or digest, the assigned tag/digest is preserved:
+  `docker.io/warpdotdev/warp-agent:v123` becomes
+  `registry.internal/warp-agent:v123`.
+- When the destination includes a tag and/or digest, that destination version
+  replaces the assigned version entirely. For example, any version of the Claude
+  image above becomes `registry.internal/claude:approved`. Replace `<digest>` with
+  the full digest of your mirrored computer-use image before using this config.
+- Matching is by normalized repository, not prefix or pattern:
+  `warpdotdev/warp-agent` and `docker.io/warpdotdev/warp-agent` identify the same
+  source. Duplicate normalized sources, versioned source keys and malformed
+  references are rejected at startup.
+- Existing `sidecar_image` and Kubernetes `coding_cli_sidecars` overrides are
+  applied first; mappings then act once on the resulting repositories, including
+  injected coding-CLI sidecars. A mapped destination is not remapped again.
+  Unmatched images and mount options are unchanged, and mappings do not inject
+  sidecars on their own.
+
+For Helm installations, configure the equivalent
+`kubernetesBackend.sidecarImageMappings` map in your values file.
+
+Docker sidecar pulls use credentials from the worker's Docker configuration
+(including credential helpers), just like task-image pulls. Make that
+configuration available to the worker process when using private mirrors.
+Kubernetes uses `imagePullSecrets` from `backend.kubernetes.pod_template`.
+Operators remain responsible for mirroring the selected versions and ensuring
+that pinned custom images are compatible with the server and agent.
+
 ### Image releases and pinning
 
 Production self-hosted workers should pin an immutable image version instead of relying on `latest`.

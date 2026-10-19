@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
@@ -195,6 +196,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}
 
+	var sidecarImageMappings map[string]string
 	switch backendType {
 	case "kubernetes":
 		var (
@@ -227,6 +229,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
 			sidecarImage = kc.SidecarImage
+			sidecarImageMappings = kc.SidecarImageMappings
 			codingCLISidecars = copyStringMap(kc.CodingCLISidecars)
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
@@ -379,6 +382,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
 			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
 			sidecarImage = fileConfig.Backend.Docker.SidecarImage
+			sidecarImageMappings = fileConfig.Backend.Docker.SidecarImageMappings
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
@@ -391,6 +395,10 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		}
 	}
 
+	wc.SidecarImageMappings, err = common.NewImageRemapper(sidecarImageMappings)
+	if err != nil {
+		return worker.Config{}, fmt.Errorf("invalid backend.%s.sidecar_image_mappings: %w", backendType, err)
+	}
 	return wc, nil
 }
 

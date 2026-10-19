@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -501,5 +503,38 @@ func TestMergeConfigKubernetesCodingCLISidecars(t *testing.T) {
 	fileConfig.Backend.Kubernetes.CodingCLISidecars["claude"] = "mutated"
 	if got := wc.Kubernetes.CodingCLISidecars["claude"]; got != "registry.internal/my-claude:v1" {
 		t.Errorf("expected merged config to be insulated from file config mutation, got %q", got)
+	}
+}
+
+func TestSidecarImageMappingsFromYAML(t *testing.T) {
+	for _, backend := range []string{"docker", "kubernetes"} {
+		t.Run(backend, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			content := fmt.Sprintf("worker_id: test-worker\nbackend:\n  %s:\n    sidecar_image_mappings:\n      warpdotdev/warp-agent: mirror.example/agent:approved\n", backend)
+			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc, err := mergeConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := wc.SidecarImageMappings.Remap("docker.io/warpdotdev/warp-agent:v1"); got != "mirror.example/agent:approved" {
+				t.Fatalf("merged mapping = %q", got)
+			}
+			if backend == "docker" {
+				cfg.Backend.Docker.SidecarImageMappings["warpdotdev/warp-agent"] = ""
+			} else {
+				cfg.Backend.Kubernetes.SidecarImageMappings["warpdotdev/warp-agent"] = ""
+			}
+			if _, err := mergeConfig(cfg); err == nil || !strings.Contains(err.Error(), "backend."+backend+".sidecar_image_mappings") {
+				t.Fatalf("startup error = %v, want contextual mapping validation error", err)
+			}
+		})
 	}
 }

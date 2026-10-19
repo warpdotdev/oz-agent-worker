@@ -676,8 +676,8 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 
 		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
 
-		// Additional sidecar images are public, so no auth is needed when a pull is required.
-		if err := b.prepareImage(ctx, sidecar.Image, "", nil); err != nil {
+		authStr := b.getRegistryAuth(ctx, sidecar.Image)
+		if err := b.prepareImage(ctx, sidecar.Image, authStr, nil); err != nil {
 			return nil, fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
 		}
 

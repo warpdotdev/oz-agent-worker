@@ -63,6 +63,7 @@ type Config struct {
 	SessionSharingServerURL string
 	CollectTaskLogs         bool
 	Tracing                 *tracing.Handle
+	SidecarImageMappings    *common.ImageRemapper
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -852,6 +853,10 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 				}
 			}
 		}
+	}
+
+	for i := range sidecars {
+		sidecars[i].Image = w.config.SidecarImageMappings.Remap(sidecars[i].Image)
 	}
 
 	setupEvents := newSetupEventReporter(w.config.ServerRootURL, assignment)

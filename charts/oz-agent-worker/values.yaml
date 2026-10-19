@@ -83,6 +83,9 @@ kubernetesBackend:
   useImageVolumes: false
   preflightImage: ""
   sidecarImage: ""
+  # Source repositories have no tag/digest. Unpinned destinations preserve the
+  # assigned version; a destination tag/digest replaces it.
+  sidecarImageMappings: {}
   setupCommand: ""
   teardownCommand: ""
   extraLabels: {}
