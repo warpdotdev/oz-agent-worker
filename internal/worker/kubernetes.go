@@ -136,10 +136,9 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
-	config               KubernetesBackendConfig
-	clientset            kubernetes.Interface
-	useImageVolumes      bool
-	imageVolumesRequired bool
+	config          KubernetesBackendConfig
+	clientset       kubernetes.Interface
+	useImageVolumes bool
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -206,8 +205,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.TaskEnv)
-	useImageVolumes, err := b.useImageVolumesForTask(ctx, params.Sidecars)
-	if err != nil {
+	if err := validateTaskSidecars(params.Sidecars); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
@@ -248,7 +246,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	var initContainers []corev1.Container
 	for i, sidecar := range params.Sidecars {
-		if useImageVolumes {
+		if b.useImageVolumes && !sidecar.ReadWrite {
 			volumeName := fmt.Sprintf("sidecar-%d-image", i)
 			volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
 
@@ -843,7 +841,7 @@ func workspaceVolumeName() string {
 	return "workspace"
 }
 
-func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) error {
+func validateTaskSidecars(sidecars []types.SidecarMount) error {
 	seenMountPaths := make(map[string]bool)
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
@@ -858,33 +856,13 @@ func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) e
 		if seenMountPaths[sidecar.MountPath] {
 			return fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
 		}
-		if useImageVolumes && sidecar.ReadWrite {
-			return fmt.Errorf("additional sidecar %s cannot request a read-write mount: kubernetes image volumes are read-only", sidecar.Image)
-		}
 		seenMountPaths[sidecar.MountPath] = true
 	}
 	return nil
 }
 
-func (b *KubernetesBackend) useImageVolumesForTask(ctx context.Context, sidecars []types.SidecarMount) (bool, error) {
-	if err := validateTaskSidecars(sidecars, b.useImageVolumes && b.imageVolumesRequired); err != nil {
-		return false, err
-	}
-	if !b.useImageVolumes {
-		return false, nil
-	}
-	for _, sidecar := range sidecars {
-		if sidecar.ReadWrite {
-			log.Infof(ctx, "Using legacy sidecar copy path because a sidecar requests a read-write mount")
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 func (b *KubernetesBackend) configureImageVolumes(ctx context.Context) error {
 	b.useImageVolumes = false
-	b.imageVolumesRequired = false
 	if b.config.UseImageVolumes != nil && !*b.config.UseImageVolumes {
 		if err := b.runStartupPreflight(ctx, false); err != nil {
 			return err
@@ -906,8 +884,7 @@ func (b *KubernetesBackend) configureImageVolumes(ctx context.Context) error {
 	}
 
 	b.useImageVolumes = true
-	b.imageVolumesRequired = b.config.UseImageVolumes != nil
-	if b.imageVolumesRequired {
+	if b.config.UseImageVolumes != nil {
 		log.Infof(ctx, "Kubernetes image-volume mode resolved: forced-on")
 	} else {
 		log.Infof(ctx, "Kubernetes image-volume mode resolved: auto-on")

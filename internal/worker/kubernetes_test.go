@@ -928,58 +928,7 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 	}
 }
 
-func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
-	err := validateTaskSidecars([]types.SidecarMount{
-		{
-			Image:     "registry.internal/agent:1.0",
-			MountPath: "/agent",
-			ReadWrite: true,
-		},
-	}, false)
-	if err != nil {
-		t.Fatalf("expected read-write sidecar to be allowed by default, got %v", err)
-	}
-}
-
-func TestValidateTaskSidecarsRejectsReadWriteMountsWhenImageVolumesEnabled(t *testing.T) {
-	err := validateTaskSidecars([]types.SidecarMount{
-		{
-			Image:     "registry.internal/agent:1.0",
-			MountPath: "/agent",
-			ReadWrite: true,
-		},
-	}, true)
-	if err == nil {
-		t.Fatal("expected read-write sidecar validation failure")
-	}
-	if !strings.Contains(err.Error(), "read-write mount") {
-		t.Fatalf("expected read-write validation detail, got %v", err)
-	}
-}
-
-func TestUseImageVolumesForTask(t *testing.T) {
-	readWriteSidecar := []types.SidecarMount{{
-		Image:     "registry.internal/agent:1.0",
-		MountPath: "/agent",
-		ReadWrite: true,
-	}}
-
-	autoBackend := &KubernetesBackend{useImageVolumes: true}
-	useImageVolumes, err := autoBackend.useImageVolumesForTask(context.Background(), readWriteSidecar)
-	if err != nil {
-		t.Fatalf("auto mode returned an unexpected error: %v", err)
-	}
-	if useImageVolumes {
-		t.Fatal("auto mode should use the legacy copy path for a read-write sidecar")
-	}
-
-	forcedBackend := &KubernetesBackend{useImageVolumes: true, imageVolumesRequired: true}
-	if _, err := forcedBackend.useImageVolumesForTask(context.Background(), readWriteSidecar); err == nil {
-		t.Fatal("forced-on mode should reject a read-write sidecar")
-	}
-}
-
-func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
+func TestExecuteTaskMixesImageAndCopyVolumes(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1028,9 +977,8 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			SetupCommand:    "true",
 			UseImageVolumes: workerBoolPtr(true),
 		},
-		clientset:            fakeClient,
-		useImageVolumes:      true,
-		imageVolumesRequired: true,
+		clientset:       fakeClient,
+		useImageVolumes: true,
 	}
 
 	result := backend.ExecuteTask(context.Background(), &TaskParams{
@@ -1042,6 +990,11 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			{
 				Image:     "registry.internal/agent:1.0",
 				MountPath: "/agent",
+			},
+			{
+				Image:     "registry.internal/tools:1.0",
+				MountPath: "/tools",
+				ReadWrite: true,
 			},
 		},
 	})
@@ -1073,14 +1026,21 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		t.Fatalf("execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("execution-1"))
 	}
 
-	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
-		t.Fatalf("expected only setup init container, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
+	if len(createdJob.Spec.Template.Spec.InitContainers) != 2 {
+		t.Fatalf("expected writable-sidecar copy and setup init containers, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
-	if createdJob.Spec.Template.Spec.InitContainers[0].Name != kubernetesSetupContainerName {
-		t.Fatalf("expected setup init container, got %q", createdJob.Spec.Template.Spec.InitContainers[0].Name)
+	copyContainer := createdJob.Spec.Template.Spec.InitContainers[0]
+	if copyContainer.Name != "copy-sidecar-1" || copyContainer.Image != "registry.internal/tools:1.0" {
+		t.Fatalf("expected only the writable sidecar to be copied, got %+v", copyContainer)
 	}
-	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
-		t.Fatalf("expected workspace and sidecar image volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
+	if len(copyContainer.VolumeMounts) != 1 || copyContainer.VolumeMounts[0].Name != "sidecar-1-data" {
+		t.Fatalf("expected copy output in the writable sidecar volume, got %+v", copyContainer.VolumeMounts)
+	}
+	if createdJob.Spec.Template.Spec.InitContainers[1].Name != kubernetesSetupContainerName {
+		t.Fatalf("expected setup after the sidecar copy, got %q", createdJob.Spec.Template.Spec.InitContainers[1].Name)
+	}
+	if len(createdJob.Spec.Template.Spec.Volumes) != 3 {
+		t.Fatalf("expected workspace, image, and writable data volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
 	}
 
 	var sidecarVolume *corev1.Volume
@@ -1101,6 +1061,10 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if sidecarVolume.Image.PullPolicy != corev1.PullAlways {
 		t.Fatalf("image volume pullPolicy = %q, want %q", sidecarVolume.Image.PullPolicy, corev1.PullAlways)
+	}
+	writableVolume := createdJob.Spec.Template.Spec.Volumes[2]
+	if writableVolume.Name != "sidecar-1-data" || writableVolume.EmptyDir == nil {
+		t.Fatalf("expected an emptyDir for the writable sidecar, got %+v", writableVolume)
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
@@ -1141,7 +1105,7 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		t.Fatal("expected task sidecar mount to be read-only")
 	}
 
-	setupContainer := createdJob.Spec.Template.Spec.InitContainers[0]
+	setupContainer := createdJob.Spec.Template.Spec.InitContainers[1]
 	var setupSidecarMount *corev1.VolumeMount
 	for i := range setupContainer.VolumeMounts {
 		if setupContainer.VolumeMounts[i].Name == "sidecar-0-image" {
@@ -1154,6 +1118,20 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if !setupSidecarMount.ReadOnly {
 		t.Fatal("expected setup sidecar mount to be read-only")
+	}
+	for _, container := range []corev1.Container{taskContainer, setupContainer} {
+		found := false
+		for _, mount := range container.VolumeMounts {
+			if mount.MountPath == "/tools" {
+				found = true
+				if mount.Name != "sidecar-1-data" || mount.ReadOnly {
+					t.Fatalf("expected a writable copied-sidecar mount in %s, got %+v", container.Name, mount)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing writable sidecar mount in %s", container.Name)
+		}
 	}
 }
 
@@ -1925,7 +1903,6 @@ func TestConfigureImageVolumes(t *testing.T) {
 		imageVolumesSupported bool
 		wantModes             []bool
 		wantUseImageVolumes   bool
-		wantRequired          bool
 		wantError             bool
 	}{
 		{
@@ -1958,7 +1935,6 @@ func TestConfigureImageVolumes(t *testing.T) {
 			imageVolumesSupported: true,
 			wantModes:             []bool{true},
 			wantUseImageVolumes:   true,
-			wantRequired:          true,
 		},
 	}
 
@@ -1980,10 +1956,24 @@ func TestConfigureImageVolumes(t *testing.T) {
 			if backend.useImageVolumes != tt.wantUseImageVolumes {
 				t.Fatalf("useImageVolumes = %t, want %t", backend.useImageVolumes, tt.wantUseImageVolumes)
 			}
-			if backend.imageVolumesRequired != tt.wantRequired {
-				t.Fatalf("imageVolumesRequired = %t, want %t", backend.imageVolumesRequired, tt.wantRequired)
-			}
 		})
+	}
+}
+
+func TestConfigureImageVolumesFallsBackOnInconclusiveProbe(t *testing.T) {
+	backend, createdModes := newImageVolumeModeTestBackend(t, nil, true)
+	backend.clientset.(*fake.Clientset).PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewTimeoutError("temporary API timeout", 1)
+	})
+
+	if err := backend.configureImageVolumes(context.Background()); err != nil {
+		t.Fatalf("unexpected startup error after inconclusive image-volume probe: %v", err)
+	}
+	if backend.useImageVolumes {
+		t.Fatal("inconclusive probe should leave image volumes disabled")
+	}
+	if len(*createdModes) != 2 || !(*createdModes)[0] || (*createdModes)[1] {
+		t.Fatalf("expected image-volume probe followed by legacy preflight, got %v", *createdModes)
 	}
 }
 
