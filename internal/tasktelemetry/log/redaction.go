@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -40,6 +41,40 @@ func (b *redactionBuffer) WriteString(s string) (int, error) {
 		return 0, errors.New("redacted log exceeds record budget")
 	}
 	return b.Builder.WriteString(s)
+}
+
+func (r *redactor) addEnv(name, value string) {
+	name = strings.ToUpper(name)
+	for _, marker := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "PRIVATE"} {
+		if strings.Contains(name, marker) {
+			r.add(value)
+			return
+		}
+	}
+	// When adding the task environment, do not mask flag values or known non-sensitive variables.
+	// Because the redactor matches on values alone, over-redacting makes the log output unreadable.
+	// For example, we shouldn't redact every occurrence of "0".
+	if value == "true" || value == "false" {
+		return
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return
+	}
+	switch name {
+	case "TASK_ID", "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TERM", "TMPDIR", "DISPLAY":
+		return
+	}
+	if strings.HasPrefix(name, "OZ_") || strings.HasPrefix(name, "WARP_") {
+		switch name[strings.IndexByte(name, '_')+1:] {
+		case "RUN_ID", "EXECUTION_ID", "WORKER_BACKEND", "WORKSPACE_ROOT", "ENVIRONMENT_FILE", "DOCKER_IMAGE":
+			return
+		case "SERVER_ROOT_URL":
+			if endpoint, err := url.Parse(value); err == nil && endpoint.User == nil && endpoint.RawQuery == "" && endpoint.Fragment == "" {
+				return
+			}
+		}
+	}
+	r.add(value)
 }
 
 func (r *redactor) add(value string) {

@@ -425,7 +425,7 @@ slash) and `log.iostream` (`stdout` or `stderr`). Kubernetes records carry
 `k8s.container.name` and `k8s.pod.name`, including init containers. Direct, command,
 hook, and worker logs do not carry container attributes.
 
-Before export, the worker redacts known environment values supplied to the task
+Before export, the worker redacts known secret environment values supplied to the task
 or its hooks. Local stdout/stderr is not scrubbed. Secrets created inside tasks
 or resolved through Kubernetes `valueFrom`/`envFrom` are not known to the worker
 and cannot be redacted. Setup hooks must write generated credentials to the
