@@ -120,8 +120,9 @@ func TestSidecarImageMappingsBackends(t *testing.T) {
 				return true, nil, stop
 			})
 			backend := &KubernetesBackend{
-				config:    KubernetesBackendConfig{Namespace: "agents", UseImageVolumes: mode == "kubernetes-image-volume"},
-				clientset: client,
+				config:          KubernetesBackendConfig{Namespace: "agents"},
+				clientset:       client,
+				useImageVolumes: mode == "kubernetes-image-volume",
 			}
 			if result := backend.ExecuteTask(context.Background(), params); !errors.Is(result.Error, stop) {
 				t.Fatalf("ExecuteTask error = %v, want captured Job", result.Error)
