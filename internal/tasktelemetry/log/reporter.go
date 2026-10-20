@@ -73,14 +73,14 @@ func (r *Reporter) Context() context.Context {
 	return r.ctx
 }
 
-// AddEnv registers nonempty environment values for task-local credential redaction.
+// AddEnv registers potentially sensitive environment values for task-local redaction.
 // Structured events match complete values; raw lines also match newline fragments.
 func (r *Reporter) AddEnv(env map[string]string) {
 	if r == nil {
 		return
 	}
-	for _, value := range env {
-		r.redactor.add(value)
+	for name, value := range env {
+		r.redactor.addEnv(name, value)
 	}
 }
 
@@ -89,8 +89,8 @@ func (r *Reporter) AddEnvList(env []string) {
 		return
 	}
 	for _, entry := range env {
-		_, value, _ := strings.Cut(entry, "=")
-		r.redactor.add(value)
+		name, value, _ := strings.Cut(entry, "=")
+		r.redactor.addEnv(name, value)
 	}
 }
 
