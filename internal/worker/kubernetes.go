@@ -95,7 +95,7 @@ type KubernetesBackendConfig struct {
 	Kubeconfig            string
 	DefaultImage          string
 	ImagePullPolicy       string
-	UseImageVolumes       bool
+	UseImageVolumes       *bool
 	PreflightImage        string
 	SetupCommand          string
 	TeardownCommand       string
@@ -131,8 +131,9 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
-	config    KubernetesBackendConfig
-	clientset kubernetes.Interface
+	config          KubernetesBackendConfig
+	clientset       kubernetes.Interface
+	useImageVolumes bool
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -176,7 +177,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 		config:    config,
 		clientset: clientset,
 	}
-	if err := backend.runStartupPreflight(ctx); err != nil {
+	if err := backend.configureImageVolumes(ctx); err != nil {
 		return nil, err
 	}
 
@@ -199,7 +200,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.TaskEnv)
-	if err := validateTaskSidecars(params.Sidecars, b.config.UseImageVolumes); err != nil {
+	if err := validateTaskSidecars(params.Sidecars); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
@@ -240,7 +241,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	var initContainers []corev1.Container
 	for i, sidecar := range params.Sidecars {
-		if b.config.UseImageVolumes {
+		if b.useImageVolumes && !sidecar.ReadWrite {
 			volumeName := fmt.Sprintf("sidecar-%d-image", i)
 			volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
 
@@ -835,7 +836,7 @@ func workspaceVolumeName() string {
 	return "workspace"
 }
 
-func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) error {
+func validateTaskSidecars(sidecars []types.SidecarMount) error {
 	seenMountPaths := make(map[string]bool)
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
@@ -850,19 +851,47 @@ func validateTaskSidecars(sidecars []types.SidecarMount, useImageVolumes bool) e
 		if seenMountPaths[sidecar.MountPath] {
 			return fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
 		}
-		if useImageVolumes && sidecar.ReadWrite {
-			return fmt.Errorf("additional sidecar %s cannot request a read-write mount: kubernetes image volumes are read-only", sidecar.Image)
-		}
 		seenMountPaths[sidecar.MountPath] = true
 	}
 	return nil
 }
 
-func (b *KubernetesBackend) runStartupPreflight(ctx context.Context) error {
-	job := b.startupPreflightJob()
+func (b *KubernetesBackend) configureImageVolumes(ctx context.Context) error {
+	b.useImageVolumes = false
+	if b.config.UseImageVolumes != nil && !*b.config.UseImageVolumes {
+		if err := b.runStartupPreflight(ctx, false); err != nil {
+			return err
+		}
+		log.Infof(ctx, "Kubernetes image-volume mode resolved: forced-off (legacy copy path)")
+		return nil
+	}
+
+	if err := b.runStartupPreflight(ctx, true); err != nil {
+		if b.config.UseImageVolumes != nil {
+			return err
+		}
+		log.Warnf(ctx, "Kubernetes image-volume auto-detection failed; falling back to the legacy copy path: %v", err)
+		if legacyErr := b.runStartupPreflight(ctx, false); legacyErr != nil {
+			return legacyErr
+		}
+		log.Infof(ctx, "Kubernetes image-volume mode resolved: auto-fallback (legacy copy path)")
+		return nil
+	}
+
+	b.useImageVolumes = true
+	if b.config.UseImageVolumes != nil {
+		log.Infof(ctx, "Kubernetes image-volume mode resolved: forced-on")
+	} else {
+		log.Infof(ctx, "Kubernetes image-volume mode resolved: auto-on")
+	}
+	return nil
+}
+
+func (b *KubernetesBackend) runStartupPreflight(ctx context.Context, useImageVolumes bool) error {
+	job := b.startupPreflightJob(useImageVolumes)
 	createdJob, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
 	if err != nil {
-		return b.startupPreflightError(err)
+		return b.startupPreflightError(err, useImageVolumes)
 	}
 	defer func() {
 		if err := b.deleteJob(context.Background(), createdJob.Name); err != nil {
@@ -873,23 +902,23 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context) error {
 	preflightCtx, cancel := context.WithTimeout(ctx, startupPreflightTimeout)
 	defer cancel()
 
-	if err := b.waitForStartupPreflight(ctx, preflightCtx, createdJob); err != nil {
+	if err := b.waitForStartupPreflight(ctx, preflightCtx, createdJob, useImageVolumes); err != nil {
 		if err == context.Canceled && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return b.startupPreflightError(err)
+		return b.startupPreflightError(err, useImageVolumes)
 	}
 
 	return nil
 }
 
-func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
+func (b *KubernetesBackend) startupPreflightJob(useImageVolumes bool) *batchv1.Job {
 	backoffLimit := int32(0)
 	pullPolicy := normalizePullPolicy(b.config.ImagePullPolicy)
 	podSpec := b.basePodSpec()
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
 	preflightRes := b.preflightResourceRequirements()
-	if b.config.UseImageVolumes {
+	if useImageVolumes {
 		podSpec.InitContainers = nil
 		podSpec.Volumes = append(podSpec.Volumes, imageVolume(startupPreflightImageVolumeName, b.config.PreflightImage, pullPolicy))
 		podSpec.Containers = []corev1.Container{
@@ -944,8 +973,8 @@ func (b *KubernetesBackend) startupPreflightJob() *batchv1.Job {
 	return job
 }
 
-func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job) error {
-	if b.config.UseImageVolumes {
+func (b *KubernetesBackend) waitForStartupPreflight(logCtx, ctx context.Context, job *batchv1.Job, useImageVolumes bool) error {
+	if useImageVolumes {
 		return b.waitForImageVolumeStartupPreflight(logCtx, ctx, job)
 	}
 	return b.waitForLegacyStartupPreflight(logCtx, ctx, job)
@@ -1072,9 +1101,9 @@ func startupPreflightFailureFromEvents(jobName string, events []corev1.Event) er
 	return nil
 }
 
-func (b *KubernetesBackend) startupPreflightError(err error) error {
-	if b.config.UseImageVolumes {
-		return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs that mount sidecars via image volumes; verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
+func (b *KubernetesBackend) startupPreflightError(err error, useImageVolumes bool) error {
+	if useImageVolumes {
+		return fmt.Errorf("kubernetes image-volume startup preflight failed: verify service account/RBAC, Pod Security or admission policy, and Kubernetes/runtime image-volume support for namespace %q: %w", b.config.Namespace, err)
 	}
 	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }

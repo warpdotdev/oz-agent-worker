@@ -22,6 +22,10 @@ func durationPtr(value time.Duration) *time.Duration {
 	return &value
 }
 
+func workerBoolPtr(value bool) *bool {
+	return &value
+}
+
 func TestKubernetesTaskJobNameEmbedsFullRunIDAndExecSuffix(t *testing.T) {
 	runID := "019f5de4-bfd1-762e-92ed-199c971abcba"
 	execID := "019f5df0-aaaa-bbbb-cccc-abcdef012345"
@@ -924,36 +928,7 @@ func TestBuildTaskPodSpecRunnerShapeOverridesPodTemplateResources(t *testing.T) 
 	}
 }
 
-func TestValidateTaskSidecarsAllowsReadWriteMountsByDefault(t *testing.T) {
-	err := validateTaskSidecars([]types.SidecarMount{
-		{
-			Image:     "registry.internal/agent:1.0",
-			MountPath: "/agent",
-			ReadWrite: true,
-		},
-	}, false)
-	if err != nil {
-		t.Fatalf("expected read-write sidecar to be allowed by default, got %v", err)
-	}
-}
-
-func TestValidateTaskSidecarsRejectsReadWriteMountsWhenImageVolumesEnabled(t *testing.T) {
-	err := validateTaskSidecars([]types.SidecarMount{
-		{
-			Image:     "registry.internal/agent:1.0",
-			MountPath: "/agent",
-			ReadWrite: true,
-		},
-	}, true)
-	if err == nil {
-		t.Fatal("expected read-write sidecar validation failure")
-	}
-	if !strings.Contains(err.Error(), "read-write mount") {
-		t.Fatalf("expected read-write validation detail, got %v", err)
-	}
-}
-
-func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
+func TestExecuteTaskMixesImageAndCopyVolumes(t *testing.T) {
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1000,9 +975,10 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			Namespace:       "agents",
 			ImagePullPolicy: string(corev1.PullAlways),
 			SetupCommand:    "true",
-			UseImageVolumes: true,
+			UseImageVolumes: workerBoolPtr(true),
 		},
-		clientset: fakeClient,
+		clientset:       fakeClient,
+		useImageVolumes: true,
 	}
 
 	result := backend.ExecuteTask(context.Background(), &TaskParams{
@@ -1014,6 +990,11 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 			{
 				Image:     "registry.internal/agent:1.0",
 				MountPath: "/agent",
+			},
+			{
+				Image:     "registry.internal/tools:1.0",
+				MountPath: "/tools",
+				ReadWrite: true,
 			},
 		},
 	})
@@ -1045,14 +1026,21 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		t.Fatalf("execution hash label = %q, want %q", createdJob.Labels[kubernetesExecutionHashLabel], kubernetesLabelHash("execution-1"))
 	}
 
-	if len(createdJob.Spec.Template.Spec.InitContainers) != 1 {
-		t.Fatalf("expected only setup init container, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
+	if len(createdJob.Spec.Template.Spec.InitContainers) != 2 {
+		t.Fatalf("expected writable-sidecar copy and setup init containers, got %d", len(createdJob.Spec.Template.Spec.InitContainers))
 	}
-	if createdJob.Spec.Template.Spec.InitContainers[0].Name != kubernetesSetupContainerName {
-		t.Fatalf("expected setup init container, got %q", createdJob.Spec.Template.Spec.InitContainers[0].Name)
+	copyContainer := createdJob.Spec.Template.Spec.InitContainers[0]
+	if copyContainer.Name != "copy-sidecar-1" || copyContainer.Image != "registry.internal/tools:1.0" {
+		t.Fatalf("expected only the writable sidecar to be copied, got %+v", copyContainer)
 	}
-	if len(createdJob.Spec.Template.Spec.Volumes) != 2 {
-		t.Fatalf("expected workspace and sidecar image volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
+	if len(copyContainer.VolumeMounts) != 1 || copyContainer.VolumeMounts[0].Name != "sidecar-1-data" {
+		t.Fatalf("expected copy output in the writable sidecar volume, got %+v", copyContainer.VolumeMounts)
+	}
+	if createdJob.Spec.Template.Spec.InitContainers[1].Name != kubernetesSetupContainerName {
+		t.Fatalf("expected setup after the sidecar copy, got %q", createdJob.Spec.Template.Spec.InitContainers[1].Name)
+	}
+	if len(createdJob.Spec.Template.Spec.Volumes) != 3 {
+		t.Fatalf("expected workspace, image, and writable data volumes, got %d", len(createdJob.Spec.Template.Spec.Volumes))
 	}
 
 	var sidecarVolume *corev1.Volume
@@ -1073,6 +1061,10 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if sidecarVolume.Image.PullPolicy != corev1.PullAlways {
 		t.Fatalf("image volume pullPolicy = %q, want %q", sidecarVolume.Image.PullPolicy, corev1.PullAlways)
+	}
+	writableVolume := createdJob.Spec.Template.Spec.Volumes[2]
+	if writableVolume.Name != "sidecar-1-data" || writableVolume.EmptyDir == nil {
+		t.Fatalf("expected an emptyDir for the writable sidecar, got %+v", writableVolume)
 	}
 
 	taskContainer := createdJob.Spec.Template.Spec.Containers[0]
@@ -1113,7 +1105,7 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 		t.Fatal("expected task sidecar mount to be read-only")
 	}
 
-	setupContainer := createdJob.Spec.Template.Spec.InitContainers[0]
+	setupContainer := createdJob.Spec.Template.Spec.InitContainers[1]
 	var setupSidecarMount *corev1.VolumeMount
 	for i := range setupContainer.VolumeMounts {
 		if setupContainer.VolumeMounts[i].Name == "sidecar-0-image" {
@@ -1126,6 +1118,20 @@ func TestExecuteTaskUsesImageVolumesForSidecars(t *testing.T) {
 	}
 	if !setupSidecarMount.ReadOnly {
 		t.Fatal("expected setup sidecar mount to be read-only")
+	}
+	for _, container := range []corev1.Container{taskContainer, setupContainer} {
+		found := false
+		for _, mount := range container.VolumeMounts {
+			if mount.MountPath == "/tools" {
+				found = true
+				if mount.Name != "sidecar-1-data" || mount.ReadOnly {
+					t.Fatalf("expected a writable copied-sidecar mount in %s, got %+v", container.Name, mount)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing writable sidecar mount in %s", container.Name)
+		}
 	}
 }
 
@@ -1821,8 +1827,153 @@ func TestRunStartupPreflightCreatesLegacyRootInitJobAndWaitsForPodCreationByDefa
 		clientset: fakeClient,
 	}
 
-	if err := backend.runStartupPreflight(context.Background()); err != nil {
+	if err := backend.runStartupPreflight(context.Background(), false); err != nil {
 		t.Fatalf("unexpected preflight error: %v", err)
+	}
+}
+
+func newImageVolumeModeTestBackend(t *testing.T, preference *bool, imageVolumesSupported bool) (*KubernetesBackend, *[]bool) {
+	t.Helper()
+
+	fakeClient := fake.NewSimpleClientset()
+	createdModes := make([]bool, 0, 2)
+	var currentJob *batchv1.Job
+	var currentMode bool
+
+	fakeClient.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateActionImpl)
+		currentJob = createAction.GetObject().(*batchv1.Job).DeepCopy()
+		currentJob.UID = "preflight-job-uid"
+		currentMode = false
+		for _, volume := range currentJob.Spec.Template.Spec.Volumes {
+			if volume.Image != nil {
+				currentMode = true
+				break
+			}
+		}
+		createdModes = append(createdModes, currentMode)
+		return true, currentJob, nil
+	})
+	fakeClient.PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := currentJob.DeepCopy()
+		conditionType := batchv1.JobComplete
+		if currentMode && !imageVolumesSupported {
+			conditionType = batchv1.JobFailed
+		}
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type:   conditionType,
+			Status: corev1.ConditionTrue,
+		}}
+		return true, job, nil
+	})
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if currentMode {
+			return true, &corev1.PodList{}, nil
+		}
+		return true, &corev1.PodList{Items: []corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "preflight-pod",
+				Namespace: "agents",
+				Labels:    map[string]string{"job-name": currentJob.Name},
+			},
+		}}}, nil
+	})
+	fakeClient.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.EventList{}, nil
+	})
+	fakeClient.PrependReactor("delete", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, nil
+	})
+
+	return &KubernetesBackend{
+		config: KubernetesBackendConfig{
+			WorkerID:        "worker-123",
+			Namespace:       "agents",
+			PreflightImage:  "busybox:1.36",
+			UseImageVolumes: preference,
+		},
+		clientset: fakeClient,
+	}, &createdModes
+}
+
+func TestConfigureImageVolumes(t *testing.T) {
+	tests := []struct {
+		name                  string
+		preference            *bool
+		imageVolumesSupported bool
+		wantModes             []bool
+		wantUseImageVolumes   bool
+		wantError             bool
+	}{
+		{
+			name:                  "auto probe success enables image volumes",
+			imageVolumesSupported: true,
+			wantModes:             []bool{true},
+			wantUseImageVolumes:   true,
+		},
+		{
+			name:                  "auto probe failure falls back to legacy preflight",
+			imageVolumesSupported: false,
+			wantModes:             []bool{true, false},
+		},
+		{
+			name:                  "explicit true fails closed",
+			preference:            workerBoolPtr(true),
+			imageVolumesSupported: false,
+			wantModes:             []bool{true},
+			wantError:             true,
+		},
+		{
+			name:                  "explicit false skips image-volume probe",
+			preference:            workerBoolPtr(false),
+			imageVolumesSupported: true,
+			wantModes:             []bool{false},
+		},
+		{
+			name:                  "explicit true preserves strict mode",
+			preference:            workerBoolPtr(true),
+			imageVolumesSupported: true,
+			wantModes:             []bool{true},
+			wantUseImageVolumes:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend, createdModes := newImageVolumeModeTestBackend(t, tt.preference, tt.imageVolumesSupported)
+			err := backend.configureImageVolumes(context.Background())
+			if (err != nil) != tt.wantError {
+				t.Fatalf("configureImageVolumes() error = %v, wantError %t", err, tt.wantError)
+			}
+			if len(*createdModes) != len(tt.wantModes) {
+				t.Fatalf("created preflight modes = %v, want %v", *createdModes, tt.wantModes)
+			}
+			for i := range tt.wantModes {
+				if (*createdModes)[i] != tt.wantModes[i] {
+					t.Fatalf("created preflight modes = %v, want %v", *createdModes, tt.wantModes)
+				}
+			}
+			if backend.useImageVolumes != tt.wantUseImageVolumes {
+				t.Fatalf("useImageVolumes = %t, want %t", backend.useImageVolumes, tt.wantUseImageVolumes)
+			}
+		})
+	}
+}
+
+func TestConfigureImageVolumesFallsBackOnInconclusiveProbe(t *testing.T) {
+	backend, createdModes := newImageVolumeModeTestBackend(t, nil, true)
+	backend.clientset.(*fake.Clientset).PrependReactor("get", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewTimeoutError("temporary API timeout", 1)
+	})
+
+	if err := backend.configureImageVolumes(context.Background()); err != nil {
+		t.Fatalf("unexpected startup error after inconclusive image-volume probe: %v", err)
+	}
+	if backend.useImageVolumes {
+		t.Fatal("inconclusive probe should leave image volumes disabled")
+	}
+	if len(*createdModes) != 2 || !(*createdModes)[0] || (*createdModes)[1] {
+		t.Fatalf("expected image-volume probe followed by legacy preflight, got %v", *createdModes)
 	}
 }
 
@@ -1927,10 +2078,9 @@ func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:        "worker-123",
-			Namespace:       "agents",
-			PreflightImage:  preflightImage,
-			UseImageVolumes: true,
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: preflightImage,
 			PodTemplate: &corev1.PodSpec{
 				ServiceAccountName: "oz-agent-worker",
 				ImagePullSecrets: []corev1.LocalObjectReference{
@@ -1941,7 +2091,7 @@ func TestRunStartupPreflightCreatesImageVolumeJobAndWaitsForSuccess(t *testing.T
 		clientset: fakeClient,
 	}
 
-	if err := backend.runStartupPreflight(context.Background()); err != nil {
+	if err := backend.runStartupPreflight(context.Background(), true); err != nil {
 		t.Fatalf("unexpected preflight error: %v", err)
 	}
 }
@@ -2003,15 +2153,14 @@ func TestRunStartupPreflightFailsOnFailedMountEvent(t *testing.T) {
 
 	backend := &KubernetesBackend{
 		config: KubernetesBackendConfig{
-			WorkerID:        "worker-123",
-			Namespace:       "agents",
-			PreflightImage:  "registry.internal/platform/preflight:1.0",
-			UseImageVolumes: true,
+			WorkerID:       "worker-123",
+			Namespace:      "agents",
+			PreflightImage: "registry.internal/platform/preflight:1.0",
 		},
 		clientset: fakeClient,
 	}
 
-	err := backend.runStartupPreflight(context.Background())
+	err := backend.runStartupPreflight(context.Background(), true)
 	if err == nil {
 		t.Fatal("expected preflight failure")
 	}
@@ -2072,7 +2221,7 @@ func TestRunStartupPreflightFailsOnFailedCreateEvent(t *testing.T) {
 		clientset: fakeClient,
 	}
 
-	err := backend.runStartupPreflight(context.Background())
+	err := backend.runStartupPreflight(context.Background(), false)
 	if err == nil {
 		t.Fatal("expected preflight failure")
 	}
