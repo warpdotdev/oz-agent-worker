@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -144,51 +143,36 @@ func TestSidecarImageMappingsBackends(t *testing.T) {
 	}
 }
 
-func TestSidecarImageMappingsApplyAfterLegacyOverrides(t *testing.T) {
+func TestSidecarImageMappingsPreserveAssignedSidecars(t *testing.T) {
 	remapper, err := common.NewImageRemapper(map[string]string{
-		"custom.example/agent":  "mirror.example/agent",
-		"custom.example/claude": "mirror.example/claude:approved",
+		"warpdotdev/warp-agent":              "mirror.example/agent",
+		"warpdotdev/warp-claude-cli-sidecar": "mirror.example/claude:approved",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	harness := "claude"
-	for _, mainImage := range []string{"warpdotdev/warp-agent:v1", ""} {
-		t.Run(mainImage, func(t *testing.T) {
-			w := &Worker{
-				ctx: context.Background(),
-				config: Config{
-					SidecarImageMappings: remapper,
-					Kubernetes: &KubernetesBackendConfig{
-						SidecarImage:      "custom.example/agent:custom",
-						CodingCLISidecars: map[string]string{"claude": "custom.example/claude:v2"},
-					},
-				},
-			}
-			assignment := &types.TaskAssignmentMessage{
-				TaskID:             "task-1",
-				Task:               &types.Task{ID: "task-1", AgentConfigSnapshot: &types.AmbientAgentConfig{Harness: &types.Harness{Type: &harness}}},
-				SidecarImage:       mainImage,
-				AdditionalSidecars: []types.SidecarMount{{Image: "custom.example/claude:server", MountPath: "/mnt/claude-cli-sidecar", ReadWrite: true}},
-			}
-			original, _ := json.Marshal(assignment)
-			params := w.prepareTaskParams(assignment)
-			cli := params.Sidecars[len(params.Sidecars)-1]
-			if cli.Image != "mirror.example/claude:approved" || !cli.ReadWrite {
-				t.Fatalf("coding CLI = %+v, want mapped legacy override preserving read/write", cli)
-			}
-			if mainImage != "" && params.Sidecars[0].Image != "mirror.example/agent:custom" {
-				t.Fatalf("main image = %q, want mapped legacy override", params.Sidecars[0].Image)
-			}
-			after, _ := json.Marshal(assignment)
-			if string(after) != string(original) {
-				t.Fatal("preparation mutated the assignment")
-			}
-			assignment.AdditionalSidecars = nil
-			params = w.prepareTaskParams(assignment)
-			if cli := params.Sidecars[len(params.Sidecars)-1]; cli.Image != "mirror.example/claude:approved" {
-				t.Fatalf("injected coding CLI was not remapped: %+v", cli)
-			}
-		})
+	w := &Worker{ctx: context.Background(), config: Config{SidecarImageMappings: remapper}}
+	assignment := &types.TaskAssignmentMessage{
+		TaskID:       "task-1",
+		Task:         &types.Task{ID: "task-1", AgentConfigSnapshot: &types.AmbientAgentConfig{Harness: &types.Harness{Type: &harness}}},
+		SidecarImage: "custom.example/agent:v1",
+		AdditionalSidecars: []types.SidecarMount{
+			{Image: "custom.example/claude:v2", MountPath: "/mnt/claude-cli-sidecar"},
+			{Image: "warpdotdev/warp-claude-cli-sidecar:v3", MountPath: "/mnt/other", ReadWrite: true},
+		},
+	}
+	want := []types.SidecarMount{
+		{Image: "custom.example/agent:v1", MountPath: "/agent"},
+		assignment.AdditionalSidecars[0],
+		{Image: "mirror.example/claude:approved", MountPath: "/mnt/other", ReadWrite: true},
+	}
+	if got := w.prepareTaskParams(assignment).Sidecars; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sidecars = %+v, want %+v", got, want)
+	}
+	assignment.SidecarImage = ""
+	assignment.AdditionalSidecars = nil
+	if got := w.prepareTaskParams(assignment).Sidecars; len(got) != 0 {
+		t.Fatalf("empty assignment injected sidecars: %+v", got)
 	}
 }

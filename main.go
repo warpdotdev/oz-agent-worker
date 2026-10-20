@@ -196,7 +196,11 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		SessionSharingServerURL: CLI.SessionSharingServerURL,
 	}
 
-	var sidecarImageMappings map[string]string
+	var (
+		sidecarImageMappings    map[string]string
+		legacySidecarImage      string
+		legacyCodingCLISidecars map[string]string
+	)
 	switch backendType {
 	case "kubernetes":
 		var (
@@ -206,8 +210,6 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy       string
 			useImageVolumes       bool
 			preflightImage        string
-			sidecarImage          string
-			codingCLISidecars     map[string]string
 			setupCmd              string
 			teardownCmd           string
 			extraLabels           map[string]string
@@ -228,9 +230,9 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy = kc.ImagePullPolicy
 			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
-			sidecarImage = kc.SidecarImage
+			legacySidecarImage = kc.SidecarImage
 			sidecarImageMappings = kc.SidecarImageMappings
-			codingCLISidecars = copyStringMap(kc.CodingCLISidecars)
+			legacyCodingCLISidecars = kc.CodingCLISidecars
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
 			extraLabels = copyStringMap(kc.ExtraLabels)
@@ -283,8 +285,6 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ImagePullPolicy:       imagePullPolicy,
 			UseImageVolumes:       useImageVolumes,
 			PreflightImage:        preflightImage,
-			SidecarImage:          sidecarImage,
-			CodingCLISidecars:     codingCLISidecars,
 			SetupCommand:          setupCmd,
 			TeardownCommand:       teardownCmd,
 			NoCleanup:             noCleanup,
@@ -377,11 +377,11 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 
 		// Merge volumes: config file + CLI (concatenated).
 		var volumes []string
-		var imagePullPolicy, sidecarImage string
+		var imagePullPolicy string
 		if fileConfig != nil && fileConfig.Backend.Docker != nil {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
 			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
-			sidecarImage = fileConfig.Backend.Docker.SidecarImage
+			legacySidecarImage = fileConfig.Backend.Docker.SidecarImage
 			sidecarImageMappings = fileConfig.Backend.Docker.SidecarImageMappings
 		}
 		volumes = append(volumes, CLI.Volumes...)
@@ -391,10 +391,29 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			Volumes:         volumes,
 			Env:             mergedEnv,
 			ImagePullPolicy: imagePullPolicy,
-			SidecarImage:    sidecarImage,
 		}
 	}
 
+	if len(sidecarImageMappings) > 0 {
+		if legacySidecarImage != "" {
+			return worker.Config{}, fmt.Errorf("backend.%s.sidecar_image_mappings cannot be combined with sidecar_image", backendType)
+		}
+		if len(legacyCodingCLISidecars) > 0 {
+			return worker.Config{}, fmt.Errorf("backend.%s.sidecar_image_mappings cannot be combined with coding_cli_sidecars", backendType)
+		}
+	} else {
+		sidecarImageMappings = make(map[string]string)
+		if legacySidecarImage != "" {
+			sidecarImageMappings["warpdotdev/warp-agent"] = legacySidecarImage
+		}
+		for harness, image := range legacyCodingCLISidecars {
+			if image == "" {
+				continue
+			}
+			sidecarImageMappings[fmt.Sprintf("warpdotdev/warp-%s-cli-sidecar", harness)] = image
+			sidecarImageMappings[fmt.Sprintf("warpdotdev/warp-%s-acp-sidecar", harness)] = image
+		}
+	}
 	wc.SidecarImageMappings, err = common.NewImageRemapper(sidecarImageMappings)
 	if err != nil {
 		return worker.Config{}, fmt.Errorf("invalid backend.%s.sidecar_image_mappings: %w", backendType, err)

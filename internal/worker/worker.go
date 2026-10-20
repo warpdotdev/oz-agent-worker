@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -812,48 +811,12 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	// entrypoint.sh lives) comes first, followed by any additional sidecars.
 	var sidecars []types.SidecarMount
 	if assignment.SidecarImage != "" {
-		sidecarImage := assignment.SidecarImage
-		if override := w.configuredWarpAgentSidecarImage(); override != "" {
-			log.Infof(w.ctx, "Overriding server sidecar image %s with configured sidecar image %s", assignment.SidecarImage, override)
-			sidecarImage = override
-		}
 		sidecars = append(sidecars, types.SidecarMount{
-			Image:     sidecarImage,
+			Image:     assignment.SidecarImage,
 			MountPath: "/agent",
 		})
 	}
 	sidecars = append(sidecars, assignment.AdditionalSidecars...)
-
-	// Apply worker-configured coding CLI sidecar overrides.
-	// For each harness entry in the worker's coding_cli_sidecars config, replace the
-	// server-provided sidecar image at /mnt/{harness}-cli-sidecar or inject a new entry
-	// when the server did not send one (e.g. because no Warp-side image is configured).
-	if w.config.Kubernetes != nil && len(w.config.Kubernetes.CodingCLISidecars) > 0 {
-		if task != nil && task.AgentConfigSnapshot != nil &&
-			task.AgentConfigSnapshot.Harness != nil &&
-			task.AgentConfigSnapshot.Harness.Type != nil {
-			harnessType := strings.TrimSpace(*task.AgentConfigSnapshot.Harness.Type)
-			if customImage, ok := w.config.Kubernetes.CodingCLISidecars[harnessType]; ok && customImage != "" {
-				mountPath := fmt.Sprintf("/mnt/%s-cli-sidecar", harnessType)
-				overridden := false
-				for i, s := range sidecars {
-					if s.MountPath == mountPath {
-						log.Infof(w.ctx, "Overriding server coding CLI sidecar %s with configured image %s for harness %s", s.Image, customImage, harnessType)
-						sidecars[i].Image = customImage
-						overridden = true
-						break
-					}
-				}
-				if !overridden {
-					log.Infof(w.ctx, "Injecting configured coding CLI sidecar %s for harness %s at %s", customImage, harnessType, mountPath)
-					sidecars = append(sidecars, types.SidecarMount{
-						Image:     customImage,
-						MountPath: mountPath,
-					})
-				}
-			}
-		}
-	}
 
 	for i := range sidecars {
 		sidecars[i].Image = w.config.SidecarImageMappings.Remap(sidecars[i].Image)
@@ -882,19 +845,6 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		InstanceShape: assignment.InstanceShape,
 		SetupEvents:   setupEvents,
 	}
-}
-
-// configuredWarpAgentSidecarImage returns the operator-configured warp-agent sidecar
-// image, or empty if neither backend set one. Only one backend config is populated
-// at runtime.
-func (w *Worker) configuredWarpAgentSidecarImage() string {
-	if w.config.Kubernetes != nil && w.config.Kubernetes.SidecarImage != "" {
-		return w.config.Kubernetes.SidecarImage
-	}
-	if w.config.Docker != nil && w.config.Docker.SidecarImage != "" {
-		return w.config.Docker.SidecarImage
-	}
-	return ""
 }
 
 // defaultImageForTask returns the Docker image to use for a task, applying the

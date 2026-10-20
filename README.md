@@ -49,7 +49,10 @@ backend:
 
 This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
 
-`backend.docker.sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when the worker host cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility.
+`backend.docker.sidecar_image` is a legacy shorthand for mapping the official
+`docker.io/warpdotdev/warp-agent` repository to a custom image. Prefer
+`sidecar_image_mappings` for new configurations. Do not combine the two options.
+The [remapping version rules](#remapping-sidecar-images) apply to both forms.
 
 ```yaml
 worker_id: "my-worker"
@@ -88,11 +91,20 @@ backend:
   `warpdotdev/warp-agent` and `docker.io/warpdotdev/warp-agent` identify the same
   source. Duplicate normalized sources, versioned source keys and malformed
   references are rejected at startup.
-- Existing `sidecar_image` and Kubernetes `coding_cli_sidecars` overrides are
-  applied first; mappings then act once on the resulting repositories, including
-  injected coding-CLI sidecars. A mapped destination is not remapped again.
-  Unmatched images and mount options are unchanged, and mappings do not inject
-  sidecars on their own.
+- Mappings act once on the assigned repositories. A mapped destination is not
+  remapped again. Unmatched images and mount options are unchanged; no sidecars
+  are injected.
+- Legacy `sidecar_image` and Kubernetes `coding_cli_sidecars` settings are
+  converted into mappings at startup. `sidecar_image` maps
+  `docker.io/warpdotdev/warp-agent`; each `coding_cli_sidecars` harness maps both
+  `docker.io/warpdotdev/warp-{harness}-cli-sidecar` and
+  `docker.io/warpdotdev/warp-{harness}-acp-sidecar` to its configured image.
+  Non-empty `sidecar_image_mappings` cannot be combined with either legacy option.
+  These aliases use the same version rules as explicit mappings.
+- **Compatibility change:** legacy options now match only official Warp
+  repositories. They no longer override arbitrary source images by mount path or
+  inject coding-CLI sidecars missing from the assignment. Use explicit mappings
+  for non-Warp repositories; the server must assign a sidecar for it to be used.
 
 For Helm installations, configure the equivalent
 `kubernetesBackend.sidecarImageMappings` map in your values file.
@@ -261,8 +273,8 @@ Notes:
 - `unschedulable_timeout` controls the Pod-age threshold for failing an unschedulable task; it defaults to `10m` to allow node autoscaling, and `0s` disables that fail-fast behavior
 - `image_pull_policy` defaults to `IfNotPresent`
 - the worker owns a set of names in the task container's environment and writes them last, so an entry with one of these names in `task_env` or `pod_template` is overwritten rather than honoured: `OZ_RUN_ID`, `OZ_WORKER_BACKEND`, `OZ_WORKSPACE_ROOT`, `OZ_ENVIRONMENT_FILE`, and the `WARP_`-prefixed name of each (`WARP_RUN_ID` and so on). Pick different names for operator-supplied variables. Warp reserves the `WARP_` names against managed secrets too, but a worker's own config is yours, so nothing stops you setting them — they just will not survive
-- `sidecar_image` overrides the warp-agent sidecar image reference sent by the server (e.g. `docker.io/warpdotdev/warp-agent:latest`); set this when cluster nodes cannot pull directly from Docker Hub and must use an internal registry mirror or pull-through cache instead. This only affects the warp-agent sidecar (mounted at `/agent`), not any additional sidecars. When using this override, you are responsible for keeping your mirror in sync with `docker.io/warpdotdev/warp-agent` — the server normally sends the correct version-matched image per task, so a stale mirror may cause version incompatibility
-- `coding_cli_sidecars` maps a harness config name (e.g. `claude`, `codex`) to a custom Docker image that will be mounted as the coding CLI sidecar for runs using that harness. When set, the worker replaces the server-provided sidecar image (or injects a new entry if the server did not send one) at the standard mount path `/mnt/{harness}-cli-sidecar`. Use this when your cluster uses a custom or internal Claude Code binary wrapper instead of the Warp-provided image. Example:
+- `sidecar_image` is a legacy shorthand for mapping the official warp-agent repository to a custom image, with the same [remapping rules](#remapping-sidecar-images) as Docker
+- `coding_cli_sidecars` is a legacy shorthand mapping a harness config name (e.g. `claude`, `codex`) to a custom image for its official Warp CLI and ACP repositories. It affects only assigned sidecars; it does not inject missing sidecars or match by mount path. Neither legacy option can be combined with non-empty `sidecar_image_mappings`. Example:
 
 ```yaml
 backend:

@@ -47,7 +47,6 @@ type DockerBackendConfig struct {
 	// empty value defaults to PullPolicyAlways, preserving the backend's original
 	// unconditional-pull behavior for installations that don't set it.
 	ImagePullPolicy string
-	SidecarImage    string
 }
 
 type sidecarVolumeState struct {
