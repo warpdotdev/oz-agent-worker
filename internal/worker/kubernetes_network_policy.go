@@ -25,6 +25,7 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -419,16 +420,24 @@ func (p networkPolicyProvider) get(ctx context.Context, name string) (*unstructu
 }
 
 func (p networkPolicyProvider) create(ctx context.Context, object *unstructured.Unstructured) error {
+	body, err := json.Marshal(object)
+	if err != nil {
+		return err
+	}
+	return p.writeRequest("POST").SetHeader("Content-Type", "application/json").
+		Body(body).Do(ctx).Error()
+}
+
+func (p networkPolicyProvider) writeRequest(method string) *rest.Request {
+	// Replayed writes can hide a committed reservation behind AlreadyExists or a
+	// resourceVersion conflict.
+	request := p.backend.clientset.NetworkingV1().RESTClient().Verb(method).
+		SetHeader("Accept", "application/json").MaxRetries(0)
 	if p.cilium {
-		_, err := p.ciliumClient().Create(ctx, object, metav1.CreateOptions{})
-		return err
+		return request.AbsPath("apis", ciliumNetworkPolicyResource.Group, ciliumNetworkPolicyResource.Version).
+			Namespace(p.backend.config.Namespace).Resource(ciliumNetworkPolicyResource.Resource)
 	}
-	var typed networkingv1.NetworkPolicy
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, &typed); err != nil {
-		return err
-	}
-	_, err := p.backend.clientset.NetworkingV1().NetworkPolicies(p.backend.config.Namespace).Create(ctx, &typed, metav1.CreateOptions{})
-	return err
+	return request.Namespace(p.backend.config.Namespace).Resource("networkpolicies")
 }
 
 func (p networkPolicyProvider) patchMetadata(ctx context.Context, object *unstructured.Unstructured) error {
@@ -439,12 +448,8 @@ func (p networkPolicyProvider) patchMetadata(ctx context.Context, object *unstru
 	if err != nil {
 		return err
 	}
-	if p.cilium {
-		_, err = p.ciliumClient().Patch(ctx, object.GetName(), k8stypes.MergePatchType, patch, metav1.PatchOptions{})
-	} else {
-		_, err = p.backend.clientset.NetworkingV1().NetworkPolicies(p.backend.config.Namespace).Patch(ctx, object.GetName(), k8stypes.MergePatchType, patch, metav1.PatchOptions{})
-	}
-	return err
+	return p.writeRequest("PATCH").Name(object.GetName()).
+		SetHeader("Content-Type", string(k8stypes.MergePatchType)).Body(patch).Do(ctx).Error()
 }
 
 func (p networkPolicyProvider) delete(ctx context.Context, object *unstructured.Unstructured) error {

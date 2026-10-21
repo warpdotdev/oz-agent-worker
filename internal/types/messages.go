@@ -181,8 +181,9 @@ type TaskFailedMessage struct {
 	FailureDetails *FailureDetails `json:"failure_details,omitempty"`
 }
 
-// TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
-// (e.g. at maximum concurrency). The server should keep the task queued rather than marking it failed.
+// TaskRejectedMessage is sent before claim when the worker cannot accept a task.
+// Uncoded rejections, such as capacity, keep the task queued. Codes network_policy_unsupported
+// and network_policy_invalid are terminal failures for the matching execution.
 type TaskRejectedMessage struct {
 	TaskID      string `json:"task_id"`
 	Reason      string `json:"reason"`

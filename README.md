@@ -496,7 +496,14 @@ upgrades.
   expiry/TTL and retained-Job tests also passed.
 - Kubernetes **v1.32.2**, Calico **3.29.3**, native provider: **BLOCKED / NOT
   VERIFIED**. This sandbox kernel lacks iptables `rpfilter` support; Felix could
-  not program rules. Policy API acceptance does not constitute native-CNI proof.
+  not program iptables rules. The documented eBPF/VXLAN alternative also failed:
+  its connect-time BPF program could not load (`Invalid argument`). With the
+  optional connect-time load balancer disabled and packet-path NAT enabled,
+  `calico-node` became Ready, but the unrestricted external control failed and
+  node-side cluster-DNS UDP writes returned `invalid argument`. Controller
+  expiry/TTL tests passed; native network enforcement and terminating-policy
+  retention did not. A compatible isolated native-CNI cluster is required before
+  native acceptance. Agent readiness/API acceptance do not constitute proof.
 - Default kindnet is non-enforcing and is not a supported validation result.
   Dual-stack/IPv6 dataplane, NodeLocal/custom DNS, additional Kubernetes/CNI
   versions, and multi-node propagation remain **NOT VERIFIED**.

@@ -39,6 +39,7 @@ type networkPolicyAPIFixture struct {
 	version            int
 	jobPosts           int
 	policyCreates      int
+	policyPatches      int
 	beforeJobPost      func()
 	loseJobResponse    bool
 	losePolicyResponse bool
@@ -49,33 +50,44 @@ type networkPolicyAPIFixture struct {
 }
 
 func TestKubernetesNetworkPolicyRegistrationRecovery(t *testing.T) {
-	fixture, backend := newNetworkPolicyAPIFixture(t)
-	provider := networkPolicyProvider{backend: backend}
-	intended := compileTestNetworkPolicy(t, &types.NetworkPolicy{}, false, nil)
-	fixture.losePolicyResponse = true
-	first, err := provider.register(context.Background(), intended.DeepCopy(), testNetworkConsumer("one", "execution"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture.losePatchResponse = true
-	second, err := provider.register(context.Background(), intended.DeepCopy(), testNetworkConsumer("two", "execution"))
-	if err != nil || second.GetUID() != first.GetUID() {
-		t.Fatalf("recover registration: %v %v", second, err)
-	}
-	_, ledger := requireNetworkLedger(t, provider, first.GetName())
-	if len(ledger.Consumers) != 2 || fixture.jobPosts != 0 {
-		t.Fatalf("registrations=%+v", ledger)
-	}
-	other := testNetworkConsumer("one", "execution")
-	other.Launcher = "replacement-process"
-	if _, err := provider.register(context.Background(), intended.DeepCopy(), other); err == nil {
-		t.Fatal("replacement launcher reused an ambiguous reservation")
-	}
-	fixture.mu.Lock()
-	fixture.objects["networkpolicies/"+first.GetName()].SetUID("replacement-policy")
-	fixture.mu.Unlock()
-	if err := provider.bind(context.Background(), first, testNetworkConsumer("one", "execution"), "job-uid"); err == nil {
-		t.Fatal("bound against replacement policy UID")
+	for _, cilium := range []bool{false, true} {
+		for _, write := range []string{"create", "registration"} {
+			t.Run(fmt.Sprintf("cilium=%v/%s", cilium, write), func(t *testing.T) {
+				fixture, backend := newNetworkPolicyAPIFixture(t)
+				fixture.cilium = cilium
+				provider := networkPolicyProvider{backend: backend, cilium: cilium}
+				intended := compileTestNetworkPolicy(t, &types.NetworkPolicy{}, cilium, nil)
+				fixture.losePolicyResponse = write == "create"
+				first, err := provider.register(context.Background(), intended.DeepCopy(), testNetworkConsumer("one", "execution"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.losePatchResponse = write == "registration"
+				second, err := provider.register(context.Background(), intended.DeepCopy(), testNetworkConsumer("two", "execution"))
+				if err != nil || second.GetUID() != first.GetUID() {
+					t.Fatalf("recover registration: %v %v", second, err)
+				}
+				_, ledger := requireNetworkLedger(t, provider, first.GetName())
+				if len(ledger.Consumers) != 2 || fixture.jobPosts != 0 || fixture.policyCreates != 1 || fixture.policyPatches != 1 {
+					t.Fatalf("registrations=%+v creates=%d patches=%d jobs=%d", ledger, fixture.policyCreates, fixture.policyPatches, fixture.jobPosts)
+				}
+				other := testNetworkConsumer("one", "execution")
+				other.Launcher = "replacement-process"
+				if _, err := provider.register(context.Background(), intended.DeepCopy(), other); err == nil {
+					t.Fatal("replacement launcher reused an ambiguous reservation")
+				}
+				resource := "networkpolicies"
+				if cilium {
+					resource = "ciliumnetworkpolicies"
+				}
+				fixture.mu.Lock()
+				fixture.objects[resource+"/"+first.GetName()].SetUID("replacement-policy")
+				fixture.mu.Unlock()
+				if err := provider.bind(context.Background(), first, testNetworkConsumer("one", "execution"), "job-uid"); err == nil {
+					t.Fatal("bound against replacement policy UID")
+				}
+			})
+		}
 	}
 }
 
@@ -263,6 +275,7 @@ func (f *networkPolicyAPIFixture) serve(w http.ResponseWriter, r *http.Request) 
 		f.objects[key] = object
 		if resource != "jobs" && f.losePolicyResponse {
 			f.losePolicyResponse = false
+			w.Header().Set("Retry-After", "0")
 			fixtureStatus(w, 504, metav1.StatusReasonTimeout)
 			return
 		}
@@ -274,6 +287,7 @@ func (f *networkPolicyAPIFixture) serve(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(201)
 		_ = json.NewEncoder(w).Encode(object)
 	case http.MethodPatch:
+		f.policyPatches++
 		var patch unstructured.Unstructured
 		_ = json.Unmarshal(body, &patch.Object)
 		if current == nil {
@@ -300,6 +314,7 @@ func (f *networkPolicyAPIFixture) serve(w http.ResponseWriter, r *http.Request) 
 		}
 		if f.losePatchResponse {
 			f.losePatchResponse = false
+			w.Header().Set("Retry-After", "0")
 			fixtureStatus(w, 504, metav1.StatusReasonTimeout)
 			return
 		}
