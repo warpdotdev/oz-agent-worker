@@ -7,9 +7,11 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/tracing"
@@ -23,6 +25,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -90,6 +94,7 @@ func kubernetesTaskOwnedEnvVars(taskID string) []string {
 
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
+	NetworkPolicy         config.NetworkPolicyConfig
 	WorkerID              string
 	Namespace             string
 	Kubeconfig            string
@@ -134,6 +139,13 @@ type KubernetesBackend struct {
 	config          KubernetesBackendConfig
 	clientset       kubernetes.Interface
 	useImageVolumes bool
+	networkDynamic dynamic.Interface
+	networkDiscovery discovery.DiscoveryInterface
+	networkInCluster bool
+	networkLaunchMu sync.Mutex
+	networkLaunches map[[2]string]chan struct{}
+	networkReconcile chan struct{}
+	networkStop context.CancelFunc
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -146,6 +158,11 @@ func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {
 
 // NewKubernetesBackend creates a new Kubernetes backend and validates startup requirements.
 func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (*KubernetesBackend, error) {
+	for key := range config.ExtraLabels {
+		if strings.HasPrefix(key, "warp-") {
+			return nil, fmt.Errorf("task label %q is reserved for Warp", key)
+		}
+	}
 	if config.Namespace == "" {
 		config.Namespace = defaultKubernetesNamespace
 	}
@@ -157,7 +174,7 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 		config.PreflightImage = kubernetesStartupPreflightImage
 	}
 
-	clientConfig, err := loadKubernetesClientConfig(config.Kubeconfig)
+	clientConfig, inCluster, err := loadKubernetesClientConfig(config.Kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build Kubernetes client config: %w", err)
 	}
@@ -176,9 +193,26 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 	backend := &KubernetesBackend{
 		config:    config,
 		clientset: clientset,
+		networkInCluster: inCluster,
 	}
 	if err := backend.configureImageVolumes(ctx); err != nil {
 		return nil, err
+	}
+	if config.NetworkPolicy.Enabled {
+		policyClientConfig := rest.CopyConfig(clientConfig)
+		policyClientConfig.Timeout = kubernetesAPIRequestTimeout
+		backend.networkDynamic, err = dynamic.NewForConfig(policyClientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create network policy client: %w", err)
+		}
+		backend.networkDiscovery, err = discovery.NewDiscoveryClientForConfig(policyClientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create network policy discovery client: %w", err)
+		}
+		backend.networkReconcile = make(chan struct{}, 1)
+		reconcileCtx, stop := context.WithCancel(ctx)
+		backend.networkStop = stop
+		go backend.runNetworkPolicyReconciler(reconcileCtx)
 	}
 
 	return backend, nil
@@ -371,9 +405,19 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	log.Infof(ctx, "Creating Kubernetes Job %s in namespace %s", jobName, b.config.Namespace)
 	doneJobCreate := params.SetupEvents.startPhase(ctx, SetupEventJobCreate)
-	createdJob, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	var createdJob *batchv1.Job
+	var err error
+	if params.NetworkPolicy != nil {
+		createdJob, err = b.createRestrictedJob(ctx, params, job)
+		defer b.notifyNetworkPolicyReconciler()
+	} else {
+		createdJob, err = b.clientset.BatchV1().Jobs(b.config.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	}
 	if err != nil {
 		doneJobCreate(true)
+		if params.NetworkPolicy != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonNetworkPolicy, err))
+		}
 		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonJobCreate, fmt.Errorf("failed to create Kubernetes Job: %w", err))
 		return executeError(withFailureDetails(failure, buildKubernetesFailureDetails("", job, nil, nil, nil)))
 	}
@@ -583,6 +627,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 // Job whose pod is still pending outlives the cancellation and boots an agent against a run
 // the server has already finished. A Job that no longer exists is not an error.
 func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	defer b.notifyNetworkPolicyReconciler()
 	if params == nil {
 		return fmt.Errorf("cancel params are required")
 	}
@@ -612,6 +657,9 @@ func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams
 // worker pod disruption (for example Karpenter node rotation), deleting Jobs
 // here would kill otherwise healthy running sessions.
 func (b *KubernetesBackend) Shutdown(ctx context.Context) {
+	if b.networkStop != nil {
+		b.networkStop()
+	}
 	log.Infof(ctx, "Preserving Kubernetes task Jobs during worker shutdown")
 }
 
@@ -702,18 +750,20 @@ func (b *KubernetesBackend) watchTaskPods(ctx context.Context, executionID strin
 	})
 }
 
-func loadKubernetesClientConfig(kubeconfigPath string) (*rest.Config, error) {
+func loadKubernetesClientConfig(kubeconfigPath string) (*rest.Config, bool, error) {
 	if kubeconfigPath != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		return config, false, err
 	}
 	if inCluster, err := rest.InClusterConfig(); err == nil {
-		return inCluster, nil
+		return inCluster, true, nil
 	}
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},
 	)
-	return loader.ClientConfig()
+	config, err := loader.ClientConfig()
+	return config, false, err
 }
 
 func (b *KubernetesBackend) basePodSpec() corev1.PodSpec {

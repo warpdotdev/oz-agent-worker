@@ -220,10 +220,12 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
 			preflightResources    *corev1.ResourceRequirements
+			networkPolicy         config.NetworkPolicyConfig
 		)
 
 		if fileConfig != nil && fileConfig.Backend.Kubernetes != nil {
 			kc := fileConfig.Backend.Kubernetes
+			networkPolicy = kc.NetworkPolicy
 			namespace = kc.Namespace
 			kubeconfig = kc.Kubeconfig
 			defaultImage = kc.DefaultImage
@@ -278,6 +280,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		}
 
 		wc.Kubernetes = &worker.KubernetesBackendConfig{
+			NetworkPolicy:         networkPolicy,
 			WorkerID:              workerID,
 			Namespace:             namespace,
 			Kubeconfig:            kubeconfig,

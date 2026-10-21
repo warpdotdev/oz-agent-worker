@@ -625,6 +625,18 @@ func (w *Worker) rememberCompletedLocked(key taskExecution, cancellationAccepted
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
+	if assignment.NetworkPolicy != nil {
+		code, err := w.admitNetworkPolicy(assignment.NetworkPolicy)
+		if err != nil {
+			metrics.RecordTaskRejected(code)
+			if sendErr := w.sendRejection(types.TaskRejectedMessage{
+				TaskID: assignment.TaskID, ExecutionID: assignment.ExecutionID, Code: code, Reason: err.Error(),
+			}); sendErr != nil {
+				log.Errorf(w.ctx, "Failed to send network policy rejection: %v", sendErr)
+			}
+			return
+		}
+	}
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 	taskCtx, session, err := w.config.Tracing.Start(w.ctx, w.config.ServerRootURL, assignment, receivedAt)
@@ -843,6 +855,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		DockerImage:   dockerImage,
 		Sidecars:      sidecars,
 		InstanceShape: assignment.InstanceShape,
+		NetworkPolicy: assignment.NetworkPolicy,
 		SetupEvents:   setupEvents,
 	}
 }
@@ -1107,11 +1120,13 @@ func (w *Worker) sendTaskCancelled(taskID, executionID, message string) error {
 }
 
 func (w *Worker) sendTaskRejected(taskID, reason string) error {
-	rejectedMsg := types.TaskRejectedMessage{
+	return w.sendRejection(types.TaskRejectedMessage{
 		TaskID: taskID,
 		Reason: reason,
-	}
+	})
+}
 
+func (w *Worker) sendRejection(rejectedMsg types.TaskRejectedMessage) error {
 	data, err := json.Marshal(rejectedMsg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal task rejected message: %w", err)

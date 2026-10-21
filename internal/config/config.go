@@ -30,6 +30,17 @@ type FileConfig struct {
 	Backend        BackendConfig `yaml:"backend"`
 }
 
+type NetworkPolicyConfig struct {
+	Enabled bool `yaml:"enabled"`
+	DNS NetworkPolicyDNSConfig `yaml:"dns"`
+}
+
+type NetworkPolicyDNSConfig struct {
+	ServerIPs []string `yaml:"server_ips"`
+	Namespace string `yaml:"namespace"`
+	PodLabels map[string]string `yaml:"pod_labels"`
+}
+
 // BackendConfig contains the backend selection.
 // At most one backend field may be non-nil; configuring multiple backends simultaneously is an error.
 type BackendConfig struct {
@@ -75,6 +86,7 @@ type DirectConfig struct {
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.
 type KubernetesConfig struct {
+	NetworkPolicy NetworkPolicyConfig `yaml:"network_policy"`
 	Namespace       string `yaml:"namespace"`
 	Kubeconfig      string `yaml:"kubeconfig"`
 	DefaultImage    string `yaml:"default_image" validate:"omitempty,no_whitespace"`
@@ -172,6 +184,13 @@ func Load(path string) (*FileConfig, error) {
 
 	if err := configValidator.Struct(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", formatValidationErrors(err))
+	}
+	if cfg.Backend.Kubernetes != nil {
+		for key := range cfg.Backend.Kubernetes.ExtraLabels {
+			if strings.HasPrefix(key, "warp-") {
+				return nil, fmt.Errorf("backend.kubernetes.extra_labels key %q is reserved for Warp", key)
+			}
+		}
 	}
 
 	return &cfg, nil
