@@ -25,15 +25,15 @@ import (
 var networkLauncherIncarnation = uuid.NewString()
 
 type networkPolicyConsumer struct {
-	RunID string `json:"run_id"`
-	ExecutionID string `json:"execution_id"`
-	JobName string `json:"job_name"`
-	Launcher string `json:"launcher"`
-	JobUID k8stypes.UID `json:"job_uid,omitempty"`
+	RunID       string       `json:"run_id"`
+	ExecutionID string       `json:"execution_id"`
+	JobName     string       `json:"job_name"`
+	Launcher    string       `json:"launcher"`
+	JobUID      k8stypes.UID `json:"job_uid,omitempty"`
 }
 
 type networkPolicyLedger struct {
-	Version int `json:"version"`
+	Version   int                     `json:"version"`
 	Consumers []networkPolicyConsumer `json:"consumers"`
 }
 
@@ -70,7 +70,7 @@ func writeNetworkLedger(object *unstructured.Unstructured, ledger networkPolicyL
 	annotations[networkConsumersAnnotation] = string(data)
 	size := 0
 	for key, value := range annotations {
-		size += len(key)+len(value)
+		size += len(key) + len(value)
 	}
 	if size >= 256*1024 {
 		return fmt.Errorf("network policy annotations exceed the 256 KiB limit; wait for consumers to stop")
@@ -343,20 +343,20 @@ func (b *KubernetesBackend) createRestrictedJob(ctx context.Context, params *Tas
 	if createErr != nil {
 		if apierrors.IsInvalid(createErr) || apierrors.IsBadRequest(createErr) || apierrors.IsForbidden(createErr) || apierrors.IsUnauthorized(createErr) {
 			b.releaseRejectedNetworkLaunch(ctx, provider, policy, entry)
-			return nil, fmt.Errorf("Job launch rejected before admission: %w", createErr)
+			return nil, fmt.Errorf("job launch rejected before admission: %w", createErr)
 		}
 		created, err = b.getTaskJob(ctx, job.Name)
 		if err != nil {
-			return nil, fmt.Errorf("Job launch outcome unresolved; reservation retained (POST: %v; GET: %w)", createErr, err)
+			return nil, fmt.Errorf("job launch outcome unresolved; reservation retained (POST: %v; GET: %w)", createErr, err)
 		}
 	}
 	if created == nil || created.Name != entry.JobName || !networkExecutionMatches(created, entry, policy) {
-		return nil, fmt.Errorf("Job identity conflicts with restricted execution; reservation retained")
+		return nil, fmt.Errorf("job identity conflicts with restricted execution; reservation retained")
 	}
 	if !networkExecutionMatches(&created.Spec.Template, entry, policy) {
 		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 		defer stopCancel()
-		err := fmt.Errorf("Job Pod template conflicts with restricted execution")
+		err := fmt.Errorf("job Pod template conflicts with restricted execution")
 		stopErr := b.requestJobExecutionStop(stopCtx, created, err)
 		return nil, fmt.Errorf("%w (stop request: %v); reservation retained", err, stopErr)
 	}
@@ -380,11 +380,6 @@ func applyNetworkExecutionMetadata(meta metav1.Object, entry networkPolicyConsum
 	annotations := meta.GetAnnotations()
 	if annotations == nil {
 		annotations = make(map[string]string)
-	}
-	for key := range annotations {
-		if strings.HasPrefix(key, "warp-") {
-			delete(annotations, key)
-		}
 	}
 	annotations[networkRunAnnotation] = entry.RunID
 	annotations[networkExecutionAnnotation] = entry.ExecutionID
@@ -450,14 +445,14 @@ func (b *KubernetesBackend) networkConsumerStopped(ctx context.Context, policy *
 	}
 	if err == nil {
 		if job.UID != entry.JobUID || !networkExecutionMatches(job, entry, policy) || !networkExecutionMatches(&job.Spec.Template, entry, policy) {
-			return false, fmt.Errorf("Job %s conflicts with consumer %s/%s UID %s", entry.JobName, entry.RunID, entry.ExecutionID, entry.JobUID)
+			return false, fmt.Errorf("job %s conflicts with consumer %s/%s UID %s", entry.JobName, entry.RunID, entry.ExecutionID, entry.JobUID)
 		}
 		if !jobComplete(job) && !jobFailed(job) {
 			return false, nil
 		}
 	}
 	pods, err := b.clientset.CoreV1().Pods(b.config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: batchv1.ControllerUidLabel+"="+string(entry.JobUID),
+		LabelSelector: batchv1.ControllerUidLabel + "=" + string(entry.JobUID),
 	})
 	if err != nil {
 		return false, err
@@ -474,7 +469,7 @@ func (b *KubernetesBackend) networkConsumerStopped(ctx context.Context, policy *
 }
 
 func (b *KubernetesBackend) networkMatchingObjectsStopped(ctx context.Context, policy *unstructured.Unstructured) (bool, error) {
-	selector := networkRestrictedLabel+"=true,"+networkPolicyIDLabel+"="+policy.GetLabels()[networkPolicyIDLabel]
+	selector := networkRestrictedLabel + "=true," + networkPolicyIDLabel + "=" + policy.GetLabels()[networkPolicyIDLabel]
 	jobs, err := b.clientset.BatchV1().Jobs(b.config.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return false, err
@@ -621,7 +616,7 @@ func (b *KubernetesBackend) reconcileNetworkPolicies(ctx context.Context) {
 }
 
 func (b *KubernetesBackend) runNetworkPolicyReconciler(ctx context.Context) {
-	ticker := time.NewTicker(30*time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)

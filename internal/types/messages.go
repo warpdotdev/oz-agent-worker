@@ -29,9 +29,9 @@ type NetworkPolicy struct {
 }
 
 type NetworkPolicyRule struct {
-	Hosts []string `json:"hosts"`
-	Action string `json:"action"`
-	Description string `json:"description"`
+	Hosts       []string `json:"hosts"`
+	Action      string   `json:"action"`
+	Description string   `json:"description"`
 }
 
 // FailureDetails contains backend-specific structured diagnostics.
@@ -184,10 +184,10 @@ type TaskFailedMessage struct {
 // TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
 // (e.g. at maximum concurrency). The server should keep the task queued rather than marking it failed.
 type TaskRejectedMessage struct {
-	TaskID string `json:"task_id"`
-	Reason string `json:"reason"`
+	TaskID      string `json:"task_id"`
+	Reason      string `json:"reason"`
 	ExecutionID string `json:"execution_id,omitempty"`
-	Code string `json:"code,omitempty"`
+	Code        string `json:"code,omitempty"`
 }
 
 // TaskCancellationMessage is sent from server to worker to cancel an active task.

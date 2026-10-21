@@ -31,13 +31,13 @@ type FileConfig struct {
 }
 
 type NetworkPolicyConfig struct {
-	Enabled bool `yaml:"enabled"`
-	DNS NetworkPolicyDNSConfig `yaml:"dns"`
+	Enabled bool                   `yaml:"enabled"`
+	DNS     NetworkPolicyDNSConfig `yaml:"dns"`
 }
 
 type NetworkPolicyDNSConfig struct {
-	ServerIPs []string `yaml:"server_ips"`
-	Namespace string `yaml:"namespace"`
+	ServerIPs []string          `yaml:"server_ips"`
+	Namespace string            `yaml:"namespace"`
 	PodLabels map[string]string `yaml:"pod_labels"`
 }
 
@@ -86,11 +86,11 @@ type DirectConfig struct {
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.
 type KubernetesConfig struct {
-	NetworkPolicy NetworkPolicyConfig `yaml:"network_policy"`
-	Namespace       string `yaml:"namespace"`
-	Kubeconfig      string `yaml:"kubeconfig"`
-	DefaultImage    string `yaml:"default_image" validate:"omitempty,no_whitespace"`
-	ImagePullPolicy string `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	NetworkPolicy   NetworkPolicyConfig `yaml:"network_policy"`
+	Namespace       string              `yaml:"namespace"`
+	Kubeconfig      string              `yaml:"kubeconfig"`
+	DefaultImage    string              `yaml:"default_image" validate:"omitempty,no_whitespace"`
+	ImagePullPolicy string              `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
 	// UseImageVolumes is nil when support should be detected by the startup preflight.
 	UseImageVolumes       *bool             `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`

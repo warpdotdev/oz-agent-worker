@@ -309,6 +309,227 @@ pod_template:
 ```
 
 
+#### Restricted Kubernetes egress
+
+Restricted assignments require an upgraded Kubernetes worker with explicit local
+opt-in. Docker, Direct, Command, and Kubernetes workers without opt-in reject
+them before claiming work. An absent/null `network_policy` remains unrestricted;
+a present policy with zero rules denies all egress, including DNS. Host rules
+allow all ports to their destinations; they are not HTTPS-only rules.
+
+File configuration:
+
+```yaml
+backend:
+  kubernetes:
+    network_policy:
+      enabled: false
+      dns:
+        server_ips: []
+        namespace: kube-system
+        pod_labels:
+          k8s-app: kube-dns
+```
+
+The Helm equivalents are `kubernetesBackend.networkPolicy.enabled` and
+`kubernetesBackend.networkPolicy.dns.{serverIPs,namespace,podLabels}`. No CLI
+switch enables this feature. Leave it disabled until the prerequisites below
+are verified.
+
+**Install and verify the baseline first.** The chart always renders a persistent
+native egress-only default deny, even with support disabled or `rbac.create=false`.
+Non-Helm operators must install the equivalent in the task namespace:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: oz-restricted-baseline
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      warp-network-restricted: "true"
+  policyTypes: [Egress]
+  egress: []
+```
+
+The baseline does not select unrestricted tasks or change ingress. Successful
+Helm installation or policy creation proves API acceptance, not dataplane
+enforcement. Verify blocking on your CNI before opting in, including on newly
+scheduled nodes. The CNI must continue enforcing a policy while it has a
+`deletionTimestamp` and the consumer finalizer remains, including across CNI
+agent restarts. Revalidate on CNI upgrades. The worker does not run per-task
+connectivity probes or attest CNI health.
+
+Other native, Cilium, and administrative policies are additive and must not widen
+restricted-task egress. Admission must preserve reserved task labels and the
+network boundary. All `warp-` task label keys are reserved; `extra_labels` and
+Helm `extraLabels` reject them. Worker-owned `warp-` annotations override
+conflicting extra annotations.
+
+**DNS and providers.** A definite absence of the Cilium API selects native
+`NetworkPolicy`; a present `cilium.io/v2` `ciliumnetworkpolicies` API selects
+Cilium. Discovery errors and Cilium permission/API errors fail closed, without
+native fallback. The CRD alone does not prove that Cilium is enforcing.
+
+- Native rules snapshot every A/AAAA answer once per launch and allow exact
+  `/32` or `/128` destinations. Resolution errors or empty answers prevent Job
+  creation. Existing snapshots never refresh. Long-lived/debug-idle executions
+  can lose reachability or retain stale allowed addresses as DNS changes.
+- Cilium rules use exact `toFQDNs.matchName` and literal `toCIDR` grants, with DNS
+  proxy rules limited to allowed query names. Cilium tracks changing answers and
+  handles CNAME chains according to its DNS policy semantics; the worker does not
+  add unrelated hostnames or worker-side snapshots.
+- Hostnames sharing an allowed IP share IP-level access. This is not strict
+  hostname, HTTP authority, or data-loss-prevention isolation. Service DNAT and
+  Cilium-managed endpoint identity can deny a named IP; no broad cluster/world
+  exception is added to fix this.
+
+Explicit `dns.server_ips` take precedence. Otherwise only an actual in-cluster
+client reads the worker Pod's `/etc/resolv.conf` nameservers. Out-of-cluster or
+explicit-kubeconfig workers must supply the target cluster's trusted resolver
+addresses. Loopback, unspecified, malformed, and zone-qualified addresses fail.
+There is no public-resolver fallback or worker Service lookup. Empty/IP-only
+policies need no DNS grant. Hostname policies require valid resolver addresses,
+DNS namespace, and nonempty Pod labels.
+
+Native policies grant UDP/TCP 53 only to exact resolver IPs and a combined
+namespace/Pod selector. Cilium uses that DNS Pod selector and its restricted
+query proxy. Ordinary `ClusterFirst` Pod networking is the zero-configuration
+case. NodeLocal DNS, custom forwarders, service meshes, secondary interfaces, and
+different task DNS views require explicit topology configuration and live CNI
+validation. Set the resolver/selector overrides and task `pod_template.dnsPolicy`
+/ `dnsConfig` as appropriate; the worker does not overwrite those Pod settings
+or synthesize Cilium `host`/broad DNS allowances. Inspecting
+`kubectl -n kube-system get service kube-dns` can help diagnose a cluster, but its
+ClusterIP is not necessarily the resolver tasks use.
+
+**Security boundary.** The worker does not generate host networking, privileged
+containers, or `NET_ADMIN`/`SYS_ADMIN` grants. Explicit operator PodSpec/container
+settings remain supported and can bypass enforcement; `hostNetwork` semantics
+are CNI-dependent. Root sidecar-copy init containers remain supported and root
+UID alone is not privileged mode. Keep task ServiceAccounts separate from the
+worker's policy-management account. Task credentials should not permit creating
+Pods, changing labels/policies, reaching privileged daemons, or escaping to host
+networking. Node/runtime image pulls are not task-Pod egress.
+
+**Shared policies and cleanup.** Policies are immutable and named
+`warp-np-<52-character SHA-256 base32 digest>` from canonical final enforcement
+content, not run IDs, metadata, or source descriptions. Equal content shares one
+policy in the selected namespace/resource kind. Native DNS changes create new
+snapshots; they never edit an existing policy's rules.
+
+The policy is created with its consumer finalizer and first durable registration
+before the ordinary unsuspended Job is posted. Later consumers register through
+UID/resourceVersion CAS. The versioned `warp-network-policy-consumers` annotation
+records full run/execution IDs, expected Job name, launcher incarnation, and
+optional Job UID. The canonical annotation is diagnostic, not proof of content.
+The complete annotations must fit below 256 KiB; exhaustion fails before a Job
+is created rather than evicting registrations.
+
+Startup, 30-second sweeps, and terminal notifications reconcile both provider
+kinds. A consumer is released only after its Job cannot restart and all owned
+regular/init/native-sidecar/ephemeral containers have stopped. Pending, Unknown,
+missing statuses, live sidecars, or unexplained matching Jobs/Pods retain
+protection. Job cancellation/expiry is asynchronous; worker shutdown preserves
+live Jobs, policies, and registrations. `cleanup: false` retains terminal
+inspection Jobs/Pods, but does not retain their policies after execution stops.
+
+The last stopped consumer triggers UID/resourceVersion-fenced deletion and
+removal of only `warp.dev/network-policy-consumers`. New consumers cannot join a
+terminating UID; an identical launch waits for actual removal within its
+two-minute provisioning budget or fails. It does not bypass a stuck policy with
+a new selector. Policy/DNS/lifecycle failures after claim are terminal
+`network_policy` task failures, not capacity requeues.
+
+A launcher submits at most one Job POST per registration. Lost responses are
+recovered only through matching API identity. A crash before posting, or a Job
+that disappears before UID binding, can leave an irreducibly ambiguous
+registration. Age, disconnect, cancellation, and one missing-Job read are never
+permission to expire it.
+
+For a stuck reservation, an operator must:
+
+1. Fence every original launcher that could still post that execution's Job.
+   Establish that no create request remains in flight.
+2. Inspect the policy UID, complete ledger, expected Job names, full
+   run/execution/policy-UID annotations, Job UIDs, and owned/matching Pods.
+   Confirm actual termination or fence affected/partitioned nodes; force deletion
+   alone does not prove processes stopped.
+3. Take a fresh policy read. CAS-remove only entries proven stale, preserving all
+   other consumers. For example, a JSON Patch must test `/metadata/uid` and
+   `/metadata/resourceVersion` before replacing the ledger annotation with the
+   verified reduced version-1 ledger. Retry from a fresh read on conflict.
+4. Let an enabled reconciler perform normal zero-consumer finalization.
+
+Unknown ledger schemas, malformed metadata, permission errors, operator-mutated
+rules, or unexplained live objects retain protection and emit policy UID and
+consumer diagnostics. Without an enabled reconciler or necessary rights, a
+policy can remain terminating indefinitely. Direct finalizer removal is a
+break-glass action outside this guarantee. The worker does not repair
+force-removed enforcement or resurrect a deleted shared policy.
+
+**Coordinated rollout and rollback.** There is no capability negotiation: old
+workers silently ignore the new JSON field. Publish the upgraded worker/chart
+first. Keep policy-bearing dispatch disabled for the target pool, upgrade every
+connected replica to an immutable image, verify the baseline and CNI/DNS
+prerequisites, then explicitly enable local support. Only then deploy/enable
+server assignment plumbing under the existing `WorkerNetworkPoliciesEnabled`
+gate. That gate is not assumed to be pool-scoped. Mixed old/new workers with
+policy-bearing dispatch are unsupported and insecure. Turning the gate off
+intentionally returns new runs to nil-policy dispatch; it is not an isolation
+workaround. Before rollback to old binaries, stop policy-bearing assignments.
+Drain restricted Jobs, reservations, and policies before removing policy RBAC,
+the baseline/chart, or reconciliation. Preserve in-use ledger schemas during
+upgrades.
+
+**Measured validation matrix (not a universal support claim).**
+
+- Kubernetes **v1.32.2**, Cilium **1.18.3**, Cilium provider, single-node kind:
+  controlled external IPv4 allowed/forbidden endpoints and controlled CoreDNS
+  records passed setup/main probes, empty-policy DNS denial, two-consumer
+  immutable reuse, and final
+  cleanup with retained terminal Jobs/Pods. Terminating-policy UID/spec and
+  allow/deny enforcement survived an authorized Job POST delayed until after
+  DELETE, Cilium agent restart, and fresh reconciliation. Existing controller
+  expiry/TTL and retained-Job tests also passed.
+- Kubernetes **v1.32.2**, Calico **3.29.3**, native provider: **BLOCKED / NOT
+  VERIFIED**. This sandbox kernel lacks iptables `rpfilter` support; Felix could
+  not program rules. Policy API acceptance does not constitute native-CNI proof.
+- Default kindnet is non-enforcing and is not a supported validation result.
+  Dual-stack/IPv6 dataplane, NodeLocal/custom DNS, additional Kubernetes/CNI
+  versions, and multi-node propagation remain **NOT VERIFIED**.
+
+The opt-in integration tests require an explicitly disposable kubeconfig,
+`kubectl`, two externally reachable HTTP endpoints on port 8080 with distinct IPs,
+and trusted DNS mapping the supplied names to those endpoints. They delete test
+namespaces and restart selected CNI agent Pods; never point them at production.
+The recorded Cilium run used Docker-network endpoints `172.18.0.12` and
+`172.18.0.13`, with CoreDNS records `allowed.remote3452.test` and
+`blocked.remote3452.test`. To reproduce in an equivalent disposable cluster:
+
+```bash
+OZ_K8S_TEST_KUBECONFIG=/path/to/disposable-kubeconfig \
+OZ_K8S_TEST_CNI_VERSION=cilium-1.18.3 \
+OZ_K8S_TEST_PROVIDER=cilium \
+OZ_K8S_TEST_ALLOWED_IP=172.18.0.12 \
+OZ_K8S_TEST_FORBIDDEN_IP=172.18.0.13 \
+OZ_K8S_TEST_ALLOWED_HOST=allowed.remote3452.test \
+OZ_K8S_TEST_FORBIDDEN_HOST=blocked.remote3452.test \
+OZ_K8S_TEST_DNS_IPS=10.96.0.10 \
+OZ_K8S_TEST_CNI_NAMESPACE=kube-system \
+OZ_K8S_TEST_CNI_POD_SELECTOR=k8s-app=cilium \
+go test -tags=integration ./internal/worker \
+  -run 'Test(KubernetesNetworkPolicyWithCNI|KubernetesNetworkPolicyTerminatingWithCNI|JobExpirationWithController)' \
+  -count=1 -v
+```
+
+Use `OZ_K8S_TEST_PROVIDER=native` on an enforcing native cluster without the
+Cilium API, and supply that CNI's version and agent selector. Out-of-cluster
+native hostname compilation additionally needs a route to the configured DNS
+resolver. A skipped fixture is not an enforcement result.
+
 ### Helm Chart
 
 This repo includes a namespace-scoped Helm chart at `charts/oz-agent-worker`.

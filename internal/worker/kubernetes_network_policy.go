@@ -28,16 +28,16 @@ import (
 )
 
 const (
-	networkRestrictedLabel = "warp-network-restricted"
-	networkPolicyIDLabel = "warp-network-policy-id"
-	networkManagedLabel = "warp-network-managed"
+	networkRestrictedLabel     = "warp-network-restricted"
+	networkPolicyIDLabel       = "warp-network-policy-id"
+	networkManagedLabel        = "warp-network-managed"
 	networkCanonicalAnnotation = "warp-network-policy-canonical"
 	networkConsumersAnnotation = "warp-network-policy-consumers"
 	networkPolicyUIDAnnotation = "warp-network-policy-uid"
-	networkRunAnnotation = "warp-run-id"
+	networkRunAnnotation       = "warp-run-id"
 	networkExecutionAnnotation = "warp-execution-id"
-	networkPolicyFinalizer = "warp.dev/network-policy-consumers"
-	networkPolicyPlaceholder = "POLICY_ID"
+	networkPolicyFinalizer     = "warp.dev/network-policy-consumers"
+	networkPolicyPlaceholder   = "POLICY_ID"
 )
 
 var ciliumNetworkPolicyResource = schema.GroupVersionResource{
@@ -152,14 +152,14 @@ func networkDNSResolver(ips []string) *net.Resolver {
 	var next atomic.Uint64
 	return &net.Resolver{PreferGo: true, StrictErrors: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		ip := ips[(next.Add(1)-1)%uint64(len(ips))]
-		dialer := net.Dialer{Timeout: 5*time.Second}
+		dialer := net.Dialer{Timeout: 5 * time.Second}
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ip, "53"))
 	}}
 }
 
 type networkPolicyProvider struct {
 	backend *KubernetesBackend
-	cilium bool
+	cilium  bool
 }
 
 func (b *KubernetesBackend) discoverNetworkPolicyProvider() (networkPolicyProvider, error) {
@@ -175,13 +175,13 @@ func (b *KubernetesBackend) discoverNetworkPolicyProvider() (networkPolicyProvid
 		return provider, fmt.Errorf("discover Cilium policies (native fallback requires definite API absence): %w", err)
 	}
 	if resources == nil {
-		return provider, fmt.Errorf("Cilium discovery returned no resource list")
+		return provider, fmt.Errorf("cilium discovery returned no resource list")
 	}
 	for _, resource := range resources.APIResources {
 		if resource.Name == ciliumNetworkPolicyResource.Resource {
 			provider.cilium = true
 			if b.networkDynamic == nil {
-				return provider, fmt.Errorf("Cilium dynamic client is unavailable")
+				return provider, fmt.Errorf("cilium dynamic client is unavailable")
 			}
 			break
 		}
@@ -290,7 +290,7 @@ func compileNetworkPolicy(ctx context.Context, policy *types.NetworkPolicy, cili
 			}
 			peers = append(peers, map[string]any{
 				"namespaceSelector": map[string]any{"matchLabels": map[string]any{"kubernetes.io/metadata.name": dns.Namespace}},
-				"podSelector": map[string]any{"matchLabels": podLabels},
+				"podSelector":       map[string]any{"matchLabels": podLabels},
 			})
 			egress = append(egress, map[string]any{"to": peers, "ports": []any{
 				map[string]any{"port": int64(53), "protocol": "UDP"},
@@ -298,7 +298,10 @@ func compileNetworkPolicy(ctx context.Context, policy *types.NetworkPolicy, cili
 			}})
 		}
 	}
-	if len(egress) > 0 {
+	if cilium && egress == nil {
+		egress = []any{}
+	}
+	if len(egress) > 0 || cilium {
 		spec["egress"] = egress
 	}
 	object := &unstructured.Unstructured{Object: map[string]any{"apiVersion": apiVersion, "kind": kind, "spec": spec}}
@@ -309,7 +312,7 @@ func compileNetworkPolicy(ctx context.Context, policy *types.NetworkPolicy, cili
 	sum := sha256.Sum256(canonical)
 	id := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]))
 	selector["matchLabels"].(map[string]any)[networkPolicyIDLabel] = id
-	object.SetName("warp-np-"+id)
+	object.SetName("warp-np-" + id)
 	object.SetLabels(map[string]string{networkManagedLabel: "true", networkPolicyIDLabel: id})
 	object.SetAnnotations(map[string]string{networkCanonicalAnnotation: string(canonical)})
 	object.SetFinalizers([]string{networkPolicyFinalizer})
@@ -454,7 +457,7 @@ func (p networkPolicyProvider) delete(ctx context.Context, object *unstructured.
 }
 
 func (p networkPolicyProvider) list(ctx context.Context) ([]unstructured.Unstructured, error) {
-	options := metav1.ListOptions{LabelSelector: networkManagedLabel+"=true"}
+	options := metav1.ListOptions{LabelSelector: networkManagedLabel + "=true"}
 	if p.cilium {
 		list, err := p.ciliumClient().List(ctx, options)
 		if err != nil {

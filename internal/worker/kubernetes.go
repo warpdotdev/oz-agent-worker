@@ -24,9 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -136,16 +136,16 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
-	config          KubernetesBackendConfig
-	clientset       kubernetes.Interface
-	useImageVolumes bool
-	networkDynamic dynamic.Interface
+	config           KubernetesBackendConfig
+	clientset        kubernetes.Interface
+	useImageVolumes  bool
+	networkDynamic   dynamic.Interface
 	networkDiscovery discovery.DiscoveryInterface
 	networkInCluster bool
-	networkLaunchMu sync.Mutex
-	networkLaunches map[[2]string]chan struct{}
+	networkLaunchMu  sync.Mutex
+	networkLaunches  map[[2]string]chan struct{}
 	networkReconcile chan struct{}
-	networkStop context.CancelFunc
+	networkStop      context.CancelFunc
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -191,8 +191,8 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 	log.Debugf(ctx, "Connected to Kubernetes API server version %s", serverVersion.String())
 
 	backend := &KubernetesBackend{
-		config:    config,
-		clientset: clientset,
+		config:           config,
+		clientset:        clientset,
 		networkInCluster: inCluster,
 	}
 	if err := backend.configureImageVolumes(ctx); err != nil {
