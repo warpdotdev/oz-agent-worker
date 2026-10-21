@@ -57,9 +57,10 @@ type DockerConfig struct {
 	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
 	// Kubernetes backend, an omitted value defaults to Always here, preserving the Docker
 	// backend's original unconditional-pull behavior for existing installations.
-	ImagePullPolicy string     `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
-	SidecarImage    string     `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
-	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+	ImagePullPolicy      string            `yaml:"image_pull_policy" validate:"omitempty,oneof=Always Never IfNotPresent"`
+	SidecarImage         string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
+	SidecarImageMappings map[string]string `yaml:"sidecar_image_mappings"`
+	Environment          []EnvEntry        `yaml:"environment" validate:"dive"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.
@@ -82,6 +83,7 @@ type KubernetesConfig struct {
 	UseImageVolumes       *bool             `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
 	SidecarImage          string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
+	SidecarImageMappings  map[string]string `yaml:"sidecar_image_mappings"`
 	SetupCommand          string            `yaml:"setup_command"`
 	TeardownCommand       string            `yaml:"teardown_command"`
 	ExtraLabels           map[string]string `yaml:"extra_labels"`
@@ -90,13 +92,9 @@ type KubernetesConfig struct {
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
 	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
-	// CodingCLISidecars maps harness config name (e.g. "claude", "codex") to a custom
-	// Docker image. When set, the worker overrides the server-provided sidecar image for
-	// that harness (or injects a new sidecar entry if the server did not send one),
-	// mounting it at /mnt/{harness}-cli-sidecar. Use this to bring your own Claude Code
-	// wrapper or custom harness binary instead of the Warp-provided sidecar image.
-	// The custom image must place the harness binary in the path where the Warp agent
-	// entrypoint expects it (e.g. /usr/local/bin for most sidecar layouts).
+	// CodingCLISidecars is a compatibility alias for mappings from the official
+	// Warp CLI and ACP repositories for each harness to a custom image.
+	// It cannot be combined with SidecarImageMappings and does not inject sidecars.
 	CodingCLISidecars map[string]string `yaml:"coding_cli_sidecars"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
 	// required fields at runtime. Declarative task Job configuration such as

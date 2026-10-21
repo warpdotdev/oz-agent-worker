@@ -85,6 +85,10 @@ kubernetesBackend:
   useImageVolumes: null
   preflightImage: ""
   sidecarImage: ""
+  # Mapping from Warp-provided sidecar images to mirrored repositories. If the destination
+  # repository includes a tag or digest, that takes precedence over any server-provided
+  # version.
+  sidecarImageMappings: {}
   setupCommand: ""
   teardownCommand: ""
   extraLabels: {}
