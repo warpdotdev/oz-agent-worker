@@ -2,7 +2,7 @@
 ## Summary
 Enforce the server-resolved egress policy for each self-hosted Kubernetes execution. Refuse restricted executions when enforcement is unavailable. Preserve the existing behavior for executions without a policy.
 - Work item: [REMOTE-3452](https://linear.app/warpdotdev/issue/REMOTE-3452/self-hosted-kubernetes-network-policy-support).
-- Status: proposed specification, awaiting Ben Navetta's approval. This PR does not implement the feature.
+- Status: [approved by Ben Navetta in the origin thread](https://warpdev.slack.com/archives/C0A3CQ638NQ/p1792589633164009). This PR does not implement the feature.
 - The companion [TECH.md](TECH.md) defines the implementation and validation criteria.
 ## Behavior
 1. **Policy presence controls enforcement.** An absent or null resolved policy adds no worker restriction. A present policy with zero rules denies all policy-controlled egress. Do not treat an empty policy as absent. A policy declaration that the server combines with system allowances is not an empty resolved policy.
