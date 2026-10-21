@@ -1,0 +1,13 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "oz-agent-worker.fullname" . }}-restricted-baseline
+  namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace }}
+  labels:
+    {{- include "oz-agent-worker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      warp-network-restricted: "true"
+  policyTypes: [Egress]
+  egress: []

@@ -19,4 +19,12 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
+  {{- if .Values.kubernetesBackend.networkPolicy.enabled }}
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  {{- end }}
 {{- end }}

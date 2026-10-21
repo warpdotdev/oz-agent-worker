@@ -165,6 +165,7 @@ type TaskParams struct {
 	// Containerized backends apply it as CPU/memory limits (Docker) or resource
 	// requests/limits (Kubernetes). Backends that cannot enforce a shape (direct) ignore it.
 	InstanceShape *types.InstanceShape
+	NetworkPolicy *types.NetworkPolicy
 
 	// SetupEvents reports worker-observed setup phase durations to warp-server.
 	// It may be nil, and all of its methods are safe to call on a nil reporter.

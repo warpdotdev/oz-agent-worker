@@ -93,6 +93,13 @@ kubernetesBackend:
   teardownCommand: ""
   extraLabels: {}
   extraAnnotations: {}
+  networkPolicy:
+    enabled: false
+    dns:
+      serverIPs: []
+      namespace: kube-system
+      podLabels:
+        k8s-app: kube-dns
   # Hard wall-clock cap on how long a single task Job (and its pod) may run
   # before Kubernetes terminates it and marks the Job failed with a
   # DeadlineExceeded condition. This is a safety backstop against tasks whose

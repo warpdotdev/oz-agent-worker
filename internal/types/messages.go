@@ -24,6 +24,16 @@ type WebSocketMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+type NetworkPolicy struct {
+	Rules []NetworkPolicyRule `json:"rules"`
+}
+
+type NetworkPolicyRule struct {
+	Hosts       []string `json:"hosts"`
+	Action      string   `json:"action"`
+	Description string   `json:"description"`
+}
+
 // FailureDetails contains backend-specific structured diagnostics.
 type FailureDetails struct {
 	Kubernetes *KubernetesFailureDetails `json:"kubernetes,omitempty"`
@@ -139,6 +149,7 @@ type TaskAssignmentMessage struct {
 	// backends size the task container/pod from it; omitted when the run has no explicit
 	// runner instance shape, in which case the worker keeps its default sizing.
 	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
+	NetworkPolicy *NetworkPolicy `json:"network_policy,omitempty"`
 }
 
 // TaskClaimedMessage is sent from worker to server after successfully claiming a task
@@ -170,11 +181,14 @@ type TaskFailedMessage struct {
 	FailureDetails *FailureDetails `json:"failure_details,omitempty"`
 }
 
-// TaskRejectedMessage is sent from worker to server when the worker cannot accept the task
-// (e.g. at maximum concurrency). The server should keep the task queued rather than marking it failed.
+// TaskRejectedMessage is sent before claim when the worker cannot accept a task.
+// Uncoded rejections, such as capacity, keep the task queued. Codes network_policy_unsupported
+// and network_policy_invalid are terminal failures for the matching execution.
 type TaskRejectedMessage struct {
-	TaskID string `json:"task_id"`
-	Reason string `json:"reason"`
+	TaskID      string `json:"task_id"`
+	Reason      string `json:"reason"`
+	ExecutionID string `json:"execution_id,omitempty"`
+	Code        string `json:"code,omitempty"`
 }
 
 // TaskCancellationMessage is sent from server to worker to cancel an active task.

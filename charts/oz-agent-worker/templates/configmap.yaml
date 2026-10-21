@@ -17,6 +17,12 @@ data:
     backend:
       kubernetes:
         namespace: {{ default .Release.Namespace .Values.kubernetesBackend.namespace | quote }}
+        network_policy:
+          enabled: {{ .Values.kubernetesBackend.networkPolicy.enabled }}
+          dns:
+            server_ips: {{ .Values.kubernetesBackend.networkPolicy.dns.serverIPs | toJson }}
+            namespace: {{ .Values.kubernetesBackend.networkPolicy.dns.namespace | quote }}
+            pod_labels: {{ .Values.kubernetesBackend.networkPolicy.dns.podLabels | toJson }}
         {{- if .Values.kubernetesBackend.defaultImage }}
         default_image: {{ .Values.kubernetesBackend.defaultImage | quote }}
         {{- end }}
@@ -44,6 +50,11 @@ data:
 {{ .Values.kubernetesBackend.teardownCommand | indent 10 }}
         {{- end }}
         {{- with .Values.kubernetesBackend.extraLabels }}
+        {{- range $key, $_ := . }}
+        {{- if hasPrefix "warp-" $key }}
+        {{- fail (printf "kubernetesBackend.extraLabels key %q is reserved for Warp" $key) }}
+        {{- end }}
+        {{- end }}
         extra_labels:
 {{ toYaml . | indent 10 }}
         {{- end }}
