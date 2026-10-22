@@ -413,7 +413,9 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			if time.Since(begin) > time.Second {
 				t.Fatal("queue overflow blocked task instrumentation")
 			}
-			<-flushed
+			if err := <-flushed; err == nil {
+				t.Fatal("blocked trace flush succeeded")
+			}
 			session.End("interrupted", nil)
 			shutdownCtx, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
 			begin = time.Now()
