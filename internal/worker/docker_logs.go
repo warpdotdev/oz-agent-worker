@@ -45,7 +45,7 @@ func (b *DockerBackend) followContainerLogs(ctx context.Context, containerID str
 		stderr := reporter.Writer(ctx, "container.stderr", append(attrs, attribute.String("log.iostream", "stderr"))...)
 		defer stdout.Flush()
 		defer stderr.Flush()
-		if err := copyDockerLogFrames(stream, stdout, stderr); err != nil && !errors.Is(err, io.EOF) && streamCtx.Err() == nil {
+		if err := copyDockerLogFrames(stream, stdout, stderr); !errors.Is(err, io.EOF) && streamCtx.Err() == nil {
 			log.Warnf(ctx, "Docker task log stream interrupted")
 		}
 	}()

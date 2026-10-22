@@ -408,7 +408,9 @@ func (w *Worker) gracefullyCloseConnection(
 		log.Warnf(w.ctx, "Failed to send close message: %v", err)
 	}
 	connectionCancel()
-	<-groupDone
+	if err := <-groupDone; err != nil {
+		log.Warnf(w.ctx, "Connection closed: %v", err)
+	}
 }
 
 func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
