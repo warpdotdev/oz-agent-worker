@@ -23,10 +23,16 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+
+// sidecarPrepConcurrency bounds how many sidecar images one task resolves and
+// materializes at once, so a task with many sidecars cannot saturate the daemon
+// with parallel pulls and extractions.
+const sidecarPrepConcurrency = 4
 
 // PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
 // backend.docker.image_pull_policy values. They mirror the Kubernetes backend's
@@ -655,12 +661,16 @@ func (b *DockerBackend) copySidecarFilesystemToVolume(ctx context.Context, docke
 }
 
 // prepareSidecars resolves each sidecar image according to the configured image pull policy,
-// creates a Docker volume from its filesystem, and returns the list of bind mount strings to
-// add to the container.
+// creates a Docker volume from its filesystem, and returns the bind mount strings to add to
+// the container, in sidecar order. Sidecars are prepared concurrently (bounded by
+// sidecarPrepConcurrency); the first failure cancels the rest and is returned. Sidecars that
+// share an image resolve to the same volume name, and prepareSidecarVolume serializes
+// population per volume, so the shared volume is populated once and reused.
 func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *client.Client, sidecars []types.SidecarMount, labels map[string]string) ([]string, error) {
-	var binds []string
+	if len(sidecars) == 0 {
+		return nil, nil
+	}
 	seenMountPaths := make(map[string]bool)
-
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
 			return nil, fmt.Errorf("additional sidecar has empty image")
@@ -672,37 +682,57 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 			return nil, fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)
 		}
 		seenMountPaths[sidecar.MountPath] = true
+	}
 
-		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
-
-		authStr := b.getRegistryAuth(ctx, sidecar.Image)
-		if err := b.prepareImage(ctx, sidecar.Image, authStr, nil); err != nil {
-			return nil, fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
-		}
-
-		digest, err := b.getImageDigest(ctx, sidecar.Image)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get digest for additional sidecar image %s: %w", sidecar.Image, err)
-		}
-
-		volumeName := sanitizeVolumeName(sidecar.Image, digest)
-		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
-
-		if err := b.prepareSidecarVolume(ctx, dockerClient, volumeName, func(ctx context.Context) error {
-			return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName, labels)
-		}); err != nil {
-			return nil, fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", sidecar.Image, err)
-		}
-
-		mode := ":ro"
-		if sidecar.ReadWrite {
-			// Docker defaults to read-write when no mode suffix is provided.
-			mode = ""
-		}
-		binds = append(binds, fmt.Sprintf("%s:%s%s", volumeName, sidecar.MountPath, mode))
+	binds := make([]string, len(sidecars))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(sidecarPrepConcurrency)
+	for i, sidecar := range sidecars {
+		group.Go(func() error {
+			bind, err := b.prepareSidecar(groupCtx, dockerClient, sidecar, labels)
+			if err != nil {
+				return err
+			}
+			binds[i] = bind
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 	return binds, nil
 }
+
+func (b *DockerBackend) prepareSidecar(ctx context.Context, dockerClient *client.Client, sidecar types.SidecarMount, labels map[string]string) (string, error) {
+	log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
+
+	authStr := b.getRegistryAuth(ctx, sidecar.Image)
+	if err := b.prepareImage(ctx, sidecar.Image, authStr, nil); err != nil {
+		return "", fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
+	}
+
+	digest, err := b.getImageDigest(ctx, sidecar.Image)
+	if err != nil {
+		return "", fmt.Errorf("failed to get digest for additional sidecar image %s: %w", sidecar.Image, err)
+	}
+
+	volumeName := sanitizeVolumeName(sidecar.Image, digest)
+	log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
+
+	if err := b.prepareSidecarVolume(ctx, dockerClient, volumeName, func(ctx context.Context) error {
+		return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName, labels)
+	}); err != nil {
+		return "", fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", sidecar.Image, err)
+	}
+
+	mode := ":ro"
+	if sidecar.ReadWrite {
+		// Docker defaults to read-write when no mode suffix is provided.
+		mode = ""
+	}
+	return fmt.Sprintf("%s:%s%s", volumeName, sidecar.MountPath, mode), nil
+}
+
 func (b *DockerBackend) prepareSidecarVolume(ctx context.Context, dockerClient *client.Client, volumeName string, populate func(context.Context) error) error {
 	entry, _ := b.sidecarVolumes.LoadOrStore(volumeName, &sidecarVolumeState{gate: semaphore.NewWeighted(1)})
 	state := entry.(*sidecarVolumeState)
