@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,20 @@ func taskInitFinished(pod *corev1.Pod) bool {
 	return false
 }
 
+// sidecarInitIndex returns the sidecar index encoded in a copy-sidecar-<i>
+// init container name.
+func sidecarInitIndex(containerName string) (int, bool) {
+	suffix, ok := strings.CutPrefix(containerName, kubernetesSidecarInitPrefix)
+	if !ok {
+		return 0, false
+	}
+	index, err := strconv.Atoi(suffix)
+	if err != nil || index < 0 {
+		return 0, false
+	}
+	return index, true
+}
+
 func newKubernetesSetupPhaseTracker(reporter *setupEventReporter) *kubernetesSetupPhaseTracker {
 	return &kubernetesSetupPhaseTracker{
 		reporter: reporter,
@@ -78,6 +93,16 @@ func (t *kubernetesSetupPhaseTracker) report(ctx context.Context, eventName stri
 		return
 	}
 	t.observeInterval(ctx, eventName, setupTracePhase(eventName), start, finish, setupPhaseError(isError))
+	t.reporter.reportPhase(ctx, eventName, start, finish, isError)
+}
+
+// reportEvent sends one client event at most once without opening a trace
+// span, for intervals observeInterval already traces under another key.
+func (t *kubernetesSetupPhaseTracker) reportEvent(ctx context.Context, eventName string, start, finish time.Time, isError bool) {
+	if t.reported[eventName] || start.IsZero() || finish.IsZero() || finish.Before(start) {
+		return
+	}
+	t.reported[eventName] = true
 	t.reporter.reportPhase(ctx, eventName, start, finish, isError)
 }
 
@@ -139,6 +164,8 @@ func (t *kubernetesSetupPhaseTracker) observeSchedule(ctx context.Context, pod *
 
 // Pod status has no image-pull timestamps. Preparation includes pulling images
 // and other pre-start delays, separately from the init container's runtime.
+// Copy-sidecar init containers additionally report both halves as client
+// events so the per-boundary cost is visible outside traces.
 func (t *kubernetesSetupPhaseTracker) observeInitContainers(ctx context.Context, pod *corev1.Pod) {
 	var anchor time.Time
 	for _, condition := range pod.Status.Conditions {
@@ -163,6 +190,10 @@ func (t *kubernetesSetupPhaseTracker) observeInitContainers(ctx context.Context,
 		}
 		attrs := []attribute.KeyValue{attribute.String("k8s.container.name", container.Name)}
 		t.observeInterval(ctx, "image_prepare/"+container.Name, "image_prepare", anchor, started, nil, attrs...)
+		sidecarIndex, isCopySidecar := sidecarInitIndex(container.Name)
+		if isCopySidecar {
+			t.reportEvent(ctx, setupEventSidecarImageWait(sidecarIndex), anchor, started, false)
+		}
 		if started.IsZero() {
 			return
 		}
@@ -171,7 +202,11 @@ func (t *kubernetesSetupPhaseTracker) observeInitContainers(ctx context.Context,
 			anchor = started
 			continue
 		}
-		if container.Name != kubernetesSetupContainerName && !strings.HasPrefix(container.Name, kubernetesSidecarInitPrefix) {
+		switch {
+		case isCopySidecar:
+			t.observeInterval(ctx, "sidecar_copy/"+container.Name, "sidecar_copy", started, finished, setupPhaseError(failed), attrs...)
+			t.reportEvent(ctx, setupEventSidecarCopy(sidecarIndex), started, finished, failed)
+		case container.Name != kubernetesSetupContainerName:
 			t.observeInterval(ctx, "init_container/"+container.Name, "init_container", started, finished, setupPhaseError(failed), attrs...)
 		}
 		if finished.IsZero() || finished.Before(started) || failed {
