@@ -62,6 +62,6 @@ jobs:
     permissions: {}
     uses: ./.github/workflows/update_homebrew_formula.yml
     secrets:
-      HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+      WARP_WORKFLOWS_APP_PRIVATE_KEY: ${{ secrets.WARP_WORKFLOWS_APP_PRIVATE_KEY }}
     with:
       release_tag: ${{ needs.generate-tag.outputs.tag_name }}
