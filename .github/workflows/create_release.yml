@@ -59,9 +59,8 @@ jobs:
 
   update-homebrew-formula:
     needs: [generate-tag, release]
-    permissions: {}
+    permissions:
+      id-token: write # octo-sts/action exchanges the job's OIDC token for a scoped GitHub token
     uses: ./.github/workflows/update_homebrew_formula.yml
-    secrets:
-      WARP_WORKFLOWS_APP_PRIVATE_KEY: ${{ secrets.WARP_WORKFLOWS_APP_PRIVATE_KEY }}
     with:
       release_tag: ${{ needs.generate-tag.outputs.tag_name }}
