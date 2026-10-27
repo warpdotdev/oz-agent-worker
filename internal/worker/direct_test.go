@@ -419,6 +419,169 @@ git config --global --add url."https://x-access-token:tok@github.com/".insteadOf
 	}
 }
 
+func TestSeedHarnessConfigDir(t *testing.T) {
+	// Build a fake oz binary that just exits 0.
+	testDir := t.TempDir()
+	ozPath := filepath.Join(testDir, "oz")
+	if err := os.WriteFile(ozPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake oz script: %v", err)
+	}
+
+	t.Run("seeds harness config dir from host path", func(t *testing.T) {
+		// Create a source directory that mimics a local ~/.claude dir.
+		srcDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(srcDir, "settings.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
+			t.Fatalf("failed to write source file: %v", err)
+		}
+		subDir := filepath.Join(srcDir, "plugins")
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatalf("failed to create plugins dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(subDir, "my-plugin.js"), []byte(`console.log("hi")`), 0o644); err != nil {
+			t.Fatalf("failed to write plugin file: %v", err)
+		}
+
+		workspaceRoot := filepath.Join(testDir, "ws-seed")
+		backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+			WorkspaceRoot: workspaceRoot,
+			OzPath:        ozPath,
+			NoCleanup:     true,
+			HarnessConfigDirs: map[string]string{
+				"claude": srcDir,
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create backend: %v", err)
+		}
+
+		taskID := "task-harness-seed"
+		harnessType := "claude"
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{
+			TaskID: taskID,
+			Task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: &harnessType},
+				},
+			},
+		}); result.Error != nil {
+			t.Fatalf("ExecuteTask failed: %v", result.Error)
+		}
+
+		// Verify the harness config dir was seeded.
+		seededSettings := filepath.Join(workspaceRoot, taskID, ".claude", "settings.json")
+		data, err := os.ReadFile(seededSettings)
+		if err != nil {
+			t.Fatalf("seeded settings.json not found: %v", err)
+		}
+		if string(data) != `{"theme":"dark"}` {
+			t.Fatalf("seeded settings.json content = %q, want %q", string(data), `{"theme":"dark"}`)
+		}
+
+		seededPlugin := filepath.Join(workspaceRoot, taskID, ".claude", "plugins", "my-plugin.js")
+		if _, err := os.Stat(seededPlugin); err != nil {
+			t.Fatalf("seeded plugin file not found: %v", err)
+		}
+	})
+
+	t.Run("skips seed when host dir does not exist", func(t *testing.T) {
+		workspaceRoot := filepath.Join(testDir, "ws-nodir")
+		backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+			WorkspaceRoot: workspaceRoot,
+			OzPath:        ozPath,
+			NoCleanup:     true,
+			HarnessConfigDirs: map[string]string{
+				"claude": filepath.Join(testDir, "nonexistent-claude-dir"),
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create backend: %v", err)
+		}
+
+		taskID := "task-nodir"
+		harnessType := "claude"
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{
+			TaskID: taskID,
+			Task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: &harnessType},
+				},
+			},
+		}); result.Error != nil {
+			t.Fatalf("ExecuteTask should not fail when host harness dir is absent: %v", result.Error)
+		}
+
+		// The .claude dir should not have been created (no files to copy).
+		claudeDir := filepath.Join(workspaceRoot, taskID, ".claude")
+		if _, err := os.Stat(claudeDir); !os.IsNotExist(err) {
+			t.Fatalf(".claude dir should not exist when host dir is absent; stat err = %v", err)
+		}
+	})
+
+	t.Run("no-op when harness type is not in HarnessConfigDirs", func(t *testing.T) {
+		srcDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(srcDir, "settings.json"), []byte(`{}`), 0o600); err != nil {
+			t.Fatalf("failed to write source file: %v", err)
+		}
+
+		workspaceRoot := filepath.Join(testDir, "ws-noop")
+		backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+			WorkspaceRoot: workspaceRoot,
+			OzPath:        ozPath,
+			NoCleanup:     true,
+			HarnessConfigDirs: map[string]string{
+				"codex": srcDir, // configured for codex, not claude
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create backend: %v", err)
+		}
+
+		taskID := "task-noop-harness"
+		harnessType := "claude"
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{
+			TaskID: taskID,
+			Task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: &harnessType},
+				},
+			},
+		}); result.Error != nil {
+			t.Fatalf("ExecuteTask failed: %v", result.Error)
+		}
+
+		// .claude dir should not have been seeded.
+		claudeDir := filepath.Join(workspaceRoot, taskID, ".claude")
+		if _, err := os.Stat(claudeDir); !os.IsNotExist(err) {
+			t.Fatalf(".claude dir should not exist when harness is not configured; stat err = %v", err)
+		}
+	})
+
+	t.Run("no-op when HarnessConfigDirs is nil", func(t *testing.T) {
+		workspaceRoot := filepath.Join(testDir, "ws-nilmap")
+		backend, err := NewDirectBackend(context.Background(), DirectBackendConfig{
+			WorkspaceRoot: workspaceRoot,
+			OzPath:        ozPath,
+			NoCleanup:     true,
+		})
+		if err != nil {
+			t.Fatalf("failed to create backend: %v", err)
+		}
+
+		taskID := "task-nilmap"
+		harnessType := "claude"
+		if result := backend.ExecuteTask(context.Background(), &TaskParams{
+			TaskID: taskID,
+			Task: &types.Task{
+				AgentConfigSnapshot: &types.AmbientAgentConfig{
+					Harness: &types.Harness{Type: &harnessType},
+				},
+			},
+		}); result.Error != nil {
+			t.Fatalf("ExecuteTask failed: %v", result.Error)
+		}
+	})
+}
+
 func TestDirectBackendRejectsUnsafeTaskID(t *testing.T) {
 	testDir := t.TempDir()
 	ozPath := filepath.Join(testDir, "oz")
