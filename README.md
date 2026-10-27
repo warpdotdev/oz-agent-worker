@@ -308,6 +308,31 @@ pod_template:
               key: secret-key
 ```
 
+#### Enabling image volumes
+
+On the legacy copy path every sidecar (the Warp agent, the computer-use sidecar, and any coding-CLI sidecar) is a separate `copy-sidecar-<i>` init container that the kubelet must resolve, create, start, and run before the next one, and each of those boundaries typically costs several seconds before the task container can start. With image volumes the kubelet mounts each sidecar image directly and no copy init containers are created, so enabling them is the single largest startup-latency improvement available on this backend.
+
+Requirements:
+
+- Kubernetes `1.35+` (recommended; `ImageVolume` is on by default). On `1.33`-`1.34` the `ImageVolume` feature gate must be enabled on `kube-apiserver` and on every kubelet that runs task Pods. Older versions are unsupported
+- a container runtime with image-volume support on the task nodes: containerd `2.1+` or CRI-O `1.31+`
+- admission policies (Pod Security Admission, Kyverno, Gatekeeper/OPA, mutating webhooks) must allow the `image` volume type in the worker namespace
+- image volumes pull with the same credentials as container images (node credentials, the task service account's `imagePullSecrets`, and `pod_template` `imagePullSecrets`)
+
+`script/k8s-image-volume-check.sh` verifies the API server and kubelet versions, the feature gate (when `/metrics` is readable), and every node's runtime with only `kubectl` and `jq`, and prints the exact value to flip. It makes no cluster writes unless `--run-preflight` is passed, which creates one short-lived Job equivalent to the worker's own startup preflight in the target namespace and deletes it:
+
+```bash
+script/k8s-image-volume-check.sh
+script/k8s-image-volume-check.sh --run-preflight -n agents --node-selector pool=agents
+```
+
+Recommended rollout:
+
+1. Check the current mode. The worker logs `Kubernetes image-volume mode resolved: <mode>` at startup. When `use_image_volumes` is unset, any probe failure, including an inconclusive timeout, silently falls back to the copy path (`auto-fallback`), so a cluster that supports image volumes can still be running the slow path
+2. Enable it on a canary worker first: a separate Helm release or `worker_id` with `use_image_volumes: true` (`--set kubernetesBackend.useImageVolumes=true`) on the same task node pool. Confirm the startup log says `forced-on` and run a few tasks
+3. Flip the primary workers
+
+This is fail-safe: with `use_image_volumes: true` the worker refuses to start when its image-volume preflight Job is rejected by admission, fails to mount, or times out, and the error names the namespace and the likely cause. It never falls back to the copy path, so a misconfiguration cannot silently slow tasks down. Rollback is setting the value back to `false` (or unsetting it) and restarting the worker; no task Pods are affected.
 
 ### Helm Chart
 
@@ -459,7 +484,11 @@ oz-agent-worker --api-key "wk-abc123" --worker-id "my-worker"
 
 When a task assignment enables `telemetry_collection.logging_enabled`, the worker
 sends task-scoped worker logs, setup phase events, and task stdout/stderr to the
-assigned OTLP/HTTP collector. This includes Docker task output, Kubernetes
+assigned OTLP/HTTP collector. On the Kubernetes copy path the setup phase events
+include, per `copy-sidecar-<i>` init container, `setup_worker_sidecar_<i>_image_wait`
+(previous init container finish, or scheduling for the first one, to this container's
+start) and `setup_worker_sidecar_<i>_copy` (its run time), alongside the aggregate
+`setup_worker_sidecar_prep`.
 task-pod output (including init containers), and Direct agent and hook output.
 The Command backend collects dispatch-command output, not remote-runtime output.
 
