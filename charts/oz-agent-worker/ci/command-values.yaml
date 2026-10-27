@@ -1,0 +1,32 @@
+backend:
+  type: command
+
+commandBackend:
+  dispatchCommand: python3 /opt/oz/dispatch.py
+  cancelCommand: python3 /opt/oz/cancel.py
+  dispatchTimeout: 45s
+  environment:
+    - name: OZ_DISPATCH_URL
+      value: https://runtime.example.test/dispatch
+    - name: OZ_DISPATCH_AUTH_HEADER
+
+image:
+  repository: example.registry.internal/oz-agent-worker-python
+  tag: ci
+
+worker:
+  workerId: ci-command-worker
+  extraEnv:
+    - name: OZ_DISPATCH_AUTH_HEADER
+      valueFrom:
+        secretKeyRef:
+          name: oz-dispatch-credentials
+          key: OZ_DISPATCH_AUTH_HEADER
+  extraVolumes:
+    - name: dispatch-scripts
+      configMap:
+        name: oz-dispatch
+  extraVolumeMounts:
+    - name: dispatch-scripts
+      mountPath: /opt/oz
+      readOnly: true
