@@ -139,6 +139,7 @@ const (
 	TaskFailureReasonInvalidImage     TaskFailureReason = "invalid_image"
 	TaskFailureReasonActiveDeadline   TaskFailureReason = "active_deadline"
 	TaskFailureReasonCleanup          TaskFailureReason = "cleanup"
+	TaskFailureReasonNetworkPolicy    TaskFailureReason = "network_policy"
 )
 
 var (
@@ -183,6 +184,7 @@ var (
 		TaskFailureReasonInvalidImage,
 		TaskFailureReasonActiveDeadline,
 		TaskFailureReasonCleanup,
+		TaskFailureReasonNetworkPolicy,
 	}
 )
 
