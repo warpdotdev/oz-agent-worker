@@ -15,9 +15,6 @@ on:
         description: Release tag to publish to Homebrew
         required: true
         type: string
-    secrets:
-      HOMEBREW_TAP_PAT:
-        required: true
 
 permissions: {}
 concurrency:
@@ -27,12 +24,21 @@ concurrency:
 jobs:
   update-formula:
     runs-on: namespace-profile-ubuntu-small
+    permissions:
+      id-token: write # octo-sts/action exchanges the job's OIDC token for a scoped GitHub token
     steps:
+      - name: Mint homebrew-warp token
+        id: app_token
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: warpdotdev/homebrew-warp
+          identity: oz-agent-worker-formula-bump
+
       - name: Set up Homebrew
         uses: Homebrew/actions/setup-homebrew@f8d4222eb633e65c2a0157383cf80861fc7fae7f # 2026.09.07.1
         with:
-          token: ${{ secrets.HOMEBREW_TAP_PAT }}
-          brew-gh-api-token: ${{ secrets.HOMEBREW_TAP_PAT }}
+          token: ${{ steps.app_token.outputs.token }}
+          brew-gh-api-token: ${{ steps.app_token.outputs.token }}
 
       - name: Tap Homebrew repository
         run: brew tap warpdotdev/warp
@@ -40,19 +46,14 @@ jobs:
       - name: Trust Homebrew repository
         run: brew trust warpdotdev/warp
 
-      - name: Configure machine user
+      - name: Configure git identity for the octo-sts bot
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
-          user="$(gh api user)"
-          login="$(jq -r '.login' <<< "${user}")"
-          email="$(jq -r '.email // empty' <<< "${user}")"
-          if [[ -z "${email}" ]]; then
-            user_id="$(jq -r '.id' <<< "${user}")"
-            email="${user_id}+${login}@users.noreply.github.com"
-          fi
-          git config --global user.name "${login}"
-          git config --global user.email "${email}"
+          bot_login="octo-sts[bot]"
+          bot_id="$(gh api "/users/${bot_login}" --jq .id)"
+          git config --global user.name "${bot_login}"
+          git config --global user.email "${bot_id}+${bot_login}@users.noreply.github.com"
 
       - name: Wait for livecheck to observe release
         env:
@@ -87,6 +88,6 @@ jobs:
 
       - name: Open version bump pull request
         env:
-          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
+          HOMEBREW_GITHUB_API_TOKEN: ${{ steps.app_token.outputs.token }}
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: brew bump --open-pr --no-fork --formula warpdotdev/warp/oz-agent-worker
