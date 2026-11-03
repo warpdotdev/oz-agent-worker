@@ -116,6 +116,47 @@ Kubernetes uses `imagePullSecrets` from `backend.kubernetes.pod_template`.
 Operators remain responsible for mirroring the selected versions and ensuring
 that pinned custom images are compatible with the server and agent.
 
+### ACP support (`acp_harnesses`)
+
+Warp can drive the Claude Code and Codex harnesses over the Agent Client
+Protocol (ACP) instead of a PTY, which adds native streaming and file
+attachments on follow-ups. A run only uses ACP on a self-hosted worker when
+that worker advertised the harness as ACP-capable when it connected; otherwise
+the server drives it over a PTY and records the fallback on the run. Workers
+older than this option advertise nothing and keep running over a PTY.
+
+Each backend auto-detects what to advertise:
+
+- **Docker and Kubernetes** advertise every supported harness, because the
+  worker can pull the official `warpdotdev/warp-{harness}-acp-sidecar` images
+  (or their `sidecar_image_mappings` mirrors). A harness covered by the legacy
+  Kubernetes `coding_cli_sidecars` alias is left out, because that alias points
+  the ACP repository at a CLI image. Mirror the ACP repository with
+  `sidecar_image_mappings` instead to keep ACP.
+- **Direct** advertises a harness only when its ACP adapter is on the `PATH`
+  tasks inherit: `claude-code-acp` for Claude Code and `codex-acp` for Codex.
+  The worker's own `PATH` is used unless `backend.direct.environment` sets
+  `PATH`. The published `@agentclientprotocol/claude-agent-acp` package installs
+  a `claude-agent-acp` binary, so add a `claude-code-acp` symlink or wrapper to
+  it.
+- **Command** advertises nothing, because the worker cannot tell whether the
+  dispatch runtime mounts the payload's `sidecars`.
+
+Set `acp_harnesses` under the backend to override auto-detection: a list such
+as `[claude]` advertises exactly those harnesses, and `[]` drives every harness
+over a PTY. Omitting the key auto-detects. Unknown names fail worker startup.
+
+```yaml
+worker_id: "my-worker"
+backend:
+  docker:
+    acp_harnesses: [] # drive Claude Code and Codex over a PTY on this worker
+```
+
+For Helm installations, set `kubernetesBackend.acpHarnesses`. The decision is
+made once at startup and logged as `Advertising ACP support for harnesses:
+...`, so restart the worker after installing an adapter or changing the option.
+
 ### Image releases and pinning
 
 Production self-hosted workers should pin an immutable image version instead of relying on `latest`.
@@ -137,7 +178,7 @@ docker pull warpdotdev/oz-agent-worker@sha256:<digest>
 
 ### Direct
 
-The direct backend executes tasks directly on the host instead of inside Docker or Kubernetes. It requires the `oz` CLI to be available on `PATH` (or configured explicitly with `backend.direct.oz_path`) and stores per-task workspaces under `backend.direct.workspace_root` (default: `/var/lib/oz/workspaces`).
+The direct backend executes tasks directly on the host instead of inside Docker or Kubernetes. It requires the `oz` CLI to be available on `PATH` (or configured explicitly with `backend.direct.oz_path`) and stores per-task workspaces under `backend.direct.workspace_root` (default: `/var/lib/oz/workspaces`). Claude Code and Codex run over a PTY unless their ACP adapters (`claude-code-acp`, `codex-acp`) are on that `PATH`; see [ACP support](#acp-support-acp_harnesses).
 
 Example config:
 
@@ -187,7 +228,7 @@ the backend's `environment` is overwritten rather than honoured.
 
 ### Command
 
-The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).
+The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.). Claude Code and Codex run over a PTY unless `backend.command.acp_harnesses` lists them, which is only correct when the runtime mounts the payload's `sidecars`; see [ACP support](#acp-support-acp_harnesses).
 
 Example config:
 
@@ -283,7 +324,7 @@ backend:
       claude: "registry.internal.example.com/my-claude-wrapper:v1"
 ```
 
-  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked
+  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked. The alias also drives that harness over a PTY on this worker; see [ACP support](#acp-support-acp_harnesses)
 - when `use_image_volumes` is omitted, the worker probes native image-volume support with a real startup Job. A successful probe enables image volumes; any failure, including an inconclusive timeout or registry/network error, is logged and falls back to root init containers that materialize sidecars into `emptyDir` volumes
 - set `use_image_volumes: true` to require native image volumes and fail worker startup if the probe fails, or `use_image_volumes: false` to skip the image-volume probe and always use the legacy copy path
 - image-volume sidecar mounts are read-only. When image volumes are enabled, each read-only sidecar uses an image volume, while each read-write sidecar uses a root init container to copy its contents into an `emptyDir`. A task can mix both paths in automatic or forced-on mode; writable sidecars still require permission to run root init containers

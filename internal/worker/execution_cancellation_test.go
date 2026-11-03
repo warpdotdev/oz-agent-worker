@@ -374,3 +374,32 @@ func TestExecutionCancellationCapabilityHandshake(t *testing.T) {
 		t.Fatalf("capability = %q", got)
 	}
 }
+
+func TestACPHarnessCapabilityHandshake(t *testing.T) {
+	capability := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		capability <- r.Header.Get("X-Warp-Worker-Capabilities")
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	w := &Worker{
+		ctx:          context.Background(),
+		config:       Config{WebSocketURL: "ws" + strings.TrimPrefix(server.URL, "http")},
+		acpHarnesses: []string{"claude", "codex"},
+	}
+	conn, err := w.connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	want := "execution-scoped-cancellation-v1,acp-harness-v1:claude,acp-harness-v1:codex"
+	if got := <-capability; got != want {
+		t.Fatalf("capability = %q, want %q", got, want)
+	}
+}

@@ -47,6 +47,10 @@ type CommandConfig struct {
 	CancelCommand   string     `yaml:"cancel_command"`
 	DispatchTimeout string     `yaml:"dispatch_timeout"`
 	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+	// ACPHarnesses lists the harnesses (claude, codex) this worker advertises as drivable
+	// over ACP. The command backend advertises none unless this is set, because the worker
+	// cannot tell whether the dispatch runtime mounts the payload's sidecars.
+	ACPHarnesses *[]string `yaml:"acp_harnesses" validate:"omitempty,dive,required,no_whitespace"`
 }
 
 // DockerConfig holds Docker-backend-specific configuration.
@@ -61,6 +65,10 @@ type DockerConfig struct {
 	SidecarImage         string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
 	SidecarImageMappings map[string]string `yaml:"sidecar_image_mappings"`
 	Environment          []EnvEntry        `yaml:"environment" validate:"dive"`
+	// ACPHarnesses overrides which harnesses (claude, codex) this worker advertises as
+	// drivable over ACP. Omitted auto-detects (every known harness, since the worker can pull
+	// the official ACP sidecar images); an empty list drives every harness over a PTY.
+	ACPHarnesses *[]string `yaml:"acp_harnesses" validate:"omitempty,dive,required,no_whitespace"`
 }
 
 // DirectConfig holds direct-backend-specific configuration.
@@ -71,6 +79,10 @@ type DirectConfig struct {
 	SetupCommand    string     `yaml:"setup_command"`
 	TeardownCommand string     `yaml:"teardown_command"`
 	Environment     []EnvEntry `yaml:"environment" validate:"dive"`
+	// ACPHarnesses overrides which harnesses (claude, codex) this worker advertises as
+	// drivable over ACP. Omitted auto-detects by probing for each harness's ACP adapter on the
+	// PATH tasks inherit; an empty list drives every harness over a PTY.
+	ACPHarnesses *[]string `yaml:"acp_harnesses" validate:"omitempty,dive,required,no_whitespace"`
 }
 
 // KubernetesConfig holds Kubernetes-backend-specific configuration.
@@ -96,6 +108,10 @@ type KubernetesConfig struct {
 	// Warp CLI and ACP repositories for each harness to a custom image.
 	// It cannot be combined with SidecarImageMappings and does not inject sidecars.
 	CodingCLISidecars map[string]string `yaml:"coding_cli_sidecars"`
+	// ACPHarnesses overrides which harnesses (claude, codex) this worker advertises as
+	// drivable over ACP. Omitted auto-detects: every known harness except one remapped by
+	// CodingCLISidecars; an empty list drives every harness over a PTY.
+	ACPHarnesses *[]string `yaml:"acp_harnesses" validate:"omitempty,dive,required,no_whitespace"`
 	// PodTemplate holds a raw Kubernetes PodSpec that is merged with the worker's
 	// required fields at runtime. Declarative task Job configuration such as
 	// serviceAccountName, imagePullSecrets, node selectors, tolerations,

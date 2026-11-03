@@ -63,6 +63,13 @@ type Config struct {
 	CollectTaskLogs         bool
 	Tracing                 *tracing.Handle
 	SidecarImageMappings    *common.ImageRemapper
+	// ACPHarnesses overrides which harnesses the worker advertises ACP support for; see
+	// resolveACPHarnesses. nil auto-detects from the backend and an empty list advertises none.
+	ACPHarnesses *[]string
+	// LegacyCodingCLISidecarHarnesses names the harnesses whose Kubernetes coding_cli_sidecars
+	// alias remaps the official ACP sidecar repository to a CLI image, which cannot be driven
+	// over ACP.
+	LegacyCodingCLISidecarHarnesses []string
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -94,6 +101,9 @@ type Worker struct {
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
+	// acpHarnesses are the harness names advertised in X-Warp-Worker-Capabilities as
+	// drivable over ACP on this worker; see resolveACPHarnesses.
+	acpHarnesses []string
 }
 
 type runOutcome int
@@ -215,6 +225,11 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		return nil, err
 	}
 
+	acpHarnesses, err := resolveACPHarnesses(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
 	var taskSemaphore *semaphore.Weighted
 	if config.MaxConcurrentTasks > 0 {
 		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
@@ -229,6 +244,7 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		backend:           backend,
 		taskSemaphore:     taskSemaphore,
 		heartbeatInterval: HeartbeatInterval,
+		acpHarnesses:      acpHarnesses,
 	}, nil
 }
 
@@ -317,7 +333,7 @@ func (w *Worker) connect() (*websocket.Conn, error) {
 
 	headers := make(map[string][]string)
 	headers["Authorization"] = []string{fmt.Sprintf("Bearer %s", w.config.APIKey)}
-	headers["X-Warp-Worker-Capabilities"] = []string{executionCancellationCapability}
+	headers["X-Warp-Worker-Capabilities"] = []string{w.capabilityHeader()}
 
 	log.Infof(w.ctx, "Connecting to %s", u.String())
 	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), headers)

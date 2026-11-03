@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -493,6 +494,100 @@ func TestMergeConfigLegacySidecarMappings(t *testing.T) {
 				if got := wc.SidecarImageMappings.Remap(source); got != source {
 					t.Fatalf("empty legacy image remapped %q to %q", source, got)
 				}
+			}
+		})
+	}
+}
+
+func TestMergeConfigACPHarnesses(t *testing.T) {
+	// Every backend gets a body so the YAML mapping is not null.
+	backendBody := map[string]string{
+		"docker":     "    image_pull_policy: Always\n",
+		"kubernetes": "    namespace: agents\n",
+		"direct":     "    workspace_root: /tmp/oz-workspaces\n",
+		"command":    "    dispatch_command: /opt/oz/dispatch.sh\n",
+	}
+	for _, backend := range []string{"docker", "kubernetes", "direct", "command"} {
+		for _, tc := range []struct {
+			name, yaml string
+			want       *[]string
+		}{
+			{"absent auto-detects", "", nil},
+			{"empty advertises none", "    acp_harnesses: []\n", &[]string{}},
+			{"list advertises those", "    acp_harnesses: [claude]\n", &[]string{"claude"}},
+		} {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				resetCLIForTest()
+				t.Cleanup(resetCLIForTest)
+				content := fmt.Sprintf("worker_id: test-worker\nbackend:\n  %s:\n%s%s", backend, backendBody[backend], tc.yaml)
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := config.Load(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wc, err := mergeConfig(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if wc.BackendType != backend {
+					t.Fatalf("BackendType = %q, want %q", wc.BackendType, backend)
+				}
+				switch {
+				case tc.want == nil:
+					if wc.ACPHarnesses != nil {
+						t.Fatalf("ACPHarnesses = %v, want nil (auto-detect)", *wc.ACPHarnesses)
+					}
+				case wc.ACPHarnesses == nil:
+					t.Fatalf("ACPHarnesses = nil, want %v", *tc.want)
+				case !slices.Equal(*wc.ACPHarnesses, *tc.want):
+					t.Fatalf("ACPHarnesses = %v, want %v", *wc.ACPHarnesses, *tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestMergeConfigLegacyCodingCLISidecarHarnesses(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		want          []string
+	}{
+		{
+			name:    "kubernetes aliases name their harnesses",
+			content: "worker_id: test-worker\nbackend:\n  kubernetes:\n    coding_cli_sidecars:\n      codex: mirror.example/codex\n      claude: mirror.example/claude\n      gemini: \"\"\n",
+			want:    []string{"claude", "codex"},
+		},
+		{
+			name:    "explicit mappings name none",
+			content: "worker_id: test-worker\nbackend:\n  kubernetes:\n    sidecar_image_mappings:\n      warpdotdev/warp-claude-cli-sidecar: mirror.example/claude\n",
+			want:    nil,
+		},
+		{
+			name:    "docker has no alias",
+			content: "worker_id: test-worker\nbackend:\n  docker:\n    sidecar_image: mirror.example/agent\n",
+			want:    nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc, err := mergeConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(wc.LegacyCodingCLISidecarHarnesses, tc.want) {
+				t.Fatalf("LegacyCodingCLISidecarHarnesses = %v, want %v", wc.LegacyCodingCLISidecarHarnesses, tc.want)
 			}
 		})
 	}

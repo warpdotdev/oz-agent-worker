@@ -111,6 +111,63 @@ backend:
 	}
 }
 
+func TestLoadACPHarnesses(t *testing.T) {
+	for _, backend := range []string{"docker", "kubernetes", "direct", "command"} {
+		// Every backend gets a body so the YAML mapping is not null.
+		body := map[string]string{
+			"docker":     "    image_pull_policy: Always\n",
+			"kubernetes": "    namespace: agents\n",
+			"direct":     "    workspace_root: /tmp/oz-workspaces\n",
+			"command":    "    dispatch_command: /opt/oz/dispatch.sh\n",
+		}[backend]
+		acpHarnesses := func(cfg *FileConfig) *[]string {
+			switch backend {
+			case "docker":
+				return cfg.Backend.Docker.ACPHarnesses
+			case "kubernetes":
+				return cfg.Backend.Kubernetes.ACPHarnesses
+			case "direct":
+				return cfg.Backend.Direct.ACPHarnesses
+			default:
+				return cfg.Backend.Command.ACPHarnesses
+			}
+		}
+		t.Run(backend+"/absent", func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, "worker_id: w\nbackend:\n  "+backend+":\n"+body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if acpHarnesses(cfg) != nil {
+				t.Fatalf("acp_harnesses = %v, want nil", *acpHarnesses(cfg))
+			}
+		})
+		t.Run(backend+"/empty", func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, "worker_id: w\nbackend:\n  "+backend+":\n"+body+"    acp_harnesses: []\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := acpHarnesses(cfg); got == nil || len(*got) != 0 {
+				t.Fatalf("acp_harnesses = %v, want an empty list", got)
+			}
+		})
+		t.Run(backend+"/list", func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, "worker_id: w\nbackend:\n  "+backend+":\n"+body+"    acp_harnesses: [claude, codex]\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := acpHarnesses(cfg); got == nil || len(*got) != 2 || (*got)[0] != "claude" || (*got)[1] != "codex" {
+				t.Fatalf("acp_harnesses = %v, want [claude codex]", got)
+			}
+		})
+		t.Run(backend+"/whitespace entry is rejected", func(t *testing.T) {
+			_, err := Load(writeTestConfig(t, "worker_id: w\nbackend:\n  "+backend+":\n"+body+"    acp_harnesses: [\"cl aude\"]\n"))
+			if err == nil {
+				t.Fatal("expected a validation error for a whitespace entry")
+			}
+		})
+	}
+}
+
 func TestLoadKubernetesCodingCLISidecars(t *testing.T) {
 	path := writeTestConfig(t, `
 worker_id: "k8s-worker"

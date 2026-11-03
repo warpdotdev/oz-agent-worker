@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -200,6 +201,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		sidecarImageMappings    map[string]string
 		legacySidecarImage      string
 		legacyCodingCLISidecars map[string]string
+		acpHarnesses            *[]string
 	)
 	switch backendType {
 	case "kubernetes":
@@ -233,6 +235,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			legacySidecarImage = kc.SidecarImage
 			sidecarImageMappings = kc.SidecarImageMappings
 			legacyCodingCLISidecars = kc.CodingCLISidecars
+			acpHarnesses = kc.ACPHarnesses
 			setupCmd = kc.SetupCommand
 			teardownCmd = kc.TeardownCommand
 			extraLabels = copyStringMap(kc.ExtraLabels)
@@ -315,6 +318,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ozPath = fileConfig.Backend.Direct.OzPath
 			setupCmd = fileConfig.Backend.Direct.SetupCommand
 			teardownCmd = fileConfig.Backend.Direct.TeardownCommand
+			acpHarnesses = fileConfig.Backend.Direct.ACPHarnesses
 		}
 
 		// CLI --target-dir overrides config file.
@@ -342,6 +346,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			dispatchCmd = cc.DispatchCommand
 			cancelCmd = cc.CancelCommand
 			dispatchTimeoutStr = cc.DispatchTimeout
+			acpHarnesses = cc.ACPHarnesses
 		}
 		for k, v := range cliEnv {
 			mergedEnv[k] = v
@@ -383,6 +388,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
 			legacySidecarImage = fileConfig.Backend.Docker.SidecarImage
 			sidecarImageMappings = fileConfig.Backend.Docker.SidecarImageMappings
+			acpHarnesses = fileConfig.Backend.Docker.ACPHarnesses
 		}
 		volumes = append(volumes, CLI.Volumes...)
 
@@ -412,8 +418,13 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			}
 			sidecarImageMappings[fmt.Sprintf("warpdotdev/warp-%s-cli-sidecar", harness)] = image
 			sidecarImageMappings[fmt.Sprintf("warpdotdev/warp-%s-acp-sidecar", harness)] = image
+			// The alias points the ACP repository at a CLI image, which cannot be driven over
+			// ACP; the worker leaves that harness out of its advertised ACP support.
+			wc.LegacyCodingCLISidecarHarnesses = append(wc.LegacyCodingCLISidecarHarnesses, harness)
 		}
+		slices.Sort(wc.LegacyCodingCLISidecarHarnesses)
 	}
+	wc.ACPHarnesses = acpHarnesses
 	wc.SidecarImageMappings, err = common.NewImageRemapper(sidecarImageMappings)
 	if err != nil {
 		return worker.Config{}, fmt.Errorf("invalid backend.%s.sidecar_image_mappings: %w", backendType, err)

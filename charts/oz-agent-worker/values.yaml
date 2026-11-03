@@ -89,6 +89,13 @@ kubernetesBackend:
   # repository includes a tag or digest, that takes precedence over any server-provided
   # version.
   sidecarImageMappings: {}
+  # Harnesses this worker advertises as drivable over the Agent Client Protocol (ACP)
+  # instead of a PTY: claude and/or codex. null auto-detects (every harness, since the
+  # worker can pull the official ACP sidecar images or their sidecarImageMappings
+  # mirrors), [] drives every harness over a PTY, and a list such as [claude]
+  # advertises exactly those. Workers that advertise nothing keep running these
+  # harnesses over a PTY.
+  acpHarnesses: null
   setupCommand: ""
   teardownCommand: ""
   extraLabels: {}

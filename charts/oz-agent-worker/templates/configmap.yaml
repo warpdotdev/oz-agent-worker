@@ -35,6 +35,14 @@ data:
         sidecar_image_mappings:
 {{ toYaml . | indent 10 }}
         {{- end }}
+        {{- if ne .Values.kubernetesBackend.acpHarnesses nil }}
+        {{- if .Values.kubernetesBackend.acpHarnesses }}
+        acp_harnesses:
+{{ toYaml .Values.kubernetesBackend.acpHarnesses | indent 10 }}
+        {{- else }}
+        acp_harnesses: []
+        {{- end }}
+        {{- end }}
         {{- if .Values.kubernetesBackend.setupCommand }}
         setup_command: |-
 {{ .Values.kubernetesBackend.setupCommand | indent 10 }}
