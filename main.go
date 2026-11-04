@@ -160,7 +160,6 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if maxConcurrentTasks == 0 && fileConfig != nil && fileConfig.MaxConcurrentTasks != nil {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
-	// Resolve max_prewarmed_sandboxes: CLI (non-zero) > config file > 0 (shares the task limit).
 	maxPrewarmedSandboxes := CLI.MaxPrewarmedSandboxes
 	if maxPrewarmedSandboxes == 0 && fileConfig != nil && fileConfig.MaxPrewarmedSandboxes != nil {
 		maxPrewarmedSandboxes = *fileConfig.MaxPrewarmedSandboxes

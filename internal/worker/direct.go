@@ -24,11 +24,6 @@ const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
 // directBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
 const directBackendTypeName = "direct"
 
-// directSetupEnvVars, directTeardownEnvVars, and their standby variants return exactly the worker-owned variables this
-// backend adds to the operator's setup and teardown hooks. TestBackendEnvPairsEveryOZName runs
-// its pairing assertion over these, so a variable added here under only one of its two names
-// fails the build. GIT_CONFIG_GLOBAL has no OZ_/WARP_ spelling and WARP_PREWARMED_SANDBOX_ID has
-// no OZ_ spelling, so both are left unpaired.
 func directSetupEnvVars(workspaceDir, taskID, environmentFile string) []string {
 	return concatEnvVars(
 		workspaceRootEnvVars(workspaceDir),
@@ -47,7 +42,6 @@ func directTeardownEnvVars(workspaceDir, gitConfigPath, taskID string) []string 
 	)
 }
 
-// prewarmedSandboxIDEnvVars returns a standby's sandbox ID under its WARP_ name.
 func prewarmedSandboxIDEnvVars(sandboxID string) []string {
 	return []string{fmt.Sprintf("WARP_PREWARMED_SANDBOX_ID=%s", sandboxID)}
 }
@@ -264,10 +258,10 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			return
 		}
 		if standbyID != "" {
-			_ = b.cleanupStandby(ctx, standbyID, workspaceDir, gitConfigPath, params.Logs)
+			_ = b.removeWorkspace(ctx, directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID), workspaceDir, params.Logs)
 			return
 		}
-		_ = b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
+		_ = b.removeWorkspace(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -433,16 +427,6 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, teardownEnv
 		return err
 	}
 	return nil
-}
-
-// cleanup runs the run teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) error {
-	return b.removeWorkspace(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, reporter)
-}
-
-// cleanupStandby runs the standby teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanupStandby(ctx context.Context, sandboxID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) error {
-	return b.removeWorkspace(ctx, directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, sandboxID), workspaceDir, reporter)
 }
 
 func (b *DirectBackend) removeWorkspace(ctx context.Context, teardownEnv []string, workspaceDir string, reporter *tasklogs.Reporter) (err error) {

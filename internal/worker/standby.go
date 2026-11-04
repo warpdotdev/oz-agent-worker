@@ -24,7 +24,7 @@ const (
 // errStandbyNotWaited reports a backend that returned before its standby sandbox exited.
 var errStandbyNotWaited = errors.New("backend returned before the standby sandbox exited")
 
-// standbyEntry tracks one running standby sandbox. cancelSource is guarded by tasksMutex.
+// standbyEntry's cancelSource is guarded by tasksMutex.
 type standbyEntry struct {
 	cancel          context.CancelFunc
 	stopObservation context.CancelCauseFunc
@@ -34,7 +34,6 @@ type standbyEntry struct {
 	slots *semaphore.Weighted
 }
 
-// standbysSupported reports whether this worker can run standby sandboxes.
 func (w *Worker) standbysSupported() bool {
 	if !w.capabilities.supportsStandbys || w.config.OneShot {
 		return false
@@ -42,7 +41,6 @@ func (w *Worker) standbysSupported() bool {
 	return w.config.Direct == nil || w.config.Direct.TargetDir == ""
 }
 
-// standbySlotsLocked returns the semaphore that standbys acquire from, or nil when unlimited.
 func (w *Worker) standbySlotsLocked() *semaphore.Weighted {
 	if w.standbySemaphore != nil {
 		return w.standbySemaphore
@@ -50,7 +48,6 @@ func (w *Worker) standbySlotsLocked() *semaphore.Weighted {
 	return w.taskSemaphore
 }
 
-// standbyBaseContext returns the parent context for standby executions.
 func (w *Worker) standbyBaseContext() context.Context {
 	if w.backend.PreservesTasksOnShutdown() {
 		return context.WithoutCancel(w.ctx)
@@ -58,7 +55,6 @@ func (w *Worker) standbyBaseContext() context.Context {
 	return w.ctx
 }
 
-// admitStandbyLocked reserves a capacity slot, or returns the reason to reject the create.
 func (w *Worker) admitStandbyLocked() (*semaphore.Weighted, string) {
 	switch {
 	case w.shuttingDown || w.ctx.Err() != nil:
@@ -155,14 +151,7 @@ func (w *Worker) reportStandbyExit(sandboxID string, entry *standbyEntry, err er
 
 	exitCode, reason := standbyExitStatus(err, source)
 	log.Infof(w.ctx, "Standby sandbox %s exited: exit_code=%d reason=%q", sandboxID, exitCode, reason)
-	sendErr := w.sendStandbyMessage(types.MessageTypePrewarmExited, types.PrewarmExitedMessage{
-		SandboxID: sandboxID,
-		ExitCode:  exitCode,
-		Reason:    reason,
-	})
-	if sendErr != nil {
-		log.Errorf(w.ctx, "Failed to send prewarm exited message: %v", sendErr)
-	}
+	w.sendStandbyExit(sandboxID, exitCode, reason)
 }
 
 func (w *Worker) releaseStandby(sandboxID string, entry *standbyEntry) {
@@ -176,7 +165,6 @@ func (w *Worker) releaseStandby(sandboxID string, entry *standbyEntry) {
 	close(entry.done)
 }
 
-// standbyExitStatus maps a standby's execution error to the exit code and reason sent to the server.
 func standbyExitStatus(err error, source taskCancellationSource) (int, string) {
 	if err == nil {
 		return 0, ""
@@ -221,7 +209,6 @@ func (w *Worker) handlePrewarmDestroy(destroy *types.PrewarmDestroyMessage) {
 	}()
 }
 
-// stopStandbysLocked stops every standby for shutdown and returns the observer channels to wait on.
 func (w *Worker) stopStandbysLocked(preserve bool) ([]chan struct{}, int) {
 	var observersDone []chan struct{}
 	for _, entry := range w.standbys {
@@ -240,7 +227,6 @@ func (w *Worker) stopStandbysLocked(preserve bool) ([]chan struct{}, int) {
 	return observersDone, len(w.standbys)
 }
 
-// sweepStandbys reports standbys that a previous worker process left behind.
 func (w *Worker) sweepStandbys() {
 	sweeper, ok := w.backend.(StandbySweeper)
 	if !ok {
@@ -253,18 +239,10 @@ func (w *Worker) sweepStandbys() {
 		log.Warnf(w.ctx, "Failed to sweep leftover standby sandboxes: %v", err)
 	}
 	for _, sandboxID := range sandboxIDs {
-		sendErr := w.sendStandbyMessage(types.MessageTypePrewarmExited, types.PrewarmExitedMessage{
-			SandboxID: sandboxID,
-			ExitCode:  sweptStandbyExitCode,
-			Reason:    string(metrics.TaskFailureReasonGracefulShutdown),
-		})
-		if sendErr != nil {
-			log.Errorf(w.ctx, "Failed to send prewarm exited message for swept sandbox %s: %v", sandboxID, sendErr)
-		}
+		w.sendStandbyExit(sandboxID, sweptStandbyExitCode, string(metrics.TaskFailureReasonGracefulShutdown))
 	}
 }
 
-// startStandbyExitWatcher reports standby exits for the worker lifetime.
 func (w *Worker) startStandbyExitWatcher() {
 	watcher, ok := w.backend.(StandbyExitWatcher)
 	if !ok {
@@ -273,7 +251,6 @@ func (w *Worker) startStandbyExitWatcher() {
 	go watcher.WatchStandbyExits(w.ctx, w.reportWatchedStandbyExit)
 }
 
-// reportWatchedStandbyExit reports an exit that this worker does not track locally.
 func (w *Worker) reportWatchedStandbyExit(sandboxID string, exitCode int, reason string) {
 	w.tasksMutex.Lock()
 	_, local := w.standbys[sandboxID]
@@ -281,13 +258,17 @@ func (w *Worker) reportWatchedStandbyExit(sandboxID string, exitCode int, reason
 	if local {
 		return
 	}
+	w.sendStandbyExit(sandboxID, exitCode, reason)
+}
+
+func (w *Worker) sendStandbyExit(sandboxID string, exitCode int, reason string) {
 	err := w.sendStandbyMessage(types.MessageTypePrewarmExited, types.PrewarmExitedMessage{
 		SandboxID: sandboxID,
 		ExitCode:  exitCode,
 		Reason:    reason,
 	})
 	if err != nil {
-		log.Errorf(w.ctx, "Failed to send prewarm exited message for watched sandbox %s: %v", sandboxID, err)
+		log.Errorf(w.ctx, "Failed to send prewarm exited message for sandbox %s: %v", sandboxID, err)
 	}
 }
 
@@ -315,7 +296,6 @@ func (w *Worker) sendStandbyMessage(messageType types.MessageType, payload any) 
 	return w.sendMessage(msgBytes)
 }
 
-// prepareStandbyTaskParams builds backend parameters for a standby sandbox, which has no task or run ID.
 func (w *Worker) prepareStandbyTaskParams(create *types.PrewarmCreateMessage) *TaskParams {
 	envVars := w.commonEnvVars()
 	for key, value := range create.EnvVars {

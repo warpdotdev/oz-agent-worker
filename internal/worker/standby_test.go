@@ -26,7 +26,6 @@ type standbyExecution struct {
 	queued int
 }
 
-// standbyTestBackend ends each execution when the test sends a result or the context ends.
 type standbyTestBackend struct {
 	executed chan standbyExecution
 	finish   chan ExecuteResult
@@ -63,7 +62,6 @@ func (b *standbyTestBackend) CancelTask(context.Context, *CancelParams) error { 
 func (b *standbyTestBackend) Shutdown(context.Context)                        {}
 func (b *standbyTestBackend) PreservesTasksOnShutdown() bool                  { return b.preserve }
 
-// destroyingStandbyBackend also implements StandbyDestroyer.
 type destroyingStandbyBackend struct {
 	*standbyTestBackend
 	destroyed chan string
@@ -74,7 +72,6 @@ func (b *destroyingStandbyBackend) DestroyStandby(_ context.Context, sandboxID s
 	return nil
 }
 
-// sweepingStandbyBackend also implements StandbySweeper.
 type sweepingStandbyBackend struct {
 	*standbyTestBackend
 	swept []string
@@ -90,7 +87,6 @@ type standbyWatchReport struct {
 	reason    string
 }
 
-// watchingStandbyBackend also implements StandbyExitWatcher.
 type watchingStandbyBackend struct {
 	*standbyTestBackend
 	reports []standbyWatchReport
@@ -151,7 +147,6 @@ func awaitStandbyExecution(t *testing.T, backend *standbyTestBackend) standbyExe
 	return standbyExecution{}
 }
 
-// awaitStandbyMessage returns the next outbound message of messageType and discards other messages.
 func awaitStandbyMessage(t *testing.T, w *Worker, messageType types.MessageType) types.WebSocketMessage {
 	t.Helper()
 	timeout := time.After(2 * time.Second)
@@ -650,7 +645,7 @@ func TestStandbyTaskParams(t *testing.T) {
 		"WARP_API_KEY=secret-key",
 		"FOO=bar",
 	} {
-		if !containsString(params.EnvVars, want) {
+		if !slices.Contains(params.EnvVars, want) {
 			t.Errorf("EnvVars missing %q: %v", want, params.EnvVars)
 		}
 	}
@@ -777,13 +772,4 @@ func TestShutdownStopsStandbysUnlessPreserved(t *testing.T) {
 			}
 		}
 	})
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }

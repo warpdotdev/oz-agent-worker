@@ -12,7 +12,6 @@ import (
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 )
 
-// writeStandbyOzScript writes an oz stand-in whose body runs after the shebang.
 func writeStandbyOzScript(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "oz")

@@ -22,7 +22,6 @@ type standbyCreateSpec struct {
 	Env    []string          `json:"Env"`
 }
 
-// standbyLifecycleEngine scripts the Engine calls for one container and records its create and remove requests.
 type standbyLifecycleEngine struct {
 	t         *testing.T
 	blockWait bool
@@ -181,7 +180,6 @@ func TestDockerStandbyCancellationRemovesContainer(t *testing.T) {
 	}
 }
 
-// standbySweepEngine serves a labeled container list and records removals during SweepStandbys.
 type standbySweepEngine struct {
 	t          *testing.T
 	failRemove string

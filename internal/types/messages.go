@@ -54,8 +54,7 @@ type PrewarmDestroyMessage struct {
 	SandboxID string `json:"sandbox_id"`
 }
 
-// PrewarmCreatedMessage reports that the worker accepted a create request. The worker sends it
-// before it pulls an image or starts the standby.
+// PrewarmCreatedMessage acknowledges a create request before pulling an image or starting the standby.
 type PrewarmCreatedMessage struct {
 	SandboxID   string `json:"sandbox_id"`
 	InstanceRef string `json:"instance_ref"`
@@ -68,8 +67,7 @@ type PrewarmRejectedMessage struct {
 	Reason    string `json:"reason"`
 }
 
-// PrewarmExitedMessage reports that a standby sandbox stopped. Reason is a
-// metrics.TaskFailureReason value, and it is empty for exit code 0.
+// PrewarmExitedMessage reports a stopped standby, with an empty failure reason for exit code 0.
 type PrewarmExitedMessage struct {
 	SandboxID string `json:"sandbox_id"`
 	ExitCode  int    `json:"exit_code"`

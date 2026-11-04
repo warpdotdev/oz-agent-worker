@@ -75,7 +75,6 @@ const (
 	maxFailureDetailsBytes                = 32 * 1024
 )
 
-// kubernetesWorkerOwnedEnvVars returns the worker-owned variables that every Kubernetes unit carries.
 func kubernetesWorkerOwnedEnvVars() []string {
 	return concatEnvVars(
 		environmentFileEnvVars(defaultSetupEnvironmentFile),
@@ -722,11 +721,6 @@ func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch
 	})
 }
 
-func (b *KubernetesBackend) watchTaskPods(ctx context.Context, executionID string) (watch.Interface, error) {
-	return b.watchPods(ctx, kubernetesExecutionPodSelector(executionID))
-}
-
-// watchPods opens a watch on the pods in the namespace that match labelSelector.
 func (b *KubernetesBackend) watchPods(ctx context.Context, labelSelector string) (watch.Interface, error) {
 	return retryKubernetesAPI(ctx, kubernetesAPIBackoff(), func() (watch.Interface, error) {
 		return openKubernetesWatch(ctx, kubernetesAPIRequestTimeout, func(watchCtx context.Context) (watch.Interface, error) {
@@ -1147,7 +1141,6 @@ func (b *KubernetesBackend) startupPreflightError(err error, useImageVolumes boo
 	return fmt.Errorf("kubernetes startup preflight failed: the kubernetes backend requires creating task Jobs with a root init container for sidecar materialization; verify service account/RBAC and Pod Security or admission policy for namespace %q: %w", b.config.Namespace, err)
 }
 
-// workerLabels returns the labels that identify this worker on every Kubernetes unit it creates.
 func (b *KubernetesBackend) workerLabels() map[string]string {
 	labels := copyStringMap(b.config.ExtraLabels)
 	if labels == nil {
@@ -1174,7 +1167,6 @@ func (b *KubernetesBackend) listTaskPods(ctx context.Context, executionID string
 	return b.listPods(ctx, kubernetesExecutionPodSelector(executionID))
 }
 
-// listPods returns the pods in the namespace that match labelSelector.
 func (b *KubernetesBackend) listPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error) {
 	podList, err := retryKubernetesAPI(ctx, kubernetesAPIBackoff(), func() (*corev1.PodList, error) {
 		requestCtx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)

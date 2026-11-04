@@ -869,7 +869,6 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 }
 
-// commonEnvVars returns the environment variables shared by tasks and standbys.
 func (w *Worker) commonEnvVars() []string {
 	envVars := []string{"GIT_TERMINAL_PROMPT=0", "GH_PROMPT_DISABLED=1"}
 	if w.config.ServerRootURL != "" {
@@ -878,7 +877,6 @@ func (w *Worker) commonEnvVars() []string {
 	return envVars
 }
 
-// sidecarMounts returns the remapped sidecars, with the agent sidecar first when present.
 func (w *Worker) sidecarMounts(sidecarImage string, additional []types.SidecarMount) []types.SidecarMount {
 	var sidecars []types.SidecarMount
 	if sidecarImage != "" {

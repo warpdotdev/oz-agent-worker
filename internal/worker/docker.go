@@ -312,7 +312,6 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	return res
 }
 
-// dockerUnitIdentity returns the container labels, tracking key, and container name for a task or standby.
 // A standby is tracked by its sandbox ID as its task ID, so CancelParams{TaskID: sandboxID} finds it.
 func dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
 	if params.StandbyID != "" {

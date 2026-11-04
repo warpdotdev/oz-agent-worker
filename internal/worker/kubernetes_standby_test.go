@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -409,35 +410,35 @@ func TestKubernetesStandbyWatcherReportsDeadlineWithoutPod(t *testing.T) {
 }
 
 func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
-	previousInterval := kubernetesStandbyWatchRetryInterval
-	kubernetesStandbyWatchRetryInterval = time.Millisecond
-	t.Cleanup(func() { kubernetesStandbyWatchRetryInterval = previousInterval })
+	synctest.Test(t, func(t *testing.T) {
+		job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
+		backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
+			standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
 
-	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
-	backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
-		standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
+		closed := watch.NewRaceFreeFake()
+		closed.Stop()
+		live := watch.NewRaceFreeFake()
+		live.Add(job)
+		watches := []watch.Interface{closed, live}
+		client.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
+			next := watches[0]
+			if len(watches) > 1 {
+				watches = watches[1:]
+			}
+			return true, next, nil
+		})
 
-	closed := watch.NewRaceFreeFake()
-	closed.Stop()
-	live := watch.NewRaceFreeFake()
-	live.Add(job)
-	watches := []watch.Interface{closed, live}
-	client.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
-		next := watches[0]
-		if len(watches) > 1 {
-			watches = watches[1:]
+		reports, cancel, done := startStandbyExitWatcher(backend)
+		defer cancel()
+
+		synctest.Wait()
+		time.Sleep(kubernetesStandbyWatchRetryInterval)
+		if got := awaitStandbyExit(t, reports); got != (standbyExitReport{"sb-1", 0, ""}) {
+			t.Fatalf("report = %+v, want success for sb-1 after reopen", got)
 		}
-		return true, next, nil
+		cancel()
+		<-done
 	})
-
-	reports, cancel, done := startStandbyExitWatcher(backend)
-	defer cancel()
-
-	if got := awaitStandbyExit(t, reports); got != (standbyExitReport{"sb-1", 0, ""}) {
-		t.Fatalf("report = %+v, want success for sb-1 after reopen", got)
-	}
-	cancel()
-	<-done
 }
 
 func TestKubernetesStandbyDestroyDeletesByLabel(t *testing.T) {

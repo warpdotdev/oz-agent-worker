@@ -157,7 +157,7 @@ type StandbySweeper interface {
 // StandbyDestroyer is implemented by backends whose standby units another worker replica may
 // have created.
 type StandbyDestroyer interface {
-	// DestroyStandby deletes the standby unit for sandboxID. It returns nil when none exists.
+	// DestroyStandby deletes the standby unit for sandboxID, returning nil when none exists.
 	DestroyStandby(ctx context.Context, sandboxID string) error
 }
 
@@ -176,8 +176,7 @@ type TaskParams struct {
 	TaskID      string
 	ExecutionID string
 	Task        *types.Task
-	// StandbyID is set only for a standby sandbox. Then TaskID and ExecutionID are empty, Task
-	// is nil, and backends name and label the unit by StandbyID and set no run ID variables.
+	// StandbyID identifies a standby instead of a task, with Task nil and both run IDs empty.
 	StandbyID string
 
 	// EnvVars contains pre-resolved common environment variables (TASK_ID, Git config,

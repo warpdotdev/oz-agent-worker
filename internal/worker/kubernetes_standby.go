@@ -19,10 +19,8 @@ var (
 	_ StandbyExitWatcher = (*KubernetesBackend)(nil)
 )
 
-// kubernetesStandbyWatchRetryInterval is the wait before a closed or failed standby Job watch reopens.
-var kubernetesStandbyWatchRetryInterval = 5 * time.Second
+const kubernetesStandbyWatchRetryInterval = 5 * time.Second
 
-// kubernetesStandbyJobName returns the standby Job name and rejects a sandbox ID that cannot form a DNS-1123 label.
 func kubernetesStandbyJobName(sandboxID string) (string, error) {
 	name := StandbyInstanceRef(sandboxID)
 	if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
@@ -31,19 +29,16 @@ func kubernetesStandbyJobName(sandboxID string) (string, error) {
 	return name, nil
 }
 
-// kubernetesStandbyLabels returns the worker labels and the standby label for sandboxID.
 func (b *KubernetesBackend) kubernetesStandbyLabels(sandboxID string) map[string]string {
 	labels := b.workerLabels()
 	labels[StandbyKubernetesLabel] = sandboxID
 	return labels
 }
 
-// kubernetesStandbyLabelSelector selects the Jobs and Pods of the standby sandbox sandboxID.
 func kubernetesStandbyLabelSelector(sandboxID string) string {
 	return StandbyKubernetesLabel + "=" + sandboxID
 }
 
-// kubernetesStandbyActiveDeadlineSeconds returns the seconds left on ctx when that is below configured.
 func kubernetesStandbyActiveDeadlineSeconds(ctx context.Context, configured *int64) *int64 {
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -56,7 +51,6 @@ func kubernetesStandbyActiveDeadlineSeconds(ctx context.Context, configured *int
 	return &remaining
 }
 
-// kubernetesStandbyDeleteJob deletes a standby Job even when ctx is cancelled.
 func (b *KubernetesBackend) kubernetesStandbyDeleteJob(ctx context.Context, job *batchv1.Job) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 	defer cancel()
@@ -111,7 +105,6 @@ func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(s
 	}
 }
 
-// consumeStandbyJobEvents reports finished standby Jobs from watcher until the watch ends or ctx is done.
 func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher watch.Interface, reported map[k8stypes.UID]bool, report func(sandboxID string, exitCode int, reason string)) {
 	for {
 		select {
@@ -141,7 +134,6 @@ func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher
 	}
 }
 
-// kubernetesStandbyExitStatus returns the exit code and the failure reason of a finished standby Job.
 func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job *batchv1.Job) (int, string) {
 	if jobComplete(job) {
 		return b.kubernetesStandbyTaskExitCode(ctx, job, 0), ""
@@ -149,7 +141,6 @@ func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job
 	return b.kubernetesStandbyTaskExitCode(ctx, job, 1), string(classifyJobFailure(job))
 }
 
-// kubernetesStandbyTaskExitCode returns the exit code of the task container, or fallback when none is observed.
 func (b *KubernetesBackend) kubernetesStandbyTaskExitCode(ctx context.Context, job *batchv1.Job, fallback int) int {
 	pods, err := b.listPods(ctx, kubernetesStandbyLabelSelector(job.Labels[StandbyKubernetesLabel]))
 	if err != nil {

@@ -49,7 +49,7 @@ func TestDirectExecutionWorkspaceIsolation(t *testing.T) {
 				}
 				workspaces = append(workspaces, string(workspace))
 			}
-			if err := backend.cleanup(context.Background(), "run", workspaces[0], "", nil); err != nil {
+			if err := backend.removeWorkspace(context.Background(), directTeardownEnvVars(workspaces[0], "", "run"), workspaces[0], nil); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := os.Stat(workspaces[1]); err != nil {

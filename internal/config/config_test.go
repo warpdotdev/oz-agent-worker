@@ -873,41 +873,30 @@ worker_id: "test"
 }
 
 func TestLoadMaxPrewarmedSandboxes(t *testing.T) {
-	t.Run("parses max_prewarmed_sandboxes when set", func(t *testing.T) {
-		path := writeTestConfig(t, `
-worker_id: "test"
-max_prewarmed_sandboxes: 3
-`)
-		cfg, err := Load(path)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if cfg.MaxPrewarmedSandboxes == nil || *cfg.MaxPrewarmedSandboxes != 3 {
-			t.Fatalf("max_prewarmed_sandboxes = %v, want 3", cfg.MaxPrewarmedSandboxes)
-		}
-	})
-
-	t.Run("max_prewarmed_sandboxes is nil when not set", func(t *testing.T) {
-		path := writeTestConfig(t, `
-worker_id: "test"
-`)
-		cfg, err := Load(path)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if cfg.MaxPrewarmedSandboxes != nil {
-			t.Errorf("expected max_prewarmed_sandboxes to be nil, got %d", *cfg.MaxPrewarmedSandboxes)
-		}
-	})
-
-	t.Run("rejects negative max_prewarmed_sandboxes", func(t *testing.T) {
-		path := writeTestConfig(t, `
-worker_id: "test"
-max_prewarmed_sandboxes: -1
-`)
-		_, err := Load(path)
-		if err == nil || !strings.Contains(err.Error(), "MaxPrewarmedSandboxes") {
-			t.Fatalf("Load() error = %v, want MaxPrewarmedSandboxes validation error", err)
-		}
-	})
+	for _, tc := range []struct {
+		name, setting string
+		want          *int
+		wantError     bool
+	}{
+		{name: "explicit capacity", setting: "max_prewarmed_sandboxes: 3", want: new(3)},
+		{name: "shared task limit"},
+		{name: "negative capacity", setting: "max_prewarmed_sandboxes: -1", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, "worker_id: test\n"+tc.setting+"\n"))
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "MaxPrewarmedSandboxes") {
+					t.Fatalf("Load() error = %v, want capacity validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.MaxPrewarmedSandboxes == nil) != (tc.want == nil) ||
+				(tc.want != nil && *cfg.MaxPrewarmedSandboxes != *tc.want) {
+				t.Fatalf("MaxPrewarmedSandboxes = %v, want %v", cfg.MaxPrewarmedSandboxes, tc.want)
+			}
+		})
+	}
 }
