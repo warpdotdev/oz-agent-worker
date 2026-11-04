@@ -275,7 +275,7 @@ func TestKubernetesAPIOperationsRetry(t *testing.T) {
 				case "get":
 					_, err = backend.getTaskJob(ctx, job.Name)
 				case "list":
-					_, err = backend.listTaskPods(ctx, "exec")
+					_, err = backend.listPods(ctx, kubernetesExecutionPodSelector("exec"))
 				case "delete":
 					err = backend.deleteTaskJob(ctx, job.Name, &job.UID)
 				}

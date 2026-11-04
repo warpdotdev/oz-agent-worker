@@ -531,7 +531,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceJobWatch, job, nil, nil)))
 			}
 			job = jobState
-			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, executionID, kubernetesFailureSourceJobWatch); result != nil {
+			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, podSelector, kubernetesFailureSourceJobWatch); result != nil {
 				return result.outcome()
 			}
 
@@ -586,7 +586,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceSafetyPoll, job, nil, nil)))
 			}
 			job = jobState
-			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, executionID, kubernetesFailureSourceSafetyPoll); result != nil {
+			if result := b.handleJobStateAt(ctx, jobState, params.TaskID, podSelector, kubernetesFailureSourceSafetyPoll); result != nil {
 				return result.outcome()
 			}
 
@@ -683,14 +683,14 @@ func (r *jobResult) outcome() ExecuteResult {
 // handleJobState checks whether a Job has reached a terminal state and, if so,
 // returns a *jobResult. A nil return means the Job is still in progress.
 func (b *KubernetesBackend) handleJobState(ctx context.Context, jobState *batchv1.Job, taskID, executionID string) *jobResult {
-	return b.handleJobStateAt(ctx, jobState, taskID, executionID, "")
+	return b.handleJobStateAt(ctx, jobState, taskID, kubernetesExecutionPodSelector(executionID), "")
 }
 
-func (b *KubernetesBackend) handleJobStateAt(ctx context.Context, jobState *batchv1.Job, taskID, executionID string, source kubernetesFailureObservationSource) *jobResult {
+func (b *KubernetesBackend) handleJobStateAt(ctx context.Context, jobState *batchv1.Job, taskID, podSelector string, source kubernetesFailureObservationSource) *jobResult {
 	jobName := jobState.Name
 	if jobComplete(jobState) {
 		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-			pods, _ := b.listTaskPods(ctx, executionID)
+			pods, _ := b.listPods(ctx, podSelector)
 			logs := b.collectPodLogs(ctx, pods)
 			if logs != "" {
 				log.Debugf(ctx, "Job %s output:\n%s", jobName, logs)
@@ -700,7 +700,7 @@ func (b *KubernetesBackend) handleJobStateAt(ctx context.Context, jobState *batc
 		return &jobResult{err: nil}
 	}
 	if jobFailed(jobState) {
-		pods, _ := b.listTaskPods(ctx, executionID)
+		pods, _ := b.listPods(ctx, podSelector)
 		logs := b.collectPodLogs(ctx, pods)
 		if logs != "" {
 			log.Infof(ctx, "Job %s output:\n%s", jobName, logs)
@@ -1165,10 +1165,6 @@ func (b *KubernetesBackend) baseLabels(taskID, executionID string) map[string]st
 	labels[kubernetesExecutionIDLabel] = sanitizeKubernetesLabelValue(executionID)
 	labels[kubernetesExecutionHashLabel] = kubernetesLabelHash(executionID)
 	return labels
-}
-
-func (b *KubernetesBackend) listTaskPods(ctx context.Context, executionID string) ([]corev1.Pod, error) {
-	return b.listPods(ctx, kubernetesExecutionPodSelector(executionID))
 }
 
 func (b *KubernetesBackend) listPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error) {

@@ -264,6 +264,24 @@ func TestKubernetesStandbyCompletionLeavesJobForExitWatcher(t *testing.T) {
 	requireJobPresence(t, client, job.Name, true)
 }
 
+func TestKubernetesStandbyJobFailureKeepsContainerExitCode(t *testing.T) {
+	pod := standbyExitTestPod("warp-prewarm-sb-1", "job-uid", "sb-1", 42)
+	backend, _, created, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, pod)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
+	job := awaitStandbyTestJob(t, created)
+
+	failed := job.DeepCopy()
+	failed.Status.Conditions = []batchv1.JobCondition{standbyFailedCondition("BackoffLimitExceeded")}
+	jobWatch.Modify(failed)
+
+	result := awaitExecuteTaskResult(t, done)
+	if result.Outcome != ExecuteOutcomeError || failureExitCode(result.Error) != 42 {
+		t.Fatalf("ExecuteTask() = %+v, want error with container exit code 42", result)
+	}
+}
+
 func TestKubernetesTaskJobIsUnchangedByStandbySupport(t *testing.T) {
 	deadline := int64(600)
 	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a", ActiveDeadlineSeconds: &deadline})
