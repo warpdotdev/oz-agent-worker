@@ -14,11 +14,13 @@ import (
 // operator config by construction — neither of those is paired on purpose.
 func TestBackendEnvPairsEveryOZName(t *testing.T) {
 	backendEnvs := map[string][]string{
-		"command dispatch": commandDispatchEnvVars("task-1", "exec-1", "https://app.warp.dev/?a=b", "ubuntu:22.04"),
-		"command cancel":   commandCancelEnvVars("task-1", "exec-1"),
-		"direct setup":     directSetupEnvVars("/workspace", "task-1", "/tmp/oz-env"),
-		"direct teardown":  directTeardownEnvVars("/workspace", "/workspace/.gitconfig", "task-1"),
-		"kubernetes task":  kubernetesTaskOwnedEnvVars("task-1"),
+		"command dispatch":        commandDispatchEnvVars("task-1", "exec-1", "https://app.warp.dev/?a=b", "ubuntu:22.04"),
+		"command cancel":          commandCancelEnvVars("task-1", "exec-1"),
+		"direct setup":            directSetupEnvVars("/workspace", "task-1", "/tmp/oz-env"),
+		"direct teardown":         directTeardownEnvVars("/workspace", "/workspace/.gitconfig", "task-1"),
+		"direct standby setup":    directStandbySetupEnvVars("/workspace", "sb-1", "/tmp/oz-env"),
+		"direct standby teardown": directStandbyTeardownEnvVars("/workspace", "/workspace/.gitconfig", "sb-1"),
+		"kubernetes task":         kubernetesTaskOwnedEnvVars("task-1"),
 	}
 
 	for name, envVars := range backendEnvs {
