@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -128,10 +129,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.Env)
-	labels := map[string]string{
-		"oz-task-id":      params.TaskID,
-		"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
-	}
+	labels, key, containerName := dockerUnitIdentity(params)
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -189,12 +187,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}
 
 	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
-	key := taskExecution{params.TaskID, params.ExecutionID}
 	// Transport and server failures cannot prove that the daemon created no container.
 	b.taskContainers.Store(key, "")
 	_, create := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_create",
 		trace.WithAttributes(attribute.String("phase", "container_create")))
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name:       containerName,
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
@@ -312,6 +310,45 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 		res.MemorySwap = memoryBytes
 	}
 	return res
+}
+
+// dockerUnitIdentity returns the container labels, tracking key, and container name for a task or standby.
+// A standby is tracked by its sandbox ID as its task ID, so CancelParams{TaskID: sandboxID} finds it.
+func dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
+	if params.StandbyID != "" {
+		return map[string]string{StandbyDockerLabel: params.StandbyID},
+			taskExecution{params.StandbyID, ""},
+			StandbyInstanceRef(params.StandbyID)
+	}
+	return map[string]string{
+			"oz-task-id":      params.TaskID,
+			"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
+		},
+		taskExecution{params.TaskID, params.ExecutionID},
+		""
+}
+
+var _ StandbySweeper = (*DockerBackend)(nil)
+
+// SweepStandbys force-removes every standby container, running or stopped, and returns the sandbox IDs it removed.
+func (b *DockerBackend) SweepStandbys(ctx context.Context) ([]string, error) {
+	listed, err := b.dockerClient.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("label", StandbyDockerLabel),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list standby containers: %w", err)
+	}
+	var sandboxIDs []string
+	var errs []error
+	for _, c := range listed.Items {
+		if _, err := b.dockerClient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("failed to remove standby container %s: %w", c.ID, err))
+			continue
+		}
+		sandboxIDs = append(sandboxIDs, c.Labels[StandbyDockerLabel])
+	}
+	return sandboxIDs, errors.Join(errs...)
 }
 
 // CancelTask removes the captured execution container, including when normal cleanup failed.
