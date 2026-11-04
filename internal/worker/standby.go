@@ -16,8 +16,6 @@ import (
 )
 
 const (
-	standbySweepTimeout   = 30 * time.Second
-	sweptStandbyExitCode  = 137
 	standbyDestroyTimeout = BackendShutdownTimeout
 	standbyExitCacheSize  = 4096
 )
@@ -231,22 +229,6 @@ func (w *Worker) stopStandbysLocked(preserve bool) ([]chan struct{}, int) {
 		entry.cancel()
 	}
 	return observersDone, len(w.standbys)
-}
-
-func (w *Worker) sweepStandbys() {
-	sweeper, ok := w.backend.(StandbySweeper)
-	if !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(w.ctx, standbySweepTimeout)
-	defer cancel()
-	sandboxIDs, err := sweeper.SweepStandbys(ctx)
-	if err != nil {
-		log.Warnf(w.ctx, "Failed to sweep leftover standby sandboxes: %v", err)
-	}
-	for _, sandboxID := range sandboxIDs {
-		w.sendStandbyExit(sandboxID, sweptStandbyExitCode, string(metrics.TaskFailureReasonGracefulShutdown))
-	}
 }
 
 func (w *Worker) startStandbyExitWatcher() {

@@ -261,7 +261,7 @@ With the Direct backend, the setup and teardown hooks run with `WARP_PREWARMED_S
 
 On shutdown, the worker stops standbys unless the backend preserves them. The Kubernetes backend preserves standby Jobs.
 
-Docker standby containers carry a `warp.worker-id` ownership label, and startup cleanup removes only standbys with the configured `worker_id`. Keep this ID stable across restarts and unique among workers sharing a Docker daemon, including workers from different teams. Containers without an ownership label are left untouched and require manual cleanup.
+Docker standby containers carry `warp.prewarmed-sandbox.id` and `warp.worker-id` labels to identify them for manual cleanup. The worker removes its current containers during normal completion and cancellation unless cleanup is disabled. It does not discover or clean up containers left by a previous worker process. After a worker crash or failed cleanup, inspect and remove leftover Docker standby containers manually.
 
 ### Kubernetes
 

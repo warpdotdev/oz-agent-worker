@@ -278,7 +278,6 @@ func (w *Worker) Run() error {
 	protocolCtx, protocolCancel := context.WithCancel(context.Background())
 	defer protocolCancel()
 	defer w.shutdownBackend()
-	w.sweepStandbys()
 	w.startStandbyExitWatcher()
 	reconnectDelay := InitialReconnectDelay
 

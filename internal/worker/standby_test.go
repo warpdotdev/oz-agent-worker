@@ -74,15 +74,6 @@ func (b *destroyingStandbyBackend) DestroyStandby(_ context.Context, sandboxID s
 	return nil
 }
 
-type sweepingStandbyBackend struct {
-	*standbyTestBackend
-	swept []string
-}
-
-func (b *sweepingStandbyBackend) SweepStandbys(context.Context) ([]string, error) {
-	return b.swept, nil
-}
-
 type standbyWatchReport struct {
 	sandboxID string
 	exitCode  int
@@ -523,24 +514,6 @@ func TestPrewarmDestroyCallsStandbyDestroyer(t *testing.T) {
 		}
 		awaitStandbyMessage(t, w, types.MessageTypePrewarmExited)
 	})
-}
-
-func TestSweepStandbysReportsLeftoverSandboxes(t *testing.T) {
-	backend := &sweepingStandbyBackend{
-		standbyTestBackend: newStandbyTestBackend(false),
-		swept:              []string{"old-1", "old-2"},
-	}
-	w := newStandbyTestWorker(t, backend, Config{})
-
-	w.sweepStandbys()
-
-	for _, want := range []string{"old-1", "old-2"} {
-		msg := awaitStandbyMessage(t, w, types.MessageTypePrewarmExited)
-		exited := decodeStandbyExited(t, msg)
-		if exited.SandboxID != want || exited.ExitCode != 137 || exited.Reason != string(metrics.TaskFailureReasonGracefulShutdown) {
-			t.Fatalf("prewarm exited = %+v, want sandbox %s exit 137 graceful_shutdown", exited, want)
-		}
-	}
 }
 
 func TestStandbyExitWatcherSkipsLocalSandboxes(t *testing.T) {

@@ -161,13 +161,6 @@ func validateStandbyID(sandboxID string) error {
 	return nil
 }
 
-// StandbySweeper is implemented by backends that can find standby units that a previous worker
-// process left behind.
-type StandbySweeper interface {
-	// SweepStandbys deletes leftover standby units and returns their sandbox IDs.
-	SweepStandbys(ctx context.Context) ([]string, error)
-}
-
 // StandbyDestroyer is implemented by backends whose standby units another worker replica may
 // have created.
 type StandbyDestroyer interface {

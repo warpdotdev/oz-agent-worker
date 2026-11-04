@@ -337,28 +337,6 @@ func (b *DockerBackend) dockerUnitIdentity(params *TaskParams) (map[string]strin
 		""
 }
 
-var _ StandbySweeper = (*DockerBackend)(nil)
-
-func (b *DockerBackend) SweepStandbys(ctx context.Context) ([]string, error) {
-	listed, err := b.dockerClient.ContainerList(ctx, client.ContainerListOptions{
-		All:     true,
-		Filters: make(client.Filters).Add("label", StandbyDockerLabel).Add("label", dockerWorkerIDLabel+"="+b.config.WorkerID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list standby containers: %w", err)
-	}
-	var sandboxIDs []string
-	var errs []error
-	for _, c := range listed.Items {
-		if _, err := b.dockerClient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("failed to remove standby container %s: %w", c.ID, err))
-			continue
-		}
-		sandboxIDs = append(sandboxIDs, c.Labels[StandbyDockerLabel])
-	}
-	return sandboxIDs, errors.Join(errs...)
-}
-
 // CancelTask removes the captured execution container, including when normal cleanup failed.
 func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) error {
 	key := taskExecution{params.TaskID, params.ExecutionID}

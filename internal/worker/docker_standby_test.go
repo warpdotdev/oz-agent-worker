@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/url"
+	"net/http/httptest"
 	"path"
 	"reflect"
 	"strings"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/moby/moby/client"
 )
 
@@ -180,99 +181,28 @@ func TestDockerStandbyCancellationRemovesContainer(t *testing.T) {
 	}
 }
 
-type standbySweepEngine struct {
-	t          *testing.T
-	failRemove string
-	listQuery  url.Values
-	removed    []string
-}
-
-func (e *standbySweepEngine) RoundTrip(r *http.Request) (*http.Response, error) {
-	switch {
-	case r.URL.Path == "/_ping":
-		return mockEngineResponse(r, http.StatusOK, "text/plain", "OK"), nil
-	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/json"):
-		e.listQuery = r.URL.Query()
-		var filters map[string]map[string]bool
-		if err := json.Unmarshal([]byte(e.listQuery.Get("filters")), &filters); err != nil {
-			e.t.Fatalf("failed to decode list filters: %v", err)
-		}
-		containers := []struct {
-			ID     string            `json:"Id"`
-			Labels map[string]string `json:"Labels"`
-		}{
-			{"c1", map[string]string{StandbyDockerLabel: "sb-1", "warp.worker-id": "worker-1"}},
-			{"c2", map[string]string{StandbyDockerLabel: "sb-2", "warp.worker-id": "worker-1"}},
-			{"foreign", map[string]string{StandbyDockerLabel: "sb-3", "warp.worker-id": "worker-2"}},
-			{"unowned", map[string]string{StandbyDockerLabel: "sb-4"}},
-			{"task", map[string]string{"oz-task-id": "run-1", "warp.worker-id": "worker-1"}},
-		}
-		matched := containers[:0]
-		for _, c := range containers {
-			matches := true
-			for filter := range filters["label"] {
-				key, value, hasValue := strings.Cut(filter, "=")
-				label, exists := c.Labels[key]
-				if !exists || (hasValue && label != value) {
-					matches = false
-					break
-				}
-			}
-			if matches {
-				matched = append(matched, c)
-			}
-		}
-		body, err := json.Marshal(matched)
+func TestDockerWorkerStartupDoesNotEnumerateContainers(t *testing.T) {
+	backend := newStandbyDockerBackend(t, newStandbyLifecycleEngine(t, false))
+	w := newStandbyTestWorker(t, backend, Config{WorkerID: "worker-1"})
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	w.ctx = ctx
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(rw, r, nil)
 		if err != nil {
-			e.t.Fatal(err)
+			t.Errorf("failed to upgrade worker connection: %v", err)
+			return
 		}
-		return mockEngineResponse(r, http.StatusOK, "application/json", string(body)), nil
-	case r.Method == http.MethodDelete:
-		id := path.Base(r.URL.Path)
-		if id == e.failRemove {
-			return mockEngineErrorResponse(e.t, r, http.StatusInternalServerError, "unavailable"), nil
-		}
-		e.removed = append(e.removed, id)
-		return mockEngineResponse(r, http.StatusNoContent, "application/json", ""), nil
-	default:
-		e.t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		return mockEngineErrorResponse(e.t, r, http.StatusInternalServerError, "unexpected request"), nil
+		defer func() { _ = conn.Close() }()
+		cancel()
+	}))
+	defer server.Close()
+	w.config.WebSocketURL = "ws" + strings.TrimPrefix(server.URL, "http")
+
+	if err := w.Run(); err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
-}
-
-func TestDockerSweepStandbysOnlyRemovesOwnedContainers(t *testing.T) {
-	t.Run("removes owned standbys and returns sandbox IDs", func(t *testing.T) {
-		engine := &standbySweepEngine{t: t}
-		backend := newStandbyDockerBackend(t, engine)
-
-		ids, err := backend.SweepStandbys(context.Background())
-		if err != nil {
-			t.Fatalf("SweepStandbys() error = %v", err)
-		}
-		if want := []string{"sb-1", "sb-2"}; !reflect.DeepEqual(ids, want) {
-			t.Errorf("SweepStandbys() ids = %v, want %v", ids, want)
-		}
-		if want := []string{"c1", "c2"}; !reflect.DeepEqual(engine.removed, want) {
-			t.Errorf("removed containers = %v, want %v", engine.removed, want)
-		}
-		if engine.listQuery.Get("all") != "1" {
-			t.Errorf("list query all = %q, want 1 (stopped containers must be listed)", engine.listQuery.Get("all"))
-		}
-	})
-
-	t.Run("omits sandbox IDs whose containers failed removal", func(t *testing.T) {
-		engine := &standbySweepEngine{t: t, failRemove: "c1"}
-		backend := newStandbyDockerBackend(t, engine)
-
-		ids, err := backend.SweepStandbys(context.Background())
-		if err == nil {
-			t.Fatal("SweepStandbys() error = nil, want removal failure")
-		}
-		if want := []string{"sb-2"}; !reflect.DeepEqual(ids, want) {
-			t.Errorf("SweepStandbys() ids = %v, want %v", ids, want)
-		}
-		if want := []string{"c2"}; !reflect.DeepEqual(engine.removed, want) {
-			t.Errorf("removed containers = %v, want %v", engine.removed, want)
-		}
-	})
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("worker did not connect before shutdown: %v", ctx.Err())
+	}
 }
