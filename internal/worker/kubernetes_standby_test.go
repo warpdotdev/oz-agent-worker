@@ -111,22 +111,8 @@ func TestKubernetesStandbyJobNameChecksDNSLabelLimit(t *testing.T) {
 	}
 }
 
-func TestKubernetesStandbyLabelsHaveNoTaskOrExecutionIdentity(t *testing.T) {
-	backend := &KubernetesBackend{config: KubernetesBackendConfig{WorkerID: "Worker A", ExtraLabels: map[string]string{"team": "infra"}}}
-	got := backend.kubernetesStandbyLabels("sb-1")
-	want := map[string]string{
-		kubernetesWorkerIDLabel:   "worker-a",
-		kubernetesWorkerHashLabel: kubernetesLabelHash("Worker A"),
-		StandbyKubernetesLabel:    "sb-1",
-		"team":                    "infra",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("labels = %v, want %v", got, want)
-	}
-}
-
 func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
-	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "Worker A"})
+	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "Worker A", ExtraLabels: map[string]string{"team": "infra"}})
 	podSelectors := make(chan string, 1)
 	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
 		podSelectors <- action.(k8stesting.WatchAction).GetWatchRestrictions().Labels.String()
@@ -144,6 +130,7 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 		kubernetesWorkerIDLabel:   "worker-a",
 		kubernetesWorkerHashLabel: kubernetesLabelHash("Worker A"),
 		StandbyKubernetesLabel:    "sb-1",
+		"team":                    "infra",
 	}
 	if !reflect.DeepEqual(job.Labels, wantLabels) {
 		t.Fatalf("job labels = %v, want %v", job.Labels, wantLabels)
