@@ -255,7 +255,7 @@ The worker rejects a standby request when it is at its limit or when it is shutt
 
 Standbys connect to warp-server directly. Sandbox egress must allow `app.warp.dev` and the control host `platform.warp.dev`.
 
-With the Direct backend, the setup and teardown hooks run with `OZ_PREWARMED_SANDBOX_ID` and `WARP_PREWARMED_SANDBOX_ID` set to the sandbox ID. The hooks do not get any run ID variables.
+With the Direct backend, the setup and teardown hooks run with `WARP_PREWARMED_SANDBOX_ID` set to the sandbox ID. This variable has no `OZ_` name. The hooks do not get any run ID variables.
 
 On shutdown, the worker stops standbys unless the backend preserves them. The Kubernetes backend preserves standby Jobs.
 

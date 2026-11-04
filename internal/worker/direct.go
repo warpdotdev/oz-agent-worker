@@ -27,7 +27,8 @@ const directBackendTypeName = "direct"
 // directSetupEnvVars, directTeardownEnvVars, and their standby variants return exactly the worker-owned variables this
 // backend adds to the operator's setup and teardown hooks. TestBackendEnvPairsEveryOZName runs
 // its pairing assertion over these, so a variable added here under only one of its two names
-// fails the build. GIT_CONFIG_GLOBAL has no OZ_/WARP_ spelling and is left unpaired.
+// fails the build. GIT_CONFIG_GLOBAL has no OZ_/WARP_ spelling and WARP_PREWARMED_SANDBOX_ID has
+// no OZ_ spelling, so both are left unpaired.
 func directSetupEnvVars(workspaceDir, taskID, environmentFile string) []string {
 	return concatEnvVars(
 		workspaceRootEnvVars(workspaceDir),
@@ -46,12 +47,9 @@ func directTeardownEnvVars(workspaceDir, gitConfigPath, taskID string) []string 
 	)
 }
 
-// prewarmedSandboxIDEnvVars returns a standby's sandbox ID under both its OZ_ and WARP_ names.
+// prewarmedSandboxIDEnvVars returns a standby's sandbox ID under its WARP_ name.
 func prewarmedSandboxIDEnvVars(sandboxID string) []string {
-	return []string{
-		fmt.Sprintf("OZ_PREWARMED_SANDBOX_ID=%s", sandboxID),
-		fmt.Sprintf("WARP_PREWARMED_SANDBOX_ID=%s", sandboxID),
-	}
+	return []string{fmt.Sprintf("WARP_PREWARMED_SANDBOX_ID=%s", sandboxID)}
 }
 
 func directStandbySetupEnvVars(workspaceDir, sandboxID, environmentFile string) []string {

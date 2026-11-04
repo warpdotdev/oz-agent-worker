@@ -101,12 +101,10 @@ func TestDirectHookEnvNamesStandbyNotRun(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, name := range []string{"OZ_PREWARMED_SANDBOX_ID", "WARP_PREWARMED_SANDBOX_ID"} {
-			if env[name] != "sb-1" {
-				t.Errorf("%s = %q, want sb-1", name, env[name])
-			}
+		if env["WARP_PREWARMED_SANDBOX_ID"] != "sb-1" {
+			t.Errorf("WARP_PREWARMED_SANDBOX_ID = %q, want sb-1", env["WARP_PREWARMED_SANDBOX_ID"])
 		}
-		for _, name := range []string{"OZ_RUN_ID", "WARP_RUN_ID", "OZ_EXECUTION_ID", "WARP_EXECUTION_ID"} {
+		for _, name := range []string{"OZ_PREWARMED_SANDBOX_ID", "OZ_RUN_ID", "WARP_RUN_ID", "OZ_EXECUTION_ID", "WARP_EXECUTION_ID"} {
 			if _, ok := env[name]; ok {
 				t.Errorf("%s is set in the standby hook environment", name)
 			}
@@ -154,8 +152,8 @@ func TestDirectHookEnvNamesStandbyNotRun(t *testing.T) {
 		if env["OZ_RUN_ID"] != "run-1" || env["WARP_RUN_ID"] != "run-1" {
 			t.Errorf("run ID = (%q, %q), want run-1 under both names", env["OZ_RUN_ID"], env["WARP_RUN_ID"])
 		}
-		if _, ok := env["OZ_PREWARMED_SANDBOX_ID"]; ok {
-			t.Error("OZ_PREWARMED_SANDBOX_ID is set in the task hook environment")
+		if _, ok := env["WARP_PREWARMED_SANDBOX_ID"]; ok {
+			t.Error("WARP_PREWARMED_SANDBOX_ID is set in the task hook environment")
 		}
 	})
 }

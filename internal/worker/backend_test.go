@@ -5,6 +5,9 @@ import (
 	"testing"
 )
 
+// unpairedWARPNames have no OZ_ spelling.
+var unpairedWARPNames = map[string]bool{"WARP_PREWARMED_SANDBOX_ID": true}
+
 // Nothing derives the WARP_ names any more: each set site writes both outright. This is the
 // guard that keeps them in step.
 //
@@ -29,7 +32,9 @@ func TestBackendEnvPairsEveryOZName(t *testing.T) {
 			ozNames, warpNames := 0, 0
 			for envName, value := range env {
 				if strings.HasPrefix(envName, "WARP_") {
-					warpNames++
+					if !unpairedWARPNames[envName] {
+						warpNames++
+					}
 					continue
 				}
 				suffix, isOZ := strings.CutPrefix(envName, "OZ_")
