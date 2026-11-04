@@ -25,6 +25,7 @@ func resetCLIForTest() {
 	CLI.Volumes = nil
 	CLI.Env = nil
 	CLI.MaxConcurrentTasks = 0
+	CLI.MaxPrewarmedSandboxes = 0
 	CLI.OneShot = false
 	CLI.CollectTaskLogs = nil
 	CLI.IdleOnComplete = ""
@@ -554,6 +555,47 @@ func TestSidecarImageMappingsFromYAML(t *testing.T) {
 			}
 			if _, err := mergeConfig(cfg); err == nil || !strings.Contains(err.Error(), "backend."+backend+".sidecar_image_mappings") {
 				t.Fatalf("startup error = %v, want contextual mapping validation error", err)
+			}
+		})
+	}
+}
+
+func TestMergeConfigMaxPrewarmedSandboxes(t *testing.T) {
+	tests := []struct {
+		name    string
+		cli     int
+		file    *int
+		want    int
+		wantErr bool
+	}{
+		{name: "defaults to shared limit", want: 0},
+		{name: "file value", file: intPtr(3), want: 3},
+		{name: "CLI overrides file", cli: 5, file: intPtr(3), want: 5},
+		{name: "negative CLI rejected", cli: -1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			CLI.MaxPrewarmedSandboxes = tt.cli
+			fileConfig := &config.FileConfig{
+				WorkerID:              "prewarm-worker",
+				MaxPrewarmedSandboxes: tt.file,
+			}
+
+			wc, err := mergeConfig(fileConfig)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error for negative max-prewarmed-sandboxes")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if wc.MaxPrewarmedSandboxes != tt.want {
+				t.Fatalf("MaxPrewarmedSandboxes = %d, want %d", wc.MaxPrewarmedSandboxes, tt.want)
 			}
 		})
 	}
