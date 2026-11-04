@@ -642,7 +642,7 @@ func TestStandbyExitDeduplication(t *testing.T) {
 }
 
 func TestStandbyRejectsInvalidIDBeforeCreation(t *testing.T) {
-	for _, id := range []string{"", ".", "..", "../escape", `a\b`, "a/b", "UPPER", "under_score", strings.Repeat("a", 53)} {
+	for _, id := range []string{"", ".", "..", "../escape", `a\b`, "a/b", "UPPER", "under_score", strings.Repeat("a", 51)} {
 		t.Run(id, func(t *testing.T) {
 			backend := newStandbyTestBackend(false)
 			w := newStandbyTestWorker(t, backend, Config{MaxPrewarmedSandboxes: 1})

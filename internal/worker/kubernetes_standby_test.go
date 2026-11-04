@@ -101,8 +101,8 @@ func requireJobPresence(t *testing.T, client *fake.Clientset, name string, wantP
 }
 
 func TestKubernetesStandbyJobNameChecksDNSLabelLimit(t *testing.T) {
-	maxID := strings.Repeat("a", 63-len("oz-prewarm-"))
-	if name, err := kubernetesStandbyJobName(maxID); err != nil || name != "oz-prewarm-"+maxID {
+	maxID := strings.Repeat("a", 63-len("warp-prewarm-"))
+	if name, err := kubernetesStandbyJobName(maxID); err != nil || name != "warp-prewarm-"+maxID {
 		t.Fatalf("name=%q err=%v, want a valid 63-character name", name, err)
 	}
 	if _, err := kubernetesStandbyJobName(maxID + "a"); err == nil {
@@ -125,14 +125,14 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 	done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
 	job := awaitStandbyTestJob(t, created)
 
-	if job.Name != "oz-prewarm-sb-1" {
-		t.Fatalf("job name = %q, want %q", job.Name, "oz-prewarm-sb-1")
+	if job.Name != "warp-prewarm-sb-1" {
+		t.Fatalf("job name = %q, want %q", job.Name, "warp-prewarm-sb-1")
 	}
 	wantLabels := map[string]string{
-		kubernetesWorkerIDLabel:   "worker-a",
-		kubernetesWorkerHashLabel: kubernetesLabelHash("Worker A"),
-		StandbyKubernetesLabel:    "sb-1",
-		"team":                    "infra",
+		kubernetesWorkerIDLabel:     "worker-a",
+		kubernetesWorkerHashLabel:   kubernetesLabelHash("Worker A"),
+		"warp-prewarmed-sandbox-id": "sb-1",
+		"team":                      "infra",
 	}
 	if !reflect.DeepEqual(job.Labels, wantLabels) {
 		t.Fatalf("job labels = %v, want %v", job.Labels, wantLabels)
@@ -157,7 +157,7 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 
 	select {
 	case selector := <-podSelectors:
-		if selector != "oz-prewarmed-sandbox-id=sb-1" {
+		if selector != "warp-prewarmed-sandbox-id=sb-1" {
 			t.Fatalf("pod watch selector = %q, want the standby label", selector)
 		}
 	case <-time.After(5 * time.Second):
@@ -170,7 +170,7 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 
 func TestKubernetesStandbyExecuteRejectsLongJobName(t *testing.T) {
 	backend, _, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{})
-	result := backend.ExecuteTask(context.Background(), standbyTestParams(strings.Repeat("a", 53)))
+	result := backend.ExecuteTask(context.Background(), standbyTestParams(strings.Repeat("a", 51)))
 	if result.Outcome != ExecuteOutcomeError || result.Error == nil {
 		t.Fatalf("outcome = %v, error = %v; want an error outcome", result.Outcome, result.Error)
 	}
@@ -376,8 +376,8 @@ func awaitStandbyExit(t *testing.T, reports <-chan standbyExitReport) standbyExi
 }
 
 func TestKubernetesStandbyWatcherReportsEachJobOnce(t *testing.T) {
-	first := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
-	second := standbyExitTestJob("oz-prewarm-sb-2", "job-2", "sb-2", standbyFailedCondition("BackoffLimitExceeded"))
+	first := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
+	second := standbyExitTestJob("warp-prewarm-sb-2", "job-2", "sb-2", standbyFailedCondition("BackoffLimitExceeded"))
 	backend, client, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"},
 		first, second,
 		standbyExitTestPod(first.Name, "job-1", "sb-1", 0),
@@ -410,7 +410,7 @@ func TestKubernetesStandbyWatcherReportsEachJobOnce(t *testing.T) {
 }
 
 func TestKubernetesStandbyWatcherReportsDeadlineWithoutPod(t *testing.T) {
-	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
+	job := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
 	backend, _, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job)
 	reports, cancel, done := startStandbyExitWatcher(backend)
 	defer cancel()
@@ -425,7 +425,7 @@ func TestKubernetesStandbyWatcherReportsDeadlineWithoutPod(t *testing.T) {
 }
 
 func TestKubernetesStandbyFailedJobDoesNotReportSuccess(t *testing.T) {
-	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
+	job := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
 	backend, _, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
 		standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
 
@@ -441,7 +441,7 @@ func TestKubernetesStandbyFailedJobDoesNotReportSuccess(t *testing.T) {
 
 func TestKubernetesStandbyWatcherCancellationStopsCleanup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
+		job := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
 		backend, client, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job)
 		var cancel context.CancelFunc
 		deletes := 0
@@ -462,7 +462,7 @@ func TestKubernetesStandbyWatcherCancellationStopsCleanup(t *testing.T) {
 
 func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
+		job := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
 		backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
 			standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
 
@@ -493,8 +493,8 @@ func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
 }
 
 func TestKubernetesStandbyDestroyDeletesByLabel(t *testing.T) {
-	target := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1")
-	other := standbyExitTestJob("oz-prewarm-sb-2", "job-2", "sb-2")
+	target := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1")
+	other := standbyExitTestJob("warp-prewarm-sb-2", "job-2", "sb-2")
 	backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, target, other)
 	ctx := context.Background()
 

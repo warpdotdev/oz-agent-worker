@@ -117,10 +117,10 @@ func TestDockerStandbyExecuteTaskNamesAndLabelsContainer(t *testing.T) {
 	if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
 		t.Fatalf("ExecuteTask() = %+v, want completed", result)
 	}
-	if engine.createName != StandbyInstanceRef("sb-1") {
-		t.Errorf("container name = %q, want %q", engine.createName, StandbyInstanceRef("sb-1"))
+	if engine.createName != "warp-prewarm-sb-1" {
+		t.Errorf("container name = %q, want %q", engine.createName, "warp-prewarm-sb-1")
 	}
-	if want := map[string]string{StandbyDockerLabel: "sb-1", "oz.worker-id": "worker-1"}; !reflect.DeepEqual(engine.createSpec.Labels, want) {
+	if want := map[string]string{"warp.prewarmed-sandbox.id": "sb-1", "warp.worker-id": "worker-1"}; !reflect.DeepEqual(engine.createSpec.Labels, want) {
 		t.Errorf("container labels = %v, want %v", engine.createSpec.Labels, want)
 	}
 	assertNoRunIdentityEnv(t, engine.createSpec.Env)
@@ -201,11 +201,11 @@ func (e *standbySweepEngine) RoundTrip(r *http.Request) (*http.Response, error) 
 			ID     string            `json:"Id"`
 			Labels map[string]string `json:"Labels"`
 		}{
-			{"c1", map[string]string{StandbyDockerLabel: "sb-1", "oz.worker-id": "worker-1"}},
-			{"c2", map[string]string{StandbyDockerLabel: "sb-2", "oz.worker-id": "worker-1"}},
-			{"foreign", map[string]string{StandbyDockerLabel: "sb-3", "oz.worker-id": "worker-2"}},
+			{"c1", map[string]string{StandbyDockerLabel: "sb-1", "warp.worker-id": "worker-1"}},
+			{"c2", map[string]string{StandbyDockerLabel: "sb-2", "warp.worker-id": "worker-1"}},
+			{"foreign", map[string]string{StandbyDockerLabel: "sb-3", "warp.worker-id": "worker-2"}},
 			{"unowned", map[string]string{StandbyDockerLabel: "sb-4"}},
-			{"task", map[string]string{"oz-task-id": "run-1", "oz.worker-id": "worker-1"}},
+			{"task", map[string]string{"oz-task-id": "run-1", "warp.worker-id": "worker-1"}},
 		}
 		matched := containers[:0]
 		for _, c := range containers {

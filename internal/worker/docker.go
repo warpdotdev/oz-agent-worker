@@ -28,7 +28,7 @@ import (
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
-const dockerWorkerIDLabel = "oz.worker-id"
+const dockerWorkerIDLabel = "warp.worker-id"
 
 // PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
 // backend.docker.image_pull_policy values. They mirror the Kubernetes backend's

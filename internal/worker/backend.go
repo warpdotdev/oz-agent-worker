@@ -139,12 +139,12 @@ type backendCapabilities struct {
 
 const (
 	// StandbyDockerLabel labels the container of a standby sandbox with its sandbox ID.
-	StandbyDockerLabel = "oz.prewarmed-sandbox.id"
+	StandbyDockerLabel = "warp.prewarmed-sandbox.id"
 	// StandbyKubernetesLabel labels the Job of a standby sandbox with its sandbox ID.
-	StandbyKubernetesLabel = "oz-prewarmed-sandbox-id"
+	StandbyKubernetesLabel = "warp-prewarmed-sandbox-id"
 )
 
-const standbyInstancePrefix = "oz-prewarm-"
+const standbyInstancePrefix = "warp-prewarm-"
 
 // StandbyInstanceRef is the logical sandbox identity, also used as the container or Job name.
 func StandbyInstanceRef(sandboxID string) string {
