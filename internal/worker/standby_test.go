@@ -700,6 +700,7 @@ func TestStandbyAndTaskCapacity(t *testing.T) {
 
 		backend.finish <- executeCompleted()
 		awaitStandbyMessage(t, w, types.MessageTypePrewarmExited)
+		w.taskWG.Wait()
 		if !w.taskSemaphore.TryAcquire(1) {
 			t.Fatal("shared slot was not released after the standby exited")
 		}

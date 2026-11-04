@@ -396,8 +396,11 @@ func TestKubernetesStandbyWatcherReportsEachJobOnce(t *testing.T) {
 	if got := awaitStandbyExit(t, reports); got != (standbyExitReport{"sb-2", 2, "job_failed"}) {
 		t.Fatalf("second report = %+v, want failure with exit 2 for sb-2", got)
 	}
-	requireJobPresence(t, client, first.Name, false)
-	requireJobPresence(t, client, second.Name, false)
+	waitFor(t, 2*time.Second, func() bool {
+		_, firstErr := client.BatchV1().Jobs(standbyTestNamespace).Get(context.Background(), first.Name, metav1.GetOptions{})
+		_, secondErr := client.BatchV1().Jobs(standbyTestNamespace).Get(context.Background(), second.Name, metav1.GetOptions{})
+		return apierrors.IsNotFound(firstErr) && apierrors.IsNotFound(secondErr)
+	})
 
 	cancel()
 	<-done
