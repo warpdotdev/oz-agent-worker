@@ -87,7 +87,7 @@ func newStandbyDockerBackend(t *testing.T, engine http.RoundTripper) *DockerBack
 	}
 	t.Cleanup(func() { _ = dockerClient.Close() })
 	return &DockerBackend{
-		config:       DockerBackendConfig{ImagePullPolicy: PullPolicyNever},
+		config:       DockerBackendConfig{WorkerID: "worker-1", ImagePullPolicy: PullPolicyNever},
 		dockerClient: dockerClient,
 		platform:     "linux/amd64",
 	}
@@ -120,7 +120,7 @@ func TestDockerStandbyExecuteTaskNamesAndLabelsContainer(t *testing.T) {
 	if engine.createName != StandbyInstanceRef("sb-1") {
 		t.Errorf("container name = %q, want %q", engine.createName, StandbyInstanceRef("sb-1"))
 	}
-	if want := map[string]string{StandbyDockerLabel: "sb-1"}; !reflect.DeepEqual(engine.createSpec.Labels, want) {
+	if want := map[string]string{StandbyDockerLabel: "sb-1", "oz.worker-id": "worker-1"}; !reflect.DeepEqual(engine.createSpec.Labels, want) {
 		t.Errorf("container labels = %v, want %v", engine.createSpec.Labels, want)
 	}
 	assertNoRunIdentityEnv(t, engine.createSpec.Env)
@@ -193,8 +193,40 @@ func (e *standbySweepEngine) RoundTrip(r *http.Request) (*http.Response, error) 
 		return mockEngineResponse(r, http.StatusOK, "text/plain", "OK"), nil
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/json"):
 		e.listQuery = r.URL.Query()
-		body := `[{"Id":"c1","Labels":{"oz.prewarmed-sandbox.id":"sb-1"}},{"Id":"c2","Labels":{"oz.prewarmed-sandbox.id":"sb-2"}}]`
-		return mockEngineResponse(r, http.StatusOK, "application/json", body), nil
+		var filters map[string]map[string]bool
+		if err := json.Unmarshal([]byte(e.listQuery.Get("filters")), &filters); err != nil {
+			e.t.Fatalf("failed to decode list filters: %v", err)
+		}
+		containers := []struct {
+			ID     string            `json:"Id"`
+			Labels map[string]string `json:"Labels"`
+		}{
+			{"c1", map[string]string{StandbyDockerLabel: "sb-1", "oz.worker-id": "worker-1"}},
+			{"c2", map[string]string{StandbyDockerLabel: "sb-2", "oz.worker-id": "worker-1"}},
+			{"foreign", map[string]string{StandbyDockerLabel: "sb-3", "oz.worker-id": "worker-2"}},
+			{"unowned", map[string]string{StandbyDockerLabel: "sb-4"}},
+			{"task", map[string]string{"oz-task-id": "run-1", "oz.worker-id": "worker-1"}},
+		}
+		matched := containers[:0]
+		for _, c := range containers {
+			matches := true
+			for filter := range filters["label"] {
+				key, value, hasValue := strings.Cut(filter, "=")
+				label, exists := c.Labels[key]
+				if !exists || (hasValue && label != value) {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				matched = append(matched, c)
+			}
+		}
+		body, err := json.Marshal(matched)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		return mockEngineResponse(r, http.StatusOK, "application/json", string(body)), nil
 	case r.Method == http.MethodDelete:
 		id := path.Base(r.URL.Path)
 		if id == e.failRemove {
@@ -208,8 +240,8 @@ func (e *standbySweepEngine) RoundTrip(r *http.Request) (*http.Response, error) 
 	}
 }
 
-func TestDockerSweepStandbysRemovesLabeledContainers(t *testing.T) {
-	t.Run("removes every labeled container and returns sandbox IDs", func(t *testing.T) {
+func TestDockerSweepStandbysOnlyRemovesOwnedContainers(t *testing.T) {
+	t.Run("removes owned standbys and returns sandbox IDs", func(t *testing.T) {
 		engine := &standbySweepEngine{t: t}
 		backend := newStandbyDockerBackend(t, engine)
 
@@ -225,13 +257,6 @@ func TestDockerSweepStandbysRemovesLabeledContainers(t *testing.T) {
 		}
 		if engine.listQuery.Get("all") != "1" {
 			t.Errorf("list query all = %q, want 1 (stopped containers must be listed)", engine.listQuery.Get("all"))
-		}
-		var filters map[string]map[string]bool
-		if err := json.Unmarshal([]byte(engine.listQuery.Get("filters")), &filters); err != nil {
-			t.Fatalf("failed to decode list filters: %v", err)
-		}
-		if !filters["label"][StandbyDockerLabel] {
-			t.Errorf("list filters = %v, want label %s", filters, StandbyDockerLabel)
 		}
 	})
 

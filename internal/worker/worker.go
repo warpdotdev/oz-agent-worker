@@ -214,7 +214,9 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		if config.Docker == nil {
 			config.Docker = &DockerBackendConfig{}
 		}
-		backend, err = NewDockerBackend(ctx, *config.Docker)
+		dockerConfig := *config.Docker
+		dockerConfig.WorkerID = config.WorkerID
+		backend, err = NewDockerBackend(ctx, dockerConfig)
 	default:
 		return nil, fmt.Errorf("unknown backend type: %q", backendType)
 	}

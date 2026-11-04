@@ -28,6 +28,7 @@ import (
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+const dockerWorkerIDLabel = "oz.worker-id"
 
 // PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
 // backend.docker.image_pull_policy values. They mirror the Kubernetes backend's
@@ -40,6 +41,7 @@ const (
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
+	WorkerID  string
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
@@ -75,6 +77,9 @@ type DockerBackend struct {
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
 func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerBackend, error) {
+	if config.WorkerID == "" {
+		return nil, errors.New("worker ID is required for Docker standby ownership")
+	}
 	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -129,7 +134,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.Env)
-	labels, key, containerName := dockerUnitIdentity(params)
+	labels, key, containerName := b.dockerUnitIdentity(params)
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -313,9 +318,9 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 }
 
 // A standby is tracked by its sandbox ID as its task ID, so CancelParams{TaskID: sandboxID} finds it.
-func dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
+func (b *DockerBackend) dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
 	if params.StandbyID != "" {
-		return map[string]string{StandbyDockerLabel: params.StandbyID},
+		return map[string]string{StandbyDockerLabel: params.StandbyID, dockerWorkerIDLabel: b.config.WorkerID},
 			taskExecution{params.StandbyID, ""},
 			StandbyInstanceRef(params.StandbyID)
 	}
@@ -329,11 +334,10 @@ func dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, s
 
 var _ StandbySweeper = (*DockerBackend)(nil)
 
-// SweepStandbys force-removes every standby container, running or stopped, and returns the sandbox IDs it removed.
 func (b *DockerBackend) SweepStandbys(ctx context.Context) ([]string, error) {
 	listed, err := b.dockerClient.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
-		Filters: make(client.Filters).Add("label", StandbyDockerLabel),
+		Filters: make(client.Filters).Add("label", StandbyDockerLabel).Add("label", dockerWorkerIDLabel+"="+b.config.WorkerID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list standby containers: %w", err)

@@ -259,6 +259,8 @@ With the Direct backend, the setup and teardown hooks run with `WARP_PREWARMED_S
 
 On shutdown, the worker stops standbys unless the backend preserves them. The Kubernetes backend preserves standby Jobs.
 
+Docker standby containers carry an `oz.worker-id` ownership label, and startup cleanup removes only standbys with the configured `worker_id`. Keep this ID stable across restarts and unique among workers sharing a Docker daemon, including workers from different teams. Containers without an ownership label are left untouched and require manual cleanup.
+
 ### Kubernetes
 
 The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
