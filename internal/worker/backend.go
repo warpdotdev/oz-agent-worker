@@ -131,6 +131,41 @@ type backendCapabilities struct {
 	// supportsOneShot requires ExecuteTask to wait for a terminal outcome; a
 	// backend that returns ExecuteOutcomeSpawned cannot support one-shot mode.
 	supportsOneShot bool
+	// supportsStandbys means ExecuteTask can run TaskParams with a StandbyID.
+	supportsStandbys bool
+}
+
+const (
+	// StandbyDockerLabel labels the container of a standby sandbox with its sandbox ID.
+	StandbyDockerLabel = "oz.prewarmed-sandbox.id"
+	// StandbyKubernetesLabel labels the Job of a standby sandbox with its sandbox ID.
+	StandbyKubernetesLabel = "oz-prewarmed-sandbox-id"
+)
+
+// StandbyInstanceRef names the container or Job that runs a standby sandbox.
+func StandbyInstanceRef(sandboxID string) string {
+	return "oz-prewarm-" + sandboxID
+}
+
+// StandbySweeper is implemented by backends that can find standby units that a previous worker
+// process left behind.
+type StandbySweeper interface {
+	// SweepStandbys deletes leftover standby units and returns their sandbox IDs.
+	SweepStandbys(ctx context.Context) ([]string, error)
+}
+
+// StandbyDestroyer is implemented by backends whose standby units another worker replica may
+// have created.
+type StandbyDestroyer interface {
+	// DestroyStandby deletes the standby unit for sandboxID. It returns nil when none exists.
+	DestroyStandby(ctx context.Context, sandboxID string) error
+}
+
+// StandbyExitWatcher is implemented by backends whose standby units can outlive the worker
+// process that started them.
+type StandbyExitWatcher interface {
+	// WatchStandbyExits calls report once for each standby unit that finishes, until ctx ends.
+	WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string))
 }
 
 // TaskParams contains pre-processed task parameters common to all backends.
@@ -141,6 +176,9 @@ type TaskParams struct {
 	TaskID      string
 	ExecutionID string
 	Task        *types.Task
+	// StandbyID is set only for a standby sandbox. Then TaskID and ExecutionID are empty, Task
+	// is nil, and backends name and label the unit by StandbyID and set no run ID variables.
+	StandbyID string
 
 	// EnvVars contains pre-resolved common environment variables (TASK_ID, Git config,
 	// assignment env vars). Backends append their own config-specific env vars.

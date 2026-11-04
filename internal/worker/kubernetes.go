@@ -137,7 +137,7 @@ type KubernetesBackend struct {
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
-	return backendCapabilities{}
+	return backendCapabilities{supportsStandbys: true}
 }
 
 func (b *KubernetesBackend) PreservesTasksOnShutdown() bool {

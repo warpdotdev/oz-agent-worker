@@ -24,6 +24,58 @@ type WebSocketMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// PrewarmedSandboxesCapability tells the server that this worker can run standby sandboxes.
+const PrewarmedSandboxesCapability = "prewarmed-sandboxes-v1"
+
+const (
+	MessageTypePrewarmCreate   MessageType = "prewarm_create"
+	MessageTypePrewarmDestroy  MessageType = "prewarm_destroy"
+	MessageTypePrewarmCreated  MessageType = "prewarm_created"
+	MessageTypePrewarmRejected MessageType = "prewarm_rejected"
+	MessageTypePrewarmExited   MessageType = "prewarm_exited"
+)
+
+// PrewarmCreateMessage asks the worker to start one standby sandbox.
+type PrewarmCreateMessage struct {
+	SandboxID          string            `json:"sandbox_id"`
+	DockerImage        string            `json:"docker_image,omitempty"`
+	SidecarImage       string            `json:"sidecar_image,omitempty"`
+	AdditionalSidecars []SidecarMount    `json:"additional_sidecars,omitempty"`
+	EnvVars            map[string]string `json:"env_vars,omitempty"`
+	// Args are the oz CLI arguments after the binary.
+	Args          []string       `json:"args"`
+	InstanceShape *InstanceShape `json:"instance_shape,omitempty"`
+	// DeadlineCapSeconds is a safety limit for the whole standby and the run it may serve.
+	DeadlineCapSeconds int64 `json:"deadline_cap_seconds"`
+}
+
+// PrewarmDestroyMessage asks the worker to stop a standby sandbox if it holds one.
+type PrewarmDestroyMessage struct {
+	SandboxID string `json:"sandbox_id"`
+}
+
+// PrewarmCreatedMessage reports that the worker accepted a create request. The worker sends it
+// before it pulls an image or starts the standby.
+type PrewarmCreatedMessage struct {
+	SandboxID   string `json:"sandbox_id"`
+	InstanceRef string `json:"instance_ref"`
+	ReportedBy  string `json:"reported_by,omitempty"`
+}
+
+// PrewarmRejectedMessage reports that the worker declined a create request.
+type PrewarmRejectedMessage struct {
+	SandboxID string `json:"sandbox_id"`
+	Reason    string `json:"reason"`
+}
+
+// PrewarmExitedMessage reports that a standby sandbox stopped. Reason is a
+// metrics.TaskFailureReason value, and it is empty for exit code 0.
+type PrewarmExitedMessage struct {
+	SandboxID string `json:"sandbox_id"`
+	ExitCode  int    `json:"exit_code"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // FailureDetails contains backend-specific structured diagnostics.
 type FailureDetails struct {
 	Kubernetes *KubernetesFailureDetails `json:"kubernetes,omitempty"`

@@ -345,7 +345,7 @@ func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 }
 
 func (b *DockerBackend) Capabilities() backendCapabilities {
-	return backendCapabilities{}
+	return backendCapabilities{supportsStandbys: true}
 }
 
 // normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,

@@ -118,7 +118,7 @@ type DirectBackend struct {
 }
 
 func (b *DirectBackend) Capabilities() backendCapabilities {
-	return backendCapabilities{supportsOneShot: true}
+	return backendCapabilities{supportsOneShot: true, supportsStandbys: true}
 }
 
 // NewDirectBackend creates a new direct backend, verifying the oz CLI is available.
