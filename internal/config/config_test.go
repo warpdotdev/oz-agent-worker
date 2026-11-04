@@ -871,3 +871,43 @@ worker_id: "test"
 		}
 	})
 }
+
+func TestLoadMaxPrewarmedSandboxes(t *testing.T) {
+	t.Run("parses max_prewarmed_sandboxes when set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+max_prewarmed_sandboxes: 3
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MaxPrewarmedSandboxes == nil || *cfg.MaxPrewarmedSandboxes != 3 {
+			t.Fatalf("max_prewarmed_sandboxes = %v, want 3", cfg.MaxPrewarmedSandboxes)
+		}
+	})
+
+	t.Run("max_prewarmed_sandboxes is nil when not set", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MaxPrewarmedSandboxes != nil {
+			t.Errorf("expected max_prewarmed_sandboxes to be nil, got %d", *cfg.MaxPrewarmedSandboxes)
+		}
+	})
+
+	t.Run("rejects negative max_prewarmed_sandboxes", func(t *testing.T) {
+		path := writeTestConfig(t, `
+worker_id: "test"
+max_prewarmed_sandboxes: -1
+`)
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "MaxPrewarmedSandboxes") {
+			t.Fatalf("Load() error = %v, want MaxPrewarmedSandboxes validation error", err)
+		}
+	})
+}
