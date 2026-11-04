@@ -237,6 +237,28 @@ The dispatch contract:
 Because dispatched tasks run independently of the worker process, the command backend does not consume a local concurrency slot for the lifetime of the remote task, and worker shutdown does not cancel already-dispatched tasks.
 The runtime *must* report completion by executing `oz harness-support report-shutdown` using the provided run ID.
 
+### Standby sandboxes
+
+warp-server can ask a worker to start standby sandboxes. A standby is a sandbox that waits until warp-server assigns a run to it. The worker advertises the `prewarmed-sandboxes-v1` capability when its backend supports standbys. The Docker and Kubernetes backends support standbys, and so does the Direct backend unless `target_dir` is set. The Command backend, one-shot mode, and the Direct backend in `target_dir` mode do not support standbys.
+
+Limit the number of standbys that run at once with `max_prewarmed_sandboxes` (or `--max-prewarmed-sandboxes`):
+
+```yaml
+worker_id: "my-worker"
+max_prewarmed_sandboxes: 4
+```
+
+- `0` (the default): standbys share the `max_concurrent_tasks` limit.
+- A value above `0`: standbys use their own limit, separate from `max_concurrent_tasks`.
+
+The worker rejects a standby request when it is at its limit or when it is shutting down.
+
+Standbys connect to warp-server directly. Sandbox egress must allow `app.warp.dev` and the control host `platform.warp.dev`.
+
+With the Direct backend, the setup and teardown hooks run with `OZ_PREWARMED_SANDBOX_ID` and `WARP_PREWARMED_SANDBOX_ID` set to the sandbox ID. The hooks do not get any run ID variables.
+
+On shutdown, the worker stops standbys unless the backend preserves them. The Kubernetes backend preserves standby Jobs.
+
 ### Kubernetes
 
 The Kubernetes backend creates one Job per task. Cluster selection is controlled by the Kubernetes client config:
