@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -408,7 +409,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 
 	defer func() {
 		if ctx.Err() != nil {
-			if standby {
+			if standby && !errors.Is(context.Cause(ctx), errObservationInterrupted) {
 				b.kubernetesStandbyDeleteJob(ctx, createdJob)
 				return
 			}

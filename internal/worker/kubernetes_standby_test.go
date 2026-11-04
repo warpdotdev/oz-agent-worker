@@ -222,16 +222,27 @@ func int64Ptr(value int64) *int64 {
 	return &value
 }
 
-func TestKubernetesStandbyCancelDeletesJob(t *testing.T) {
-	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
-	job := awaitStandbyTestJob(t, created)
+func TestKubernetesStandbyCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		cause        error
+		wantPreserve bool
+	}{
+		{name: "explicit cancellation deletes job"},
+		{name: "worker shutdown preserves job", cause: errObservationInterrupted, wantPreserve: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{})
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
+			job := awaitStandbyTestJob(t, created)
 
-	cancel()
-	awaitExecuteTaskResult(t, done)
-	requireJobPresence(t, client, job.Name, false)
+			cancel(tc.cause)
+			awaitExecuteTaskResult(t, done)
+			requireJobPresence(t, client, job.Name, tc.wantPreserve)
+		})
+	}
 }
 
 func TestKubernetesStandbyCompletionLeavesJobForExitWatcher(t *testing.T) {
