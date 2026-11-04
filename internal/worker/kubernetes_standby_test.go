@@ -19,7 +19,7 @@ import (
 
 const standbyTestNamespace = "agents"
 
-func newStandbyTestBackend(t *testing.T, config KubernetesBackendConfig, objects ...runtime.Object) (*KubernetesBackend, *fake.Clientset, <-chan *batchv1.Job, *watch.RaceFreeFakeWatcher) {
+func newKubernetesStandbyTestBackend(t *testing.T, config KubernetesBackendConfig, objects ...runtime.Object) (*KubernetesBackend, *fake.Clientset, <-chan *batchv1.Job, *watch.RaceFreeFakeWatcher) {
 	t.Helper()
 	config.Namespace = standbyTestNamespace
 	client := fake.NewSimpleClientset(objects...)
@@ -126,7 +126,7 @@ func TestKubernetesStandbyLabelsHaveNoTaskOrExecutionIdentity(t *testing.T) {
 }
 
 func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
-	backend, client, created, _ := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "Worker A"})
+	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "Worker A"})
 	podSelectors := make(chan string, 1)
 	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
 		podSelectors <- action.(k8stesting.WatchAction).GetWatchRestrictions().Labels.String()
@@ -180,7 +180,7 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 }
 
 func TestKubernetesStandbyExecuteRejectsLongJobName(t *testing.T) {
-	backend, _, created, _ := newStandbyTestBackend(t, KubernetesBackendConfig{})
+	backend, _, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{})
 	result := backend.ExecuteTask(context.Background(), standbyTestParams(strings.Repeat("a", 53)))
 	if result.Outcome != ExecuteOutcomeError || result.Error == nil {
 		t.Fatalf("outcome = %v, error = %v; want an error outcome", result.Outcome, result.Error)
@@ -235,7 +235,7 @@ func int64Ptr(value int64) *int64 {
 }
 
 func TestKubernetesStandbyCancelDeletesJob(t *testing.T) {
-	backend, client, created, _ := newStandbyTestBackend(t, KubernetesBackendConfig{})
+	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
@@ -247,7 +247,7 @@ func TestKubernetesStandbyCancelDeletesJob(t *testing.T) {
 }
 
 func TestKubernetesStandbyCompletionLeavesJobForExitWatcher(t *testing.T) {
-	backend, client, created, jobWatch := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"})
+	backend, client, created, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	done := executeTaskAsync(ctx, backend, standbyTestParams("sb-1"))
@@ -266,7 +266,7 @@ func TestKubernetesStandbyCompletionLeavesJobForExitWatcher(t *testing.T) {
 
 func TestKubernetesTaskJobIsUnchangedByStandbySupport(t *testing.T) {
 	deadline := int64(600)
-	backend, client, created, _ := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a", ActiveDeadlineSeconds: &deadline})
+	backend, client, created, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a", ActiveDeadlineSeconds: &deadline})
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	done := executeTaskAsync(ctx, backend, &TaskParams{
@@ -378,7 +378,7 @@ func awaitStandbyExit(t *testing.T, reports <-chan standbyExitReport) standbyExi
 func TestKubernetesStandbyWatcherReportsEachJobOnce(t *testing.T) {
 	first := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
 	second := standbyExitTestJob("oz-prewarm-sb-2", "job-2", "sb-2", standbyFailedCondition("BackoffLimitExceeded"))
-	backend, client, _, jobWatch := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"},
+	backend, client, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"},
 		first, second,
 		standbyExitTestPod(first.Name, "job-1", "sb-1", 0),
 		standbyExitTestPod(second.Name, "job-2", "sb-2", 2),
@@ -408,7 +408,7 @@ func TestKubernetesStandbyWatcherReportsEachJobOnce(t *testing.T) {
 
 func TestKubernetesStandbyWatcherReportsDeadlineWithoutPod(t *testing.T) {
 	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
-	backend, _, _, jobWatch := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job)
+	backend, _, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job)
 	reports, cancel, done := startStandbyExitWatcher(backend)
 	defer cancel()
 
@@ -427,7 +427,7 @@ func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
 	t.Cleanup(func() { kubernetesStandbyWatchRetryInterval = previousInterval })
 
 	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
-	backend, client, _, _ := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
+	backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
 		standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
 
 	closed := watch.NewRaceFreeFake()
@@ -456,7 +456,7 @@ func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
 func TestKubernetesStandbyDestroyDeletesByLabel(t *testing.T) {
 	target := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1")
 	other := standbyExitTestJob("oz-prewarm-sb-2", "job-2", "sb-2")
-	backend, client, _, _ := newStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, target, other)
+	backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, target, other)
 	ctx := context.Background()
 
 	if err := backend.DestroyStandby(ctx, "sb-1"); err != nil {
