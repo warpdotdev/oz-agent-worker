@@ -69,8 +69,11 @@ type destroyingStandbyBackend struct {
 	destroyed chan string
 }
 
-func (b *destroyingStandbyBackend) DestroyStandby(_ context.Context, sandboxID string) error {
-	b.destroyed <- sandboxID
+func (b *destroyingStandbyBackend) CancelTask(_ context.Context, params *CancelParams) error {
+	if params.TaskID != "" || params.ExecutionID != "" {
+		return fmt.Errorf("standby cancellation contains task identifiers")
+	}
+	b.destroyed <- params.StandbyID
 	return nil
 }
 
@@ -470,7 +473,22 @@ func TestPrewarmDestroyCancelsLocalStandby(t *testing.T) {
 	}
 }
 
-func TestPrewarmDestroyCallsStandbyDestroyer(t *testing.T) {
+func TestPrewarmDestroyCallsBackendCancellation(t *testing.T) {
+	t.Run("empty sandbox does not cancel a task", func(t *testing.T) {
+		backend := &destroyingStandbyBackend{
+			standbyTestBackend: newStandbyTestBackend(false),
+			destroyed:          make(chan string, 1),
+		}
+		w := newStandbyTestWorker(t, backend, Config{})
+
+		w.handlePrewarmDestroy(&types.PrewarmDestroyMessage{})
+		w.cancellationWG.Wait()
+
+		if len(backend.destroyed) != 0 {
+			t.Fatal("empty sandbox ID reached backend cancellation")
+		}
+	})
+
 	t.Run("unknown sandbox is not an error", func(t *testing.T) {
 		backend := &destroyingStandbyBackend{
 			standbyTestBackend: newStandbyTestBackend(false),
@@ -483,10 +501,10 @@ func TestPrewarmDestroyCallsStandbyDestroyer(t *testing.T) {
 		select {
 		case id := <-backend.destroyed:
 			if id != "remote-standby" {
-				t.Fatalf("DestroyStandby id = %q, want remote-standby", id)
+				t.Fatalf("CancelTask standby ID = %q, want remote-standby", id)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("DestroyStandby was not called")
+			t.Fatal("CancelTask was not called")
 		}
 		if len(w.outbound.messages) != 0 {
 			t.Fatal("destroy of an unknown sandbox sent a message")
@@ -507,10 +525,10 @@ func TestPrewarmDestroyCallsStandbyDestroyer(t *testing.T) {
 		select {
 		case id := <-backend.destroyed:
 			if id != "standby-both" {
-				t.Fatalf("DestroyStandby id = %q, want standby-both", id)
+				t.Fatalf("CancelTask standby ID = %q, want standby-both", id)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("DestroyStandby was not called")
+			t.Fatal("CancelTask was not called")
 		}
 		awaitStandbyMessage(t, w, types.MessageTypePrewarmExited)
 	})

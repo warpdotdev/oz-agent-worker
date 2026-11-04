@@ -161,13 +161,6 @@ func validateStandbyID(sandboxID string) error {
 	return nil
 }
 
-// StandbyDestroyer is implemented by backends whose standby units another worker replica may
-// have created.
-type StandbyDestroyer interface {
-	// DestroyStandby deletes the standby unit for sandboxID, returning nil when none exists.
-	DestroyStandby(ctx context.Context, sandboxID string) error
-}
-
 // StandbyExitWatcher is implemented by backends whose standby units can outlive the worker
 // process that started them.
 type StandbyExitWatcher interface {
@@ -222,9 +215,11 @@ type Backend interface {
 	// failures are surfaced as ExecuteOutcomeError with an error that is (or
 	// wraps) *TaskFailure.
 	ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult
-	// CancelTask requests cancellation after ExecuteTask returns. A nil error
-	// means the request was accepted, not that asynchronous resources stopped.
-	// Failed requests may be retried and must be execution-scoped and idempotent.
+	// CancelTask requests cancellation of a task execution or standby. Task requests
+	// arrive after ExecuteTask returns; standby requests may arrive while it unwinds.
+	// Local standby contexts must be cancelled separately.
+	// A nil error means the request was accepted, not that asynchronous resources stopped.
+	// Failed requests may be retried and must be resource-scoped and idempotent.
 	CancelTask(ctx context.Context, params *CancelParams) error
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
@@ -234,11 +229,13 @@ type Backend interface {
 }
 
 // CancelParams carries the minimal, non-secret identifiers a backend needs to
-// cancel a task. It deliberately excludes env/secrets so the worker need not
-// retain secrets for the lifetime of a spawned task.
+// cancel a task or standby. It excludes env/secrets so the worker need not retain
+// secrets for the lifetime of a spawned task.
 type CancelParams struct {
 	TaskID      string
 	ExecutionID string
+	// StandbyID identifies a standby instead of a task; both run IDs must be empty.
+	StandbyID string
 }
 
 // TaskFailure is the structured error backends return from ExecuteTask when

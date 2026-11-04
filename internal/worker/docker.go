@@ -322,7 +322,6 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	return res
 }
 
-// A standby is tracked by its sandbox ID as its task ID, so CancelParams{TaskID: sandboxID} finds it.
 func (b *DockerBackend) dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
 	if params.StandbyID != "" {
 		return map[string]string{StandbyDockerLabel: params.StandbyID, dockerWorkerIDLabel: b.config.WorkerID},
@@ -339,6 +338,10 @@ func (b *DockerBackend) dockerUnitIdentity(params *TaskParams) (map[string]strin
 
 // CancelTask removes the captured execution container, including when normal cleanup failed.
 func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	if params.StandbyID != "" {
+		// Standbys use context cancellation and its configured cleanup policy.
+		return nil
+	}
 	key := taskExecution{params.TaskID, params.ExecutionID}
 	containerID, ok := b.taskContainers.Load(key)
 	if !ok {

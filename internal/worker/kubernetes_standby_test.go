@@ -492,22 +492,27 @@ func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {
 	})
 }
 
-func TestKubernetesStandbyDestroyDeletesByLabel(t *testing.T) {
+func TestKubernetesStandbyCancellationDeletesByLabel(t *testing.T) {
 	target := standbyExitTestJob("warp-prewarm-sb-1", "job-1", "sb-1")
 	other := standbyExitTestJob("warp-prewarm-sb-2", "job-2", "sb-2")
 	backend, client, _, _ := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, target, other)
 	ctx := context.Background()
 
-	if err := backend.DestroyStandby(ctx, "sb-1"); err != nil {
-		t.Fatalf("DestroyStandby(sb-1) error: %v", err)
+	if err := backend.CancelTask(ctx, &CancelParams{StandbyID: "sb-1", TaskID: "run-1", ExecutionID: "exec-1"}); err == nil {
+		t.Fatal("mixed task and standby identifiers were accepted")
+	}
+	requireJobPresence(t, client, target.Name, true)
+
+	if err := backend.CancelTask(ctx, &CancelParams{StandbyID: "sb-1"}); err != nil {
+		t.Fatalf("CancelTask(sb-1) error: %v", err)
 	}
 	requireJobPresence(t, client, target.Name, false)
 	requireJobPresence(t, client, other.Name, true)
 
-	if err := backend.DestroyStandby(ctx, "sb-1"); err != nil {
-		t.Fatalf("second DestroyStandby(sb-1) error: %v", err)
+	if err := backend.CancelTask(ctx, &CancelParams{StandbyID: "sb-1"}); err != nil {
+		t.Fatalf("second CancelTask(sb-1) error: %v", err)
 	}
-	if err := backend.DestroyStandby(ctx, "missing"); err != nil {
-		t.Fatalf("DestroyStandby(missing) error: %v", err)
+	if err := backend.CancelTask(ctx, &CancelParams{StandbyID: "missing"}); err != nil {
+		t.Fatalf("CancelTask(missing) error: %v", err)
 	}
 }

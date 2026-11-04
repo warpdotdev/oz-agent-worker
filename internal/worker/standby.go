@@ -189,6 +189,9 @@ func standbyExitStatus(err error, source taskCancellationSource) (int, string) {
 
 func (w *Worker) handlePrewarmDestroy(destroy *types.PrewarmDestroyMessage) {
 	sandboxID := destroy.SandboxID
+	if sandboxID == "" {
+		return
+	}
 	w.tasksMutex.Lock()
 	if entry, known := w.standbys[sandboxID]; known {
 		if entry.cancelSource == "" {
@@ -198,16 +201,12 @@ func (w *Worker) handlePrewarmDestroy(destroy *types.PrewarmDestroyMessage) {
 	}
 	w.tasksMutex.Unlock()
 
-	destroyer, ok := w.backend.(StandbyDestroyer)
-	if !ok {
-		return
-	}
 	w.cancellationWG.Add(1)
 	go func() {
 		defer w.cancellationWG.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), standbyDestroyTimeout)
 		defer cancel()
-		if err := destroyer.DestroyStandby(ctx, sandboxID); err != nil {
+		if err := w.backend.CancelTask(ctx, &CancelParams{StandbyID: sandboxID}); err != nil {
 			log.Warnf(w.ctx, "Failed to destroy standby sandbox %s on backend: %v", sandboxID, err)
 		}
 	}()

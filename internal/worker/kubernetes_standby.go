@@ -13,10 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 )
 
-var (
-	_ StandbyDestroyer   = (*KubernetesBackend)(nil)
-	_ StandbyExitWatcher = (*KubernetesBackend)(nil)
-)
+var _ StandbyExitWatcher = (*KubernetesBackend)(nil)
 
 const kubernetesStandbyWatchRetryInterval = 5 * time.Second
 
@@ -57,8 +54,7 @@ func (b *KubernetesBackend) kubernetesStandbyDeleteJob(ctx context.Context, job 
 	}
 }
 
-// DestroyStandby deletes the Jobs labeled with sandboxID and returns nil when none exists.
-func (b *KubernetesBackend) DestroyStandby(ctx context.Context, sandboxID string) error {
+func (b *KubernetesBackend) cancelStandby(ctx context.Context, sandboxID string) error {
 	// No Job can carry a label value that is invalid, so there is nothing to delete.
 	if errs := validation.IsValidLabelValue(sandboxID); len(errs) > 0 {
 		return nil

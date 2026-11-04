@@ -606,15 +606,18 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 }
 
-// CancelTask deletes the task Job so a server-requested cancellation actually stops the
-// sandbox. Cancelling the ExecuteTask context only stops the local watch: the Job is
-// deliberately left in place on context cancellation so that worker shutdown never kills a
-// healthy run, which means an explicit cancellation has to remove it here. Without this, a
-// Job whose pod is still pending outlives the cancellation and boots an agent against a run
-// the server has already finished. A Job that no longer exists is not an error.
+// CancelTask requests deletion of the identified task or standby Job.
+// Worker shutdown must only stop observation, not call this method, so healthy
+// Jobs can outlive the worker. A Job that no longer exists is not an error.
 func (b *KubernetesBackend) CancelTask(ctx context.Context, params *CancelParams) error {
 	if params == nil {
 		return fmt.Errorf("cancel params are required")
+	}
+	if params.StandbyID != "" {
+		if params.TaskID != "" || params.ExecutionID != "" {
+			return fmt.Errorf("standby cancellation cannot contain task identifiers")
+		}
+		return b.cancelStandby(ctx, params.StandbyID)
 	}
 	executionID := executionIDOrTaskID(params.TaskID, params.ExecutionID)
 	jobName := kubernetesTaskJobName(params.TaskID, executionID)

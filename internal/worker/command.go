@@ -154,7 +154,7 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) (r
 // CancelTask best-effort cancels a dispatched task via the configured cancel
 // command. It is a no-op when no cancel command is configured.
 func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) error {
-	if b.config.CancelCommand == "" {
+	if params.StandbyID != "" || b.config.CancelCommand == "" {
 		return nil
 	}
 
