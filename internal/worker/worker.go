@@ -547,10 +547,6 @@ func (w *Worker) handleMessage(message []byte, receivedAt time.Time) {
 			log.Errorf(w.ctx, "Failed to unmarshal prewarm create: %v", err)
 			return
 		}
-		if create.SandboxID == "" {
-			log.Errorf(w.ctx, "Invalid prewarm create: missing sandbox ID")
-			return
-		}
 		w.handlePrewarmCreate(&create)
 
 	case types.MessageTypePrewarmDestroy:

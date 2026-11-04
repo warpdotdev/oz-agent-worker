@@ -646,7 +646,15 @@ func TestStandbyRejectsInvalidIDBeforeCreation(t *testing.T) {
 		t.Run(id, func(t *testing.T) {
 			backend := newStandbyTestBackend(false)
 			w := newStandbyTestWorker(t, backend, Config{MaxPrewarmedSandboxes: 1})
-			w.handlePrewarmCreate(standbyCreate(id))
+			data, err := json.Marshal(standbyCreate(id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := json.Marshal(types.WebSocketMessage{Type: types.MessageTypePrewarmCreate, Data: data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.handleMessage(wire, time.Now())
 			messages := drainMessages(t, w.outbound.messages)
 			if len(messages) != 1 || messages[0].Type != types.MessageTypePrewarmRejected {
 				t.Fatalf("messages = %+v, want only prewarm_rejected", messages)
