@@ -10,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -418,6 +419,42 @@ func TestKubernetesStandbyWatcherReportsDeadlineWithoutPod(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestKubernetesStandbyFailedJobDoesNotReportSuccess(t *testing.T) {
+	job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyFailedCondition("DeadlineExceeded"))
+	backend, _, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job,
+		standbyExitTestPod(job.Name, "job-1", "sb-1", 0))
+
+	reports, cancel, done := startStandbyExitWatcher(backend)
+	defer cancel()
+	jobWatch.Add(job)
+	if got := awaitStandbyExit(t, reports); got != (standbyExitReport{"sb-1", 1, "active_deadline"}) {
+		t.Fatalf("report = %+v, want failure despite task container exit 0", got)
+	}
+	cancel()
+	<-done
+}
+
+func TestKubernetesStandbyWatcherCancellationStopsCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := standbyExitTestJob("oz-prewarm-sb-1", "job-1", "sb-1", standbyCompleteCondition())
+		backend, client, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, job)
+		var cancel context.CancelFunc
+		deletes := 0
+		client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+			deletes++
+			cancel()
+			return true, nil, apierrors.NewServiceUnavailable("temporarily unavailable")
+		})
+		_, cancel, done := startStandbyExitWatcher(backend)
+		defer cancel()
+		jobWatch.Add(job)
+		<-done
+		if deletes != 1 {
+			t.Fatalf("cleanup made %d delete attempts after cancellation, want 1", deletes)
+		}
+	})
 }
 
 func TestKubernetesStandbyWatcherReopensClosedWatch(t *testing.T) {

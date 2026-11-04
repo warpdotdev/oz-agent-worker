@@ -248,10 +248,12 @@ worker_id: "my-worker"
 max_prewarmed_sandboxes: 4
 ```
 
-- `0` (the default): standbys share the `max_concurrent_tasks` limit.
+- `0` (the default): standbys share the `max_concurrent_tasks` limit. When both limits are `0`, standbys are unlimited. With a finite shared limit, standbys hold slots for their entire lifetime and can cause cold task assignments to be rejected at capacity.
 - A value above `0`: standbys use their own limit, separate from `max_concurrent_tasks`.
 
 The worker rejects a standby request when it is at its limit or when it is shutting down.
+
+Sandbox IDs must be DNS-1123 labels of at most 52 characters: lowercase letters, digits, and internal hyphens. The worker validates IDs before reporting creation. The reported instance reference is the logical `oz-prewarm-<sandbox-id>` identity; Direct workspaces use separate, randomly suffixed directories.
 
 Standbys connect to warp-server directly. Sandbox egress must allow `app.warp.dev` and the control host `platform.warp.dev`.
 

@@ -196,8 +196,8 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		if b.config.TargetDir != "" {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("standby sandboxes are not supported in shared target_dir mode")))
 		}
-		if validateTaskIDForPath(standbyID) != nil {
-			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid standby ID for workspace path: %q", standbyID)))
+		if err := validateStandbyID(standbyID); err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid standby ID for workspace path: %w", err)))
 		}
 	} else if err := validateTaskIDForPath(taskID); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))

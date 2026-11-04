@@ -98,7 +98,12 @@ type Worker struct {
 	standbys map[string]*standbyEntry
 	// standbySemaphore is nil when standbys share taskSemaphore.
 	standbySemaphore *semaphore.Weighted
-	capabilities     backendCapabilities
+	// Recent exits and watcher lifecycle are guarded by tasksMutex.
+	standbyExits       map[string]struct{}
+	standbyExitIDs     []string
+	stopStandbyWatcher context.CancelFunc
+	standbyWatcherDone chan struct{}
+	capabilities       backendCapabilities
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
@@ -1245,6 +1250,10 @@ func (w *Worker) shutdownTasks() {
 		return
 	}
 	w.shuttingDown = true
+	standbyWatcherDone := w.standbyWatcherDone
+	if w.stopStandbyWatcher != nil {
+		w.stopStandbyWatcher()
+	}
 	var observersDone []chan struct{}
 	standbyObservers, standbyCount := w.stopStandbysLocked(preserveActiveTasks)
 	observersDone = append(observersDone, standbyObservers...)
@@ -1288,6 +1297,14 @@ func (w *Worker) shutdownTasks() {
 		}
 	}
 	w.tasksMutex.Unlock()
+
+	if standbyWatcherDone != nil {
+		select {
+		case <-standbyWatcherDone:
+		case <-time.After(BackendShutdownTimeout):
+			log.Warnf(w.ctx, "Timed out waiting for standby exit watcher during shutdown")
+		}
+	}
 
 	if activeTaskCount > 0 || standbyCount > 0 {
 		tasksDone := make(chan struct{})

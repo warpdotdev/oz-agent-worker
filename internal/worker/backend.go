@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // runIDEnvVars, workerBackendEnvVars and the helpers beside them return a backend's
@@ -142,9 +144,21 @@ const (
 	StandbyKubernetesLabel = "oz-prewarmed-sandbox-id"
 )
 
-// StandbyInstanceRef names the container or Job that runs a standby sandbox.
+const standbyInstancePrefix = "oz-prewarm-"
+
+// StandbyInstanceRef is the logical sandbox identity, also used as the container or Job name.
 func StandbyInstanceRef(sandboxID string) string {
-	return "oz-prewarm-" + sandboxID
+	return standbyInstancePrefix + sandboxID
+}
+
+func validateStandbyID(sandboxID string) error {
+	if len(sandboxID) > validation.DNS1123LabelMaxLength-len(standbyInstancePrefix) {
+		return fmt.Errorf("standby sandbox ID exceeds %d characters", validation.DNS1123LabelMaxLength-len(standbyInstancePrefix))
+	}
+	if errs := validation.IsDNS1123Label(sandboxID); len(errs) > 0 {
+		return fmt.Errorf("invalid standby sandbox ID: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // StandbySweeper is implemented by backends that can find standby units that a previous worker

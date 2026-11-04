@@ -19,6 +19,7 @@ const (
 	standbySweepTimeout   = 30 * time.Second
 	sweptStandbyExitCode  = 137
 	standbyDestroyTimeout = BackendShutdownTimeout
+	standbyExitCacheSize  = 4096
 )
 
 // errStandbyNotWaited reports a backend that returned before its standby sandbox exited.
@@ -76,8 +77,13 @@ func (w *Worker) admitStandbyLocked() (*semaphore.Weighted, string) {
 
 func (w *Worker) handlePrewarmCreate(create *types.PrewarmCreateMessage) {
 	sandboxID := create.SandboxID
+	if err := validateStandbyID(sandboxID); err != nil {
+		w.rejectPrewarm(sandboxID, err.Error())
+		return
+	}
 	w.tasksMutex.Lock()
-	if _, known := w.standbys[sandboxID]; known {
+	_, completed := w.standbyExits[sandboxID]
+	if _, known := w.standbys[sandboxID]; known || completed {
 		w.tasksMutex.Unlock()
 		log.Infof(w.ctx, "Ignoring duplicate prewarm create for sandbox %s", sandboxID)
 		return
@@ -248,20 +254,48 @@ func (w *Worker) startStandbyExitWatcher() {
 	if !ok {
 		return
 	}
-	go watcher.WatchStandbyExits(w.ctx, w.reportWatchedStandbyExit)
+	w.tasksMutex.Lock()
+	defer w.tasksMutex.Unlock()
+	if w.shuttingDown || w.stopStandbyWatcher != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(w.ctx)
+	w.stopStandbyWatcher = cancel
+	w.standbyWatcherDone = make(chan struct{})
+	go func() {
+		defer close(w.standbyWatcherDone)
+		watcher.WatchStandbyExits(ctx, w.reportWatchedStandbyExit)
+	}()
 }
 
 func (w *Worker) reportWatchedStandbyExit(sandboxID string, exitCode int, reason string) {
 	w.tasksMutex.Lock()
 	_, local := w.standbys[sandboxID]
+	stopping := w.shuttingDown
 	w.tasksMutex.Unlock()
-	if local {
+	if local || stopping {
 		return
 	}
 	w.sendStandbyExit(sandboxID, exitCode, reason)
 }
 
 func (w *Worker) sendStandbyExit(sandboxID string, exitCode int, reason string) {
+	w.tasksMutex.Lock()
+	if _, reported := w.standbyExits[sandboxID]; reported {
+		w.tasksMutex.Unlock()
+		return
+	}
+	if w.standbyExits == nil {
+		w.standbyExits = make(map[string]struct{})
+	}
+	w.standbyExits[sandboxID] = struct{}{}
+	w.standbyExitIDs = append(w.standbyExitIDs, sandboxID)
+	if len(w.standbyExitIDs) > standbyExitCacheSize {
+		delete(w.standbyExits, w.standbyExitIDs[0])
+		w.standbyExitIDs = w.standbyExitIDs[1:]
+	}
+	w.tasksMutex.Unlock()
+
 	err := w.sendStandbyMessage(types.MessageTypePrewarmExited, types.PrewarmExitedMessage{
 		SandboxID: sandboxID,
 		ExitCode:  exitCode,

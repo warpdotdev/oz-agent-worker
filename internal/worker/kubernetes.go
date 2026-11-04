@@ -410,7 +410,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	defer func() {
 		if ctx.Err() != nil {
 			if standby && !errors.Is(context.Cause(ctx), errObservationInterrupted) {
-				b.kubernetesStandbyDeleteJob(ctx, createdJob)
+				b.kubernetesStandbyDeleteJob(context.WithoutCancel(ctx), createdJob)
 				return
 			}
 			log.Infof(ctx, "Stopped observing Kubernetes Job %s; remote cancellation is handled only by CancelTask", jobName)

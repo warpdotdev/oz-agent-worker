@@ -188,12 +188,16 @@ func TestDirectStandbyRejectsUnsafeID(t *testing.T) {
 		OzPath:        writeStandbyOzScript(t, "exit 0"),
 	})
 
-	result := backend.ExecuteTask(context.Background(), &TaskParams{StandbyID: "../escape"})
-	if result.Outcome != ExecuteOutcomeError {
-		t.Fatalf("ExecuteTask() outcome = %v, want error", result.Outcome)
-	}
-	if reason := standbyTaskFailureReason(t, result.Error); reason != metrics.TaskFailureReasonWorkspaceSetup {
-		t.Errorf("failure reason = %v, want %v", reason, metrics.TaskFailureReasonWorkspaceSetup)
+	for _, id := range []string{"../escape", ".", "..", "a/b", `a\b`} {
+		t.Run(id, func(t *testing.T) {
+			result := backend.ExecuteTask(context.Background(), &TaskParams{StandbyID: id})
+			if result.Outcome != ExecuteOutcomeError {
+				t.Fatalf("ExecuteTask() outcome = %v, want error", result.Outcome)
+			}
+			if reason := standbyTaskFailureReason(t, result.Error); reason != metrics.TaskFailureReasonWorkspaceSetup {
+				t.Errorf("failure reason = %v, want %v", reason, metrics.TaskFailureReasonWorkspaceSetup)
+			}
+		})
 	}
 	entries, err := os.ReadDir(workspaceRoot)
 	if err != nil {

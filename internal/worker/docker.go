@@ -130,6 +130,11 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	if params.StandbyID != "" {
+		if err := validateStandbyID(params.StandbyID); err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
+		}
+	}
 	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(b.config.Env)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}

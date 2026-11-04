@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -22,11 +21,10 @@ var (
 const kubernetesStandbyWatchRetryInterval = 5 * time.Second
 
 func kubernetesStandbyJobName(sandboxID string) (string, error) {
-	name := StandbyInstanceRef(sandboxID)
-	if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
-		return "", fmt.Errorf("standby sandbox ID %q cannot name a Kubernetes Job: %s", sandboxID, strings.Join(errs, "; "))
+	if err := validateStandbyID(sandboxID); err != nil {
+		return "", err
 	}
-	return name, nil
+	return StandbyInstanceRef(sandboxID), nil
 }
 
 func (b *KubernetesBackend) kubernetesStandbyLabels(sandboxID string) map[string]string {
@@ -52,7 +50,7 @@ func kubernetesStandbyActiveDeadlineSeconds(ctx context.Context, configured *int
 }
 
 func (b *KubernetesBackend) kubernetesStandbyDeleteJob(ctx context.Context, job *batchv1.Job) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
+	cleanupCtx, cancel := context.WithTimeout(ctx, kubernetesCleanupTimeout)
 	defer cancel()
 	if err := b.deleteTaskJob(cleanupCtx, job.Name, &job.UID); err != nil {
 		log.Warnf(ctx, "Failed to delete standby Job %s: %v", job.Name, err)
@@ -138,7 +136,11 @@ func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job
 	if jobComplete(job) {
 		return b.kubernetesStandbyTaskExitCode(ctx, job, 0), ""
 	}
-	return b.kubernetesStandbyTaskExitCode(ctx, job, 1), string(classifyJobFailure(job))
+	exitCode := b.kubernetesStandbyTaskExitCode(ctx, job, 1)
+	if exitCode == 0 {
+		exitCode = 1
+	}
+	return exitCode, string(classifyJobFailure(job))
 }
 
 func (b *KubernetesBackend) kubernetesStandbyTaskExitCode(ctx context.Context, job *batchv1.Job, fallback int) int {

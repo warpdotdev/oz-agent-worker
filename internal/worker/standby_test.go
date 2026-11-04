@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +93,7 @@ type watchingStandbyBackend struct {
 	*standbyTestBackend
 	reports []standbyWatchReport
 	watched chan struct{}
+	stopped chan struct{}
 }
 
 func (b *watchingStandbyBackend) WatchStandbyExits(ctx context.Context, report func(string, int, string)) {
@@ -99,6 +102,9 @@ func (b *watchingStandbyBackend) WatchStandbyExits(ctx context.Context, report f
 	}
 	close(b.watched)
 	<-ctx.Done()
+	if b.stopped != nil {
+		close(b.stopped)
+	}
 }
 
 func newStandbyTestWorker(t *testing.T, backend Backend, config Config) *Worker {
@@ -566,6 +572,90 @@ func TestStandbyExitWatcherSkipsLocalSandboxes(t *testing.T) {
 		if queued.Type == types.MessageTypePrewarmExited {
 			t.Fatalf("watcher reported a second exit: %s", queued.Data)
 		}
+	}
+}
+
+func TestStandbyExitWatcherSkipsCompletedLocalSandbox(t *testing.T) {
+	backend := newStandbyTestBackend(false)
+	w := newStandbyTestWorker(t, backend, Config{})
+	w.handlePrewarmCreate(standbyCreate("local-1"))
+	awaitStandbyExecution(t, backend)
+	backend.finish <- executeCompleted()
+	w.taskWG.Wait()
+
+	w.reportWatchedStandbyExit("local-1", 0, "")
+	count := 0
+	for _, msg := range drainMessages(t, w.outbound.messages) {
+		if msg.Type == types.MessageTypePrewarmExited {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("sent %d exit reports for a completed local standby, want 1", count)
+	}
+}
+
+func TestStandbyExitWatcherStopsDuringShutdown(t *testing.T) {
+	backend := &watchingStandbyBackend{
+		standbyTestBackend: newStandbyTestBackend(true),
+		watched:            make(chan struct{}),
+		stopped:            make(chan struct{}),
+	}
+	w := newStandbyTestWorker(t, backend, Config{})
+	w.startStandbyExitWatcher()
+	<-backend.watched
+
+	w.shutdownTasks()
+
+	select {
+	case <-backend.stopped:
+	default:
+		t.Fatal("shutdown returned before the standby exit watcher stopped")
+	}
+}
+
+func TestStandbyExitDeduplication(t *testing.T) {
+	w := newStandbyTestWorker(t, newStandbyTestBackend(false), Config{})
+	var reporters sync.WaitGroup
+	for range 8 {
+		reporters.Go(func() { w.sendStandbyExit("sb-0", 0, "") })
+	}
+	reporters.Wait()
+	if messages := drainMessages(t, w.outbound.messages); len(messages) != 1 {
+		t.Fatalf("concurrent reporters sent %d exits, want 1", len(messages))
+	}
+
+	for i := 1; i <= standbyExitCacheSize; i++ {
+		w.sendStandbyExit(fmt.Sprintf("sb-%d", i), 0, "")
+		<-w.outbound.messages
+	}
+	if len(w.standbyExits) != standbyExitCacheSize || len(w.standbyExitIDs) != standbyExitCacheSize {
+		t.Fatalf("cache retained %d IDs in map and %d in order, want %d", len(w.standbyExits), len(w.standbyExitIDs), standbyExitCacheSize)
+	}
+	if _, retained := w.standbyExits["sb-0"]; retained {
+		t.Fatal("oldest standby exit was not evicted")
+	}
+	w.reportWatchedStandbyExit(fmt.Sprintf("sb-%d", standbyExitCacheSize), 0, "")
+	if len(w.outbound.messages) != 0 {
+		t.Fatal("latest standby exit was not deduplicated after cache eviction")
+	}
+}
+
+func TestStandbyRejectsInvalidIDBeforeCreation(t *testing.T) {
+	for _, id := range []string{"", ".", "..", "../escape", `a\b`, "a/b", "UPPER", "under_score", strings.Repeat("a", 53)} {
+		t.Run(id, func(t *testing.T) {
+			backend := newStandbyTestBackend(false)
+			w := newStandbyTestWorker(t, backend, Config{MaxPrewarmedSandboxes: 1})
+			w.handlePrewarmCreate(standbyCreate(id))
+			messages := drainMessages(t, w.outbound.messages)
+			if len(messages) != 1 || messages[0].Type != types.MessageTypePrewarmRejected {
+				t.Fatalf("messages = %+v, want only prewarm_rejected", messages)
+			}
+			if !w.standbySemaphore.TryAcquire(1) {
+				t.Fatal("invalid ID consumed a standby slot")
+			}
+			w.standbySemaphore.Release(1)
+		})
 	}
 }
 
