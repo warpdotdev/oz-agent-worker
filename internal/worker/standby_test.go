@@ -60,9 +60,10 @@ func (b *standbyTestBackend) ExecuteTask(ctx context.Context, params *TaskParams
 	}
 }
 
-func (b *standbyTestBackend) CancelTask(context.Context, *CancelParams) error { return nil }
-func (b *standbyTestBackend) Shutdown(context.Context)                        {}
-func (b *standbyTestBackend) PreservesTasksOnShutdown() bool                  { return b.preserve }
+func (b *standbyTestBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *standbyTestBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+func (b *standbyTestBackend) Shutdown(context.Context)                                     {}
+func (b *standbyTestBackend) PreservesTasksOnShutdown() bool                               { return b.preserve }
 
 type destroyingStandbyBackend struct {
 	*standbyTestBackend

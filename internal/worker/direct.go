@@ -386,6 +386,8 @@ func agentExitCode(err error) (exitCode int, ok bool) {
 // direct-backend task.
 func (b *DirectBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
+func (b *DirectBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+
 // Shutdown cleans up any workspace directories left behind under the workspace root.
 func (b *DirectBackend) Shutdown(ctx context.Context) {
 	if b.config.WorkspaceRoot == "" {

@@ -172,6 +172,8 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 	return nil
 }
 
+func (b *CommandBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+
 // PreservesTasksOnShutdown reports true: dispatched tasks run on the operator's
 // remote runtime, independent of this worker, so worker shutdown must not cancel them.
 func (b *CommandBackend) PreservesTasksOnShutdown() bool { return true }

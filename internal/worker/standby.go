@@ -231,10 +231,6 @@ func (w *Worker) stopStandbysLocked(preserve bool) ([]chan struct{}, int) {
 }
 
 func (w *Worker) startStandbyExitWatcher() {
-	watcher, ok := w.backend.(StandbyExitWatcher)
-	if !ok {
-		return
-	}
 	w.tasksMutex.Lock()
 	defer w.tasksMutex.Unlock()
 	if w.shuttingDown || w.stopStandbyWatcher != nil {
@@ -245,7 +241,7 @@ func (w *Worker) startStandbyExitWatcher() {
 	w.standbyWatcherDone = make(chan struct{})
 	go func() {
 		defer close(w.standbyWatcherDone)
-		watcher.WatchStandbyExits(ctx, w.reportWatchedStandbyExit)
+		w.backend.WatchStandbyExits(ctx, w.reportWatchedStandbyExit)
 	}()
 }
 

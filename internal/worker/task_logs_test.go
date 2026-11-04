@@ -304,9 +304,10 @@ func (b *cancellableLoggingBackend) ExecuteTask(ctx context.Context, params *Tas
 	<-ctx.Done()
 	return executeError(ctx.Err())
 }
-func (b *cancellableLoggingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
-func (b *cancellableLoggingBackend) Shutdown(context.Context)                        {}
-func (b *cancellableLoggingBackend) PreservesTasksOnShutdown() bool                  { return b.preserve }
+func (b *cancellableLoggingBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *cancellableLoggingBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+func (b *cancellableLoggingBackend) Shutdown(context.Context)                                     {}
+func (b *cancellableLoggingBackend) PreservesTasksOnShutdown() bool                               { return b.preserve }
 
 func TestTaskLogsFlushOnCancellationAndPreservingShutdown(t *testing.T) {
 	for _, preserve := range []bool{false, true} {

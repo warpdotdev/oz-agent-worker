@@ -161,13 +161,6 @@ func validateStandbyID(sandboxID string) error {
 	return nil
 }
 
-// StandbyExitWatcher is implemented by backends whose standby units can outlive the worker
-// process that started them.
-type StandbyExitWatcher interface {
-	// WatchStandbyExits calls report once for each standby unit that finishes, until ctx ends.
-	WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string))
-}
-
 // TaskParams contains pre-processed task parameters common to all backends.
 // This provides a layer of abstraction between the wire-format TaskAssignmentMessage
 // and the backend interface, so backends don't need to handle common concerns like
@@ -221,6 +214,9 @@ type Backend interface {
 	// A nil error means the request was accepted, not that asynchronous resources stopped.
 	// Failed requests may be retried and must be resource-scoped and idempotent.
 	CancelTask(ctx context.Context, params *CancelParams) error
+	// WatchStandbyExits observes terminal standbys independently of ExecuteTask until
+	// ctx ends. Backends without independent observation return immediately.
+	WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string))
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool

@@ -357,6 +357,8 @@ func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) er
 	return nil
 }
 
+func (b *DockerBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
 	if b.dockerClient != nil {

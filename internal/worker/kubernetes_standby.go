@@ -13,8 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 )
 
-var _ StandbyExitWatcher = (*KubernetesBackend)(nil)
-
 const kubernetesStandbyWatchRetryInterval = 5 * time.Second
 
 func kubernetesStandbyJobName(sandboxID string) (string, error) {
