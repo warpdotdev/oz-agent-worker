@@ -188,7 +188,9 @@ type TaskParams struct {
 	// Sidecars is the unified list of sidecar mounts for this task. The Warp agent
 	// sidecar (mounted at /agent) is included as the first entry when present, followed
 	// by any additional sidecars from the assignment. Backends that don't use sidecars
-	// can ignore this.
+	// can ignore this. Images are already remapped. An entry with a FallbackImage (an
+	// official ACP sidecar) is mounted with that image instead when its own cannot be
+	// pulled; the Docker and Kubernetes backends do so, others ignore it.
 	Sidecars []types.SidecarMount
 
 	// InstanceShape, when non-nil, is the resolved compute size for this task.
@@ -249,7 +251,11 @@ type TaskFailure struct {
 	failureDetails *types.FailureDetails
 	// Kubernetes failures require termination unless execution was observed stopped.
 	jobDisposition jobFailureDisposition
-	err            error
+	// pullFailedSidecar is the index into TaskParams.Sidecars of the sidecar whose
+	// image could not be pulled, when hasPullFailedSidecar. It is never serialized.
+	pullFailedSidecar    int
+	hasPullFailedSidecar bool
+	err                  error
 }
 
 func (e *TaskFailure) Error() string {
@@ -290,4 +296,24 @@ func taskFailureDetails(err error) *types.FailureDetails {
 		return failure.failureDetails
 	}
 	return nil
+}
+
+// withPullFailedSidecar records that err is the failed image pull of the sidecar at
+// index i of TaskParams.Sidecars.
+func withPullFailedSidecar(err error, i int) error {
+	var failure *TaskFailure
+	if errors.As(err, &failure) {
+		failure.pullFailedSidecar = i
+		failure.hasPullFailedSidecar = true
+	}
+	return err
+}
+
+// taskFailurePullFailedSidecar returns the index recorded by withPullFailedSidecar.
+func taskFailurePullFailedSidecar(err error) (int, bool) {
+	var failure *TaskFailure
+	if errors.As(err, &failure) && failure.hasPullFailedSidecar {
+		return failure.pullFailedSidecar, true
+	}
+	return 0, false
 }

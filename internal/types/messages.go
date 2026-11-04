@@ -144,6 +144,10 @@ type SidecarMount struct {
 	Image     string `json:"image"`      // Docker image to pull.
 	MountPath string `json:"mount_path"` // Path to mount the sidecar filesystem in the task container.
 	ReadWrite bool   `json:"read_write"` // If false (default), the mount is read-only.
+	// FallbackImage is the image a backend mounts at MountPath instead of Image when
+	// Image cannot be pulled. The worker sets it for the official ACP sidecar images;
+	// it is never read from or written to the wire.
+	FallbackImage string `json:"-"`
 }
 
 // InstanceShape is the resolved compute size for a task. Containerized backends apply it

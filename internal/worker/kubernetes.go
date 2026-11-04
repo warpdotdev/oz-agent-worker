@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/distribution/reference"
 	"github.com/rs/zerolog"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
@@ -64,6 +66,13 @@ const (
 	kubernetesTaskContainerName  = "task"
 	kubernetesSetupContainerName = "setup"
 	kubernetesSidecarInitPrefix  = "copy-sidecar-"
+
+	// Sidecar volume names carry the sidecar's index into TaskParams.Sidecars, as
+	// do the copy-sidecar-<i> init containers, so a pull failure can be traced
+	// back to the sidecar; see pullFailedSidecarIndex.
+	kubernetesSidecarVolumePrefix      = "sidecar-"
+	kubernetesSidecarImageVolumeSuffix = "-image"
+	kubernetesSidecarDataVolumeSuffix  = "-data"
 
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
@@ -141,6 +150,8 @@ type KubernetesBackend struct {
 	config          KubernetesBackendConfig
 	clientset       kubernetes.Interface
 	useImageVolumes bool
+	// sidecarPullFailures holds ACP sidecar images that recently failed to pull.
+	sidecarPullFailures sidecarPullFailureCache
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -192,7 +203,112 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 }
 
 // ExecuteTask runs the agent in a Kubernetes Job.
-func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
+//
+// When the Job fails because an ACP sidecar image (one with a FallbackImage) cannot
+// be pulled, ExecuteTask deletes the Job and creates it once more under the same name
+// with the fallback sidecars, so CancelTask and standby identities still resolve it.
+// The replaced Job is deleted even with cleanup disabled, since its name is reused.
+// The second attempt reports its own setup phases, so a fallback run reports
+// job_create and the phases that follow twice.
+func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult {
+	params = b.withRecentSidecarFallbacks(ctx, params)
+	first := &kubernetesTaskAttempt{sidecarFallback: true}
+	res := b.executeTaskAttempt(ctx, params, first)
+	if !first.replace {
+		return res
+	}
+	return b.retryWithSidecarFallbacks(ctx, params, first.job, res)
+}
+
+// kubernetesTaskAttempt carries one Job attempt's handoff to ExecuteTask.
+type kubernetesTaskAttempt struct {
+	// sidecarFallback lets the attempt hand a sidecar pull failure back to
+	// ExecuteTask, which replaces the Job, instead of stopping the Job itself.
+	sidecarFallback bool
+	// job is the Job the attempt created.
+	job *batchv1.Job
+	// replace reports that the attempt failed on a sidecar with a fallback and left
+	// its Job for ExecuteTask to delete and recreate.
+	replace bool
+}
+
+// withRecentSidecarFallbacks mounts the fallback for every sidecar whose image
+// failed to pull within sidecarPullFailureTTL, without trying that image again.
+func (b *KubernetesBackend) withRecentSidecarFallbacks(ctx context.Context, params *TaskParams) *TaskParams {
+	sidecars, swapped := withSidecarFallbacks(params.Sidecars, func(sidecar types.SidecarMount) bool {
+		if !b.sidecarPullFailures.recent(sidecar.Image) {
+			return false
+		}
+		reportSidecarFallback(ctx, "kubernetes", sidecar, nil)
+		return true
+	})
+	if !swapped {
+		return params
+	}
+	withFallbacks := *params
+	withFallbacks.Sidecars = sidecars
+	return &withFallbacks
+}
+
+// sidecarFallbackIndex returns the index of the sidecar whose failed pull caused
+// err, when that sidecar has a fallback and the Job has not been observed stopped
+// for another reason, such as its deadline.
+func sidecarFallbackIndex(sidecars []types.SidecarMount, err error) (int, bool) {
+	if _, reason := taskFailureLabels(err); reason != metrics.TaskFailureReasonImagePull {
+		return 0, false
+	}
+	if jobDisposition(err) != jobTerminationRequired {
+		return 0, false
+	}
+	i, ok := taskFailurePullFailedSidecar(err)
+	if !ok || i < 0 || i >= len(sidecars) || sidecars[i].FallbackImage == "" {
+		return 0, false
+	}
+	return i, true
+}
+
+// retryWithSidecarFallbacks deletes the first attempt's Job, waits for it and its
+// pods to be gone, and runs the task again with every sidecar that has a fallback
+// swapped for it. It returns the first attempt's result when the Job cannot be
+// replaced. There is at most one retry: the second attempt has no fallbacks left.
+func (b *KubernetesBackend) retryWithSidecarFallbacks(ctx context.Context, params *TaskParams, job *batchv1.Job, firstRes ExecuteResult) ExecuteResult {
+	failedIndex, _ := sidecarFallbackIndex(params.Sidecars, firstRes.Error)
+	failed := params.Sidecars[failedIndex]
+	b.sidecarPullFailures.record(failed.Image)
+	reportSidecarFallback(ctx, "kubernetes", failed, firstRes.Error)
+
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
+	defer cancel()
+	// Foreground deletion keeps the Job until its pods are gone (Job pods block
+	// their owner's deletion), so once the Job is NotFound the second attempt's pod
+	// watch and listings cannot see the first attempt's pods.
+	if err := b.deleteTaskJobWithPropagation(cleanupCtx, job.Name, &job.UID, metav1.DeletePropagationForeground); err != nil {
+		log.Errorf(ctx, "Failed to delete Kubernetes Job %s to retry it with the fallback sidecar: %v", job.Name, err)
+		if stopErr := b.requestJobExecutionStop(cleanupCtx, job, firstRes.Error); stopErr != nil {
+			log.Errorf(ctx, "Failed to stop Kubernetes Job %s after terminal task failure; it may still be active: %v", job.Name, stopErr)
+			firstRes.Error = fmt.Errorf("%w; failed to stop Kubernetes Job %s: %v", firstRes.Error, job.Name, stopErr)
+		}
+		return firstRes
+	}
+	if err := b.waitForJobGone(ctx, job); err != nil {
+		log.Warnf(ctx, "Kubernetes Job %s was not removed in time to retry it with the fallback sidecar: %v", job.Name, err)
+		return firstRes
+	}
+
+	// Swap every sidecar that has a fallback, not only the one that failed: init
+	// containers pull one at a time, so another blocked ACP image would otherwise
+	// fail the only retry.
+	retryParams := *params
+	retryParams.Sidecars, _ = withSidecarFallbacks(params.Sidecars, func(types.SidecarMount) bool { return true })
+	res := b.executeTaskAttempt(ctx, &retryParams, &kubernetesTaskAttempt{})
+	if i, ok := taskFailurePullFailedSidecar(res.Error); ok && i == failedIndex {
+		res.Error = fmt.Errorf("ACP sidecar image %s could not be pulled, and neither could its fallback %s: %w", failed.Image, failed.FallbackImage, res.Error)
+	}
+	return res
+}
+
+// executeTaskAttempt creates the task Job and observes it until it finishes.
+func (b *KubernetesBackend) executeTaskAttempt(ctx context.Context, params *TaskParams, attempt *kubernetesTaskAttempt) (res ExecuteResult) {
 	configuredEnv := envSliceFromMap(b.config.TaskEnv)
 	if b.config.PodTemplate != nil {
 		for _, container := range b.config.PodTemplate.Containers {
@@ -264,7 +380,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	var initContainers []corev1.Container
 	for i, sidecar := range params.Sidecars {
 		if b.useImageVolumes && !sidecar.ReadWrite {
-			volumeName := fmt.Sprintf("sidecar-%d-image", i)
+			volumeName := kubernetesSidecarVolumeName(i, kubernetesSidecarImageVolumeSuffix)
 			volumes = append(volumes, imageVolume(volumeName, sidecar.Image, pullPolicy))
 
 			volumeMount := corev1.VolumeMount{
@@ -277,7 +393,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			continue
 		}
 
-		dataVolumeName := fmt.Sprintf("sidecar-%d-data", i)
+		dataVolumeName := kubernetesSidecarVolumeName(i, kubernetesSidecarDataVolumeSuffix)
 		volumes = append(volumes, corev1.Volume{
 			Name: dataVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -400,6 +516,7 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return executeError(withFailureDetails(failure, buildKubernetesFailureDetails("", job, nil, nil, nil)))
 	}
 	job = createdJob
+	attempt.job = createdJob
 	doneJobCreate(false)
 
 	// Derive the remaining setup phases (scheduling, sidecar prep, setup
@@ -417,6 +534,12 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			return
 		}
 		if res.Error != nil {
+			if _, ok := sidecarFallbackIndex(params.Sidecars, res.Error); ok && attempt.sidecarFallback {
+				// ExecuteTask deletes this Job and recreates it with the fallback
+				// sidecars, so stopping it here would only be undone.
+				attempt.replace = true
+				return
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
 			defer cancel()
 			_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
@@ -1240,7 +1363,9 @@ func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1
 			if restartableSidecars[status.Name] {
 				kind = "sidecar"
 			}
-			err := newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, true), b.containerWaitingFailureError(pod, "init container", status.Name, status.State.Waiting))
+			reason := classifyWaitingReason(status.State.Waiting.Reason, true)
+			err := withPulledSidecar(pod, status.Name, status.State.Waiting, reason,
+				newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.containerWaitingFailureError(pod, "init container", status.Name, status.State.Waiting)))
 			return withDetails(err, waitingContainerFailureDetails(kind, status.Name, status.State.Waiting))
 		}
 	}
@@ -1251,7 +1376,9 @@ func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1
 			return withDetails(err, terminatedContainerFailureDetails("regular", status.Name, status.State.Terminated))
 		}
 		if status.State.Waiting != nil && isImmediateContainerFailure(status.State.Waiting.Reason) {
-			err := newBackendFailure(metrics.TaskFailurePhaseBackend, classifyWaitingReason(status.State.Waiting.Reason, false), b.containerWaitingFailureError(pod, "container", status.Name, status.State.Waiting))
+			reason := classifyWaitingReason(status.State.Waiting.Reason, false)
+			err := withPulledSidecar(pod, status.Name, status.State.Waiting, reason,
+				newBackendFailure(metrics.TaskFailurePhaseBackend, reason, b.containerWaitingFailureError(pod, "container", status.Name, status.State.Waiting)))
 			return withDetails(err, waitingContainerFailureDetails("regular", status.Name, status.State.Waiting))
 		}
 	}
@@ -1280,6 +1407,104 @@ func (b *KubernetesBackend) inspectPodFailureAt(ctx context.Context, pod *corev1
 	}
 
 	return nil
+}
+
+func kubernetesSidecarVolumeName(i int, suffix string) string {
+	return kubernetesSidecarVolumePrefix + strconv.Itoa(i) + suffix
+}
+
+// withPulledSidecar records on err which sidecar's image failed to pull, when the
+// waiting container's failure is an image pull that can be traced to one.
+func withPulledSidecar(pod *corev1.Pod, containerName string, waiting *corev1.ContainerStateWaiting, reason metrics.TaskFailureReason, err error) error {
+	if reason != metrics.TaskFailureReasonImagePull {
+		return err
+	}
+	if i, ok := pullFailedSidecarIndex(pod, containerName, waiting); ok {
+		return withPullFailedSidecar(err, i)
+	}
+	return err
+}
+
+// pullFailedSidecarIndex returns the index into TaskParams.Sidecars of the sidecar
+// whose image the waiting container could not pull. A copy-sidecar-<i> init container
+// runs the sidecar image itself. Any other container (setup or task) fails to pull a
+// sidecar only through an image volume it mounts: the kubelet reports such a failure
+// on the containers mounting the volume, naming the image in the waiting message. That
+// is attributed to a sidecar only when the message names exactly one of the
+// container's sidecar images and not the container's own image.
+func pullFailedSidecarIndex(pod *corev1.Pod, containerName string, waiting *corev1.ContainerStateWaiting) (int, bool) {
+	if suffix, ok := strings.CutPrefix(containerName, kubernetesSidecarInitPrefix); ok {
+		i, err := strconv.Atoi(suffix)
+		return i, err == nil && i >= 0
+	}
+	container := findPodContainer(pod, containerName)
+	if container == nil || waiting == nil {
+		return 0, false
+	}
+	named := quotedImageReferences(waiting.Message)
+	if len(named) == 0 || named[canonicalImageReference(container.Image)] {
+		return 0, false
+	}
+	volumeImages := make(map[string]string)
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Image != nil {
+			volumeImages[volume.Name] = volume.Image.Reference
+		}
+	}
+	match := -1
+	for _, mount := range container.VolumeMounts {
+		image, ok := volumeImages[mount.Name]
+		if !ok || !named[canonicalImageReference(image)] {
+			continue
+		}
+		i, ok := kubernetesSidecarImageVolumeIndex(mount.Name)
+		if !ok {
+			continue
+		}
+		if match >= 0 && match != i {
+			return 0, false
+		}
+		match = i
+	}
+	return match, match >= 0
+}
+
+func kubernetesSidecarImageVolumeIndex(volumeName string) (int, bool) {
+	rest, ok := strings.CutPrefix(volumeName, kubernetesSidecarVolumePrefix)
+	if !ok {
+		return 0, false
+	}
+	index, ok := strings.CutSuffix(rest, kubernetesSidecarImageVolumeSuffix)
+	if !ok {
+		return 0, false
+	}
+	i, err := strconv.Atoi(index)
+	return i, err == nil && i >= 0
+}
+
+func findPodContainer(pod *corev1.Pod, name string) *corev1.Container {
+	for _, containers := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for i := range containers {
+			if containers[i].Name == name {
+				return &containers[i]
+			}
+		}
+	}
+	return nil
+}
+
+// quotedImageReferences returns the canonical form of every double-quoted image
+// reference in a kubelet or container runtime message, such as
+// `Back-off pulling image "registry/x:tag"`.
+func quotedImageReferences(message string) map[string]bool {
+	references := make(map[string]bool)
+	parts := strings.Split(message, `"`)
+	for i := 1; i < len(parts); i += 2 {
+		if _, err := reference.ParseNormalizedNamed(parts[i]); err == nil {
+			references[canonicalImageReference(parts[i])] = true
+		}
+	}
+	return references
 }
 
 // restartableInitContainerNames returns the names of init containers declared

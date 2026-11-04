@@ -73,6 +73,8 @@ type DockerBackend struct {
 	platformSpec   ocispec.Platform
 	sidecarVolumes sync.Map // volume name -> *sidecarVolumeState
 	taskContainers sync.Map // taskExecution -> container ID; retained after cleanup failures
+	// sidecarPullFailures holds ACP sidecar images that recently failed to pull.
+	sidecarPullFailures sidecarPullFailureCache
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
@@ -703,23 +705,23 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 
 		log.Infof(ctx, "Preparing additional sidecar: image=%s, mount=%s", sidecar.Image, sidecar.MountPath)
 
-		authStr := b.getRegistryAuth(ctx, sidecar.Image)
-		if err := b.prepareImage(ctx, sidecar.Image, authStr, nil); err != nil {
-			return nil, fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
-		}
-
-		digest, err := b.getImageDigest(ctx, sidecar.Image)
+		image, err := b.prepareSidecarImage(ctx, sidecar)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get digest for additional sidecar image %s: %w", sidecar.Image, err)
+			return nil, err
 		}
 
-		volumeName := sanitizeVolumeName(sidecar.Image, digest)
-		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, sidecar.Image)
+		digest, err := b.getImageDigest(ctx, image)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get digest for additional sidecar image %s: %w", image, err)
+		}
+
+		volumeName := sanitizeVolumeName(image, digest)
+		log.Debugf(ctx, "Using volume %s for additional sidecar %s", volumeName, image)
 
 		if err := b.prepareSidecarVolume(ctx, dockerClient, volumeName, func(ctx context.Context) error {
-			return b.copySidecarFilesystemToVolume(ctx, dockerClient, sidecar.Image, volumeName, labels)
+			return b.copySidecarFilesystemToVolume(ctx, dockerClient, image, volumeName, labels)
 		}); err != nil {
-			return nil, fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", sidecar.Image, err)
+			return nil, fmt.Errorf("failed to prepare volume for additional sidecar %s: %w", image, err)
 		}
 
 		mode := ":ro"
@@ -731,6 +733,38 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 	}
 	return binds, nil
 }
+
+// prepareSidecarImage makes the sidecar's image available locally under the pull
+// policy and returns the image to mount. When the image cannot be prepared and the
+// sidecar has a fallback, it prepares and returns the fallback instead; a sidecar whose
+// image failed within sidecarPullFailureTTL goes straight to its fallback. Only image
+// preparation falls back: later digest and volume errors still fail the task.
+func (b *DockerBackend) prepareSidecarImage(ctx context.Context, sidecar types.SidecarMount) (string, error) {
+	if sidecar.FallbackImage != "" && b.sidecarPullFailures.recent(sidecar.Image) {
+		reportSidecarFallback(ctx, "docker", sidecar, nil)
+		if err := b.prepareImage(ctx, sidecar.FallbackImage, b.getRegistryAuth(ctx, sidecar.FallbackImage), nil); err != nil {
+			return "", fmt.Errorf("failed to prepare fallback sidecar image %s for %s, which failed to pull within the last %s: %w",
+				sidecar.FallbackImage, sidecar.Image, sidecarPullFailureTTL, err)
+		}
+		return sidecar.FallbackImage, nil
+	}
+
+	err := b.prepareImage(ctx, sidecar.Image, b.getRegistryAuth(ctx, sidecar.Image), nil)
+	if err == nil {
+		return sidecar.Image, nil
+	}
+	err = fmt.Errorf("failed to prepare additional sidecar image %s: %w", sidecar.Image, err)
+	if sidecar.FallbackImage == "" || ctx.Err() != nil {
+		return "", err
+	}
+	b.sidecarPullFailures.record(sidecar.Image)
+	reportSidecarFallback(ctx, "docker", sidecar, err)
+	if fallbackErr := b.prepareImage(ctx, sidecar.FallbackImage, b.getRegistryAuth(ctx, sidecar.FallbackImage), nil); fallbackErr != nil {
+		return "", fmt.Errorf("%w; fallback sidecar image %s also failed: %v", err, sidecar.FallbackImage, fallbackErr)
+	}
+	return sidecar.FallbackImage, nil
+}
+
 func (b *DockerBackend) prepareSidecarVolume(ctx context.Context, dockerClient *client.Client, volumeName string, populate func(context.Context) error) error {
 	entry, _ := b.sidecarVolumes.LoadOrStore(volumeName, &sidecarVolumeState{gate: semaphore.NewWeighted(1)})
 	state := entry.(*sidecarVolumeState)
