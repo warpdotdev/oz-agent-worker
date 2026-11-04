@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -638,8 +639,9 @@ func TestStandbyTaskParams(t *testing.T) {
 	if params.StandbyID != "standby-params" || params.TaskID != "" || params.ExecutionID != "" || params.Task != nil {
 		t.Fatalf("identity = standby %q task %q execution %q task %v, want standby only", params.StandbyID, params.TaskID, params.ExecutionID, params.Task)
 	}
-	if !reflect.DeepEqual(params.BaseArgs, create.Args) {
-		t.Fatalf("BaseArgs = %v, want %v", params.BaseArgs, create.Args)
+	wantArgs := append(slices.Clone(create.Args), "--server-root-url", "https://app.warp.dev")
+	if !reflect.DeepEqual(params.BaseArgs, wantArgs) {
+		t.Fatalf("BaseArgs = %v, want %v", params.BaseArgs, wantArgs)
 	}
 	for _, want := range []string{
 		"GIT_TERMINAL_PROMPT=0",
@@ -679,6 +681,61 @@ func TestStandbyTaskParams(t *testing.T) {
 	create.DockerImage = "registry.example/requested:2"
 	if got := w.prepareStandbyTaskParams(create).DockerImage; got != "registry.example/requested:2" {
 		t.Errorf("DockerImage = %q, want the server-provided image", got)
+	}
+}
+
+func TestStandbyBaseArgs(t *testing.T) {
+	const (
+		serverRootURL     = "https://app.warp.dev"
+		sessionSharingURL = "wss://sessions.warp.dev"
+	)
+	base := []string{"agent", "run-cloud-standby", "--standby-id", "standby-args"}
+
+	tests := []struct {
+		name   string
+		config Config
+		args   []string
+		want   []string
+	}{
+		{
+			name:   "appends server URLs",
+			config: Config{ServerRootURL: serverRootURL, SessionSharingServerURL: sessionSharingURL},
+			args:   base,
+			want:   []string{"agent", "run-cloud-standby", "--standby-id", "standby-args", "--server-root-url", serverRootURL, "--session-sharing-server-url", sessionSharingURL},
+		},
+		{
+			name:   "appends nothing when config URLs are empty",
+			config: Config{},
+			args:   base,
+			want:   []string{"agent", "run-cloud-standby", "--standby-id", "standby-args"},
+		},
+		{
+			name:   "does not duplicate flags already in args",
+			config: Config{ServerRootURL: serverRootURL, SessionSharingServerURL: sessionSharingURL},
+			args:   []string{"agent", "--server-root-url", "https://server.example", "--session-sharing-server-url", "wss://server.example/sessions"},
+			want:   []string{"agent", "--server-root-url", "https://server.example", "--session-sharing-server-url", "wss://server.example/sessions"},
+		},
+		{
+			name:   "adds only the missing flag",
+			config: Config{ServerRootURL: serverRootURL, SessionSharingServerURL: sessionSharingURL},
+			args:   []string{"agent", "--server-root-url", "https://server.example"},
+			want:   []string{"agent", "--server-root-url", "https://server.example", "--session-sharing-server-url", sessionSharingURL},
+		},
+		{
+			name:   "keeps server-supplied args in order",
+			config: Config{ServerRootURL: serverRootURL},
+			args:   []string{"c", "b", "a"},
+			want:   []string{"c", "b", "a", "--server-root-url", serverRootURL},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &Worker{config: tt.config}
+			if got := w.standbyBaseArgs(tt.args); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("standbyBaseArgs() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

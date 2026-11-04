@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -323,9 +324,22 @@ func (w *Worker) prepareStandbyTaskParams(create *types.PrewarmCreateMessage) *T
 	return &TaskParams{
 		StandbyID:     create.SandboxID,
 		EnvVars:       envVars,
-		BaseArgs:      create.Args,
+		BaseArgs:      w.standbyBaseArgs(create.Args),
 		DockerImage:   w.defaultImageForTask(create.DockerImage, nil),
 		Sidecars:      w.sidecarMounts(create.SidecarImage, create.AdditionalSidecars),
 		InstanceShape: create.InstanceShape,
 	}
+}
+
+func (w *Worker) standbyBaseArgs(args []string) []string {
+	baseArgs := slices.Clone(args)
+	baseArgs = appendFlagIfMissing(baseArgs, "--server-root-url", w.config.ServerRootURL)
+	return appendFlagIfMissing(baseArgs, "--session-sharing-server-url", w.config.SessionSharingServerURL)
+}
+
+func appendFlagIfMissing(args []string, flag, value string) []string {
+	if value == "" || slices.Contains(args, flag) {
+		return args
+	}
+	return append(args, flag, value)
 }
