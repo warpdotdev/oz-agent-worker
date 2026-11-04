@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // runIDEnvVars, workerBackendEnvVars and the helpers beside them return a backend's
@@ -131,6 +133,32 @@ type backendCapabilities struct {
 	// supportsOneShot requires ExecuteTask to wait for a terminal outcome; a
 	// backend that returns ExecuteOutcomeSpawned cannot support one-shot mode.
 	supportsOneShot bool
+	// supportsStandbys means ExecuteTask can run TaskParams with a StandbyID.
+	supportsStandbys bool
+}
+
+const (
+	// StandbyDockerLabel labels the container of a standby sandbox with its sandbox ID.
+	StandbyDockerLabel = "warp.prewarmed-sandbox.id"
+	// StandbyKubernetesLabel labels the Job of a standby sandbox with its sandbox ID.
+	StandbyKubernetesLabel = "warp-prewarmed-sandbox-id"
+)
+
+const standbyInstancePrefix = "warp-prewarm-"
+
+// StandbyInstanceRef is the logical sandbox identity, also used as the container or Job name.
+func StandbyInstanceRef(sandboxID string) string {
+	return standbyInstancePrefix + sandboxID
+}
+
+func validateStandbyID(sandboxID string) error {
+	if len(sandboxID) > validation.DNS1123LabelMaxLength-len(standbyInstancePrefix) {
+		return fmt.Errorf("standby sandbox ID exceeds %d characters", validation.DNS1123LabelMaxLength-len(standbyInstancePrefix))
+	}
+	if errs := validation.IsDNS1123Label(sandboxID); len(errs) > 0 {
+		return fmt.Errorf("invalid standby sandbox ID: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // TaskParams contains pre-processed task parameters common to all backends.
@@ -141,6 +169,8 @@ type TaskParams struct {
 	TaskID      string
 	ExecutionID string
 	Task        *types.Task
+	// StandbyID identifies a standby instead of a task, with Task nil and both run IDs empty.
+	StandbyID string
 
 	// EnvVars contains pre-resolved common environment variables (TASK_ID, Git config,
 	// assignment env vars). Backends append their own config-specific env vars.
@@ -178,10 +208,15 @@ type Backend interface {
 	// failures are surfaced as ExecuteOutcomeError with an error that is (or
 	// wraps) *TaskFailure.
 	ExecuteTask(ctx context.Context, params *TaskParams) ExecuteResult
-	// CancelTask requests cancellation after ExecuteTask returns. A nil error
-	// means the request was accepted, not that asynchronous resources stopped.
-	// Failed requests may be retried and must be execution-scoped and idempotent.
+	// CancelTask requests cancellation of a task execution or standby. Task requests
+	// arrive after ExecuteTask returns; standby requests may arrive while it unwinds.
+	// Local standby contexts must be cancelled separately.
+	// A nil error means the request was accepted, not that asynchronous resources stopped.
+	// Failed requests may be retried and must be resource-scoped and idempotent.
 	CancelTask(ctx context.Context, params *CancelParams) error
+	// WatchStandbyExits observes terminal standbys independently of ExecuteTask until
+	// ctx ends. Backends without independent observation return immediately.
+	WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string))
 	// PreservesTasksOnShutdown reports whether active task execution units can
 	// safely outlive the worker process during shutdown.
 	PreservesTasksOnShutdown() bool
@@ -190,11 +225,13 @@ type Backend interface {
 }
 
 // CancelParams carries the minimal, non-secret identifiers a backend needs to
-// cancel a task. It deliberately excludes env/secrets so the worker need not
-// retain secrets for the lifetime of a spawned task.
+// cancel a task or standby. It excludes env/secrets so the worker need not retain
+// secrets for the lifetime of a spawned task.
 type CancelParams struct {
 	TaskID      string
 	ExecutionID string
+	// StandbyID identifies a standby instead of a task; both run IDs must be empty.
+	StandbyID string
 }
 
 // TaskFailure is the structured error backends return from ExecuteTask when

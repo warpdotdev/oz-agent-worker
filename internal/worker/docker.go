@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -27,6 +28,7 @@ import (
 )
 
 const dockerHubAuthConfigKey = "https://index.docker.io/v1/"
+const dockerWorkerIDLabel = "warp.worker-id"
 
 // PullPolicyAlways, PullPolicyIfNotPresent, and PullPolicyNever are the accepted
 // backend.docker.image_pull_policy values. They mirror the Kubernetes backend's
@@ -39,6 +41,7 @@ const (
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
+	WorkerID  string
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
@@ -74,6 +77,9 @@ type DockerBackend struct {
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
 func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerBackend, error) {
+	if config.WorkerID == "" {
+		return nil, errors.New("worker ID is required for Docker standby ownership")
+	}
 	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -124,14 +130,16 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	if params.StandbyID != "" {
+		if err := validateStandbyID(params.StandbyID); err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
+		}
+	}
 	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(b.config.Env)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.Env)
-	labels := map[string]string{
-		"oz-task-id":      params.TaskID,
-		"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
-	}
+	labels, key, containerName := b.dockerUnitIdentity(params)
 	dockerClient := b.dockerClient
 	imageName := params.DockerImage
 
@@ -189,12 +197,12 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}
 
 	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
-	key := taskExecution{params.TaskID, params.ExecutionID}
 	// Transport and server failures cannot prove that the daemon created no container.
 	b.taskContainers.Store(key, "")
 	_, create := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_create",
 		trace.WithAttributes(attribute.String("phase", "container_create")))
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name:       containerName,
 		Config:     containerConfig,
 		HostConfig: hostConfig,
 	})
@@ -314,8 +322,26 @@ func dockerResourcesForShape(shape *types.InstanceShape) container.Resources {
 	return res
 }
 
+func (b *DockerBackend) dockerUnitIdentity(params *TaskParams) (map[string]string, taskExecution, string) {
+	if params.StandbyID != "" {
+		return map[string]string{StandbyDockerLabel: params.StandbyID, dockerWorkerIDLabel: b.config.WorkerID},
+			taskExecution{params.StandbyID, ""},
+			StandbyInstanceRef(params.StandbyID)
+	}
+	return map[string]string{
+			"oz-task-id":      params.TaskID,
+			"oz-execution-id": executionIDOrTaskID(params.TaskID, params.ExecutionID),
+		},
+		taskExecution{params.TaskID, params.ExecutionID},
+		""
+}
+
 // CancelTask removes the captured execution container, including when normal cleanup failed.
 func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) error {
+	if params.StandbyID != "" {
+		// Standbys use context cancellation and its configured cleanup policy.
+		return nil
+	}
 	key := taskExecution{params.TaskID, params.ExecutionID}
 	containerID, ok := b.taskContainers.Load(key)
 	if !ok {
@@ -331,6 +357,8 @@ func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) er
 	return nil
 }
 
+func (b *DockerBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
 	if b.dockerClient != nil {
@@ -345,7 +373,7 @@ func (b *DockerBackend) PreservesTasksOnShutdown() bool {
 }
 
 func (b *DockerBackend) Capabilities() backendCapabilities {
-	return backendCapabilities{}
+	return backendCapabilities{supportsStandbys: true}
 }
 
 // normalizeDockerPullPolicy validates a configured backend.docker.image_pull_policy value,

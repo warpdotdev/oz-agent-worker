@@ -5,6 +5,9 @@ import (
 	"testing"
 )
 
+// unpairedWARPNames have no OZ_ spelling.
+var unpairedWARPNames = map[string]bool{"WARP_PREWARMED_SANDBOX_ID": true}
+
 // Nothing derives the WARP_ names any more: each set site writes both outright. This is the
 // guard that keeps them in step.
 //
@@ -14,11 +17,13 @@ import (
 // operator config by construction — neither of those is paired on purpose.
 func TestBackendEnvPairsEveryOZName(t *testing.T) {
 	backendEnvs := map[string][]string{
-		"command dispatch": commandDispatchEnvVars("task-1", "exec-1", "https://app.warp.dev/?a=b", "ubuntu:22.04"),
-		"command cancel":   commandCancelEnvVars("task-1", "exec-1"),
-		"direct setup":     directSetupEnvVars("/workspace", "task-1", "/tmp/oz-env"),
-		"direct teardown":  directTeardownEnvVars("/workspace", "/workspace/.gitconfig", "task-1"),
-		"kubernetes task":  kubernetesTaskOwnedEnvVars("task-1"),
+		"command dispatch":        commandDispatchEnvVars("task-1", "exec-1", "https://app.warp.dev/?a=b", "ubuntu:22.04"),
+		"command cancel":          commandCancelEnvVars("task-1", "exec-1"),
+		"direct setup":            directSetupEnvVars("/workspace", "task-1", "/tmp/oz-env"),
+		"direct teardown":         directTeardownEnvVars("/workspace", "/workspace/.gitconfig", "task-1"),
+		"direct standby setup":    directStandbySetupEnvVars("/workspace", "sb-1", "/tmp/oz-env"),
+		"direct standby teardown": directStandbyTeardownEnvVars("/workspace", "/workspace/.gitconfig", "sb-1"),
+		"kubernetes task":         kubernetesTaskOwnedEnvVars("task-1"),
 	}
 
 	for name, envVars := range backendEnvs {
@@ -27,7 +32,9 @@ func TestBackendEnvPairsEveryOZName(t *testing.T) {
 			ozNames, warpNames := 0, 0
 			for envName, value := range env {
 				if strings.HasPrefix(envName, "WARP_") {
-					warpNames++
+					if !unpairedWARPNames[envName] {
+						warpNames++
+					}
 					continue
 				}
 				suffix, isOZ := strings.CutPrefix(envName, "OZ_")

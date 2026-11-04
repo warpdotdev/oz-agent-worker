@@ -871,3 +871,32 @@ worker_id: "test"
 		}
 	})
 }
+
+func TestLoadMaxPrewarmedSandboxes(t *testing.T) {
+	for _, tc := range []struct {
+		name, setting string
+		want          *int
+		wantError     bool
+	}{
+		{name: "explicit capacity", setting: "max_prewarmed_sandboxes: 3", want: new(3)},
+		{name: "shared task limit"},
+		{name: "negative capacity", setting: "max_prewarmed_sandboxes: -1", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, "worker_id: test\n"+tc.setting+"\n"))
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "MaxPrewarmedSandboxes") {
+					t.Fatalf("Load() error = %v, want capacity validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.MaxPrewarmedSandboxes == nil) != (tc.want == nil) ||
+				(tc.want != nil && *cfg.MaxPrewarmedSandboxes != *tc.want) {
+				t.Fatalf("MaxPrewarmedSandboxes = %v, want %v", cfg.MaxPrewarmedSandboxes, tc.want)
+			}
+		})
+	}
+}

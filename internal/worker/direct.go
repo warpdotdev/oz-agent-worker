@@ -24,10 +24,6 @@ const defaultWorkspaceRoot = "/var/lib/oz/workspaces"
 // directBackendTypeName is the value this backend reports for OZ_WORKER_BACKEND.
 const directBackendTypeName = "direct"
 
-// directSetupEnvVars and directTeardownEnvVars return exactly the worker-owned variables this
-// backend adds to the operator's setup and teardown hooks. TestBackendEnvPairsEveryOZName runs
-// its pairing assertion over these, so a variable added here under only one of its two names
-// fails the build. GIT_CONFIG_GLOBAL has no OZ_/WARP_ spelling and is left unpaired.
 func directSetupEnvVars(workspaceDir, taskID, environmentFile string) []string {
 	return concatEnvVars(
 		workspaceRootEnvVars(workspaceDir),
@@ -43,6 +39,28 @@ func directTeardownEnvVars(workspaceDir, gitConfigPath, taskID string) []string 
 		[]string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)},
 		workerBackendEnvVars(directBackendTypeName),
 		runIDEnvVars(taskID),
+	)
+}
+
+func prewarmedSandboxIDEnvVars(sandboxID string) []string {
+	return []string{fmt.Sprintf("WARP_PREWARMED_SANDBOX_ID=%s", sandboxID)}
+}
+
+func directStandbySetupEnvVars(workspaceDir, sandboxID, environmentFile string) []string {
+	return concatEnvVars(
+		workspaceRootEnvVars(workspaceDir),
+		workerBackendEnvVars(directBackendTypeName),
+		prewarmedSandboxIDEnvVars(sandboxID),
+		environmentFileEnvVars(environmentFile),
+	)
+}
+
+func directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, sandboxID string) []string {
+	return concatEnvVars(
+		workspaceRootEnvVars(workspaceDir),
+		[]string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)},
+		workerBackendEnvVars(directBackendTypeName),
+		prewarmedSandboxIDEnvVars(sandboxID),
 	)
 }
 
@@ -118,7 +136,7 @@ type DirectBackend struct {
 }
 
 func (b *DirectBackend) Capabilities() backendCapabilities {
-	return backendCapabilities{supportsOneShot: true}
+	return backendCapabilities{supportsOneShot: true, supportsStandbys: true}
 }
 
 // NewDirectBackend creates a new direct backend, verifying the oz CLI is available.
@@ -173,7 +191,15 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}
 	params.Logs.AddEnv(b.config.Env)
 	taskID := params.TaskID
-	if err := validateTaskIDForPath(taskID); err != nil {
+	standbyID := params.StandbyID
+	if standbyID != "" {
+		if b.config.TargetDir != "" {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, errors.New("standby sandboxes are not supported in shared target_dir mode")))
+		}
+		if err := validateStandbyID(standbyID); err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid standby ID for workspace path: %w", err)))
+		}
+	} else if err := validateTaskIDForPath(taskID); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))
 	}
 
@@ -183,6 +209,12 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 
 	if usingTargetDir {
 		workspaceDir = b.config.TargetDir
+	} else if standbyID != "" {
+		var err error
+		workspaceDir, err = os.MkdirTemp(b.config.WorkspaceRoot, "prewarm-"+standbyID+"-")
+		if err != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create standby workspace: %w", err)))
+		}
 	} else {
 		// Legacy assignments use a per-task workspace.
 		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
@@ -221,11 +253,15 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			_, cleanup := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
 				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			// Don't clean up the shared target directory.
-			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, params.Logs))
+			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs))
 			cleanup.End()
 			return
 		}
-		_ = b.cleanup(ctx, taskID, workspaceDir, gitConfigPath, params.Logs)
+		if standbyID != "" {
+			_ = b.removeWorkspace(ctx, directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID), workspaceDir, params.Logs)
+			return
+		}
+		_ = b.removeWorkspace(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -255,7 +291,11 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 
 	// 4. Run setup command if configured.
 	if b.config.SetupCommand != "" {
-		setupEnv := append(envVars, directSetupEnvVars(workspaceDir, taskID, envFilePath)...)
+		hookEnv := directSetupEnvVars(workspaceDir, taskID, envFilePath)
+		if standbyID != "" {
+			hookEnv = directStandbySetupEnvVars(workspaceDir, standbyID, envFilePath)
+		}
+		setupEnv := append(envVars, hookEnv...)
 
 		log.Infof(ctx, "Running setup command")
 		doneSetup := params.SetupEvents.startPhase(ctx, SetupEventSetupCommand)
@@ -346,6 +386,8 @@ func agentExitCode(err error) (exitCode int, ok bool) {
 // direct-backend task.
 func (b *DirectBackend) CancelTask(context.Context, *CancelParams) error { return nil }
 
+func (b *DirectBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+
 // Shutdown cleans up any workspace directories left behind under the workspace root.
 func (b *DirectBackend) Shutdown(ctx context.Context) {
 	if b.config.WorkspaceRoot == "" {
@@ -372,12 +414,11 @@ func (b *DirectBackend) PreservesTasksOnShutdown() bool {
 	return false
 }
 
-// runTeardownIfConfigured runs the teardown command if one is configured.
-func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) error {
+// runTeardownIfConfigured runs the teardown command with teardownEnv if one is configured.
+func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, teardownEnv []string, workspaceDir string, reporter *tasklogs.Reporter) error {
 	if b.config.TeardownCommand == "" {
 		return nil
 	}
-	teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
 	log.Infof(ctx, "Running teardown command")
 	if err := b.runCommand(ctx, b.config.TeardownCommand, workspaceDir, teardownEnv, reporter); err != nil {
 		metrics.AddTaskEvent(ctx, "cleanup.failed",
@@ -390,15 +431,14 @@ func (b *DirectBackend) runTeardownIfConfigured(ctx context.Context, taskID, wor
 	return nil
 }
 
-// cleanup runs the teardown command (if configured) and removes the workspace directory.
-func (b *DirectBackend) cleanup(ctx context.Context, taskID, workspaceDir, gitConfigPath string, reporter *tasklogs.Reporter) (err error) {
+func (b *DirectBackend) removeWorkspace(ctx context.Context, teardownEnv []string, workspaceDir string, reporter *tasklogs.Reporter) (err error) {
 	_, phase := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
 		trace.WithAttributes(attribute.String("phase", "cleanup")))
 	defer func() {
 		tracing.RecordError(phase, err)
 		phase.End()
 	}()
-	teardownErr := b.runTeardownIfConfigured(ctx, taskID, workspaceDir, gitConfigPath, reporter)
+	teardownErr := b.runTeardownIfConfigured(ctx, teardownEnv, workspaceDir, reporter)
 
 	log.Infof(ctx, "Removing workspace: %s", workspaceDir)
 	if err := os.RemoveAll(workspaceDir); err != nil {

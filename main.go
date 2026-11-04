@@ -38,6 +38,7 @@ var CLI struct {
 	Volumes                 []string `help:"Volume mounts for task containers (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:MODE)" short:"v"`
 	Env                     []string `help:"Environment variables for task containers (format: KEY=VALUE or KEY to pass through from host)" short:"e"`
 	MaxConcurrentTasks      int      `help:"Maximum number of tasks to run concurrently (0 for unlimited)" default:"0"`
+	MaxPrewarmedSandboxes   int      `help:"Maximum number of standby sandboxes to hold at once (0 shares the max-concurrent-tasks limit)" default:"0"`
 	OneShot                 bool     `help:"Exit after running one task (direct backend only)"`
 	CollectTaskLogs         *bool    `help:"Collect per-task logs requested by the server (default: true)" env:"OZ_COLLECT_TASK_LOGS"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
@@ -159,6 +160,13 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	if maxConcurrentTasks == 0 && fileConfig != nil && fileConfig.MaxConcurrentTasks != nil {
 		maxConcurrentTasks = *fileConfig.MaxConcurrentTasks
 	}
+	maxPrewarmedSandboxes := CLI.MaxPrewarmedSandboxes
+	if maxPrewarmedSandboxes == 0 && fileConfig != nil && fileConfig.MaxPrewarmedSandboxes != nil {
+		maxPrewarmedSandboxes = *fileConfig.MaxPrewarmedSandboxes
+	}
+	if maxPrewarmedSandboxes < 0 {
+		return worker.Config{}, fmt.Errorf("max-prewarmed-sandboxes must not be negative")
+	}
 	// Resolve one_shot: CLI true > config file > false. One-shot workers only
 	// ever run one task, so make that explicit in the concurrency configuration
 	// in addition to enforcing lifetime exclusivity in the worker.
@@ -190,6 +198,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		LogLevel:                CLI.LogLevel,
 		BackendType:             backendType,
 		MaxConcurrentTasks:      maxConcurrentTasks,
+		MaxPrewarmedSandboxes:   maxPrewarmedSandboxes,
 		OneShot:                 oneShot,
 		CollectTaskLogs:         collectTaskLogs,
 		IdleOnComplete:          idleOnComplete,

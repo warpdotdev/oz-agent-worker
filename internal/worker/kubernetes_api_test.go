@@ -248,7 +248,7 @@ func TestKubernetesAPIOperationsRetry(t *testing.T) {
 				if operation == "watch jobs" {
 					got, err = backend.watchJob(ctx, job.Name)
 				} else {
-					got, err = backend.watchTaskPods(ctx, "exec")
+					got, err = backend.watchPods(ctx, kubernetesExecutionPodSelector("exec"))
 				}
 				if err != nil || got == nil {
 					t.Fatalf("watch=%v err=%v", got, err)
@@ -275,7 +275,7 @@ func TestKubernetesAPIOperationsRetry(t *testing.T) {
 				case "get":
 					_, err = backend.getTaskJob(ctx, job.Name)
 				case "list":
-					_, err = backend.listTaskPods(ctx, "exec")
+					_, err = backend.listPods(ctx, kubernetesExecutionPodSelector("exec"))
 				case "delete":
 					err = backend.deleteTaskJob(ctx, job.Name, &job.UID)
 				}

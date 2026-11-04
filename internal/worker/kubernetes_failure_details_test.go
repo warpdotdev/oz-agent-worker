@@ -288,7 +288,7 @@ func TestKubernetesFailureDetailsCaptureJobAndPodFailureStates(t *testing.T) {
 				Status: corev1.ConditionTrue,
 				Reason: "DeadlineExceeded",
 			}}},
-		}, "task-1", "execution-1", kubernetesFailureSourceJobWatch)
+		}, "task-1", kubernetesExecutionPodSelector("execution-1"), kubernetesFailureSourceJobWatch)
 		if result == nil || result.err == nil {
 			t.Fatal("expected failed Job result")
 		}

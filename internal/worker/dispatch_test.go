@@ -16,9 +16,10 @@ type dispatchBackend struct{}
 func (b *dispatchBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResult {
 	return executeSpawned()
 }
-func (b *dispatchBackend) CancelTask(context.Context, *CancelParams) error { return nil }
-func (b *dispatchBackend) Shutdown(context.Context)                        {}
-func (b *dispatchBackend) PreservesTasksOnShutdown() bool                  { return true }
+func (b *dispatchBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *dispatchBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+func (b *dispatchBackend) Shutdown(context.Context)                                     {}
+func (b *dispatchBackend) PreservesTasksOnShutdown() bool                               { return true }
 
 // cancelableDispatchBackend is a dispatchBackend that also records CancelTask calls.
 type cancelableDispatchBackend struct {

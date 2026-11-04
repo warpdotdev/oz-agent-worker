@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,8 @@ type Config struct {
 	// (e.g. command), a slot is held only for the brief dispatch and the limit
 	// effectively does not bound the number of remote tasks running at once.
 	MaxConcurrentTasks int
+	// MaxPrewarmedSandboxes caps standby sandboxes held at once; zero shares MaxConcurrentTasks.
+	MaxPrewarmedSandboxes int
 	// OneShot makes the worker accept one task and exit after it reaches a
 	// terminal outcome. Backend support is validated before initialization.
 	OneShot bool
@@ -91,6 +94,16 @@ type Worker struct {
 	oneShot             oneShotState
 	backend             Backend
 	taskSemaphore       *semaphore.Weighted // nil when unlimited
+	// standbys maps sandbox IDs to running standbys and is guarded by tasksMutex.
+	standbys map[string]*standbyEntry
+	// standbySemaphore is nil when standbys share taskSemaphore.
+	standbySemaphore *semaphore.Weighted
+	// Recent exits and watcher lifecycle are guarded by tasksMutex.
+	standbyExits       map[string]struct{}
+	standbyExitIDs     []string
+	stopStandbyWatcher context.CancelFunc
+	standbyWatcherDone chan struct{}
+	capabilities       backendCapabilities
 	// heartbeatInterval is how often the worker pings the server. It defaults
 	// to HeartbeatInterval and is overridable in tests.
 	heartbeatInterval time.Duration
@@ -206,7 +219,9 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		if config.Docker == nil {
 			config.Docker = &DockerBackendConfig{}
 		}
-		backend, err = NewDockerBackend(ctx, *config.Docker)
+		dockerConfig := *config.Docker
+		dockerConfig.WorkerID = config.WorkerID
+		backend, err = NewDockerBackend(ctx, dockerConfig)
 	default:
 		return nil, fmt.Errorf("unknown backend type: %q", backendType)
 	}
@@ -219,15 +234,22 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 	if config.MaxConcurrentTasks > 0 {
 		taskSemaphore = semaphore.NewWeighted(int64(config.MaxConcurrentTasks))
 	}
+	var standbySemaphore *semaphore.Weighted
+	if config.MaxPrewarmedSandboxes > 0 {
+		standbySemaphore = semaphore.NewWeighted(int64(config.MaxPrewarmedSandboxes))
+	}
 
 	return &Worker{
 		config:            config,
 		ctx:               ctx,
 		outbound:          newOutboundQueue(256),
 		activeTasks:       make(map[taskExecution]activeTask),
+		standbys:          make(map[string]*standbyEntry),
 		oneShot:           newOneShotState(),
 		backend:           backend,
+		capabilities:      capabilities,
 		taskSemaphore:     taskSemaphore,
+		standbySemaphore:  standbySemaphore,
 		heartbeatInterval: HeartbeatInterval,
 	}, nil
 }
@@ -256,6 +278,7 @@ func (w *Worker) Run() error {
 	protocolCtx, protocolCancel := context.WithCancel(context.Background())
 	defer protocolCancel()
 	defer w.shutdownBackend()
+	w.startStandbyExitWatcher()
 	reconnectDelay := InitialReconnectDelay
 
 	for {
@@ -317,7 +340,11 @@ func (w *Worker) connect() (*websocket.Conn, error) {
 
 	headers := make(map[string][]string)
 	headers["Authorization"] = []string{fmt.Sprintf("Bearer %s", w.config.APIKey)}
-	headers["X-Warp-Worker-Capabilities"] = []string{executionCancellationCapability}
+	capabilities := []string{executionCancellationCapability}
+	if w.standbysSupported() {
+		capabilities = append(capabilities, types.PrewarmedSandboxesCapability)
+	}
+	headers["X-Warp-Worker-Capabilities"] = []string{strings.Join(capabilities, ",")}
 
 	log.Infof(w.ctx, "Connecting to %s", u.String())
 	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), headers)
@@ -512,6 +539,22 @@ func (w *Worker) handleMessage(message []byte, receivedAt time.Time) {
 			return
 		}
 		w.handleTaskCancellation(&cancellation)
+
+	case types.MessageTypePrewarmCreate:
+		var create types.PrewarmCreateMessage
+		if err := json.Unmarshal(msg.Data, &create); err != nil {
+			log.Errorf(w.ctx, "Failed to unmarshal prewarm create: %v", err)
+			return
+		}
+		w.handlePrewarmCreate(&create)
+
+	case types.MessageTypePrewarmDestroy:
+		var destroy types.PrewarmDestroyMessage
+		if err := json.Unmarshal(msg.Data, &destroy); err != nil {
+			log.Errorf(w.ctx, "Failed to unmarshal prewarm destroy: %v", err)
+			return
+		}
+		w.handlePrewarmDestroy(&destroy)
 
 	default:
 		log.Warnf(w.ctx, "Unknown message type: %s", msg.Type)
@@ -770,15 +813,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	// Precedence: server-provided image (from environment) > worker config default_image > hardcoded ubuntu:22.04.
 	dockerImage := w.defaultImageForTask(assignment.DockerImage, task)
 
-	// Build common environment variables.
-	envVars := []string{
-		fmt.Sprintf("TASK_ID=%s", task.ID),
-		"GIT_TERMINAL_PROMPT=0",
-		"GH_PROMPT_DISABLED=1",
-	}
-	if w.config.ServerRootURL != "" {
-		envVars = append(envVars, fmt.Sprintf("%s=%s", warpServerRootURLEnv, w.config.ServerRootURL))
-	}
+	envVars := append([]string{fmt.Sprintf("TASK_ID=%s", task.ID)}, w.commonEnvVars()...)
 	for key, value := range assignment.EnvVars {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
@@ -809,20 +844,7 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 		baseArgs = append(baseArgs, "--session-sharing-server-url", w.config.SessionSharingServerURL)
 	}
 
-	// Build a unified sidecar list:
-	// entrypoint.sh lives) comes first, followed by any additional sidecars.
-	var sidecars []types.SidecarMount
-	if assignment.SidecarImage != "" {
-		sidecars = append(sidecars, types.SidecarMount{
-			Image:     assignment.SidecarImage,
-			MountPath: "/agent",
-		})
-	}
-	sidecars = append(sidecars, assignment.AdditionalSidecars...)
-
-	for i := range sidecars {
-		sidecars[i].Image = w.config.SidecarImageMappings.Remap(sidecars[i].Image)
-	}
+	sidecars := w.sidecarMounts(assignment.SidecarImage, assignment.AdditionalSidecars)
 
 	setupEvents := newSetupEventReporter(w.config.ServerRootURL, assignment)
 	if setupEvents == nil {
@@ -849,6 +871,29 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 }
 
+func (w *Worker) commonEnvVars() []string {
+	envVars := []string{"GIT_TERMINAL_PROMPT=0", "GH_PROMPT_DISABLED=1"}
+	if w.config.ServerRootURL != "" {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", warpServerRootURLEnv, w.config.ServerRootURL))
+	}
+	return envVars
+}
+
+func (w *Worker) sidecarMounts(sidecarImage string, additional []types.SidecarMount) []types.SidecarMount {
+	var sidecars []types.SidecarMount
+	if sidecarImage != "" {
+		sidecars = append(sidecars, types.SidecarMount{
+			Image:     sidecarImage,
+			MountPath: "/agent",
+		})
+	}
+	sidecars = append(sidecars, additional...)
+	for i := range sidecars {
+		sidecars[i].Image = w.config.SidecarImageMappings.Remap(sidecars[i].Image)
+	}
+	return sidecars
+}
+
 // defaultImageForTask returns the Docker image to use for a task, applying the
 // precedence: server-provided > worker config default_image > hardcoded fallback.
 func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) string {
@@ -860,7 +905,7 @@ func (w *Worker) defaultImageForTask(assignmentImage string, task *types.Task) s
 		return w.config.Kubernetes.DefaultImage
 	}
 	fallback := "ubuntu:22.04"
-	if task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
+	if task != nil && task.AgentConfigSnapshot != nil && task.AgentConfigSnapshot.EnvironmentID != nil {
 		log.Warnf(w.ctx, "Environment %s specified but no Docker image resolved. Using default: %s",
 			*task.AgentConfigSnapshot.EnvironmentID, fallback)
 	} else {
@@ -1200,7 +1245,13 @@ func (w *Worker) shutdownTasks() {
 		return
 	}
 	w.shuttingDown = true
+	standbyWatcherDone := w.standbyWatcherDone
+	if w.stopStandbyWatcher != nil {
+		w.stopStandbyWatcher()
+	}
 	var observersDone []chan struct{}
+	standbyObservers, standbyCount := w.stopStandbysLocked(preserveActiveTasks)
+	observersDone = append(observersDone, standbyObservers...)
 	for _, task := range w.activeTasks {
 		if task.stopCancellation != nil {
 			task.stopCancellation()
@@ -1242,7 +1293,15 @@ func (w *Worker) shutdownTasks() {
 	}
 	w.tasksMutex.Unlock()
 
-	if activeTaskCount > 0 {
+	if standbyWatcherDone != nil {
+		select {
+		case <-standbyWatcherDone:
+		case <-time.After(BackendShutdownTimeout):
+			log.Warnf(w.ctx, "Timed out waiting for standby exit watcher during shutdown")
+		}
+	}
+
+	if activeTaskCount > 0 || standbyCount > 0 {
 		tasksDone := make(chan struct{})
 		go func() {
 			if preserveActiveTasks {

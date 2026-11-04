@@ -283,6 +283,21 @@ func TestCommandBackendCancelTaskNoCommandIsNoop(t *testing.T) {
 	}
 }
 
+func TestCommandBackendStandbyCancellationDoesNotRunTaskCommand(t *testing.T) {
+	sentinel := filepath.Join(t.TempDir(), "cancelled")
+	b := newTestCommandBackend(t, CommandBackendConfig{
+		DispatchCommand: "true",
+		CancelCommand:   "touch " + sentinel,
+	})
+
+	if err := b.CancelTask(context.Background(), &CancelParams{StandbyID: "sb-1"}); err != nil {
+		t.Fatalf("CancelTask() error = %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("standby cancellation ran the task cancel command: %v", err)
+	}
+}
+
 func TestNewWorkerSelectsCommandBackend(t *testing.T) {
 	w, err := New(context.Background(), Config{
 		BackendType: "command",

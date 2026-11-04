@@ -31,7 +31,8 @@ func (b *shutdownRecordingBackend) ExecuteTask(context.Context, *TaskParams) Exe
 	return executeCompleted()
 }
 
-func (b *shutdownRecordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+func (b *shutdownRecordingBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *shutdownRecordingBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
 
 func (b *shutdownRecordingBackend) Shutdown(ctx context.Context) {
 	b.shutdownCalled = true
@@ -60,7 +61,8 @@ func (b *recordingBackend) ExecuteTask(context.Context, *TaskParams) ExecuteResu
 	return executeCompleted()
 }
 
-func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
+func (b *recordingBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *recordingBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
 
 func (b *recordingBackend) Shutdown(context.Context) {}
 func (b *recordingBackend) PreservesTasksOnShutdown() bool {
@@ -82,9 +84,10 @@ func (b *blockingBackend) ExecuteTask(ctx context.Context, _ *TaskParams) Execut
 	}
 }
 
-func (b *blockingBackend) CancelTask(context.Context, *CancelParams) error { return nil }
-func (b *blockingBackend) Shutdown(context.Context)                        {}
-func (b *blockingBackend) PreservesTasksOnShutdown() bool                  { return false }
+func (b *blockingBackend) CancelTask(context.Context, *CancelParams) error              { return nil }
+func (b *blockingBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
+func (b *blockingBackend) Shutdown(context.Context)                                     {}
+func (b *blockingBackend) PreservesTasksOnShutdown() bool                               { return false }
 
 func TestNewValidatesOneShotBackendCapabilityBeforeConstruction(t *testing.T) {
 	for _, backendType := range []string{"", "docker", "kubernetes", "command"} {

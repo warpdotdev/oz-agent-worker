@@ -611,7 +611,7 @@ func TestWatchTaskPodsReceivesEvents(t *testing.T) {
 	}
 
 	executionID := "execution-abc"
-	watcher, err := backend.watchTaskPods(context.Background(), executionID)
+	watcher, err := backend.watchPods(context.Background(), kubernetesExecutionPodSelector(executionID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
