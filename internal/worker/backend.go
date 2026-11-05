@@ -188,9 +188,7 @@ type TaskParams struct {
 	// Sidecars is the unified list of sidecar mounts for this task. The Warp agent
 	// sidecar (mounted at /agent) is included as the first entry when present, followed
 	// by any additional sidecars from the assignment. Backends that don't use sidecars
-	// can ignore this. Images are already remapped. An entry with a FallbackImage (an
-	// official ACP sidecar) is mounted with that image instead when its own cannot be
-	// pulled; the Docker and Kubernetes backends do so, others ignore it.
+	// can ignore this.
 	Sidecars []types.SidecarMount
 
 	// InstanceShape, when non-nil, is the resolved compute size for this task.
@@ -251,24 +249,7 @@ type TaskFailure struct {
 	failureDetails *types.FailureDetails
 	// Kubernetes failures require termination unless execution was observed stopped.
 	jobDisposition jobFailureDisposition
-	// sidecarPull describes the sidecar image pull this failure reports, when it is
-	// one. It is never serialized.
-	sidecarPull *sidecarPullFailure
-	err         error
-}
-
-// sidecarPullFailure describes a sidecar image pull that a Kubernetes pod reported
-// as failed.
-type sidecarPullFailure struct {
-	// index is the sidecar's index into TaskParams.Sidecars.
-	index int
-	// container is the pod container that reported the failure.
-	container string
-	// reason is that container's waiting reason: ErrImagePull or ImagePullBackOff.
-	reason string
-	// confirmed is set once the attempt has seen the pull fail again after the
-	// kubelet backed off, which is what makes the image worth remembering.
-	confirmed bool
+	err            error
 }
 
 func (e *TaskFailure) Error() string {
@@ -309,38 +290,4 @@ func taskFailureDetails(err error) *types.FailureDetails {
 		return failure.failureDetails
 	}
 	return nil
-}
-
-// withPullFailedSidecar records that err is the failed sidecar image pull pull.
-func withPullFailedSidecar(err error, pull sidecarPullFailure) error {
-	var failure *TaskFailure
-	if errors.As(err, &failure) {
-		failure.sidecarPull = &pull
-	}
-	return err
-}
-
-// taskFailureSidecarPull returns the sidecar pull recorded by withPullFailedSidecar.
-func taskFailureSidecarPull(err error) (sidecarPullFailure, bool) {
-	var failure *TaskFailure
-	if errors.As(err, &failure) && failure.sidecarPull != nil {
-		return *failure.sidecarPull, true
-	}
-	return sidecarPullFailure{}, false
-}
-
-// taskFailurePullFailedSidecar returns the index of the sidecar whose pull err
-// reports as failed.
-func taskFailurePullFailedSidecar(err error) (int, bool) {
-	pull, ok := taskFailureSidecarPull(err)
-	return pull.index, ok
-}
-
-// confirmSidecarPullFailure marks the sidecar pull recorded on err as confirmed:
-// the attempt saw it fail again after the kubelet's back-off.
-func confirmSidecarPullFailure(err error) {
-	var failure *TaskFailure
-	if errors.As(err, &failure) && failure.sidecarPull != nil {
-		failure.sidecarPull.confirmed = true
-	}
 }

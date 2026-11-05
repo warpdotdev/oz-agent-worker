@@ -889,9 +889,7 @@ func (w *Worker) sidecarMounts(sidecarImage string, additional []types.SidecarMo
 	}
 	sidecars = append(sidecars, additional...)
 	for i := range sidecars {
-		assigned := sidecars[i].Image
-		sidecars[i].Image = w.config.SidecarImageMappings.Remap(assigned)
-		sidecars[i].FallbackImage = sidecarFallbackImage(w.config.SidecarImageMappings, assigned, sidecars[i].Image)
+		sidecars[i].Image = w.config.SidecarImageMappings.Remap(sidecars[i].Image)
 	}
 	return sidecars
 }

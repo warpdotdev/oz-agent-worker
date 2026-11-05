@@ -23,11 +23,6 @@ import (
 const (
 	kubernetesAPIRequestTimeout = 30 * time.Second
 	kubernetesCleanupTimeout    = 2 * time.Minute
-
-	// kubernetesJobReplaceTimeout bounds the wait for a Job, and with foreground
-	// deletion its pods, to be gone before it is recreated under the same name.
-	kubernetesJobReplaceTimeout      = 90 * time.Second
-	kubernetesJobReplacePollInterval = time.Second
 )
 
 type jobFailureDisposition uint8
@@ -236,37 +231,10 @@ func (b *KubernetesBackend) jobPodsStopped(ctx context.Context, job *batchv1.Job
 }
 
 func (b *KubernetesBackend) deleteTaskJob(ctx context.Context, jobName string, uid *k8stypes.UID) error {
-	return b.deleteTaskJobWithPropagation(ctx, jobName, uid, metav1.DeletePropagationBackground)
-}
-
-// waitForJobGone polls until job no longer exists, for at most
-// kubernetesJobReplaceTimeout. A Job recreated under the same name in the meantime
-// is an error. Transient API errors are retried until the deadline.
-func (b *KubernetesBackend) waitForJobGone(ctx context.Context, job *batchv1.Job) error {
-	waitCtx, cancel := context.WithTimeout(ctx, kubernetesJobReplaceTimeout)
-	defer cancel()
-	return wait.PollUntilContextCancel(waitCtx, kubernetesJobReplacePollInterval, true, func(ctx context.Context) (bool, error) {
-		requestCtx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
-		defer cancel()
-		current, err := b.clientset.BatchV1().Jobs(b.config.Namespace).Get(requestCtx, job.Name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return true, nil
-		}
-		if err != nil {
-			log.Debugf(ctx, "Waiting for Kubernetes Job %s to be deleted: %v", job.Name, err)
-			return false, nil
-		}
-		if current.UID != job.UID {
-			return false, fmt.Errorf("job %s was replaced while waiting for its deletion", job.Name)
-		}
-		return false, nil
-	})
-}
-
-func (b *KubernetesBackend) deleteTaskJobWithPropagation(ctx context.Context, jobName string, uid *k8stypes.UID, propagation metav1.DeletionPropagation) error {
 	_, err := retryKubernetesAPI(ctx, kubernetesAPIBackoff(), func() (struct{}, error) {
 		requestCtx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
 		defer cancel()
+		propagation := metav1.DeletePropagationBackground
 		options := metav1.DeleteOptions{PropagationPolicy: &propagation}
 		if uid != nil {
 			options.Preconditions = &metav1.Preconditions{UID: uid}

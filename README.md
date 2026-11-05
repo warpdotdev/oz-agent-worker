@@ -94,17 +94,15 @@ backend:
 - Mappings act once on the assigned repositories. A mapped destination is not
   remapped again. Unmatched images and mount options are unchanged; no sidecars
   are injected.
-- Claude Code and Codex each have two official sidecar images: the CLI image
-  (`docker.io/warpdotdev/warp-{harness}-cli-sidecar`, used when the harness is
-  driven through a terminal) and the ACP image
-  (`docker.io/warpdotdev/warp-{harness}-acp-sidecar`, used when it is driven over
-  the Agent Client Protocol). Mirror and map **both** repositories. An unmapped
-  ACP repository is pulled from Docker Hub as assigned; if that pull fails, the
-  Docker and Kubernetes backends mount
-  `docker.io/warpdotdev/warp-{harness}-cli-sidecar:latest`, passed through the
-  same mappings, so the run continues over a terminal. ACP images are assigned
-  by digest, so the fallback names the CLI image's `latest` tag: mirror that tag
-  or pin the CLI mapping's destination. See [ACP support](#acp-support).
+- Claude Code and Codex runs driven over the Agent Client Protocol (ACP) are
+  assigned the harness's ACP sidecar, `docker.io/warpdotdev/warp-{harness}-acp-sidecar`,
+  pinned by digest. When a harness's CLI sidecar repository
+  (`docker.io/warpdotdev/warp-{harness}-cli-sidecar`) is mapped and its ACP
+  repository is not, the worker maps the ACP repository to the CLI destination,
+  at the destination's pinned version or `latest`. Those runs then use your
+  mirrored CLI sidecar and drive the harness through a terminal instead of
+  pulling the ACP sidecar from Docker Hub. To use ACP, mirror the ACP sidecar and
+  map its repository as well.
 - Legacy `sidecar_image` and Kubernetes `coding_cli_sidecars` settings are
   converted into mappings at startup. `sidecar_image` maps
   `docker.io/warpdotdev/warp-agent`; each `coding_cli_sidecars` harness maps both
@@ -126,51 +124,6 @@ configuration available to the worker process when using private mirrors.
 Kubernetes uses `imagePullSecrets` from `backend.kubernetes.pod_template`.
 Operators remain responsible for mirroring the selected versions and ensuring
 that pinned custom images are compatible with the server and agent.
-
-### ACP support
-
-Warp can drive Claude Code and Codex over the Agent Client Protocol (ACP),
-which carries structured content such as file attachments, instead of through
-a terminal (PTY). An ACP run is assigned the
-`warpdotdev/warp-{harness}-acp-sidecar` image at the same mount path the CLI
-image uses. If the sandbox has no ACP adapter when the harness starts, for
-example because the ACP image was not mounted, the agent falls back to a
-terminal automatically. The worker needs no configuration for this:
-
-- **Docker and Kubernetes** mount every assigned sidecar, so Claude Code and
-  Codex run over ACP as soon as the ACP image is pullable. With
-  `sidecar_image_mappings` and a private mirror, mirror
-  `warp-claude-acp-sidecar` and `warp-codex-acp-sidecar` alongside the CLI
-  images, or ACP runs will try to pull them from Docker Hub. A legacy
-  `coding_cli_sidecars` entry maps the ACP repository to the same image as the
-  CLI repository, so its harness falls back to a terminal unless that image
-  carries the ACP adapter; see
-  [Remapping sidecar images](#remapping-sidecar-images).
-- When the ACP image cannot be pulled (for example, Docker Hub is blocked or
-  the mirror lacks it), **Docker and Kubernetes** mount the harness's CLI image
-  at the same path instead, and the agent drives the harness through a
-  terminal. Docker pulls the CLI image within the same task. Kubernetes sees
-  the pull fail on the task Pod, deletes the task Job, and creates it once more
-  under the same name with the CLI image. On Kubernetes the worker first keeps
-  watching the Pod for up to 30 seconds after the pull fails: if the pull then
-  succeeds, the run continues with the ACP image; if it fails again after the
-  kubelet's back-off, or the 30 seconds run out, the Job is replaced. A worker
-  remembers an ACP image that could not be obtained for 10 minutes and mounts
-  the CLI image directly in the meantime: on Docker, when the registry refused
-  or failed the pull or the image is missing under pull policy `Never`; on
-  Kubernetes, when the pull failed again within those 30 seconds. A pull that
-  failed only once, a Docker daemon error or a platform mismatch still falls
-  back for that run but is not remembered, so one transient failure does not
-  send the worker's runs to a terminal for 10 minutes. The worker logs a
-  warning naming both images. The fallback is skipped when the CLI image
-  resolves to the same reference as the ACP image, as with a legacy
-  `coding_cli_sidecars` entry pinned to one tag, since that pull would fail
-  again.
-- **Direct** never mounts sidecars, so its runs use the `claude` and `codex`
-  CLIs on the host's `PATH` through a terminal.
-- **Command** gets ACP only when the dispatch runtime mounts the payload's
-  `sidecars` at their `mount_path`; a runtime that ignores them leaves the
-  agent to fall back to a terminal.
 
 ### Image releases and pinning
 
@@ -194,10 +147,6 @@ docker pull warpdotdev/oz-agent-worker@sha256:<digest>
 ### Direct
 
 The direct backend executes tasks directly on the host instead of inside Docker or Kubernetes. It requires the `oz` CLI to be available on `PATH` (or configured explicitly with `backend.direct.oz_path`) and stores per-task workspaces under `backend.direct.workspace_root` (default: `/var/lib/oz/workspaces`).
-
-Sidecars are not materialized on the host, so Claude Code and Codex runs on this
-backend use the `claude` and `codex` CLIs already on the host's `PATH` through a
-terminal; see [ACP support](#acp-support).
 
 Example config:
 
@@ -369,7 +318,7 @@ backend:
       claude: "registry.internal.example.com/my-claude-wrapper:v1"
 ```
 
-  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked. The same image is mounted for ACP runs, so the agent falls back to a terminal unless the image also carries the ACP adapter. To run ACP from a private registry, use `sidecar_image_mappings` instead and map the ACP repository to its own image. Build a custom ACP image on top of the matching official `warp-{harness}-acp-sidecar` image so that it keeps the ACP adapter the agent expects; see [ACP support](#acp-support)
+  The custom image must have the harness binary reachable in the path that the Warp agent entrypoint scans (typically `/usr/local/bin` inside the sidecar image). `claude` must be in `PATH` when the harness process is invoked
 - when `use_image_volumes` is omitted, the worker probes native image-volume support with a real startup Job. A successful probe enables image volumes; any failure, including an inconclusive timeout or registry/network error, is logged and falls back to root init containers that materialize sidecars into `emptyDir` volumes
 - set `use_image_volumes: true` to require native image volumes and fail worker startup if the probe fails, or `use_image_volumes: false` to skip the image-volume probe and always use the legacy copy path
 - image-volume sidecar mounts are read-only. When image volumes are enabled, each read-only sidecar uses an image volume, while each read-write sidecar uses a root init container to copy its contents into an `emptyDir`. A task can mix both paths in automatic or forced-on mode; writable sidecars still require permission to run root init containers
@@ -458,9 +407,6 @@ Kubernetes stops active Pods and marks the Job failed; the Job keeps its existin
 TTL policy. Expiration can delete active Pods, so available diagnostics are
 captured first. Unsuccessful expiration is reported and may require intervention.
 Explicit cancellation still deletes Jobs; worker shutdown preserves active Jobs.
-One exception: when a Job fails because its ACP sidecar image cannot be pulled,
-the worker deletes it, regardless of `cleanup`, and recreates it under the same
-name with the CLI sidecar; see [ACP support](#acp-support).
 
 Transient Kubernetes API observation errors are retried with bounded backoff.
 
