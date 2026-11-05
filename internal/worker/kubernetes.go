@@ -274,7 +274,16 @@ func sidecarFallbackIndex(sidecars []types.SidecarMount, err error) (int, bool) 
 func (b *KubernetesBackend) retryWithSidecarFallbacks(ctx context.Context, params *TaskParams, job *batchv1.Job, firstRes ExecuteResult) ExecuteResult {
 	failedIndex, _ := sidecarFallbackIndex(params.Sidecars, firstRes.Error)
 	failed := params.Sidecars[failedIndex]
-	b.sidecarPullFailures.record(failed.Image)
+	// The retry below keeps this run alive either way. The image is remembered as
+	// failed only once the kubelet has backed off from pulling it: a first
+	// ErrImagePull can be a registry rate limit, a pull secret not yet synced, or a
+	// network blip, and remembering it would send every run on this worker to a
+	// terminal for sidecarPullFailureTTL.
+	if taskFailureSidecarPullBackedOff(firstRes.Error) {
+		b.sidecarPullFailures.record(failed.Image)
+	} else {
+		log.Infof(ctx, "Not remembering the failed pull of ACP sidecar image %s: the kubelet reported a first failure, not a back-off", failed.Image)
+	}
 	reportSidecarFallback(ctx, "kubernetes", failed, firstRes.Error)
 
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kubernetesCleanupTimeout)
@@ -1414,16 +1423,22 @@ func kubernetesSidecarVolumeName(i int, suffix string) string {
 }
 
 // withPulledSidecar records on err which sidecar's image failed to pull, when the
-// waiting container's failure is an image pull that can be traced to one.
+// waiting container's failure is an image pull that can be traced to one, and
+// whether the kubelet had backed off from that pull (ImagePullBackOff) rather than
+// reporting a first failed attempt (ErrImagePull).
 func withPulledSidecar(pod *corev1.Pod, containerName string, waiting *corev1.ContainerStateWaiting, reason metrics.TaskFailureReason, err error) error {
 	if reason != metrics.TaskFailureReasonImagePull {
 		return err
 	}
 	if i, ok := pullFailedSidecarIndex(pod, containerName, waiting); ok {
-		return withPullFailedSidecar(err, i)
+		return withPullFailedSidecar(err, i, waiting != nil && waiting.Reason == kubernetesImagePullBackOffReason)
 	}
 	return err
 }
+
+// kubernetesImagePullBackOffReason is the waiting reason the kubelet reports once it
+// has given up retrying an image pull for now, after at least one ErrImagePull.
+const kubernetesImagePullBackOffReason = "ImagePullBackOff"
 
 // pullFailedSidecarIndex returns the index into TaskParams.Sidecars of the sidecar
 // whose image the waiting container could not pull. A copy-sidecar-<i> init container

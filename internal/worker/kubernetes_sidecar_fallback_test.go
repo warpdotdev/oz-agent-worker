@@ -87,6 +87,15 @@ func TestInspectPodFailureRecordsPulledSidecar(t *testing.T) {
 	if i, ok := taskFailurePullFailedSidecar(err); !ok || i != 1 {
 		t.Fatalf("pulled sidecar = %d, %v; want 1 (err %v)", i, ok, err)
 	}
+	if taskFailureSidecarPullBackedOff(err) {
+		t.Fatalf("a first ErrImagePull must not count as a back-off: %v", err)
+	}
+
+	pod.Status.InitContainerStatuses[1].State.Waiting.Reason = "ImagePullBackOff"
+	err = backend.inspectPodFailureAt(context.Background(), pod, nil, kubernetesFailureSourcePodWatch)
+	if i, ok := taskFailurePullFailedSidecar(err); !ok || i != 1 || !taskFailureSidecarPullBackedOff(err) {
+		t.Fatalf("pulled sidecar = %d, %v, backed off = %v; want 1 and backed off (err %v)", i, ok, taskFailureSidecarPullBackedOff(err), err)
+	}
 
 	pod.Status.InitContainerStatuses[1].State.Waiting.Reason = "CreateContainerConfigError"
 	err = backend.inspectPodFailureAt(context.Background(), pod, nil, kubernetesFailureSourcePodWatch)
@@ -102,6 +111,9 @@ type fallbackTestCluster struct {
 	client       *fake.Clientset
 	imageVolumes bool
 	blocked      map[string]bool
+	// firstFailure makes the kubelet report a blocked image as a first failed pull
+	// (ErrImagePull) instead of a back-off (ImagePullBackOff).
+	firstFailure bool
 
 	mu      sync.Mutex
 	created []*batchv1.Job
@@ -169,6 +181,9 @@ func (c *fallbackTestCluster) failingPod(job *batchv1.Job) *corev1.Pod {
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
 	}
 	pulling := func(image string) *corev1.ContainerStateWaiting {
+		if c.firstFailure {
+			return &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: fmt.Sprintf("rpc error: code = Unknown desc = failed to pull and unpack image %q: toomanyrequests", image)}
+		}
 		return &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: fmt.Sprintf("Back-off pulling image %q", image)}
 	}
 	for _, container := range spec.InitContainers {
@@ -304,6 +319,43 @@ func TestKubernetesSidecarFallbackReplacesJob(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestKubernetesSidecarFallbackRemembersOnlyBackOff checks that a first failed pull
+// (ErrImagePull) still retries the task with the fallback, so the run stays alive, but
+// is not remembered: the next task tries the ACP image again. Only a back-off
+// (ImagePullBackOff, covered by TestKubernetesSidecarFallbackReplacesJob) is cached.
+func TestKubernetesSidecarFallbackRemembersOnlyBackOff(t *testing.T) {
+	for _, imageVolumes := range []bool{false, true} {
+		t.Run(fmt.Sprintf("imageVolumes=%v", imageVolumes), func(t *testing.T) {
+			cluster := newFallbackTestCluster(t, imageVolumes, fallbackTestACPImage)
+			cluster.firstFailure = true
+			backend := cluster.backend()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			result := backend.ExecuteTask(ctx, fallbackTestParams("task-1"))
+			if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
+				t.Fatalf("result = %+v, want the retried Job to complete", result)
+			}
+			jobs := cluster.jobs()
+			if len(jobs) != 2 || cluster.sidecarImage(jobs[0], 1) != fallbackTestACPImage || cluster.sidecarImage(jobs[1], 1) != fallbackTestCLIImage {
+				t.Fatalf("created %d Jobs; want the ACP attempt and then the fallback", len(jobs))
+			}
+			if backend.sidecarPullFailures.recent(fallbackTestACPImage) {
+				t.Fatal("a first ErrImagePull must not be remembered")
+			}
+
+			result = backend.ExecuteTask(ctx, fallbackTestParams("task-2"))
+			if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
+				t.Fatalf("second task result = %+v", result)
+			}
+			jobs = cluster.jobs()
+			if len(jobs) != 4 || cluster.sidecarImage(jobs[2], 1) != fallbackTestACPImage || cluster.sidecarImage(jobs[3], 1) != fallbackTestCLIImage {
+				t.Fatalf("second task must try the ACP image again before falling back; created %d Jobs", len(jobs)-2)
+			}
+		})
 	}
 }
 

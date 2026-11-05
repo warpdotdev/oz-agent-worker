@@ -137,6 +137,84 @@ func TestPrepareSidecarsFallsBackFromACPImage(t *testing.T) {
 		if want := []string{"inspect", "inspect", "inspect", "volume_inspect"}; !reflect.DeepEqual(engine.calls, want) {
 			t.Fatalf("engine calls = %v, want %v (no registry contact)", engine.calls, want)
 		}
+		if !backend.sidecarPullFailures.recent(acpImage) {
+			t.Fatal("an ACP image missing under pull policy Never must be remembered")
+		}
+	})
+
+	t.Run("a failure other than the pull falls back for this task but is not remembered", func(t *testing.T) {
+		inspectUnavailable := func(req *http.Request) *http.Response {
+			return mockEngineErrorResponse(t, req, http.StatusInternalServerError, "daemon restarting")
+		}
+		inspectWrongPlatform := func(req *http.Request) *http.Response {
+			return mockImageInspectResponse(t, req, "linux", "arm64", "sha256:a11a11a11a11a11a11a11")
+		}
+		for _, tc := range []struct {
+			name, policy string
+			// inspectResponses scripts the ACP preparation's inspects, followed by the
+			// fallback's: inspect missing then pull under IfNotPresent, pull then inspect
+			// under Always.
+			inspectResponses []func(*http.Request) *http.Response
+			wantPulled       []string
+			wantCalls        []string
+		}{
+			{
+				name: "the daemon not answering an inspect", policy: PullPolicyIfNotPresent,
+				inspectResponses: []func(*http.Request) *http.Response{inspectUnavailable, inspectMissing, inspectOK},
+				wantPulled:       []string{cliRepo},
+				// ACP inspect fails -> CLI inspect missing -> CLI pull -> platform check -> digest -> volume.
+				wantCalls: []string{"inspect", "inspect", "pull", "inspect", "inspect", "volume_inspect"},
+			},
+			{
+				name: "a platform mismatch", policy: PullPolicyAlways,
+				inspectResponses: []func(*http.Request) *http.Response{inspectWrongPlatform, inspectOK},
+				wantPulled:       []string{acpRepo, cliRepo},
+				// ACP pull -> wrong platform -> CLI pull -> platform check -> digest -> volume.
+				wantCalls: []string{"pull", "inspect", "pull", "inspect", "inspect", "volume_inspect"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var pulled []string
+				engine := &fakeDockerEngine{t: t, volumeFound: true, inspectResponses: tc.inspectResponses, pullResponse: func(req *http.Request) *http.Response {
+					pulled = append(pulled, req.URL.Query().Get("fromImage"))
+					return mockEngineResponse(req, http.StatusOK, "text/plain", "pulling image...\n")
+				}}
+				backend := newTestDockerBackend(t, engine, tc.policy)
+
+				binds, err := backend.prepareSidecars(context.Background(), backend.dockerClient, acpSidecar, nil)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(binds) != 1 || !strings.HasPrefix(binds[0], "warpdotdev-warp-claude-cli-sidecar-") {
+					t.Fatalf("binds = %v, want the CLI sidecar volume", binds)
+				}
+				if !reflect.DeepEqual(pulled, tc.wantPulled) {
+					t.Fatalf("pulled = %v, want %v", pulled, tc.wantPulled)
+				}
+				if !reflect.DeepEqual(engine.calls, tc.wantCalls) {
+					t.Fatalf("engine calls = %v, want %v", engine.calls, tc.wantCalls)
+				}
+				if backend.sidecarPullFailures.recent(acpImage) {
+					t.Fatal("a failure that is not the image's pull must not be remembered")
+				}
+
+				// The next task tries the ACP image again, and uses it once it is fine.
+				pulled, engine.calls, engine.inspectCalls = nil, nil, 0
+				engine.inspectResponses = []func(*http.Request) *http.Response{inspectOK}
+				binds, err = backend.prepareSidecars(context.Background(), backend.dockerClient, acpSidecar, nil)
+				if err != nil {
+					t.Fatalf("unexpected error on the second task: %v", err)
+				}
+				if len(binds) != 1 || !strings.HasPrefix(binds[0], "warpdotdev-warp-claude-acp-sidecar-") {
+					t.Fatalf("second task binds = %v, want the ACP sidecar volume", binds)
+				}
+				for _, repo := range pulled {
+					if repo == cliRepo {
+						t.Fatalf("second task pulled %v; the fallback must not be used once the ACP image is fine", pulled)
+					}
+				}
+			})
+		}
 	})
 
 	t.Run("a sidecar without a fallback fails as before", func(t *testing.T) {

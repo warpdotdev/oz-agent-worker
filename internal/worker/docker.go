@@ -399,6 +399,11 @@ func normalizeDockerPullPolicy(policy string) string {
 // policy. authStr is used for registry authentication only for the calls that actually pull.
 // setupEvents is non-nil for the main task image and nil for sidecars, whose image resolution
 // is already included in the sidecar-preparation phase.
+//
+// A failure to obtain the image itself (the registry refused or failed the pull, or the
+// image is missing locally under pull policy Never) is marked with imageUnavailableError.
+// Other failures, such as the daemon not answering an inspect or a platform mismatch, say
+// nothing about whether the image can be pulled and are returned unmarked.
 func (b *DockerBackend) prepareImage(ctx context.Context, imageName, authStr string, setupEvents *setupEventReporter) error {
 	switch normalizeDockerPullPolicy(b.config.ImagePullPolicy) {
 	case PullPolicyNever:
@@ -439,10 +444,27 @@ func (b *DockerBackend) useLocalImageOnly(ctx context.Context, imageName string)
 		log.Infof(ctx, "Using local image (pull policy %s): %s", PullPolicyNever, imageName)
 		return b.validateImagePlatform(inspect, imageName)
 	case cerrdefs.IsNotFound(err):
-		return fmt.Errorf("image %s not found locally and pull policy is %s", imageName, PullPolicyNever)
+		return imageUnavailable(fmt.Errorf("image %s not found locally and pull policy is %s", imageName, PullPolicyNever))
 	default:
 		return fmt.Errorf("failed to inspect local image %s: %w", imageName, err)
 	}
+}
+
+// imageUnavailableError marks a prepareImage failure in which the image itself could not
+// be obtained, as opposed to a failure of the daemon or of the image's contents. The
+// sidecar fallback uses it to decide whether a failed ACP image is worth remembering.
+type imageUnavailableError struct{ err error }
+
+func (e *imageUnavailableError) Error() string { return e.err.Error() }
+func (e *imageUnavailableError) Unwrap() error { return e.err }
+
+func imageUnavailable(err error) error { return &imageUnavailableError{err: err} }
+
+// isImageUnavailable reports whether err, or an error it wraps, was marked by
+// imageUnavailable.
+func isImageUnavailable(err error) bool {
+	var unavailable *imageUnavailableError
+	return errors.As(err, &unavailable)
 }
 
 // validateImagePlatform verifies that a resolved image's platform matches this Docker daemon's
@@ -475,7 +497,7 @@ func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr
 	}
 	reader, err := b.dockerClient.ImagePull(ctx, imageName, pullOptions)
 	if err != nil {
-		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
+		return imageUnavailable(fmt.Errorf("failed to pull image %s: %w", imageName, err))
 	}
 	defer func() {
 		if closeErr := reader.Close(); closeErr != nil {
@@ -490,7 +512,13 @@ func (b *DockerBackend) pullImage(ctx context.Context, imageName string, authStr
 
 	inspect, err := b.dockerClient.ImageInspect(ctx, imageName)
 	if err != nil {
-		return fmt.Errorf("failed to inspect pulled image %s: %w", imageName, err)
+		err = fmt.Errorf("failed to inspect pulled image %s: %w", imageName, err)
+		// The daemon reports a pull that fails part-way as an error in the stream, not
+		// as a failed request, so the image being absent now is the pull failing.
+		if cerrdefs.IsNotFound(err) {
+			return imageUnavailable(err)
+		}
+		return err
 	}
 	if err := b.validateImagePlatform(inspect, imageName); err != nil {
 		return err
@@ -739,6 +767,12 @@ func (b *DockerBackend) prepareSidecars(ctx context.Context, dockerClient *clien
 // sidecar has a fallback, it prepares and returns the fallback instead; a sidecar whose
 // image failed within sidecarPullFailureTTL goes straight to its fallback. Only image
 // preparation falls back: later digest and volume errors still fail the task.
+//
+// Only a failure to obtain the image (a failed pull, or an image missing under pull
+// policy Never) is remembered. A daemon error or a platform mismatch still falls back
+// for this task, so the run stays alive, but the image is tried again next time: the
+// daemon may be back, and remembering it would send every run on the worker to a
+// terminal for sidecarPullFailureTTL over one hiccup.
 func (b *DockerBackend) prepareSidecarImage(ctx context.Context, sidecar types.SidecarMount) (string, error) {
 	if sidecar.FallbackImage != "" && b.sidecarPullFailures.recent(sidecar.Image) {
 		reportSidecarFallback(ctx, "docker", sidecar, nil)
@@ -757,7 +791,9 @@ func (b *DockerBackend) prepareSidecarImage(ctx context.Context, sidecar types.S
 	if sidecar.FallbackImage == "" || ctx.Err() != nil {
 		return "", err
 	}
-	b.sidecarPullFailures.record(sidecar.Image)
+	if isImageUnavailable(err) {
+		b.sidecarPullFailures.record(sidecar.Image)
+	}
 	reportSidecarFallback(ctx, "docker", sidecar, err)
 	if fallbackErr := b.prepareImage(ctx, sidecar.FallbackImage, b.getRegistryAuth(ctx, sidecar.FallbackImage), nil); fallbackErr != nil {
 		return "", fmt.Errorf("%w; fallback sidecar image %s also failed: %v", err, sidecar.FallbackImage, fallbackErr)

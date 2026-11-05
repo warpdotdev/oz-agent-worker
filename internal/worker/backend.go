@@ -255,7 +255,10 @@ type TaskFailure struct {
 	// image could not be pulled, when hasPullFailedSidecar. It is never serialized.
 	pullFailedSidecar    int
 	hasPullFailedSidecar bool
-	err                  error
+	// pullFailedSidecarBackedOff reports that the runtime gave up on pulling that
+	// sidecar's image (Kubernetes ImagePullBackOff) rather than failing a first pull.
+	pullFailedSidecarBackedOff bool
+	err                        error
 }
 
 func (e *TaskFailure) Error() string {
@@ -299,12 +302,14 @@ func taskFailureDetails(err error) *types.FailureDetails {
 }
 
 // withPullFailedSidecar records that err is the failed image pull of the sidecar at
-// index i of TaskParams.Sidecars.
-func withPullFailedSidecar(err error, i int) error {
+// index i of TaskParams.Sidecars. backedOff is whether the runtime had given up
+// retrying that pull, as opposed to reporting a first failed attempt.
+func withPullFailedSidecar(err error, i int, backedOff bool) error {
 	var failure *TaskFailure
 	if errors.As(err, &failure) {
 		failure.pullFailedSidecar = i
 		failure.hasPullFailedSidecar = true
+		failure.pullFailedSidecarBackedOff = backedOff
 	}
 	return err
 }
@@ -316,4 +321,11 @@ func taskFailurePullFailedSidecar(err error) (int, bool) {
 		return failure.pullFailedSidecar, true
 	}
 	return 0, false
+}
+
+// taskFailureSidecarPullBackedOff reports whether the sidecar pull recorded by
+// withPullFailedSidecar had been given up on by the runtime.
+func taskFailureSidecarPullBackedOff(err error) bool {
+	var failure *TaskFailure
+	return errors.As(err, &failure) && failure.hasPullFailedSidecar && failure.pullFailedSidecarBackedOff
 }

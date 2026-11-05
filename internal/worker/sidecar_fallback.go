@@ -133,7 +133,11 @@ func reportSidecarFallback(ctx context.Context, backend string, sidecar types.Si
 // sidecarPullFailureCache remembers sidecar images that recently failed to pull, so a
 // backend in an environment that cannot reach them mounts the fallback straight away
 // instead of paying for a failed pull on every task. Keys are the exact references a
-// backend tried, so a new digest or a changed mapping is tried again at once. The zero
+// backend tried, so a new digest or a changed mapping is tried again at once. Backends
+// record an image only when the failure says the image cannot be obtained (a Docker
+// pull the registry refused or failed, an image missing under pull policy Never, a
+// kubelet ImagePullBackOff), not a first failed attempt or a daemon error, so one
+// transient failure does not hold every run on the worker to the fallback. The zero
 // value is ready to use.
 type sidecarPullFailureCache struct {
 	mu       sync.Mutex
