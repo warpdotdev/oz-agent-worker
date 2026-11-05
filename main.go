@@ -448,7 +448,7 @@ func withACPSidecarFallbacks(mappings map[string]string) map[string]string {
 			mapped[named.String()] = true
 		}
 	}
-	var withFallbacks map[string]string
+	withFallbacks := maps.Clone(mappings)
 	for source, destination := range mappings {
 		named, err := reference.ParseNormalizedNamed(source)
 		if err != nil {
@@ -469,13 +469,7 @@ func withACPSidecarFallbacks(mappings map[string]string) map[string]string {
 		if err != nil {
 			continue
 		}
-		if withFallbacks == nil {
-			withFallbacks = maps.Clone(mappings)
-		}
 		withFallbacks[acpSource] = reference.TagNameOnly(to).String()
-	}
-	if withFallbacks == nil {
-		return mappings
 	}
 	return withFallbacks
 }
