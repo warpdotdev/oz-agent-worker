@@ -527,6 +527,39 @@ func TestMergeConfigSidecarMappingsRejectLegacyOptions(t *testing.T) {
 	}
 }
 
+func TestMergeConfigMapsUnmappedACPSidecarToCLIDestination(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name, mappings, image, want string
+	}{
+		{"unpinned CLI destination uses latest", "warpdotdev/warp-claude-cli-sidecar: mirror.example/claude-cli", "docker.io/warpdotdev/warp-claude-acp-sidecar@" + digest, "mirror.example/claude-cli:latest"},
+		{"pinned CLI destination is kept", "docker.io/warpdotdev/warp-codex-cli-sidecar: mirror.example/codex:approved", "warpdotdev/warp-codex-acp-sidecar:v2@" + digest, "mirror.example/codex:approved"},
+		{"mapped ACP repository wins", "warpdotdev/warp-claude-cli-sidecar: mirror.example/claude-cli\n      warpdotdev/warp-claude-acp-sidecar: mirror.example/claude-acp", "warpdotdev/warp-claude-acp-sidecar@" + digest, "mirror.example/claude-acp@" + digest},
+		{"other harness unchanged", "warpdotdev/warp-claude-cli-sidecar: mirror.example/claude-cli", "warpdotdev/warp-codex-acp-sidecar@" + digest, "warpdotdev/warp-codex-acp-sidecar@" + digest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			content := "worker_id: test-worker\nbackend:\n  docker:\n    sidecar_image_mappings:\n      " + tc.mappings + "\n"
+			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc, err := mergeConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := wc.SidecarImageMappings.Remap(tc.image); got != tc.want {
+				t.Fatalf("Remap(%q) = %q, want %q", tc.image, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSidecarImageMappingsFromYAML(t *testing.T) {
 	for _, backend := range []string{"docker", "kubernetes"} {
 		t.Run(backend, func(t *testing.T) {

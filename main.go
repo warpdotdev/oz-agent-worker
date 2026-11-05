@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/signal"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/distribution/reference"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -423,11 +425,53 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			sidecarImageMappings[fmt.Sprintf("warpdotdev/warp-%s-acp-sidecar", harness)] = image
 		}
 	}
+	sidecarImageMappings = withACPSidecarFallbacks(sidecarImageMappings)
 	wc.SidecarImageMappings, err = common.NewImageRemapper(sidecarImageMappings)
 	if err != nil {
 		return worker.Config{}, fmt.Errorf("invalid backend.%s.sidecar_image_mappings: %w", backendType, err)
 	}
 	return wc, nil
+}
+
+// withACPSidecarFallbacks returns mappings with an entry added for each official ACP
+// sidecar repository that is not mapped while its harness's CLI sidecar repository
+// is. The ACP repository maps to the CLI destination, so an operator whose mirror
+// only carries the CLI sidecar keeps running that harness, through a terminal, when
+// the server assigns the ACP sidecar. A CLI destination without a version is pinned
+// to latest, because the server pins ACP images by a digest the CLI image lacks.
+// Invalid entries are left for NewImageRemapper to reject.
+func withACPSidecarFallbacks(mappings map[string]string) map[string]string {
+	const cliPrefix, cliSuffix = "docker.io/warpdotdev/warp-", "-cli-sidecar"
+	mapped := make(map[string]bool, len(mappings))
+	for source := range mappings {
+		if named, err := reference.ParseNormalizedNamed(source); err == nil {
+			mapped[named.String()] = true
+		}
+	}
+	withFallbacks := maps.Clone(mappings)
+	for source, destination := range mappings {
+		named, err := reference.ParseNormalizedNamed(source)
+		if err != nil {
+			continue
+		}
+		harness, ok := strings.CutPrefix(named.String(), cliPrefix)
+		if !ok {
+			continue
+		}
+		if harness, ok = strings.CutSuffix(harness, cliSuffix); !ok || harness == "" {
+			continue
+		}
+		acpSource := cliPrefix + harness + "-acp-sidecar"
+		if mapped[acpSource] {
+			continue
+		}
+		to, err := reference.ParseNormalizedNamed(destination)
+		if err != nil {
+			continue
+		}
+		withFallbacks[acpSource] = reference.TagNameOnly(to).String()
+	}
+	return withFallbacks
 }
 
 // parseEnvFlags parses -e/--env flag values into a map.

@@ -94,6 +94,15 @@ backend:
 - Mappings act once on the assigned repositories. A mapped destination is not
   remapped again. Unmatched images and mount options are unchanged; no sidecars
   are injected.
+- Claude Code and Codex runs driven over the Agent Client Protocol (ACP) are
+  assigned the harness's ACP sidecar, `docker.io/warpdotdev/warp-{harness}-acp-sidecar`,
+  pinned by digest. When a harness's CLI sidecar repository
+  (`docker.io/warpdotdev/warp-{harness}-cli-sidecar`) is mapped and its ACP
+  repository is not, the worker maps the ACP repository to the CLI destination,
+  at the destination's pinned version or `latest`. Those runs then use your
+  mirrored CLI sidecar and drive the harness through a terminal instead of
+  pulling the ACP sidecar from Docker Hub. To use ACP, mirror the ACP sidecar and
+  map its repository as well.
 - Legacy `sidecar_image` and Kubernetes `coding_cli_sidecars` settings are
   converted into mappings at startup. `sidecar_image` maps
   `docker.io/warpdotdev/warp-agent`; each `coding_cli_sidecars` harness maps both
