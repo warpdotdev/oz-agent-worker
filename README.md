@@ -151,15 +151,18 @@ terminal automatically. The worker needs no configuration for this:
   at the same path instead, and the agent drives the harness through a
   terminal. Docker pulls the CLI image within the same task. Kubernetes sees
   the pull fail on the task Pod, deletes the task Job, and creates it once more
-  under the same name with the CLI image. A worker remembers an ACP image that
-  could not be obtained for 10 minutes and mounts the CLI image directly in the
-  meantime: on Docker, when the registry refused or failed the pull or the
-  image is missing under pull policy `Never`; on Kubernetes, when the kubelet
-  reported `ImagePullBackOff`. A first `ErrImagePull`, a Docker daemon error or
-  a platform mismatch still falls back for that run but is not remembered, so
-  one transient failure does not send the worker's runs to a terminal for 10
-  minutes. The worker logs a warning naming both images. The fallback is
-  skipped when the CLI image
+  under the same name with the CLI image. On Kubernetes the worker first keeps
+  watching the Pod for up to 30 seconds after the pull fails: if the pull then
+  succeeds, the run continues with the ACP image; if it fails again after the
+  kubelet's back-off, or the 30 seconds run out, the Job is replaced. A worker
+  remembers an ACP image that could not be obtained for 10 minutes and mounts
+  the CLI image directly in the meantime: on Docker, when the registry refused
+  or failed the pull or the image is missing under pull policy `Never`; on
+  Kubernetes, when the pull failed again within those 30 seconds. A pull that
+  failed only once, a Docker daemon error or a platform mismatch still falls
+  back for that run but is not remembered, so one transient failure does not
+  send the worker's runs to a terminal for 10 minutes. The worker logs a
+  warning naming both images. The fallback is skipped when the CLI image
   resolves to the same reference as the ACP image, as with a legacy
   `coding_cli_sidecars` entry pinned to one tag, since that pull would fail
   again.

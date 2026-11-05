@@ -275,14 +275,14 @@ func (b *KubernetesBackend) retryWithSidecarFallbacks(ctx context.Context, param
 	failedIndex, _ := sidecarFallbackIndex(params.Sidecars, firstRes.Error)
 	failed := params.Sidecars[failedIndex]
 	// The retry below keeps this run alive either way. The image is remembered as
-	// failed only once the kubelet has backed off from pulling it: a first
-	// ErrImagePull can be a registry rate limit, a pull secret not yet synced, or a
-	// network blip, and remembering it would send every run on this worker to a
-	// terminal for sidecarPullFailureTTL.
-	if taskFailureSidecarPullBackedOff(firstRes.Error) {
+	// failed only when the attempt saw the pull fail again after the kubelet's
+	// back-off (see sidecarPullWatch): a single failure can be a registry rate limit,
+	// a pull secret not yet synced, or a network blip, and remembering it would send
+	// every run on this worker to a terminal for sidecarPullFailureTTL.
+	if pull, _ := taskFailureSidecarPull(firstRes.Error); pull.confirmed {
 		b.sidecarPullFailures.record(failed.Image)
 	} else {
-		log.Infof(ctx, "Not remembering the failed pull of ACP sidecar image %s: the kubelet reported a first failure, not a back-off", failed.Image)
+		log.Infof(ctx, "Not remembering the failed pull of ACP sidecar image %s: it failed once within %s, not repeatedly", failed.Image, kubernetesSidecarPullConfirmWindow)
 	}
 	reportSidecarFallback(ctx, "kubernetes", failed, firstRes.Error)
 
@@ -627,11 +627,74 @@ func (b *KubernetesBackend) executeTaskAttempt(ctx context.Context, params *Task
 	safetyTicker := time.NewTicker(watchSafetyInterval)
 	defer safetyTicker.Stop()
 
+	// A failed pull of a sidecar that has a fallback is not acted on at once: the
+	// attempt keeps watching the pod for kubernetesSidecarPullConfirmWindow to tell a
+	// transient failure from a persistent one. See sidecarPullWatch.
+	var pullWatch *sidecarPullWatch
+	var pullWatchExpired <-chan time.Time
+	defer func() {
+		if pullWatch != nil {
+			pullWatch.timer.Stop()
+		}
+	}()
+	// observedPod handles a fresh view of pod, with the failure inspectPodFailureAt
+	// found in it, and returns the attempt's result when that ends the attempt.
+	observedPod := func(pod *corev1.Pod, failure error) (ExecuteResult, bool) {
+		if pullWatch != nil && string(pod.UID) == pullWatch.podUID {
+			switch pullWatch.observe(pod) {
+			case sidecarPullRecovered:
+				log.Infof(ctx, "Sidecar image %s is no longer failing to pull on Pod %s; continuing without its fallback", pullWatch.image, pod.Name)
+				pullWatch.timer.Stop()
+				pullWatch, pullWatchExpired = nil, nil
+			case sidecarPullConfirmed:
+				log.Warnf(ctx, "Sidecar image %s failed to pull again on Pod %s after the kubelet backed off; falling back", pullWatch.image, pod.Name)
+				confirmSidecarPullFailure(pullWatch.failure)
+				failure = pullWatch.failure
+				pullWatch.timer.Stop()
+				pullWatch, pullWatchExpired = nil, nil
+			case sidecarPullPending:
+				if failure == nil {
+					return ExecuteResult{}, false
+				}
+				if i, ok := sidecarFallbackIndex(params.Sidecars, failure); ok && i == pullWatch.pull.index {
+					return ExecuteResult{}, false
+				}
+				// Something else failed meanwhile, and that decides the attempt.
+			}
+		}
+		if failure == nil {
+			return ExecuteResult{}, false
+		}
+		if pullWatch == nil && attempt.sidecarFallback {
+			if pull, ok := taskFailureSidecarPull(failure); ok && !pull.confirmed {
+				if _, ok := sidecarFallbackIndex(params.Sidecars, failure); ok {
+					pullWatch = newSidecarPullWatch(pod, params.Sidecars[pull.index].Image, pull, failure)
+					pullWatchExpired = pullWatch.timer.C
+					log.Warnf(ctx, "Sidecar image %s failed to pull on Pod %s (%s); watching for up to %s before falling back", pullWatch.image, pod.Name, pull.reason, kubernetesSidecarPullConfirmWindow)
+					return ExecuteResult{}, false
+				}
+			}
+		}
+		b.refreshFailureJobDetails(ctx, failure, jobName)
+		logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
+		if logs != "" {
+			log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
+		}
+		return executeError(failure), true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Infof(ctx, "Stopping local watch for Kubernetes Job %s after task context cancellation", jobName)
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+
+		case <-pullWatchExpired:
+			failure := pullWatch.failure
+			log.Warnf(ctx, "Sidecar image %s neither pulled nor failed again within %s of its first failure; falling back without remembering it", pullWatch.image, kubernetesSidecarPullConfirmWindow)
+			pullWatch, pullWatchExpired = nil, nil
+			b.refreshFailureJobDetails(ctx, failure, jobName)
+			return executeError(failure)
 
 		case event, ok := <-jobWatcher.ResultChan():
 			if !ok {
@@ -694,13 +757,8 @@ func (b *KubernetesBackend) executeTaskAttempt(ctx context.Context, params *Task
 			}
 			setupPhases.observePod(ctx, pod)
 			logStreams.observePod(pod)
-			if failure := b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch); failure != nil {
-				b.refreshFailureJobDetails(ctx, failure, jobName)
-				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
-				if logs != "" {
-					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
-				}
-				return executeError(failure)
+			if res, done := observedPod(pod, b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch)); done {
+				return res
 			}
 
 		case <-safetyTicker.C:
@@ -731,8 +789,10 @@ func (b *KubernetesBackend) executeTaskAttempt(ctx context.Context, params *Task
 				setupPhases.observePod(ctx, &pods[i])
 				logStreams.observePod(&pods[i])
 			}
-			if failure := b.detectPodFailureAt(ctx, pods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
-				return executeError(failure)
+			for i := range pods {
+				if res, done := observedPod(&pods[i], b.inspectPodFailureAt(ctx, &pods[i], jobState, kubernetesFailureSourceSafetyPoll)); done {
+					return res
+				}
 			}
 		}
 	}
@@ -1423,22 +1483,111 @@ func kubernetesSidecarVolumeName(i int, suffix string) string {
 }
 
 // withPulledSidecar records on err which sidecar's image failed to pull, when the
-// waiting container's failure is an image pull that can be traced to one, and
-// whether the kubelet had backed off from that pull (ImagePullBackOff) rather than
-// reporting a first failed attempt (ErrImagePull).
+// waiting container's failure is an image pull that can be traced to one, along
+// with the container and its waiting reason (ErrImagePull or ImagePullBackOff).
 func withPulledSidecar(pod *corev1.Pod, containerName string, waiting *corev1.ContainerStateWaiting, reason metrics.TaskFailureReason, err error) error {
 	if reason != metrics.TaskFailureReasonImagePull {
 		return err
 	}
 	if i, ok := pullFailedSidecarIndex(pod, containerName, waiting); ok {
-		return withPullFailedSidecar(err, i, waiting != nil && waiting.Reason == kubernetesImagePullBackOffReason)
+		pull := sidecarPullFailure{index: i, container: containerName}
+		if waiting != nil {
+			pull.reason = waiting.Reason
+		}
+		return withPullFailedSidecar(err, pull)
 	}
 	return err
 }
 
-// kubernetesImagePullBackOffReason is the waiting reason the kubelet reports once it
-// has given up retrying an image pull for now, after at least one ErrImagePull.
-const kubernetesImagePullBackOffReason = "ImagePullBackOff"
+// kubernetesSidecarPullConfirmWindow bounds how long an attempt keeps watching a
+// sidecar whose image pull failed before it falls back. The kubelet's first pull
+// back-off is 10s, so a pull that keeps failing fails again well within it.
+var kubernetesSidecarPullConfirmWindow = 30 * time.Second
+
+const (
+	// kubernetesErrImagePullReason is the waiting reason for a pull attempt that
+	// failed; the kubelet then backs off before the next attempt.
+	kubernetesErrImagePullReason = "ErrImagePull"
+	// kubernetesImagePullBackOffReason is the waiting reason while the kubelet waits
+	// out that back-off.
+	kubernetesImagePullBackOffReason = "ImagePullBackOff"
+)
+
+// sidecarPullWatch follows a sidecar whose image pull a pod reported as failed,
+// for up to kubernetesSidecarPullConfirmWindow, to decide what the failure means:
+//   - no container waits on that sidecar's image any more (the pull succeeded and
+//     the pod moved on): the failure was transient, and the attempt continues
+//     without a fallback;
+//   - the pull fails again, as an ErrImagePull observed after an ImagePullBackOff:
+//     the failure is confirmed, and the attempt falls back and remembers the image;
+//   - the window expires with only the first failure seen: the attempt falls back
+//     without remembering the image.
+//
+// Task-image pull failures, failures of sidecars without a fallback, and other
+// failures of the pod are not watched and end the attempt as before.
+type sidecarPullWatch struct {
+	// failure is the failure as first observed, returned once the watch decides
+	// against the pull.
+	failure    error
+	pull       sidecarPullFailure
+	image      string
+	podUID     string
+	lastReason string
+	timer      *time.Timer
+}
+
+type sidecarPullVerdict int
+
+const (
+	sidecarPullPending sidecarPullVerdict = iota
+	sidecarPullRecovered
+	sidecarPullConfirmed
+)
+
+func newSidecarPullWatch(pod *corev1.Pod, image string, pull sidecarPullFailure, failure error) *sidecarPullWatch {
+	return &sidecarPullWatch{
+		failure:    failure,
+		pull:       pull,
+		image:      image,
+		podUID:     string(pod.UID),
+		lastReason: pull.reason,
+		timer:      time.NewTimer(kubernetesSidecarPullConfirmWindow),
+	}
+}
+
+// observe returns the verdict after a fresh view of the watched pod.
+func (w *sidecarPullWatch) observe(pod *corev1.Pod) sidecarPullVerdict {
+	if len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses) == 0 {
+		// A view without container statuses says nothing about the pull.
+		return sidecarPullPending
+	}
+	waiting := sidecarPullWaiting(pod, w.pull.index)
+	if waiting == nil {
+		return sidecarPullRecovered
+	}
+	if waiting.Reason == kubernetesErrImagePullReason && w.lastReason == kubernetesImagePullBackOffReason {
+		return sidecarPullConfirmed
+	}
+	w.lastReason = waiting.Reason
+	return sidecarPullPending
+}
+
+// sidecarPullWaiting returns the waiting state of a container that cannot pull the
+// image of the sidecar at index i, or nil when no container is waiting on it.
+func sidecarPullWaiting(pod *corev1.Pod, i int) *corev1.ContainerStateWaiting {
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for _, status := range statuses {
+			waiting := status.State.Waiting
+			if waiting == nil || classifyWaitingReason(waiting.Reason, false) != metrics.TaskFailureReasonImagePull {
+				continue
+			}
+			if j, ok := pullFailedSidecarIndex(pod, status.Name, waiting); ok && j == i {
+				return waiting
+			}
+		}
+	}
+	return nil
+}
 
 // pullFailedSidecarIndex returns the index into TaskParams.Sidecars of the sidecar
 // whose image the waiting container could not pull. A copy-sidecar-<i> init container

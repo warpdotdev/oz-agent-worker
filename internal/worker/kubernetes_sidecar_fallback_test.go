@@ -87,14 +87,18 @@ func TestInspectPodFailureRecordsPulledSidecar(t *testing.T) {
 	if i, ok := taskFailurePullFailedSidecar(err); !ok || i != 1 {
 		t.Fatalf("pulled sidecar = %d, %v; want 1 (err %v)", i, ok, err)
 	}
-	if taskFailureSidecarPullBackedOff(err) {
-		t.Fatalf("a first ErrImagePull must not count as a back-off: %v", err)
+	if pull, ok := taskFailureSidecarPull(err); !ok || pull.container != "copy-sidecar-1" || pull.reason != "ErrImagePull" || pull.confirmed {
+		t.Fatalf("sidecar pull = %+v, %v; want copy-sidecar-1 waiting on ErrImagePull, unconfirmed", pull, ok)
 	}
 
 	pod.Status.InitContainerStatuses[1].State.Waiting.Reason = "ImagePullBackOff"
 	err = backend.inspectPodFailureAt(context.Background(), pod, nil, kubernetesFailureSourcePodWatch)
-	if i, ok := taskFailurePullFailedSidecar(err); !ok || i != 1 || !taskFailureSidecarPullBackedOff(err) {
-		t.Fatalf("pulled sidecar = %d, %v, backed off = %v; want 1 and backed off (err %v)", i, ok, taskFailureSidecarPullBackedOff(err), err)
+	if pull, ok := taskFailureSidecarPull(err); !ok || pull.index != 1 || pull.reason != "ImagePullBackOff" {
+		t.Fatalf("sidecar pull = %+v, %v; want sidecar 1 waiting on ImagePullBackOff", pull, ok)
+	}
+	confirmSidecarPullFailure(err)
+	if pull, _ := taskFailureSidecarPull(err); !pull.confirmed {
+		t.Fatalf("confirmation must be carried on the failure: %+v", pull)
 	}
 
 	pod.Status.InitContainerStatuses[1].State.Waiting.Reason = "CreateContainerConfigError"
@@ -105,15 +109,19 @@ func TestInspectPodFailureRecordsPulledSidecar(t *testing.T) {
 }
 
 // fallbackTestCluster fakes a cluster in which pods fail to pull every image in
-// blocked and every other Job completes.
+// blocked and every other Job completes. Its watches deliver events on virtual
+// time, so tests run it under synctest.
 type fallbackTestCluster struct {
 	t            *testing.T
 	client       *fake.Clientset
 	imageVolumes bool
 	blocked      map[string]bool
-	// firstFailure makes the kubelet report a blocked image as a first failed pull
-	// (ErrImagePull) instead of a back-off (ImagePullBackOff).
-	firstFailure bool
+	// pullStates are the kubelet's successive reports for a blocked image, one pod
+	// event every fallbackTestPullStateInterval: a waiting reason, or
+	// fallbackTestPullRecovered once the pull succeeds and the pod moves on, after
+	// which the Job completes. nil means a pull that keeps failing: ErrImagePull,
+	// then ImagePullBackOff, then ErrImagePull again.
+	pullStates []string
 
 	mu      sync.Mutex
 	created []*batchv1.Job
@@ -142,21 +150,47 @@ func newFallbackTestCluster(t *testing.T, imageVolumes bool, blocked ...string) 
 	})
 	c.client.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
 		w := watch.NewRaceFreeFake()
-		if job := c.latest(); c.failingPod(job) == nil {
-			done := job.DeepCopy()
-			done.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		job := c.latest()
+		done := job.DeepCopy()
+		done.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		states := c.states()
+		switch {
+		case c.failingPod(job, states[0]) == nil:
 			w.Modify(done)
+		case states[len(states)-1] == fallbackTestPullRecovered:
+			// Timers rather than sleeping goroutines: a bubble may end before they
+			// fire, and a pending timer does not count as a blocked goroutine.
+			time.AfterFunc(fallbackTestPullStateInterval*time.Duration(len(states)), func() { w.Modify(done) })
 		}
 		return true, w, nil
 	})
 	c.client.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
 		w := watch.NewRaceFreeFake()
-		if pod := c.failingPod(c.latest()); pod != nil {
-			w.Add(pod)
+		job := c.latest()
+		states := c.states()
+		if c.failingPod(job, states[0]) == nil {
+			return true, w, nil
+		}
+		w.Add(c.failingPod(job, states[0]))
+		for i, state := range states[1:] {
+			// Sends after the watch is stopped are dropped by the fake.
+			time.AfterFunc(fallbackTestPullStateInterval*time.Duration(i+1), func() { w.Modify(c.failingPod(job, state)) })
 		}
 		return true, w, nil
 	})
 	return c
+}
+
+const (
+	fallbackTestPullStateInterval = 2 * time.Second
+	fallbackTestPullRecovered     = "recovered"
+)
+
+func (c *fallbackTestCluster) states() []string {
+	if c.pullStates == nil {
+		return []string{"ErrImagePull", "ImagePullBackOff", "ErrImagePull"}
+	}
+	return c.pullStates
 }
 
 func (c *fallbackTestCluster) latest() *batchv1.Job {
@@ -172,34 +206,39 @@ func (c *fallbackTestCluster) jobs() []*batchv1.Job {
 }
 
 // failingPod returns job's pod as the kubelet reports it when one of its images is
-// blocked, or nil when the pod would run.
-func (c *fallbackTestCluster) failingPod(job *batchv1.Job) *corev1.Pod {
+// blocked and the pull is in state (a waiting reason, or fallbackTestPullRecovered),
+// or nil when the pod would run.
+func (c *fallbackTestCluster) failingPod(job *batchv1.Job, state string) *corev1.Pod {
 	spec := job.Spec.Template.Spec.DeepCopy()
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: job.Name + "-pod", Namespace: job.Namespace, UID: job.UID + "-pod", Labels: job.Spec.Template.Labels},
 		Spec:       *spec,
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
 	}
-	pulling := func(image string) *corev1.ContainerStateWaiting {
-		if c.firstFailure {
-			return &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: fmt.Sprintf("rpc error: code = Unknown desc = failed to pull and unpack image %q: toomanyrequests", image)}
+	pulling := func(image string) corev1.ContainerState {
+		switch state {
+		case fallbackTestPullRecovered:
+			return corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
+		case "ErrImagePull":
+			return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: state, Message: fmt.Sprintf("rpc error: code = Unknown desc = failed to pull and unpack image %q: toomanyrequests", image)}}
+		default:
+			return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: state, Message: fmt.Sprintf("Back-off pulling image %q", image)}}
 		}
-		return &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: fmt.Sprintf("Back-off pulling image %q", image)}
 	}
 	for _, container := range spec.InitContainers {
 		if c.blocked[container.Image] {
-			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: container.Name, State: corev1.ContainerState{Waiting: pulling(container.Image)}}}
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: container.Name, State: pulling(container.Image)}}
 			return pod
 		}
 	}
 	for _, volume := range spec.Volumes {
 		if volume.Image != nil && c.blocked[volume.Image.Reference] {
-			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: kubernetesTaskContainerName, State: corev1.ContainerState{Waiting: pulling(volume.Image.Reference)}}}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: kubernetesTaskContainerName, State: pulling(volume.Image.Reference)}}
 			return pod
 		}
 	}
 	if c.blocked[fallbackTestTaskImage] {
-		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: kubernetesTaskContainerName, State: corev1.ContainerState{Waiting: pulling(fallbackTestTaskImage)}}}
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: kubernetesTaskContainerName, State: pulling(fallbackTestTaskImage)}}
 		return pod
 	}
 	return nil
@@ -264,99 +303,167 @@ func TestKubernetesSidecarFallbackReplacesJob(t *testing.T) {
 	for _, imageVolumes := range []bool{false, true} {
 		for _, standby := range []bool{false, true} {
 			t.Run(fmt.Sprintf("imageVolumes=%v/standby=%v", imageVolumes, standby), func(t *testing.T) {
-				cluster := newFallbackTestCluster(t, imageVolumes, fallbackTestACPImage)
-				backend := cluster.backend()
-				params := fallbackTestParams("task-1")
-				if standby {
-					params = &TaskParams{StandbyID: "sb-1", DockerImage: params.DockerImage, Sidecars: params.Sidecars}
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
+				synctest.Test(t, func(t *testing.T) {
+					cluster := newFallbackTestCluster(t, imageVolumes, fallbackTestACPImage)
+					backend := cluster.backend()
+					params := fallbackTestParams("task-1")
+					if standby {
+						params = &TaskParams{StandbyID: "sb-1", DockerImage: params.DockerImage, Sidecars: params.Sidecars}
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
 
-				result := backend.ExecuteTask(ctx, params)
-				if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
-					t.Fatalf("result = %+v, want the retried Job to complete", result)
-				}
-				jobs := cluster.jobs()
-				if len(jobs) != 2 || jobs[0].Name != jobs[1].Name {
-					t.Fatalf("created %d Jobs, want two under one name", len(jobs))
-				}
-				if got := cluster.sidecarImage(jobs[0], 1); got != fallbackTestACPImage {
-					t.Fatalf("first Job mounts %s, want the ACP image", got)
-				}
-				if got := cluster.sidecarImage(jobs[1], 1); got != fallbackTestCLIImage {
-					t.Fatalf("retried Job mounts %s, want the fallback", got)
-				}
-				if got := cluster.sidecarImage(jobs[1], 0); got != fallbackTestAgentImage {
-					t.Fatalf("retried Job mounts agent %s, want it unchanged", got)
-				}
-				deletes := cluster.actions("delete")
-				if len(deletes) == 0 {
-					t.Fatal("first Job was not deleted")
-				}
-				options := deletes[0].(k8stesting.DeleteAction).GetDeleteOptions()
-				if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationForeground ||
-					options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != "attempt-1" {
-					t.Fatalf("first delete options = %+v, want foreground deletion of attempt-1", options)
-				}
-				if patches := cluster.actions("patch"); len(patches) != 0 {
-					t.Fatalf("got %d Job patches; the replaced Job must not be stopped first", len(patches))
-				}
-				if !backend.sidecarPullFailures.recent(fallbackTestACPImage) {
-					t.Fatal("the failed ACP image must be remembered")
-				}
+					result := backend.ExecuteTask(ctx, params)
+					if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
+						t.Fatalf("result = %+v, want the retried Job to complete", result)
+					}
+					jobs := cluster.jobs()
+					if len(jobs) != 2 || jobs[0].Name != jobs[1].Name {
+						t.Fatalf("created %d Jobs, want two under one name", len(jobs))
+					}
+					if got := cluster.sidecarImage(jobs[0], 1); got != fallbackTestACPImage {
+						t.Fatalf("first Job mounts %s, want the ACP image", got)
+					}
+					if got := cluster.sidecarImage(jobs[1], 1); got != fallbackTestCLIImage {
+						t.Fatalf("retried Job mounts %s, want the fallback", got)
+					}
+					if got := cluster.sidecarImage(jobs[1], 0); got != fallbackTestAgentImage {
+						t.Fatalf("retried Job mounts agent %s, want it unchanged", got)
+					}
+					deletes := cluster.actions("delete")
+					if len(deletes) == 0 {
+						t.Fatal("first Job was not deleted")
+					}
+					options := deletes[0].(k8stesting.DeleteAction).GetDeleteOptions()
+					if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationForeground ||
+						options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != "attempt-1" {
+						t.Fatalf("first delete options = %+v, want foreground deletion of attempt-1", options)
+					}
+					if patches := cluster.actions("patch"); len(patches) != 0 {
+						t.Fatalf("got %d Job patches; the replaced Job must not be stopped first", len(patches))
+					}
+					if !backend.sidecarPullFailures.recent(fallbackTestACPImage) {
+						t.Fatal("the failed ACP image must be remembered")
+					}
 
-				if standby {
-					return
-				}
-				result = backend.ExecuteTask(ctx, fallbackTestParams("task-2"))
-				if result.Outcome != ExecuteOutcomeCompleted {
-					t.Fatalf("second task result = %+v", result)
-				}
-				jobs = cluster.jobs()
-				if len(jobs) != 3 || cluster.sidecarImage(jobs[2], 1) != fallbackTestCLIImage {
-					t.Fatalf("second task must create one Job that already mounts the fallback; created %d", len(jobs)-2)
-				}
+					if standby {
+						return
+					}
+					result = backend.ExecuteTask(ctx, fallbackTestParams("task-2"))
+					if result.Outcome != ExecuteOutcomeCompleted {
+						t.Fatalf("second task result = %+v", result)
+					}
+					jobs = cluster.jobs()
+					if len(jobs) != 3 || cluster.sidecarImage(jobs[2], 1) != fallbackTestCLIImage {
+						t.Fatalf("second task must create one Job that already mounts the fallback; created %d", len(jobs)-2)
+					}
+				})
 			})
 		}
 	}
 }
 
-// TestKubernetesSidecarFallbackRemembersOnlyBackOff checks that a first failed pull
-// (ErrImagePull) still retries the task with the fallback, so the run stays alive, but
-// is not remembered: the next task tries the ACP image again. Only a back-off
-// (ImagePullBackOff, covered by TestKubernetesSidecarFallbackReplacesJob) is cached.
-func TestKubernetesSidecarFallbackRemembersOnlyBackOff(t *testing.T) {
-	for _, imageVolumes := range []bool{false, true} {
-		t.Run(fmt.Sprintf("imageVolumes=%v", imageVolumes), func(t *testing.T) {
-			cluster := newFallbackTestCluster(t, imageVolumes, fallbackTestACPImage)
-			cluster.firstFailure = true
+// TestKubernetesSidecarPullConfirmWindow covers what the attempt decides while it
+// watches a failed sidecar pull for kubernetesSidecarPullConfirmWindow. A pull that
+// fails again after the back-off is covered by TestKubernetesSidecarFallbackReplacesJob.
+func TestKubernetesSidecarPullConfirmWindow(t *testing.T) {
+	type expectation struct {
+		jobs       int    // Jobs created by the first task
+		lastImage  string // sidecar 1's image on the last of them
+		remembered bool
+		waited     bool // the window ran out before the attempt decided
+	}
+	run := func(name string, states []string, want expectation) {
+		for _, imageVolumes := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/imageVolumes=%v", name, imageVolumes), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					cluster := newFallbackTestCluster(t, imageVolumes, fallbackTestACPImage)
+					cluster.pullStates = states
+					backend := cluster.backend()
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+
+					start := time.Now()
+					result := backend.ExecuteTask(ctx, fallbackTestParams("task-1"))
+					if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
+						t.Fatalf("result = %+v, want a completed task", result)
+					}
+					if waited := time.Since(start) >= kubernetesSidecarPullConfirmWindow; waited != want.waited {
+						t.Fatalf("decided after %s; want waited for the %s window = %v", time.Since(start), kubernetesSidecarPullConfirmWindow, want.waited)
+					}
+					jobs := cluster.jobs()
+					if len(jobs) != want.jobs || cluster.sidecarImage(jobs[len(jobs)-1], 1) != want.lastImage {
+						t.Fatalf("created %d Jobs, the last mounting %s; want %d ending with %s", len(jobs), cluster.sidecarImage(jobs[len(jobs)-1], 1), want.jobs, want.lastImage)
+					}
+					// A replaced Job is deleted in the foreground with a UID precondition;
+					// a completed Job's cleanup delete is not.
+					replaced := 0
+					for _, action := range cluster.actions("delete") {
+						options := action.(k8stesting.DeleteAction).GetDeleteOptions()
+						if options.PropagationPolicy != nil && *options.PropagationPolicy == metav1.DeletePropagationForeground && options.Preconditions != nil {
+							replaced++
+						}
+					}
+					if (replaced != 0) != (want.jobs > 1) {
+						t.Fatalf("got %d Job replacements with %d Jobs", replaced, want.jobs)
+					}
+					if backend.sidecarPullFailures.recent(fallbackTestACPImage) != want.remembered {
+						t.Fatalf("remembered = %v, want %v", !want.remembered, want.remembered)
+					}
+
+					// The next task mounts the fallback directly only when the failure
+					// was remembered; otherwise it tries the ACP image again.
+					result = backend.ExecuteTask(ctx, fallbackTestParams("task-2"))
+					if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
+						t.Fatalf("second task result = %+v", result)
+					}
+					next := cluster.jobs()[len(jobs)]
+					if got, wantImage := cluster.sidecarImage(next, 1), fallbackTestACPImage; want.remembered {
+						wantImage = fallbackTestCLIImage
+						if got != wantImage {
+							t.Fatalf("second task's Job mounts %s, want %s", got, wantImage)
+						}
+					} else if got != wantImage {
+						t.Fatalf("second task's Job mounts %s, want %s", got, wantImage)
+					}
+				})
+			})
+		}
+	}
+
+	run("a single failure falls back after the window and is not remembered",
+		[]string{"ErrImagePull"}, expectation{jobs: 2, lastImage: fallbackTestCLIImage, waited: true})
+	run("a failure followed by a back-off alone is not a second failure",
+		[]string{"ErrImagePull", "ImagePullBackOff"}, expectation{jobs: 2, lastImage: fallbackTestCLIImage, waited: true})
+	run("a failure after a back-off is confirmed and remembered",
+		[]string{"ImagePullBackOff", "ErrImagePull"}, expectation{jobs: 2, lastImage: fallbackTestCLIImage, remembered: true})
+	run("a pull that succeeds within the window continues without a fallback",
+		[]string{"ErrImagePull", fallbackTestPullRecovered}, expectation{jobs: 1, lastImage: fallbackTestACPImage})
+
+	t.Run("cancellation during the window fails without a fallback", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cluster := newFallbackTestCluster(t, false, fallbackTestACPImage)
+			cluster.pullStates = []string{"ErrImagePull"}
 			backend := cluster.backend()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			go func() {
+				time.Sleep(fallbackTestPullStateInterval)
+				cancel()
+			}()
 
 			result := backend.ExecuteTask(ctx, fallbackTestParams("task-1"))
-			if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
-				t.Fatalf("result = %+v, want the retried Job to complete", result)
+			if result.Outcome != ExecuteOutcomeError || !errors.Is(result.Error, context.Canceled) {
+				t.Fatalf("result = %+v, want cancellation", result)
 			}
-			jobs := cluster.jobs()
-			if len(jobs) != 2 || cluster.sidecarImage(jobs[0], 1) != fallbackTestACPImage || cluster.sidecarImage(jobs[1], 1) != fallbackTestCLIImage {
-				t.Fatalf("created %d Jobs; want the ACP attempt and then the fallback", len(jobs))
+			if jobs := cluster.jobs(); len(jobs) != 1 || len(cluster.actions("delete")) != 0 {
+				t.Fatalf("created %d Jobs with %d deletes; want the one Job left alone", len(jobs), len(cluster.actions("delete")))
 			}
 			if backend.sidecarPullFailures.recent(fallbackTestACPImage) {
-				t.Fatal("a first ErrImagePull must not be remembered")
-			}
-
-			result = backend.ExecuteTask(ctx, fallbackTestParams("task-2"))
-			if result.Outcome != ExecuteOutcomeCompleted || result.Error != nil {
-				t.Fatalf("second task result = %+v", result)
-			}
-			jobs = cluster.jobs()
-			if len(jobs) != 4 || cluster.sidecarImage(jobs[2], 1) != fallbackTestACPImage || cluster.sidecarImage(jobs[3], 1) != fallbackTestCLIImage {
-				t.Fatalf("second task must try the ACP image again before falling back; created %d Jobs", len(jobs)-2)
+				t.Fatal("a cancelled attempt must not remember the image")
 			}
 		})
-	}
+	})
 }
 
 func TestKubernetesSidecarFallbackLimits(t *testing.T) {
@@ -374,8 +481,13 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 			t.Fatalf("failure reason = %s (%v), want image_pull", reason, result.Error)
 		}
 	}
+	// run runs a case under synctest, since the fake cluster delivers its pod
+	// events and the attempt's confirmation window runs on virtual time.
+	run := func(name string, f func(t *testing.T)) {
+		t.Run(name, func(t *testing.T) { synctest.Test(t, f) })
+	}
 
-	t.Run("a task image pull failure is not retried", func(t *testing.T) {
+	run("a task image pull failure is not retried", func(t *testing.T) {
 		cluster := newFallbackTestCluster(t, true, fallbackTestTaskImage)
 		result := cluster.backend().ExecuteTask(ctxWithTimeout(t), fallbackTestParams("task-1"))
 		assertImagePullFailure(t, result)
@@ -385,7 +497,7 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("a sidecar without a fallback is not retried", func(t *testing.T) {
+	run("a sidecar without a fallback is not retried", func(t *testing.T) {
 		cluster := newFallbackTestCluster(t, false, fallbackTestACPImage)
 		params := fallbackTestParams("task-1")
 		params.Sidecars[1].FallbackImage = ""
@@ -395,7 +507,7 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("a failing fallback is retried only once", func(t *testing.T) {
+	run("a failing fallback is retried only once", func(t *testing.T) {
 		cluster := newFallbackTestCluster(t, false, fallbackTestACPImage, fallbackTestCLIImage)
 		result := cluster.backend().ExecuteTask(ctxWithTimeout(t), fallbackTestParams("task-1"))
 		assertImagePullFailure(t, result)
@@ -408,7 +520,7 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("a Job that cannot be deleted is stopped instead", func(t *testing.T) {
+	run("a Job that cannot be deleted is stopped instead", func(t *testing.T) {
 		cluster := newFallbackTestCluster(t, false, fallbackTestACPImage)
 		cluster.client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "batch", Resource: "jobs"}, "task", errors.New("denied"))
@@ -419,8 +531,8 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("a Job that is not removed in time is not replaced", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) {
+	run("a Job that is not removed in time is not replaced", func(t *testing.T) {
+		{
 			cluster := newFallbackTestCluster(t, false, fallbackTestACPImage)
 			cluster.client.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
 				cluster.mu.Lock()
@@ -440,10 +552,10 @@ func TestKubernetesSidecarFallbackLimits(t *testing.T) {
 			if jobs := cluster.jobs(); len(jobs) != 1 {
 				t.Fatalf("created %d Jobs; want no retry", len(jobs))
 			}
-		})
+		}
 	})
 
-	t.Run("cancellation while waiting for the deletion stops the retry", func(t *testing.T) {
+	run("cancellation while waiting for the deletion stops the retry", func(t *testing.T) {
 		cluster := newFallbackTestCluster(t, false, fallbackTestACPImage)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
