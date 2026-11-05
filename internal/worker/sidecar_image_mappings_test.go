@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -90,7 +91,7 @@ func TestSidecarImageMappingsBackends(t *testing.T) {
 						if strings.HasPrefix(ref, "mirror.example/") {
 							auth, err := authconfig.Decode(req.Header.Get("X-Registry-Auth"))
 							if err != nil || auth.Username != "mirror-test" {
-								t.Fatal("sidecar pull did not use destination registry credentials")
+								t.Error("sidecar pull did not use destination registry credentials")
 							}
 						}
 						return mockEngineResponse(req, http.StatusOK, "application/json", "{}\n")
@@ -101,10 +102,17 @@ func TestSidecarImageMappingsBackends(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// Sidecars are prepared concurrently, so pulls arrive in any order.
+				wantPulled := make([]string, 0, len(want))
+				for _, sidecar := range want {
+					wantPulled = append(wantPulled, sidecar.Image)
+				}
+				sort.Strings(pulled)
+				sort.Strings(wantPulled)
+				if !reflect.DeepEqual(pulled, wantPulled) {
+					t.Fatalf("Docker pulled %v, want %v", pulled, wantPulled)
+				}
 				for i, sidecar := range want {
-					if i >= len(pulled) || pulled[i] != sidecar.Image {
-						t.Fatalf("Docker pulled %v, want sidecar %q at index %d", pulled, sidecar.Image, i)
-					}
 					if i >= len(binds) || !strings.HasSuffix(binds[i], ":"+sidecar.MountPath+":ro") {
 						t.Fatalf("Docker binds = %v, missing original mount %q", binds, sidecar.MountPath)
 					}

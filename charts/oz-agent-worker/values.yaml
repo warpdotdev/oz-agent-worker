@@ -82,6 +82,10 @@ kubernetesBackend:
   imagePullPolicy: IfNotPresent
   # null auto-detects image-volume support with the startup preflight. Set true
   # to require image volumes or false to always use the legacy copy path.
+  # Image volumes remove the per-sidecar copy init containers and are the
+  # largest task-startup win on this backend; run
+  # script/k8s-image-volume-check.sh against the cluster and see the README
+  # section "Enabling image volumes" before setting true.
   useImageVolumes: null
   preflightImage: ""
   sidecarImage: ""

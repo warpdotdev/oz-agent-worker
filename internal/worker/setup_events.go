@@ -45,8 +45,25 @@ const (
 	SetupEventPodSchedule  = "setup_worker_pod_schedule"
 	SetupEventSetupCommand = "setup_worker_setup_command"
 
+	// Per-sidecar Kubernetes phases, indexed like the copy-sidecar-<i> init
+	// containers. image_wait covers the kubelet gap before the container
+	// starts (image resolve, container create, start) measured from the
+	// previous init container's finish or PodScheduled for the first one;
+	// copy covers the rootfs copy itself. Together they break down
+	// SetupEventSidecarPrep, which stays as the aggregate.
+	setupEventSidecarImageWaitFormat = "setup_worker_sidecar_%d_image_wait"
+	setupEventSidecarCopyFormat      = "setup_worker_sidecar_%d_copy"
+
 	setupEventRequestTimeout = 5 * time.Second
 )
+
+func setupEventSidecarImageWait(index int) string {
+	return fmt.Sprintf(setupEventSidecarImageWaitFormat, index)
+}
+
+func setupEventSidecarCopy(index int) string {
+	return fmt.Sprintf(setupEventSidecarCopyFormat, index)
+}
 
 // setupEventReporter reports worker-observed task setup phase durations to
 // warp-server's run client-events endpoint. Reporting is best-effort: failures

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,9 +57,12 @@ func mockImageInspectResponse(t *testing.T, req *http.Request, os, architecture,
 // fakeDockerEngine is a scripted double for the subset of the Docker Engine API that image
 // preparation exercises: image inspect, image pull, and (for sidecar tests) volume inspect. It
 // records every non-negotiation call it handles, in order, so tests can assert on Engine call
-// ordering without needing a real Docker daemon.
+// ordering without needing a real Docker daemon. Sidecar preparation calls it from several
+// goroutines, so the scripted state is guarded by a mutex and unexpected calls are reported
+// with Errorf rather than Fatalf (which must not be called off the test goroutine).
 type fakeDockerEngine struct {
-	t *testing.T
+	t  *testing.T
+	mu sync.Mutex
 
 	// inspectResponses is consumed in call order for ImageInspect; once exhausted, the last
 	// entry repeats for any further calls (e.g. the digest lookup after a successful prepare).
@@ -79,6 +83,8 @@ type fakeDockerEngine struct {
 }
 
 func (e *fakeDockerEngine) RoundTrip(req *http.Request) (*http.Response, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	switch {
 	case req.URL.Path == "/_ping":
 		// Docker API version negotiation happens transparently on the first request; answer it
@@ -92,19 +98,22 @@ func (e *fakeDockerEngine) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		e.inspectCalls++
 		if idx < 0 {
-			e.t.Fatalf("unexpected ImageInspect call: no responses scripted")
+			e.t.Errorf("unexpected ImageInspect call: no responses scripted")
+			return mockEngineErrorResponse(e.t, req, http.StatusInternalServerError, "unexpected inspect"), nil
 		}
 		return e.inspectResponses[idx](req), nil
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/images/create"):
 		e.calls = append(e.calls, "pull")
 		if e.pullResponse == nil {
-			e.t.Fatalf("unexpected ImagePull call: no response scripted")
+			e.t.Errorf("unexpected ImagePull call: no response scripted")
+			return mockEngineErrorResponse(e.t, req, http.StatusInternalServerError, "unexpected pull"), nil
 		}
 		return e.pullResponse(req), nil
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/containers/create"):
 		e.calls = append(e.calls, "container_create")
 		if e.containerCreateResponse == nil {
-			e.t.Fatalf("unexpected ContainerCreate call: no response scripted")
+			e.t.Errorf("unexpected ContainerCreate call: no response scripted")
+			return mockEngineErrorResponse(e.t, req, http.StatusInternalServerError, "unexpected container create"), nil
 		}
 		return e.containerCreateResponse(req), nil
 	case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/volumes/"):
@@ -114,8 +123,8 @@ func (e *fakeDockerEngine) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		return mockEngineErrorResponse(e.t, req, http.StatusNotFound, "no such volume"), nil
 	default:
-		e.t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
-		return nil, nil
+		e.t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		return mockEngineErrorResponse(e.t, req, http.StatusInternalServerError, "unexpected request"), nil
 	}
 }
 
