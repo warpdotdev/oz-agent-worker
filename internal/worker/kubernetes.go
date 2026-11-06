@@ -97,13 +97,15 @@ func kubernetesTaskOwnedEnvVars(taskID string) []string {
 
 // KubernetesBackendConfig holds configuration specific to the Kubernetes backend.
 type KubernetesBackendConfig struct {
-	WorkerID              string
-	Namespace             string
-	Kubeconfig            string
-	DefaultImage          string
-	ImagePullPolicy       string
-	UseImageVolumes       *bool
-	PreflightImage        string
+	WorkerID        string
+	Namespace       string
+	Kubeconfig      string
+	DefaultImage    string
+	ImagePullPolicy string
+	UseImageVolumes *bool
+	PreflightImage  string
+	// PreflightTimeout bounds each startup preflight wait. Zero uses the 15s default.
+	PreflightTimeout      time.Duration
 	SetupCommand          string
 	TeardownCommand       string
 	NoCleanup             bool
@@ -936,7 +938,11 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context, useImageVol
 		}
 	}()
 
-	preflightCtx, cancel := context.WithTimeout(ctx, startupPreflightTimeout)
+	timeout := b.config.PreflightTimeout
+	if timeout == 0 {
+		timeout = startupPreflightTimeout
+	}
+	preflightCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if err := b.waitForStartupPreflight(ctx, preflightCtx, createdJob, useImageVolumes); err != nil {
