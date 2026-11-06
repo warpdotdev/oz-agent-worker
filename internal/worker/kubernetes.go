@@ -104,6 +104,7 @@ type KubernetesBackendConfig struct {
 	ImagePullPolicy       string
 	UseImageVolumes       *bool
 	PreflightImage        string
+	PreflightTimeout      time.Duration // Bounds each startup preflight wait; zero uses the 15s default.
 	SetupCommand          string
 	TeardownCommand       string
 	NoCleanup             bool
@@ -936,7 +937,11 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context, useImageVol
 		}
 	}()
 
-	preflightCtx, cancel := context.WithTimeout(ctx, startupPreflightTimeout)
+	timeout := b.config.PreflightTimeout
+	if timeout == 0 {
+		timeout = startupPreflightTimeout
+	}
+	preflightCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if err := b.waitForStartupPreflight(ctx, preflightCtx, createdJob, useImageVolumes); err != nil {

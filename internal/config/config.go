@@ -83,6 +83,7 @@ type KubernetesConfig struct {
 	// UseImageVolumes is nil when support should be detected by the startup preflight.
 	UseImageVolumes       *bool             `yaml:"use_image_volumes"`
 	PreflightImage        string            `yaml:"preflight_image" validate:"omitempty,no_whitespace"`
+	PreflightTimeout      *string           `yaml:"preflight_timeout"`
 	SidecarImage          string            `yaml:"sidecar_image" validate:"omitempty,no_whitespace"`
 	SidecarImageMappings  map[string]string `yaml:"sidecar_image_mappings"`
 	SetupCommand          string            `yaml:"setup_command"`

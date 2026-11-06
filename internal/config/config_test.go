@@ -359,6 +359,7 @@ backend:
     image_pull_policy: "IfNotPresent"
     use_image_volumes: true
     preflight_image: "registry.internal/platform/preflight:1.0"
+    preflight_timeout: "5m"
     setup_command: "printf 'SETUP=done\n' > \"$OZ_ENVIRONMENT_FILE\""
     teardown_command: "rm -rf \"$OZ_WORKSPACE_ROOT/tmp\""
     extra_labels:
@@ -407,6 +408,9 @@ backend:
 	}
 	if cfg.Backend.Kubernetes.PreflightImage != "registry.internal/platform/preflight:1.0" {
 		t.Errorf("preflight_image = %q, want %q", cfg.Backend.Kubernetes.PreflightImage, "registry.internal/platform/preflight:1.0")
+	}
+	if cfg.Backend.Kubernetes.PreflightTimeout == nil || *cfg.Backend.Kubernetes.PreflightTimeout != "5m" {
+		t.Fatalf("preflight_timeout = %v, want 5m", cfg.Backend.Kubernetes.PreflightTimeout)
 	}
 	if cfg.Backend.Kubernetes.WorkspaceSizeLimit != "10Gi" {
 		t.Fatalf("workspace_size_limit = %v, want 10Gi", cfg.Backend.Kubernetes.WorkspaceSizeLimit)

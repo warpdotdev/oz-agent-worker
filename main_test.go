@@ -232,6 +232,41 @@ func TestMergeConfigKubernetesPreservesImageVolumePreference(t *testing.T) {
 	}
 }
 
+func TestMergeConfigKubernetesPreflightTimeout(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		value     *string
+		want      time.Duration
+		wantError bool
+	}{
+		{name: "omitted"},
+		{name: "custom", value: stringPtr("5m"), want: 5 * time.Minute},
+		{name: "fractional", value: stringPtr("1.5s"), want: 1500 * time.Millisecond},
+		{name: "empty", value: stringPtr(""), wantError: true},
+		{name: "malformed", value: stringPtr("five minutes"), wantError: true},
+		{name: "zero", value: stringPtr("0s"), wantError: true},
+		{name: "negative", value: stringPtr("-1s"), wantError: true},
+		{name: "overflow", value: stringPtr("999999999999h"), wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			wc, err := mergeConfig(&config.FileConfig{
+				WorkerID: "worker-123",
+				Backend: config.BackendConfig{Kubernetes: &config.KubernetesConfig{
+					PreflightTimeout: tt.value,
+				}},
+			})
+			if (err != nil) != tt.wantError {
+				t.Fatalf("mergeConfig() error = %v, wantError %t", err, tt.wantError)
+			}
+			if err == nil && wc.Kubernetes.PreflightTimeout != tt.want {
+				t.Fatalf("PreflightTimeout = %v, want %v", wc.Kubernetes.PreflightTimeout, tt.want)
+			}
+		})
+	}
+}
+
 func TestMergeConfigOneShot(t *testing.T) {
 	tests := []struct {
 		name       string

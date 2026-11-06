@@ -221,6 +221,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy       string
 			useImageVolumes       *bool
 			preflightImage        string
+			preflightTimeout      time.Duration
 			setupCmd              string
 			teardownCmd           string
 			extraLabels           map[string]string
@@ -241,6 +242,16 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			imagePullPolicy = kc.ImagePullPolicy
 			useImageVolumes = kc.UseImageVolumes
 			preflightImage = kc.PreflightImage
+			if kc.PreflightTimeout != nil {
+				duration, err := time.ParseDuration(*kc.PreflightTimeout)
+				if err != nil {
+					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.preflight_timeout %q: %w", *kc.PreflightTimeout, err)
+				}
+				if duration <= 0 {
+					return worker.Config{}, fmt.Errorf("backend.kubernetes.preflight_timeout must be positive")
+				}
+				preflightTimeout = duration
+			}
 			legacySidecarImage = kc.SidecarImage
 			sidecarImageMappings = kc.SidecarImageMappings
 			legacyCodingCLISidecars = kc.CodingCLISidecars
@@ -296,6 +307,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ImagePullPolicy:       imagePullPolicy,
 			UseImageVolumes:       useImageVolumes,
 			PreflightImage:        preflightImage,
+			PreflightTimeout:      preflightTimeout,
 			SetupCommand:          setupCmd,
 			TeardownCommand:       teardownCmd,
 			NoCleanup:             noCleanup,
