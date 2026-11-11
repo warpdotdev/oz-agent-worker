@@ -938,7 +938,7 @@ func (b *KubernetesBackend) runStartupPreflight(ctx context.Context, useImageVol
 	}()
 
 	timeout := b.config.PreflightTimeout
-	if timeout == 0 {
+	if timeout <= 0 {
 		timeout = startupPreflightTimeout
 	}
 	preflightCtx, cancel := context.WithTimeout(ctx, timeout)

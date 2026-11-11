@@ -248,7 +248,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.preflight_timeout %q: %w", *kc.PreflightTimeout, err)
 				}
 				if duration <= 0 {
-					return worker.Config{}, fmt.Errorf("backend.kubernetes.preflight_timeout must be positive")
+					return worker.Config{}, fmt.Errorf("backend.kubernetes.preflight_timeout must be positive, got %q", *kc.PreflightTimeout)
 				}
 				preflightTimeout = duration
 			}
