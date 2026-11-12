@@ -25,6 +25,9 @@ data:
         use_image_volumes: {{ .Values.kubernetesBackend.useImageVolumes }}
         {{- end }}
         unschedulable_timeout: {{ .Values.kubernetesBackend.unschedulableTimeout | quote }}
+        {{- if .Values.kubernetesBackend.preflightTimeout }}
+        preflight_timeout: {{ .Values.kubernetesBackend.preflightTimeout | quote }}
+        {{- end }}
         {{- if .Values.kubernetesBackend.preflightImage }}
         preflight_image: {{ .Values.kubernetesBackend.preflightImage | quote }}
         {{- end }}

@@ -290,6 +290,7 @@ backend:
     namespace: "agents"
     default_image: "my-registry.io/dev-image:latest"
     unschedulable_timeout: "2m"
+    preflight_timeout: "5m"
     pod_template:
       nodeSelector:
         kubernetes.io/os: linux
@@ -324,6 +325,7 @@ backend:
 - image-volume sidecar mounts are read-only. When image volumes are enabled, each read-only sidecar uses an image volume, while each read-write sidecar uses a root init container to copy its contents into an `emptyDir`. A task can mix both paths in automatic or forced-on mode; writable sidecars still require permission to run root init containers
 - Kubernetes `1.35+` is the recommended and tested target for `use_image_volumes: true`; Kubernetes `1.33`-`1.34` may work if `ImageVolume` is enabled and the container runtime supports image volumes
 - the worker runs short-lived startup preflight Jobs and waits for either preflight success or an early controller, mount, or admission failure. Automatic mode reuses the image-volume preflight as its capability probe and then verifies the legacy path before falling back
+- `preflight_timeout` bounds each startup preflight wait and defaults to `15s` when omitted. Set a positive Go duration such as `"5m"` to allow cold-node provisioning, image pulls, and mounts on autoscaled clusters. In automatic mode, the image-volume probe and any legacy fallback each get this timeout. Early failures and caller cancellation still stop the wait; task execution deadlines are unchanged. For Helm, set `kubernetesBackend.preflightTimeout`.
 - `preflight_image` defaults to `busybox:1.36`; set it if your cluster only allows pulling startup-preflight images from an internal or allowlisted registry
 - `pod_template` accepts standard Kubernetes PodSpec YAML and is the declarative way to configure task pod scheduling, service accounts, image pull secrets, resources, and environment
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec

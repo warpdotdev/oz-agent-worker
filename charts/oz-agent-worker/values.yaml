@@ -84,6 +84,9 @@ kubernetesBackend:
   # to require image volumes or false to always use the legacy copy path.
   useImageVolumes: null
   preflightImage: ""
+  # Positive Go duration for each startup preflight wait (for example, "5m"
+  # for cold autoscaled nodes). Empty leaves the worker default of 15s.
+  preflightTimeout: ""
   sidecarImage: ""
   # Mapping from Warp-provided sidecar images to mirrored repositories. If the destination
   # repository includes a tag or digest, that takes precedence over any server-provided
