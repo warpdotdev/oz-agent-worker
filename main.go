@@ -401,9 +401,11 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		// Merge volumes: config file + CLI (concatenated).
 		var volumes []string
 		var imagePullPolicy string
+		var network string
 		if fileConfig != nil && fileConfig.Backend.Docker != nil {
 			volumes = append(volumes, fileConfig.Backend.Docker.Volumes...)
 			imagePullPolicy = fileConfig.Backend.Docker.ImagePullPolicy
+			network = fileConfig.Backend.Docker.Network
 			legacySidecarImage = fileConfig.Backend.Docker.SidecarImage
 			sidecarImageMappings = fileConfig.Backend.Docker.SidecarImageMappings
 		}
@@ -414,6 +416,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			Volumes:         volumes,
 			Env:             mergedEnv,
 			ImagePullPolicy: imagePullPolicy,
+			Network:         network,
 		}
 	}
 

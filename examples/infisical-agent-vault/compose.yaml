@@ -1,0 +1,62 @@
+name: oz-infisical-poc
+services:
+  infisical:
+    image: infisical/infisical:v0.167.10@sha256:1a8ed5e889988b37ffb439d67677de5f42b4864236a9c76fbfa9a097676daabd
+    environment:
+      NODE_ENV: production
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run init.py first}
+      AUTH_SECRET: ${AUTH_SECRET:?Run init.py first}
+      DB_CONNECTION_URI: postgres://infisical:${POSTGRES_PASSWORD:?Run init.py first}@db:5432/infisical
+      REDIS_URL: redis://redis:6379
+      SITE_URL: http://localhost:8088
+      TELEMETRY_ENABLED: "false"
+    ports: ["127.0.0.1:8088:8080"]
+    networks: [storage, control]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  db:
+    image: postgres:14.20-alpine@sha256:99b1da76e9e628f519f2aff2a2595128d7abb377ee1d7cc991ee45257efb05f0
+    environment:
+      POSTGRES_USER: infisical
+      POSTGRES_DB: infisical
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run init.py first}
+    volumes: [postgres:/var/lib/postgresql/data]
+    networks: [storage]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U infisical -d infisical"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
+    networks: [storage]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  proxy:
+    profiles: [proxy]
+    image: infisical/cli:0.45.8@sha256:ef5cd9bef770e1d13acfa18414a65719a262c4b7681735086416852f1574d019
+    command: ["agent-vault", "proxy", "--telemetry=false"]
+    environment:
+      INFISICAL_DOMAIN: http://infisical:8080
+      INFISICAL_AGENT_VAULT_PROXY_TOKEN:
+    networks: [control, agent]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:17323/_agent-vault/ca"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+networks:
+  storage:
+    internal: true
+  control: {}
+  agent:
+    name: oz-vault-agent
+volumes:
+  postgres: {}

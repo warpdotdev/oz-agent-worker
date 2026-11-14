@@ -19,8 +19,11 @@ import (
 const standbyTestContainerID = "standby-container"
 
 type standbyCreateSpec struct {
-	Labels map[string]string `json:"Labels"`
-	Env    []string          `json:"Env"`
+	Labels     map[string]string `json:"Labels"`
+	Env        []string          `json:"Env"`
+	HostConfig struct {
+		NetworkMode string `json:"NetworkMode"`
+	} `json:"HostConfig"`
 }
 
 type standbyLifecycleEngine struct {
@@ -28,10 +31,12 @@ type standbyLifecycleEngine struct {
 	blockWait bool
 	started   chan struct{}
 
-	mu         sync.Mutex
-	createName string
-	createSpec standbyCreateSpec
-	removed    []string
+	mu             sync.Mutex
+	createName     string
+	createSpec     standbyCreateSpec
+	removed        []string
+	missingNetwork bool
+	createCalls    int
 }
 
 func newStandbyLifecycleEngine(t *testing.T, blockWait bool) *standbyLifecycleEngine {
@@ -52,7 +57,11 @@ func (e *standbyLifecycleEngine) RoundTrip(r *http.Request) (*http.Response, err
 		e.mu.Lock()
 		e.createName = r.URL.Query().Get("name")
 		e.createSpec = spec
+		e.createCalls++
 		e.mu.Unlock()
+		if e.missingNetwork {
+			return mockEngineErrorResponse(e.t, r, http.StatusNotFound, "network not found"), nil
+		}
 		return mockEngineResponse(r, http.StatusCreated, "application/json", `{"Id":"`+standbyTestContainerID+`"}`), nil
 	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
 		select {
@@ -148,6 +157,40 @@ func TestDockerTaskExecuteTaskKeepsTaskLabels(t *testing.T) {
 	want := map[string]string{"oz-task-id": "run-1", "oz-execution-id": "exec-1"}
 	if !reflect.DeepEqual(engine.createSpec.Labels, want) {
 		t.Errorf("task labels = %v, want %v", engine.createSpec.Labels, want)
+	}
+}
+
+func TestDockerTaskNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name, network string
+		missing       bool
+	}{
+		{name: "default"},
+		{name: "named", network: "oz-vault-agent"},
+		{name: "missing fails closed", network: "missing", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := newStandbyLifecycleEngine(t, false)
+			engine.missingNetwork = tc.missing
+			backend := newStandbyDockerBackend(t, engine)
+			backend.config.Network = tc.network
+			result := backend.ExecuteTask(context.Background(), &TaskParams{
+				TaskID: "run-1", DockerImage: "task-image",
+			})
+			if engine.createSpec.HostConfig.NetworkMode != tc.network {
+				t.Fatalf("network = %q, want %q", engine.createSpec.HostConfig.NetworkMode, tc.network)
+			}
+			if engine.createCalls != 1 {
+				t.Fatalf("container create calls = %d, want 1", engine.createCalls)
+			}
+			if tc.missing {
+				if result.Error == nil || result.Outcome != ExecuteOutcomeError {
+					t.Fatalf("missing network result = %+v, want error", result)
+				}
+			} else if result.Error != nil || result.Outcome != ExecuteOutcomeCompleted {
+				t.Fatalf("result = %+v, want completed", result)
+			}
+		})
 	}
 }
 

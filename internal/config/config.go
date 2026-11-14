@@ -53,6 +53,7 @@ type CommandConfig struct {
 // DockerConfig holds Docker-backend-specific configuration.
 type DockerConfig struct {
 	Volumes []string `yaml:"volumes"`
+	Network string   `yaml:"network" validate:"omitempty,no_whitespace"`
 	// ImagePullPolicy controls how the Docker backend resolves the main task image and any
 	// Warp/additional sidecar images before use. Accepted values are the same as the
 	// Kubernetes backend's image_pull_policy: Always, IfNotPresent, Never. Unlike the
