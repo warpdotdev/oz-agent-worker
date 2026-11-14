@@ -447,6 +447,7 @@ func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
 		Backend: config.BackendConfig{
 			Docker: &config.DockerConfig{
 				ImagePullPolicy: "Never",
+				Network:         "oz-vault-agent",
 				Volumes:         []string{"/data:/data"},
 			},
 		},
@@ -465,6 +466,9 @@ func TestMergeConfigDockerImagePullPolicyFromFile(t *testing.T) {
 	}
 	if wc.Docker.ImagePullPolicy != "Never" {
 		t.Errorf("ImagePullPolicy = %q, want %q", wc.Docker.ImagePullPolicy, "Never")
+	}
+	if wc.Docker.Network != "oz-vault-agent" {
+		t.Errorf("Network = %q, want oz-vault-agent", wc.Docker.Network)
 	}
 	if len(wc.Docker.Volumes) != 1 || wc.Docker.Volumes[0] != "/data:/data" {
 		t.Errorf("Volumes = %v, want [/data:/data]", wc.Docker.Volumes)

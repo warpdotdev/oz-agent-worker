@@ -49,6 +49,14 @@ backend:
 
 This setting does not control how you get the long-running `oz-agent-worker` image (see [Image releases and pinning](#image-releases-and-pinning)). It controls only the task and sidecar images the worker uses to run tasks.
 
+`backend.docker.network` optionally selects an existing Docker network for task
+containers. When omitted, Docker uses its default networking. A missing network
+fails task startup; the worker does not create it or fall back to another network.
+Sidecar image-materialization containers keep their existing networking.
+
+For local GitHub credential brokering through Infisical, see the
+[Agent Vault PoC](examples/infisical-agent-vault/README.md).
+
 `backend.docker.sidecar_image` is a legacy shorthand for mapping the official
 `docker.io/warpdotdev/warp-agent` repository to a custom image. Prefer
 `sidecar_image_mappings` for new configurations. Do not combine the two options.
