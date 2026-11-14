@@ -19,8 +19,8 @@ import (
 const standbyTestContainerID = "standby-container"
 
 type standbyCreateSpec struct {
-	Labels map[string]string `json:"Labels"`
-	Env    []string          `json:"Env"`
+	Labels     map[string]string `json:"Labels"`
+	Env        []string          `json:"Env"`
 	HostConfig struct {
 		NetworkMode string `json:"NetworkMode"`
 	} `json:"HostConfig"`
@@ -31,12 +31,12 @@ type standbyLifecycleEngine struct {
 	blockWait bool
 	started   chan struct{}
 
-	mu         sync.Mutex
-	createName string
-	createSpec standbyCreateSpec
-	removed    []string
+	mu             sync.Mutex
+	createName     string
+	createSpec     standbyCreateSpec
+	removed        []string
 	missingNetwork bool
-	createCalls int
+	createCalls    int
 }
 
 func newStandbyLifecycleEngine(t *testing.T, blockWait bool) *standbyLifecycleEngine {
@@ -163,7 +163,7 @@ func TestDockerTaskExecuteTaskKeepsTaskLabels(t *testing.T) {
 func TestDockerTaskNetwork(t *testing.T) {
 	for _, tc := range []struct {
 		name, network string
-		missing bool
+		missing       bool
 	}{
 		{name: "default"},
 		{name: "named", network: "oz-vault-agent"},
