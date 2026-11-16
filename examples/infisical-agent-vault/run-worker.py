@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -47,12 +48,14 @@ class Infisical:
             urllib.request.ProxyHandler({}), NoRedirect()
         )
 
-    def request(self, path, body=None, authenticated=True):
+    def request(self, path, body=None, authenticated=True, method="POST"):
         headers = {"Content-Type": "application/json"}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(
-            self.url + path, json.dumps(body or {}).encode(), headers, method="POST"
+            self.url + path,
+            None if method == "GET" else json.dumps(body or {}).encode(),
+            headers, method=method,
         )
         try:
             with self.opener.open(request, timeout=10) as response:
@@ -136,8 +139,8 @@ def run(api, args):
         api.login()
         session_id, token = api.create_session(args.project, args.bundle)
         child = subprocess.Popen(
-            [args.worker, "--config", str(Path(__file__).with_name("worker.yaml")),
-             "--server-root-url", args.oz_server],
+            [args.worker, "--config-file", str(args.config_file),
+             "--server-root-url", args.oz_server, *args.worker_args],
             env=worker_environment(token),
             start_new_session=True,
         )
@@ -180,17 +183,37 @@ def run(api, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", required=True, help="Path to the locally built oz-agent-worker")
-    parser.add_argument("--project", required=True, help="Agent Vault project ID")
+    parser.add_argument("--project", help="Agent Vault project ID")
     parser.add_argument("--bundle", default="oz-github-poc")
     parser.add_argument("--url", default="http://127.0.0.1:8088")
     parser.add_argument("--oz-server", default="https://app.warp.dev")
+    parser.add_argument("--config-file", type=Path, default=Path(__file__).with_name("worker.yaml"))
+    parser.add_argument("--credentials-file", type=Path, help="Owner-only local setup state")
+    parser.add_argument("worker_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.worker_args[:1] == ["--"]:
+        args.worker_args.pop(0)
     if not os.environ.get("WARP_API_KEY"):
         parser.error("Export the Oz worker's team-scoped WARP_API_KEY first")
-    client_id = os.environ.get("INFISICAL_UNIVERSAL_AUTH_CLIENT_ID") or input("Infisical machine Client ID: ").strip()
-    client_secret = os.environ.get("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET") or getpass.getpass("Infisical machine Client Secret: ")
+    if args.credentials_file:
+        try:
+            fd = os.open(args.credentials_file, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+                    raise ValueError()
+                state = json.load(stream)
+            client_id, client_secret = state["client_id"], state["client_secret"]
+            args.project = args.project or state["project"]
+        except (OSError, ValueError, KeyError, TypeError):
+            parser.error("Cannot read protected local setup state")
+    else:
+        client_id = os.environ.get("INFISICAL_UNIVERSAL_AUTH_CLIENT_ID") or input("Infisical machine Client ID: ").strip()
+        client_secret = os.environ.get("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET") or getpass.getpass("Infisical machine Client Secret: ")
     if not client_id or not client_secret:
         parser.error("Machine identity client ID and secret are required")
+    if not args.project:
+        parser.error("--project or provisioned --credentials-file is required")
     try:
         return run(Infisical(args.url, client_id, client_secret), args)
     except ValueError as exc:

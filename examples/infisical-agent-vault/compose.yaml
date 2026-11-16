@@ -57,6 +57,6 @@ networks:
     internal: true
   control: {}
   agent:
-    name: oz-vault-agent
+    name: ${AGENT_VAULT_TASK_NETWORK:-oz-vault-agent}
 volumes:
   postgres: {}

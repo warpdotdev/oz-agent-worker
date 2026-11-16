@@ -61,8 +61,9 @@ class LauncherTest(unittest.TestCase):
         self.capture = self.root / "child.json"
         self.worker.write_text(
             f"#!{sys.executable}\n"
-            "import json, os\n"
-            f"open({str(self.capture)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+            "import json, os, sys\n"
+            "assert sys.argv[1] == '--config-file', sys.argv\n"
+            f"open({str(self.capture)!r}, 'w').write(json.dumps({{'environment': dict(os.environ), 'arguments': sys.argv[1:]}}))\n"
         )
         self.worker.chmod(0o700)
         self.environment = {
@@ -96,7 +97,7 @@ class LauncherTest(unittest.TestCase):
     def test_worker_gets_session_not_management_or_github_credentials(self):
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
-        child = json.loads(self.capture.read_text())
+        child = json.loads(self.capture.read_text())["environment"]
         self.assertEqual(child["INFISICAL_AGENT_VAULT_SESSION_TOKEN"], "test-session-token")
         self.assertEqual(child["WARP_API_KEY"], "test-worker-key")
         self.assertNotIn(SENTINEL, json.dumps(child))
@@ -105,6 +106,18 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(session["ttl"], "20m")
         self.assertEqual(session["accessBundle"], "oz-github-poc")
         self.assertEqual(self.server.revokes, 1)
+
+    def test_launcher_arguments_are_accepted_by_real_worker_parser(self):
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = json.loads(self.capture.read_text())["arguments"]
+        parsed = subprocess.run(
+            ["go", "run", ".", *arguments, "--help"], cwd=HERE.resolve().parents[1],
+            env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"],
+                 "WARP_API_KEY": "test-worker-key"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
 
     def test_failed_process_start_still_revokes(self):
         self.worker.unlink()
