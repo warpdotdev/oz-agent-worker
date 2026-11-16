@@ -111,6 +111,8 @@ Do not combine a manually initialized deployment with controller bootstrap.
 - State lives in `warp-server/logs/oz-local/agent-vault/` for integrated mode.
   It must remain owned by you, with directory mode 0700 and files mode 0600.
   Never print `.env`, `state.json` or `pending-token`.
+- Missing `.env` keys with retained state, containers or volumes block startup.
+  Restore the original protected file; do not generate new keys for existing data.
 - Partial bootstrap deliberately stops instead of creating duplicate resources.
   Preserve the state directory and owned database volume. Do not edit
   `phase=provisioning` to `ready`. Recover the owned deployment manually using

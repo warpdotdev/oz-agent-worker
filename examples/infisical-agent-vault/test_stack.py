@@ -98,6 +98,7 @@ class StackTest(unittest.TestCase):
             stack.read_private(link)
 
     def test_foreign_compose_project_is_not_started_or_stopped(self):
+        stack.write_private(self.root / ".env", "fixture")
         args = SimpleNamespace(state_dir=self.root, project_name="fixture")
         responses = [
             SimpleNamespace(returncode=0, stdout="container"),
@@ -110,6 +111,28 @@ class StackTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 stack.serve(args)
             compose.assert_not_called()
+
+    def test_missing_keys_do_not_recreate_existing_state_or_data(self):
+        for retained in ("state", "container", "volume"):
+            with self.subTest(retained=retained):
+                root = self.root / retained
+                root.mkdir()
+                if retained == "state":
+                    stack.write_private(root / "state.json", '{"phase":"ready"}')
+                args = SimpleNamespace(state_dir=root, project_name="fixture")
+
+                def docker(command, **kwargs):
+                    output = "owned-resource" if (
+                        (retained == "container" and command[1] == "ps")
+                        or (retained == "volume" and command[1] == "volume")
+                    ) else ""
+                    return SimpleNamespace(returncode=0, stdout=output)
+
+                with mock.patch.object(stack.subprocess, "run", side_effect=docker), \
+                        mock.patch.object(stack, "compose", side_effect=AssertionError("Must not recreate")):
+                    with self.assertRaises(ValueError):
+                        stack.serve(args)
+                self.assertFalse((root / ".env").exists())
 
 
 if __name__ == "__main__":

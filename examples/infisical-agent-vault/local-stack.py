@@ -176,7 +176,22 @@ def compose(args, *command, proxy_token=None):
 
 def serve(args):
     root = args.state_dir
+    existing = subprocess.run([
+        "docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + args.project_name,
+    ], env=docker_environment(), capture_output=True, text=True, timeout=15)
+    if existing.returncode:
+        raise RuntimeError("Cannot inspect existing Vault containers")
     if not (root / ".env").exists():
+        if (root / "state.json").exists() or existing.stdout.strip():
+            raise ValueError("Restore the original Vault deployment keys before restarting existing resources")
+        volumes = subprocess.run([
+            "docker", "volume", "ls", "-q", "--filter",
+            "label=com.docker.compose.project=" + args.project_name,
+        ], env=docker_environment(), capture_output=True, text=True, timeout=15)
+        if volumes.returncode:
+            raise RuntimeError("Cannot inspect existing Vault data volumes")
+        if volumes.stdout.strip():
+            raise ValueError("Restore the original Vault deployment keys before restarting existing data")
         write_private(root / ".env", (
             f"POSTGRES_PASSWORD={secrets.token_hex(24)}\n"
             f"ENCRYPTION_KEY={secrets.token_hex(16)}\n"
@@ -184,11 +199,6 @@ def serve(args):
         ))
     else:
         read_private(root / ".env")
-    existing = subprocess.run([
-        "docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + args.project_name,
-    ], env=docker_environment(), capture_output=True, text=True, timeout=15)
-    if existing.returncode:
-        raise RuntimeError("Cannot inspect existing Vault containers")
     if existing.stdout.split():
         inspected = subprocess.run([
             "docker", "inspect", *existing.stdout.split(),
