@@ -74,9 +74,10 @@ const (
 	maxKubernetesFailureEvents            = 10
 	maxFailureDetailsBytes                = 32 * 1024
 
-	// platformAffinityWeight is the maximum node-affinity weight, so a non-strict runner
-	// platform outranks other soft scheduling signals without becoming a requirement.
-	platformAffinityWeight = int32(100)
+	// platformAffinityWeight is the minimum node-affinity weight. The scheduler normalizes
+	// node-affinity scores, so on its own the term still steers the pod toward a matching
+	// node, while preferred terms from pod_template carry at least as much weight.
+	platformAffinityWeight = int32(1)
 )
 
 // kubernetesTaskOwnedEnvVars returns exactly the worker-owned variables this backend puts on
