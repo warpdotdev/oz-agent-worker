@@ -3,21 +3,9 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 )
-
-func newRestrictedGitHome(workspaceRoot string) (string, error) {
-	root, err := filepath.Abs(workspaceRoot)
-	if err != nil {
-		return "", err
-	}
-	// Use a sibling of the execution workspace so snapshots and retained
-	// workspaces do not contain the client's credential store.
-	return os.MkdirTemp(root, ".oz-restricted-home-")
-}
 
 const restrictedGitModeEnv = "WARP_GITHUB_CREDENTIAL_MODE=restricted_installation"
 

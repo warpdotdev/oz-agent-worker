@@ -1,3 +1,5 @@
+//go:build unix
+
 package worker
 
 import (
@@ -27,6 +29,64 @@ func privateHomeAssignment(t *testing.T) *types.TaskAssignmentMessage {
 		t.Fatal(err)
 	}
 	return &assignment
+}
+
+func TestDirectPrivateHomeValidatesWorkspaceRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, tc := range []struct {
+		name                        string
+		rootMode                    os.FileMode
+		parentMode                  os.FileMode
+		rootLink, parentLink, allow bool
+	}{
+		{name: "symlink root", rootLink: true},
+		{name: "group-writable root", rootMode: 0o770},
+		{name: "world-writable root", rootMode: 0o707},
+		{name: "writable ancestor", parentMode: 0o777},
+		{name: "trusted ancestor symlink", parentLink: true, allow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			parent := filepath.Join(dir, "parent")
+			root := filepath.Join(parent, "workspaces")
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rootMode != 0 {
+				if err := os.Chmod(root, tc.rootMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.parentMode != 0 {
+				if err := os.Chmod(parent, tc.parentMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runRoot := root
+			if tc.rootLink || tc.parentLink {
+				alias, target := filepath.Join(dir, "alias"), root
+				runRoot = alias
+				if tc.parentLink {
+					target, runRoot = parent, filepath.Join(alias, "workspaces")
+				}
+				if err := os.Symlink(target, alias); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w, b := privateHomeWorker(t, `exit 0`, DirectBackendConfig{})
+			b.config.WorkspaceRoot = runRoot
+			result := b.ExecuteTask(t.Context(), w.prepareTaskParams(privateHomeAssignment(t)))
+			if (result.Error == nil) != tc.allow {
+				t.Fatalf("unexpected execution result: %v", result.Error)
+			}
+			if info, err := os.Stat(root); err != nil || (tc.rootMode != 0 && info.Mode().Perm() != tc.rootMode) {
+				t.Fatal("validation changed the workspace root")
+			}
+			if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+				t.Fatal("unexpected files in the workspace root")
+			}
+		})
+	}
 }
 
 func privateHomeWorker(t *testing.T, script string, cfg DirectBackendConfig) (*Worker, *DirectBackend) {
@@ -161,11 +221,25 @@ func TestDirectPrivateHomeRejectsUnsafeAssignments(t *testing.T) {
 func TestDirectUnmarkedAssignmentKeepsHome(t *testing.T) {
 	personal := t.TempDir()
 	t.Setenv("HOME", personal)
+	hooks := t.TempDir()
+	t.Setenv("HOOK_RECORD", hooks)
+	t.Setenv("WORKER_HOOK_FIXTURE", "hook-only")
+	const checkHook = `test "$WORKER_HOOK_FIXTURE" = hook-only && test "$GIT_CONFIG_GLOBAL" = "$PWD/.gitconfig"`
 	w, b := privateHomeWorker(t, `
 test "$HOME" = "$ORIGINAL_HOME"
 test "$GIT_CONFIG_GLOBAL" != "$HOME/.gitconfig"
 test "$GIT_CONFIG_GLOBAL" = "$PWD/.gitconfig"
-`, DirectBackendConfig{Env: map[string]string{"ORIGINAL_HOME": personal}})
+test -z "${WORKER_HOOK_FIXTURE+x}"
+`, DirectBackendConfig{
+		Env:             map[string]string{"ORIGINAL_HOME": personal},
+		SetupCommand:    checkHook + ` && printf ok > "$HOOK_RECORD/setup"`,
+		TeardownCommand: checkHook + ` && printf ok > "$HOOK_RECORD/teardown"`,
+	})
+	// A server that did not request credential storage retains its existing
+	// workspace policy and does not run the marked-only parent checks.
+	if err := os.Chmod(b.config.WorkspaceRoot, 0o770); err != nil {
+		t.Fatal(err)
+	}
 	var assignment types.TaskAssignmentMessage
 	if err := json.Unmarshal([]byte(`{"task_id":"run","task":{"id":"run"},"execution_id":"12",
 		"env_vars":{"WARP_GITHUB_CREDENTIAL_MODE":"restricted_installation","use_private_restricted_git_home":"true"}}`), &assignment); err != nil {
@@ -173,6 +247,11 @@ test "$GIT_CONFIG_GLOBAL" = "$PWD/.gitconfig"
 	}
 	if result := b.ExecuteTask(t.Context(), w.prepareTaskParams(&assignment)); result.Error != nil {
 		t.Fatal(result.Error)
+	}
+	for _, hook := range []string{"setup", "teardown"} {
+		if _, err := os.Stat(filepath.Join(hooks, hook)); err != nil {
+			t.Fatalf("%s hook lost worker environment: %v", hook, err)
+		}
 	}
 }
 

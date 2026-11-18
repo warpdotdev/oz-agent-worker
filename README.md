@@ -198,6 +198,8 @@ For a fresh Direct execution, the server can request a private home for restrict
 The agent and its setup and teardown hooks use that home instead of the operator's home. Git uses
 the task's restricted HTTPS credentials, not the operator's Git configuration or SSH keys. The
 worker removes the private home when execution ends, even if workspace cleanup is disabled.
+This option requires a worker-owned workspace root on Unix. It cannot be a symlink or writable
+by other users. The worker rejects unsafe directories; it does not change their permissions.
 This option is not supported with `target_dir` or standby sandboxes. It does not provide OS-level
 isolation: the task still runs under the worker's account.
 

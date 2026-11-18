@@ -206,6 +206,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	taskEnv := params.EnvVars
 	configEnv := envSliceFromMap(b.config.Env)
 	hookBase := os.Environ()
+	workspaceRoot := b.config.WorkspaceRoot
 	var privateHome string
 	if params.UsePrivateRestrictedGitHome {
 		if standbyID != "" || params.ExecutionID == "" || b.config.TargetDir != "" {
@@ -218,7 +219,12 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		if configEnv, err = restrictedGitEnv(configEnv, workerEnv); err != nil {
 			return executeError(err)
 		}
-		privateHome, err = newRestrictedGitHome(b.config.WorkspaceRoot)
+		workspaceRoot, err = checkedRestrictedWorkspaceRoot(workspaceRoot)
+		if err != nil {
+			return executeError(err)
+		}
+		// A sibling of the workspace is not retained in its snapshots.
+		privateHome, err = os.MkdirTemp(workspaceRoot, ".oz-restricted-home-")
 		if err != nil {
 			return executeError(err)
 		}
@@ -239,13 +245,13 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		workspaceDir = b.config.TargetDir
 	} else if standbyID != "" {
 		var err error
-		workspaceDir, err = os.MkdirTemp(b.config.WorkspaceRoot, "prewarm-"+standbyID+"-")
+		workspaceDir, err = os.MkdirTemp(workspaceRoot, "prewarm-"+standbyID+"-")
 		if err != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create standby workspace: %w", err)))
 		}
 	} else {
 		// Legacy assignments use a per-task workspace.
-		workspaceDir = filepath.Join(b.config.WorkspaceRoot, taskID)
+		workspaceDir = filepath.Join(workspaceRoot, taskID)
 		if params.ExecutionID != "" {
 			if err := validateTaskIDForPath(params.ExecutionID); err != nil {
 				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid execution ID for workspace path: %w", err)))
@@ -253,7 +259,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			var err error
 			// Give each execution a fresh workspace so overlapping executions
 			// cannot share files or remove each other's workspace during cleanup.
-			workspaceDir, err = os.MkdirTemp(b.config.WorkspaceRoot, taskID+"-"+params.ExecutionID+"-")
+			workspaceDir, err = os.MkdirTemp(workspaceRoot, taskID+"-"+params.ExecutionID+"-")
 			if err != nil {
 				return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("failed to create execution workspace: %w", err)))
 			}
