@@ -1382,6 +1382,16 @@ func TestExecuteTaskUsesCopyInitContainersByDefault(t *testing.T) {
 // backend created.
 func executeTaskAndCaptureJob(t *testing.T, params *TaskParams) *batchv1.Job {
 	t.Helper()
+	return executeTaskWithConfigAndCaptureJob(t, KubernetesBackendConfig{
+		WorkerID:  "worker-123",
+		Namespace: "agents",
+	}, params)
+}
+
+// executeTaskWithConfigAndCaptureJob is executeTaskAndCaptureJob for a backend with the
+// given config.
+func executeTaskWithConfigAndCaptureJob(t *testing.T, config KubernetesBackendConfig, params *TaskParams) *batchv1.Job {
+	t.Helper()
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1420,10 +1430,7 @@ func executeTaskAndCaptureJob(t *testing.T, params *TaskParams) *batchv1.Job {
 	})
 
 	backend := &KubernetesBackend{
-		config: KubernetesBackendConfig{
-			WorkerID:  "worker-123",
-			Namespace: "agents",
-		},
+		config:    config,
 		clientset: fakeClient,
 	}
 
@@ -1435,6 +1442,190 @@ func executeTaskAndCaptureJob(t *testing.T, params *TaskParams) *batchv1.Job {
 		t.Fatal("expected task job to be created")
 	}
 	return createdJob
+}
+
+func workspaceVolumeOf(t *testing.T, podSpec corev1.PodSpec) corev1.Volume {
+	t.Helper()
+	for _, volume := range podSpec.Volumes {
+		if volume.Name == workspaceVolumeName() {
+			return volume
+		}
+	}
+	t.Fatalf("expected a workspace volume, got %+v", podSpec.Volumes)
+	return corev1.Volume{}
+}
+
+func workspaceMountOf(t *testing.T, container corev1.Container) corev1.VolumeMount {
+	t.Helper()
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == workspaceVolumeName() {
+			return mount
+		}
+	}
+	t.Fatalf("expected container %s to mount the workspace, got %+v", container.Name, container.VolumeMounts)
+	return corev1.VolumeMount{}
+}
+
+func TestExecuteTaskUsesEmptyDirWorkspaceByDefault(t *testing.T) {
+	createdJob := executeTaskAndCaptureJob(t, &TaskParams{
+		TaskID:        "task-1",
+		DockerImage:   "ubuntu:22.04",
+		BaseArgs:      []string{"run"},
+		InstanceShape: &types.InstanceShape{Vcpus: 8, MemoryGb: 32},
+	})
+	podSpec := createdJob.Spec.Template.Spec
+
+	volume := workspaceVolumeOf(t, podSpec)
+	if volume.EmptyDir == nil || volume.Ephemeral != nil {
+		t.Fatalf("expected an emptyDir workspace, got %+v", volume.VolumeSource)
+	}
+	if len(podSpec.InitContainers) != 0 {
+		t.Fatalf("expected no init containers, got %+v", podSpec.InitContainers)
+	}
+	mount := workspaceMountOf(t, podSpec.Containers[0])
+	if mount.MountPath != defaultWorkspaceMountPath || mount.SubPath != "" {
+		t.Fatalf("workspace mount = %+v, want %s with no subPath", mount, defaultWorkspaceMountPath)
+	}
+}
+
+func TestExecuteTaskMountsDedicatedWorkspaceVolume(t *testing.T) {
+	createdJob := executeTaskWithConfigAndCaptureJob(t, KubernetesBackendConfig{
+		WorkerID:     "worker-123",
+		Namespace:    "agents",
+		SetupCommand: "echo setup",
+		WorkspaceVolume: &KubernetesWorkspaceVolumeConfig{
+			StorageClass:       "fast",
+			BaseSize:           resource.MustParse("32Gi"),
+			SizePerComputeUnit: resource.MustParse("8Gi"),
+		},
+	}, &TaskParams{
+		TaskID:        "task-1",
+		DockerImage:   "ubuntu:22.04",
+		BaseArgs:      []string{"run"},
+		InstanceShape: &types.InstanceShape{Vcpus: 8, MemoryGb: 32},
+	})
+	podSpec := createdJob.Spec.Template.Spec
+
+	volume := workspaceVolumeOf(t, podSpec)
+	if volume.EmptyDir != nil || volume.Ephemeral == nil || volume.Ephemeral.VolumeClaimTemplate == nil {
+		t.Fatalf("expected a generic ephemeral workspace volume, got %+v", volume.VolumeSource)
+	}
+	claim := volume.Ephemeral.VolumeClaimTemplate
+	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != "fast" {
+		t.Fatalf("storage class = %v, want fast", claim.Spec.StorageClassName)
+	}
+	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Fatalf("access modes = %v, want [ReadWriteOnce]", claim.Spec.AccessModes)
+	}
+	// 8 vCPU / 32 GiB is 16 compute units: 32Gi + 16 * 8Gi.
+	if got := claim.Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse("160Gi")) != 0 {
+		t.Fatalf("storage request = %s, want 160Gi", got.String())
+	}
+	if claim.Labels[kubernetesTaskHashLabel] != kubernetesLabelHash("task-1") {
+		t.Fatalf("expected the claim to carry the task labels, got %v", claim.Labels)
+	}
+
+	if len(podSpec.InitContainers) != 2 {
+		t.Fatalf("expected prepare-workspace and setup init containers, got %+v", podSpec.InitContainers)
+	}
+	prepare := podSpec.InitContainers[0]
+	if prepare.Name != kubernetesWorkspaceInitContainerName {
+		t.Fatalf("first init container = %q, want %q so the workspace exists before setup runs", prepare.Name, kubernetesWorkspaceInitContainerName)
+	}
+	if prepare.Image != "ubuntu:22.04" {
+		t.Fatalf("prepare-workspace image = %q, want the task image", prepare.Image)
+	}
+	if prepare.SecurityContext == nil || prepare.SecurityContext.RunAsUser == nil || *prepare.SecurityContext.RunAsUser != 0 {
+		t.Fatalf("expected prepare-workspace to run as root, got %+v", prepare.SecurityContext)
+	}
+	prepareMount := workspaceMountOf(t, prepare)
+	if prepareMount.MountPath != workspaceVolumeRootMountPath || prepareMount.SubPath != "" {
+		t.Fatalf("prepare-workspace mount = %+v, want the volume root at %s", prepareMount, workspaceVolumeRootMountPath)
+	}
+	wantScript := "mkdir -p /oz-workspace-volume/workspace && chmod 0777 /oz-workspace-volume/workspace"
+	if got := prepare.Command[len(prepare.Command)-1]; got != wantScript {
+		t.Fatalf("prepare-workspace script = %q, want %q", got, wantScript)
+	}
+
+	for _, container := range []corev1.Container{podSpec.InitContainers[1], podSpec.Containers[0]} {
+		mount := workspaceMountOf(t, container)
+		if mount.MountPath != defaultWorkspaceMountPath || mount.SubPath != workspaceVolumeSubPath {
+			t.Fatalf("%s workspace mount = %+v, want %s from subPath %s", container.Name, mount, defaultWorkspaceMountPath, workspaceVolumeSubPath)
+		}
+	}
+}
+
+func TestTaskWorkspaceVolumeSize(t *testing.T) {
+	podTemplate := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name: kubernetesTaskContainerName,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("4"),
+						corev1.ResourceMemory: resource.MustParse("8Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range []struct {
+		name        string
+		podTemplate *corev1.PodSpec
+		perUnit     string
+		shape       *types.InstanceShape
+		want        string
+	}{
+		{name: "fixed size ignores the shape", perUnit: "0", shape: &types.InstanceShape{Vcpus: 8, MemoryGb: 32}, want: "32Gi"},
+		{name: "no shape and no pod template is the base size", perUnit: "8Gi", want: "32Gi"},
+		{name: "shape scales the size", perUnit: "8Gi", shape: &types.InstanceShape{Vcpus: 2, MemoryGb: 4}, want: "48Gi"},
+		{name: "pod template resources scale the size without a shape", podTemplate: podTemplate, perUnit: "8Gi", want: "64Gi"},
+		{name: "shape overrides pod template resources", podTemplate: podTemplate, perUnit: "8Gi", shape: &types.InstanceShape{Vcpus: 1, MemoryGb: 2}, want: "40Gi"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &KubernetesBackend{
+				config: KubernetesBackendConfig{
+					PodTemplate: tt.podTemplate,
+					WorkspaceVolume: &KubernetesWorkspaceVolumeConfig{
+						BaseSize:           resource.MustParse("32Gi"),
+						SizePerComputeUnit: resource.MustParse(tt.perUnit),
+					},
+				},
+			}
+			claim := backend.taskWorkspaceVolume(tt.shape, nil).Ephemeral.VolumeClaimTemplate
+			if claim.Spec.StorageClassName != nil {
+				t.Fatalf("storage class = %q, want unset so the cluster default applies", *claim.Spec.StorageClassName)
+			}
+			if got := claim.Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(resource.MustParse(tt.want)) != 0 {
+				t.Fatalf("storage request = %s, want %s", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestComputeUnits(t *testing.T) {
+	resources := func(requests, limits corev1.ResourceList) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{Requests: requests, Limits: limits}
+	}
+	for _, tt := range []struct {
+		name      string
+		resources corev1.ResourceRequirements
+		want      int64
+	}{
+		{name: "no resources", want: 0},
+		{name: "cpu dominates", resources: resources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("8Gi")}, nil), want: 8},
+		{name: "memory dominates", resources: resources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("32Gi")}, nil), want: 16},
+		{name: "fractions round up", resources: resources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("3Gi")}, nil), want: 2},
+		{name: "limits count when there is no request", resources: resources(nil, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}), want: 4},
+		{name: "requests win over limits", resources: resources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}), want: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := computeUnits(tt.resources); got != tt.want {
+				t.Fatalf("computeUnits = %d, want %d", got, tt.want)
+			}
+		})
+	}
 }
 
 // End-to-end on the worker: params.InstanceShape must flow through ExecuteTask onto the

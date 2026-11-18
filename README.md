@@ -331,6 +331,23 @@ backend:
 - when using `pod_template`, define a container named `task` if you want to customize the main task container directly; otherwise the worker appends its own `task` container to the PodSpec
 - when a run's runner specifies an instance shape, the worker sets the `task` container's CPU and memory **requests and limits** from that shape on a per-run basis, overriding any matching `resources` set on the `task` container in `pod_template` (other resource entries are preserved). Runs whose runner has no instance shape keep your `pod_template`/cluster defaults unchanged. The Docker backend applies the same shape as container CPU/memory limits; the Direct backend runs on the host and does not enforce shapes
 - when a run's runner specifies an OS/architecture (sent as an OCI platform, e.g. `linux`/`arm64`), the worker steers the task pod toward nodes with that platform. By default this is a lowest-weight preference: a cluster with no matching node still schedules the pod, and preferred node affinity from `pod_template` carries at least as much weight. When the runner marks its platform `strict`, the platform becomes a requirement, and a platform no node can satisfy leaves the pod Pending, the same failure mode as an unsatisfiable instance shape (preferred vs. required node affinity on `kubernetes.io/os` / `kubernetes.io/arch`). `nodeSelector` / `affinity` from `pod_template` are preserved
+- by default `/workspace` is an `emptyDir`, which counts against the task pod's ephemeral-storage limit together with the container's writable layer and any copied sidecars; `workspace_size_limit` caps that `emptyDir` without adding space. To give the workspace its own disk, set `workspace_volume`:
+
+```yaml
+backend:
+  kubernetes:
+    workspace_volume:
+      base_size: "32Gi"
+      size_per_compute_unit: "8Gi" # optional
+      storage_class: "standard-rwo" # optional; defaults to the cluster default StorageClass
+```
+
+  Each task pod then mounts `/workspace` from a [generic ephemeral volume](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes): Kubernetes provisions a PersistentVolumeClaim with the pod and deletes it with the pod, and the volume is not charged to the pod's ephemeral storage. This is the way to get a workspace larger than a platform-imposed ephemeral-storage ceiling, such as the 10 GiB that GKE Autopilot allows general-purpose pods. The requested size is `base_size` plus `size_per_compute_unit` for each compute unit of the `task` container, where a unit is 1 vCPU or 2 GiB of memory (whichever count is larger, rounded up) taken from the run's instance shape, or from the `pod_template` resources when the runner has none. With the example above, a 2 vCPU / 4 GiB run gets 48Gi and an 8 vCPU / 32 GiB run gets 160Gi; omit `size_per_compute_unit` for one fixed size. Things to know before enabling it:
+  - the cluster must support dynamic provisioning for the chosen StorageClass, and the namespace needs enough PersistentVolumeClaim and storage quota for every concurrent task and standby pod
+  - the worker adds a root init container named `prepare-workspace` (using the task image) that creates the workspace directory and makes it world-writable, so the namespace must admit root init containers
+  - provisioning and attaching a volume adds to pod startup time; a volume that cannot be provisioned keeps the pod Pending until the task is failed by `unschedulable_timeout` or, at the latest, the Job's `active_deadline_seconds`
+  - the volume lives as long as its pod, so failed task Jobs retained for debugging keep their volume until `ttl_seconds_after_finished` removes them
+  - `workspace_volume` cannot be combined with `workspace_size_limit`; the worker's own RBAC is unchanged, because Kubernetes creates the claim on the pod's behalf
 - to run services (databases, brokers, caches, etc.) alongside the task container, declare them in `pod_template.initContainers` with `restartPolicy: Always` (native sidecar containers). Matching Kubernetes Job semantics, the worker ignores their exit codes when detecting task failure: the kubelet stops sidecars with SIGTERM after the task container finishes, so services that exit non-zero on SIGTERM (e.g. JVM-based services exiting 143) do not fail the task. Init containers without `restartPolicy` remain run-to-completion setup steps whose non-zero exit fails the task
 - use `valueFrom.secretKeyRef` inside `pod_template` to inject Kubernetes Secret values into task container environment variables:
 

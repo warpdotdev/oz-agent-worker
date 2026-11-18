@@ -430,6 +430,43 @@ backend:
 	}
 }
 
+func TestLoadKubernetesWorkspaceVolume(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  kubernetes:
+    workspace_volume:
+      storage_class: "standard-rwo"
+      base_size: "32Gi"
+      size_per_compute_unit: "8Gi"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	volume := cfg.Backend.Kubernetes.WorkspaceVolume
+	if volume == nil {
+		t.Fatal("expected workspace_volume to be set")
+	}
+	if volume.StorageClass != "standard-rwo" || volume.BaseSize != "32Gi" || volume.SizePerComputeUnit != "8Gi" {
+		t.Fatalf("workspace_volume = %+v, want standard-rwo / 32Gi / 8Gi", *volume)
+	}
+}
+
+func TestLoadKubernetesWorkspaceVolumeRequiresBaseSize(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  kubernetes:
+    workspace_volume:
+      storage_class: "standard-rwo"
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "BaseSize is required") {
+		t.Fatalf("expected a missing base_size error, got %v", err)
+	}
+}
+
 func TestLoadKubernetesUseImageVolumesTriState(t *testing.T) {
 	tests := []struct {
 		name       string
