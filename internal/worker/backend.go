@@ -166,9 +166,10 @@ func validateStandbyID(sandboxID string) error {
 // and the backend interface, so backends don't need to handle common concerns like
 // resolving environment variables, choosing default images, or building base CLI args.
 type TaskParams struct {
-	TaskID      string
-	ExecutionID string
-	Task        *types.Task
+	TaskID                      string
+	ExecutionID                 string
+	Task                        *types.Task
+	UsePrivateRestrictedGitHome bool
 	// StandbyID identifies a standby instead of a task, with Task nil and both run IDs empty.
 	StandbyID string
 

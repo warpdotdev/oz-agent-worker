@@ -194,6 +194,13 @@ The teardown hook additionally gets `GIT_CONFIG_GLOBAL`, pointing at the task's 
 These names are worker-owned: the worker writes them last, so an entry with one of these names in
 the backend's `environment` is overwritten rather than honoured.
 
+For a fresh Direct execution, the server can request a private home for restricted Git credentials.
+The agent and its setup and teardown hooks use that home instead of the operator's home. Git uses
+the task's restricted HTTPS credentials, not the operator's Git configuration or SSH keys. The
+worker removes the private home when execution ends, even if workspace cleanup is disabled.
+This option is not supported with `target_dir` or standby sandboxes. It does not provide OS-level
+isolation: the task still runs under the worker's account.
+
 ### Command
 
 The command backend hands task execution to an operator-owned runtime over **any transport**. Instead of running the agent itself, the worker invokes an operator-configured `dispatch_command` and lets that command dispatch the task however it likes (HTTP, gRPC, a cloud SDK, a message queue, SSH, etc.).

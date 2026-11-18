@@ -203,6 +203,34 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonWorkspaceSetup, fmt.Errorf("invalid task ID for workspace path: %w", err)))
 	}
 
+	taskEnv := params.EnvVars
+	configEnv := envSliceFromMap(b.config.Env)
+	hookBase := os.Environ()
+	var privateHome string
+	if params.UsePrivateRestrictedGitHome {
+		if standbyID != "" || params.ExecutionID == "" || b.config.TargetDir != "" {
+			return executeError(errors.New("private Git home requires an execution-specific Direct workspace"))
+		}
+		var err error
+		if taskEnv, err = restrictedGitEnv(taskEnv, assignmentEnv); err != nil {
+			return executeError(err)
+		}
+		if configEnv, err = restrictedGitEnv(configEnv, workerEnv); err != nil {
+			return executeError(err)
+		}
+		privateHome, err = newRestrictedGitHome(b.config.WorkspaceRoot)
+		if err != nil {
+			return executeError(err)
+		}
+		defer func() {
+			if err := os.RemoveAll(privateHome); err != nil {
+				log.Errorf(ctx, "Failed to remove private Git home: %v", err)
+				result = executeError(errors.Join(result.Error, fmt.Errorf("remove private Git home: %w", err)))
+			}
+		}()
+		hookBase = hostBaseEnv()
+	}
+
 	// Determine working directory: shared target dir or isolated workspace.
 	var workspaceDir string
 	usingTargetDir := b.config.TargetDir != ""
@@ -240,7 +268,16 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		return executeError(err)
 	}
 	defer cleanupGitConfig()
-	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
+	var gitConfigEnv []string
+	if privateHome != "" {
+		gitConfigPath = filepath.Join(privateHome, ".gitconfig")
+		// OpenSSH can find the account's keys through the OS, even with a private HOME.
+		gitConfigEnv = []string{"HOME=" + privateHome,
+			"GH_CONFIG_DIR=" + filepath.Join(privateHome, ".config", "gh"),
+			"GIT_CONFIG_NOSYSTEM=1", "GIT_SSH_COMMAND=false", restrictedGitModeEnv}
+	}
+	gitConfigEnv = append(gitConfigEnv, "GIT_CONFIG_GLOBAL="+gitConfigPath)
+	hookBase = mergeEnvVars(hookBase, gitConfigEnv)
 
 	defer func() {
 		tracing.RecordError(workspace, result.Error)
@@ -249,19 +286,20 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
 		}
+		teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
+		if standbyID != "" {
+			teardownEnv = directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID)
+		}
+		teardownEnv = mergeEnvVars(hookBase, teardownEnv)
 		if usingTargetDir {
 			_, cleanup := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
 				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			// Don't clean up the shared target directory.
-			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs))
+			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, teardownEnv, workspaceDir, params.Logs))
 			cleanup.End()
 			return
 		}
-		if standbyID != "" {
-			_ = b.removeWorkspace(ctx, directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID), workspaceDir, params.Logs)
-			return
-		}
-		_ = b.removeWorkspace(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs)
+		_ = b.removeWorkspace(ctx, teardownEnv, workspaceDir, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
@@ -280,11 +318,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}()
 
 	// 3. Build environment variables: common + config-level.
-	envVars := make([]string, len(params.EnvVars))
-	copy(envVars, params.EnvVars)
-	for key, value := range b.config.Env {
-		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
-	}
+	envVars := mergeEnvVars(taskEnv, configEnv)
 	envVars = mergeEnvVars(envVars, harnessEnvVars(workspaceDir, params))
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
 	workspace.End()
@@ -295,7 +329,7 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		if standbyID != "" {
 			hookEnv = directStandbySetupEnvVars(workspaceDir, standbyID, envFilePath)
 		}
-		setupEnv := append(envVars, hookEnv...)
+		setupEnv := mergeEnvVars(hookBase, append(envVars, hookEnv...))
 
 		log.Infof(ctx, "Running setup command")
 		doneSetup := params.SetupEvents.startPhase(ctx, SetupEventSetupCommand)
@@ -313,15 +347,20 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	// Use merge semantics so setup script vars can override YAML config vars.
 	setupScriptEnv, err := parseEnvFile(envFilePath)
 	if err != nil {
+		if privateHome != "" {
+			return executeError(errors.New("invalid restricted task setup environment"))
+		}
 		log.Warnf(ctx, "Failed to parse environment file")
 	}
 	params.Logs.AddEnv(setupScriptEnv)
 	if err := validateMetadataEnvConflicts(params.EnvVars, envSliceFromMap(setupScriptEnv)); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSetupCommand, err))
 	}
-	var setupScriptVars []string
-	for key, value := range setupScriptEnv {
-		setupScriptVars = append(setupScriptVars, fmt.Sprintf("%s=%s", key, value))
+	setupScriptVars := envSliceFromMap(setupScriptEnv)
+	if privateHome != "" {
+		if setupScriptVars, err = restrictedGitEnv(setupScriptVars, setupEnv); err != nil {
+			return executeError(err)
+		}
 	}
 	envVars = mergeEnvVars(envVars, setupScriptVars)
 	envVars = mergeEnvVars(envVars, gitConfigEnv)
@@ -453,8 +492,6 @@ func (b *DirectBackend) removeWorkspace(ctx context.Context, teardownEnv []strin
 }
 
 // runCommand executes a shell command with the given working directory and environment.
-// Setup/teardown commands inherit the full worker environment so they can access
-// tools and credentials (e.g. aws, docker) needed for workspace provisioning.
 func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) error {
 	cmd := newHookCommand(ctx, command, dir, env, reporter)
 	stdout, flushStdout := reporter.Output(ctx, "hook.stdout", os.Stdout)
@@ -468,7 +505,7 @@ func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env
 func newHookCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) // #nosec G204 -- setup/teardown commands are explicit operator configuration.
 	cmd.Dir = dir
-	cmd.Env = mergeEnvVars(os.Environ(), env)
+	cmd.Env = env
 	reporter.AddEnvList(cmd.Env)
 	return cmd
 }

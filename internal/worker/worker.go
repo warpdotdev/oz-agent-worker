@@ -859,16 +859,17 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 
 	return &TaskParams{
-		TaskID:        assignment.TaskID,
-		ExecutionID:   assignment.ExecutionID,
-		Task:          task,
-		EnvVars:       envVars,
-		BaseArgs:      baseArgs,
-		DockerImage:   dockerImage,
-		Sidecars:      sidecars,
-		InstanceShape: assignment.InstanceShape,
-		Platform:      assignment.Platform,
-		SetupEvents:   setupEvents,
+		TaskID:                      assignment.TaskID,
+		ExecutionID:                 assignment.ExecutionID,
+		Task:                        task,
+		UsePrivateRestrictedGitHome: assignment.UsePrivateRestrictedGitHome,
+		EnvVars:                     envVars,
+		BaseArgs:                    baseArgs,
+		DockerImage:                 dockerImage,
+		Sidecars:                    sidecars,
+		InstanceShape:               assignment.InstanceShape,
+		Platform:                    assignment.Platform,
+		SetupEvents:                 setupEvents,
 	}
 }
 
