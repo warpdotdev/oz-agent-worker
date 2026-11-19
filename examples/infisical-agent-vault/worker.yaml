@@ -1,0 +1,11 @@
+worker_id: infisical-poc
+max_concurrent_tasks: 1
+idle_on_complete: 0s
+backend:
+  docker:
+    network: oz-vault-agent
+    image_pull_policy: IfNotPresent
+    environment:
+      - name: INFISICAL_AGENT_VAULT_SESSION_TOKEN
+      - name: INFISICAL_AGENT_VAULT_PROXY_ADDRESS
+        value: proxy:17323

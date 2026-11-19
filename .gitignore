@@ -34,3 +34,4 @@ vendor/
 
 # Python bytecode
 __pycache__/
+/.local-agent-vault/

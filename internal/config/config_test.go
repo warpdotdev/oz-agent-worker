@@ -24,6 +24,7 @@ worker_id: "my-worker"
 cleanup: false
 backend:
   docker:
+    network: "oz-vault-agent"
     volumes:
       - "/data:/data:ro"
       - "/cache:/cache"
@@ -50,6 +51,9 @@ backend:
 	}
 	if len(cfg.Backend.Docker.Volumes) != 2 {
 		t.Errorf("volumes count = %d, want 2", len(cfg.Backend.Docker.Volumes))
+	}
+	if cfg.Backend.Docker.Network != "oz-vault-agent" {
+		t.Errorf("network = %q, want oz-vault-agent", cfg.Backend.Docker.Network)
 	}
 	if len(cfg.Backend.Docker.Environment) != 2 {
 		t.Errorf("environment count = %d, want 2", len(cfg.Backend.Docker.Environment))

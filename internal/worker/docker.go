@@ -45,6 +45,7 @@ type DockerBackendConfig struct {
 	NoCleanup bool
 	Volumes   []string
 	Env       map[string]string
+	Network   string
 	// ImagePullPolicy controls how the main task image and every Warp/additional sidecar image
 	// are resolved before use: PullPolicyAlways, PullPolicyIfNotPresent, or PullPolicyNever. An
 	// empty value defaults to PullPolicyAlways, preserving the backend's original
@@ -192,8 +193,9 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	binds = append(binds, b.config.Volumes...)
 
 	hostConfig := &container.HostConfig{
-		Binds:     binds,
-		Resources: dockerResourcesForShape(params.InstanceShape),
+		Binds:       binds,
+		Resources:   dockerResourcesForShape(params.InstanceShape),
+		NetworkMode: container.NetworkMode(b.config.Network),
 	}
 
 	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
