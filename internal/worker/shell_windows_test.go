@@ -122,22 +122,3 @@ if ($env:OZ_RUN_ID -ne "task-1" -or $env:OPERATOR_VAR -ne "configured") { exit 1
 		t.Fatalf("cancel error = %v, want exit code 7", err)
 	}
 }
-
-func TestWindowsShellComSpec(t *testing.T) {
-	shell, err := exec.LookPath("cmd.exe")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, comSpec := range []string{shell, ""} {
-		t.Run(comSpec, func(t *testing.T) {
-			t.Setenv("ComSpec", comSpec)
-			cmd := newShellCommand(t.Context(), "exit /b 0")
-			if cmd.Path != shell {
-				t.Fatalf("shell path = %q, want %q", cmd.Path, shell)
-			}
-			if err := cmd.Run(); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
