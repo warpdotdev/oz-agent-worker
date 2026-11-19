@@ -229,6 +229,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			activeDeadlineSeconds *int64
 			ttlSecondsAfterFinish *int32
 			workspaceSizeLimit    *resource.Quantity
+			workspaceVolume       *worker.KubernetesWorkspaceVolumeConfig
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
 			preflightResources    *corev1.ResourceRequirements
@@ -267,6 +268,16 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 					return worker.Config{}, fmt.Errorf("invalid backend.kubernetes.workspace_size_limit %q: %w", kc.WorkspaceSizeLimit, err)
 				}
 				workspaceSizeLimit = &quantity
+			}
+			if kc.WorkspaceVolume != nil {
+				if kc.WorkspaceSizeLimit != "" {
+					return worker.Config{}, fmt.Errorf("backend.kubernetes.workspace_volume cannot be combined with backend.kubernetes.workspace_size_limit, which only limits an emptyDir workspace")
+				}
+				volume, err := workspaceVolumeFromConfig(kc.WorkspaceVolume)
+				if err != nil {
+					return worker.Config{}, err
+				}
+				workspaceVolume = volume
 			}
 			if kc.UnschedulableTimeout != nil {
 				duration, err := time.ParseDuration(*kc.UnschedulableTimeout)
@@ -316,6 +327,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
 			TTLSecondsAfterFinish: ttlSecondsAfterFinish,
 			WorkspaceSizeLimit:    workspaceSizeLimit,
+			WorkspaceVolume:       workspaceVolume,
 			UnschedulableTimeout:  unschedulableTimeout,
 			TaskEnv:               copyStringMap(cliEnv),
 			PodTemplate:           podTemplate,
@@ -443,6 +455,33 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 		return worker.Config{}, fmt.Errorf("invalid backend.%s.sidecar_image_mappings: %w", backendType, err)
 	}
 	return wc, nil
+}
+
+// workspaceVolumeFromConfig parses the workspace volume sizes, which must be a positive
+// base size and a non-negative per-unit increment.
+func workspaceVolumeFromConfig(cfg *config.KubernetesWorkspaceVolumeConfig) (*worker.KubernetesWorkspaceVolumeConfig, error) {
+	baseSize, err := resource.ParseQuantity(cfg.BaseSize)
+	if err != nil {
+		return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.base_size %q: %w", cfg.BaseSize, err)
+	}
+	if baseSize.Sign() <= 0 {
+		return nil, fmt.Errorf("backend.kubernetes.workspace_volume.base_size must be positive, got %q", cfg.BaseSize)
+	}
+	volume := &worker.KubernetesWorkspaceVolumeConfig{
+		StorageClass: cfg.StorageClass,
+		BaseSize:     baseSize,
+	}
+	if cfg.SizePerComputeUnit != "" {
+		sizePerComputeUnit, err := resource.ParseQuantity(cfg.SizePerComputeUnit)
+		if err != nil {
+			return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.size_per_compute_unit %q: %w", cfg.SizePerComputeUnit, err)
+		}
+		if sizePerComputeUnit.Sign() < 0 {
+			return nil, fmt.Errorf("backend.kubernetes.workspace_volume.size_per_compute_unit must not be negative, got %q", cfg.SizePerComputeUnit)
+		}
+		volume.SizePerComputeUnit = sizePerComputeUnit
+	}
+	return volume, nil
 }
 
 // withACPSidecarFallbacks returns mappings with an entry added for each official ACP

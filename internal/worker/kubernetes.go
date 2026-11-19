@@ -65,6 +65,15 @@ const (
 	kubernetesSetupContainerName = "setup"
 	kubernetesSidecarInitPrefix  = "copy-sidecar-"
 
+	kubernetesWorkspaceInitContainerName = "prepare-workspace"
+	workspaceVolumeRootMountPath         = "/oz-workspace-volume"
+	// workspaceVolumeSubPath is the directory of a dedicated workspace volume that is
+	// mounted as the workspace, so filesystem artifacts in the volume root (such as
+	// lost+found) never appear in it.
+	workspaceVolumeSubPath = "workspace"
+	// computeUnitMemoryBytes is the memory that counts as one compute unit, alongside 1 vCPU.
+	computeUnitMemoryBytes = int64(2) << 30
+
 	// maxLogBytes caps the amount of container log data read into memory per
 	// container to avoid OOM when a task produces excessive output.
 	maxLogBytes = 1 << 20 // 1 MiB
@@ -118,7 +127,10 @@ type KubernetesBackendConfig struct {
 	ActiveDeadlineSeconds *int64
 	TTLSecondsAfterFinish *int32
 	WorkspaceSizeLimit    *resource.Quantity
-	UnschedulableTimeout  *time.Duration
+	// WorkspaceVolume, when non-nil, backs the workspace with a generic ephemeral
+	// volume provisioned for each task pod instead of an emptyDir.
+	WorkspaceVolume      *KubernetesWorkspaceVolumeConfig
+	UnschedulableTimeout *time.Duration
 	// TaskEnv contains runtime-only env overrides from CLI -e/--env. Declarative
 	// task container env in file or Helm config should be set in PodTemplate.
 	TaskEnv map[string]string
@@ -129,6 +141,15 @@ type KubernetesBackendConfig struct {
 	// requests and limits applied to startup preflight Job containers.
 	// Defaults: requests 10m CPU / 16Mi memory; limits 100m CPU / 64Mi memory.
 	PreflightResources *corev1.ResourceRequirements
+}
+
+// KubernetesWorkspaceVolumeConfig sizes the dedicated workspace volume as BaseSize plus
+// SizePerComputeUnit for each compute unit of the task container.
+type KubernetesWorkspaceVolumeConfig struct {
+	// StorageClass is the StorageClass to provision from. Empty uses the cluster default.
+	StorageClass       string
+	BaseSize           resource.Quantity
+	SizePerComputeUnit resource.Quantity
 }
 
 // terminatedExitCode returns the terminated container's exit status,
@@ -252,22 +273,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	mainEnv := mergeEnvVars(taskEnv, backendEnv)
 
 	volumes := []corev1.Volume{
-		workspaceVolume(b.config.WorkspaceSizeLimit),
+		b.taskWorkspaceVolume(params.InstanceShape, jobLabels),
 	}
-	mainVolumeMounts := []corev1.VolumeMount{
-		{
-			Name:      workspaceVolumeName(),
-			MountPath: defaultWorkspaceMountPath,
-		},
-	}
-	setupVolumeMounts := []corev1.VolumeMount{
-		{
-			Name:      workspaceVolumeName(),
-			MountPath: defaultWorkspaceMountPath,
-		},
-	}
+	mainVolumeMounts := []corev1.VolumeMount{b.workspaceVolumeMount()}
+	setupVolumeMounts := []corev1.VolumeMount{b.workspaceVolumeMount()}
 
 	var initContainers []corev1.Container
+	if b.config.WorkspaceVolume != nil {
+		initContainers = append(initContainers, workspaceInitContainer(params.DockerImage, pullPolicy))
+	}
 	for i, sidecar := range params.Sidecars {
 		if b.useImageVolumes && !sidecar.ReadWrite {
 			volumeName := fmt.Sprintf("sidecar-%d-image", i)
@@ -917,6 +931,104 @@ func workspaceVolume(sizeLimit *resource.Quantity) corev1.Volume {
 		volume.EmptyDir.SizeLimit = &copy
 	}
 	return volume
+}
+
+// taskWorkspaceVolume returns the volume backing the workspace: an emptyDir by default,
+// or a generic ephemeral volume when a dedicated workspace volume is configured. The
+// claim carries the task labels so the volume can be traced back to its run.
+func (b *KubernetesBackend) taskWorkspaceVolume(shape *types.InstanceShape, labels map[string]string) corev1.Volume {
+	cfg := b.config.WorkspaceVolume
+	if cfg == nil {
+		return workspaceVolume(b.config.WorkspaceSizeLimit)
+	}
+
+	size := cfg.BaseSize.DeepCopy()
+	size.Add(*resource.NewQuantity(cfg.SizePerComputeUnit.Value()*b.taskComputeUnits(shape), resource.BinarySI))
+
+	claim := corev1.PersistentVolumeClaimSpec{
+		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		Resources: corev1.VolumeResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+		},
+	}
+	if cfg.StorageClass != "" {
+		storageClass := cfg.StorageClass
+		claim.StorageClassName = &storageClass
+	}
+	return corev1.Volume{
+		Name: workspaceVolumeName(),
+		VolumeSource: corev1.VolumeSource{
+			Ephemeral: &corev1.EphemeralVolumeSource{
+				VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+					ObjectMeta: metav1.ObjectMeta{Labels: copyStringMap(labels)},
+					Spec:       claim,
+				},
+			},
+		},
+	}
+}
+
+// taskComputeUnits returns the size of the task container in compute units, from the
+// resources it will run with: the pod_template task container's, overridden per axis by
+// the run's instance shape.
+func (b *KubernetesBackend) taskComputeUnits(shape *types.InstanceShape) int64 {
+	var task corev1.Container
+	if b.config.PodTemplate != nil {
+		for _, container := range b.config.PodTemplate.Containers {
+			if container.Name == kubernetesTaskContainerName {
+				task.Resources = *container.Resources.DeepCopy()
+			}
+		}
+	}
+	applyInstanceShapeToContainer(&task, shape)
+	return computeUnits(task.Resources)
+}
+
+// computeUnits counts whole compute units, rounding each axis up. A resource without a
+// request counts at its limit, matching how Kubernetes defaults the request.
+func computeUnits(resources corev1.ResourceRequirements) int64 {
+	effective := func(name corev1.ResourceName) resource.Quantity {
+		if quantity, ok := resources.Requests[name]; ok {
+			return quantity
+		}
+		return resources.Limits[name]
+	}
+	cpu := effective(corev1.ResourceCPU)
+	memory := effective(corev1.ResourceMemory)
+	cpuUnits := (cpu.MilliValue() + 999) / 1000
+	memoryUnits := (memory.Value() + computeUnitMemoryBytes - 1) / computeUnitMemoryBytes
+	return max(cpuUnits, memoryUnits)
+}
+
+func (b *KubernetesBackend) workspaceVolumeMount() corev1.VolumeMount {
+	mount := corev1.VolumeMount{
+		Name:      workspaceVolumeName(),
+		MountPath: defaultWorkspaceMountPath,
+	}
+	if b.config.WorkspaceVolume != nil {
+		mount.SubPath = workspaceVolumeSubPath
+	}
+	return mount
+}
+
+// workspaceInitContainer creates the workspace directory on a dedicated workspace
+// volume. A freshly provisioned volume is owned by root, so the directory is made
+// world-writable to match an emptyDir, which a non-root task user can write to.
+func workspaceInitContainer(image string, pullPolicy corev1.PullPolicy) corev1.Container {
+	workspaceDir := workspaceVolumeRootMountPath + "/" + workspaceVolumeSubPath
+	return corev1.Container{
+		Name:            kubernetesWorkspaceInitContainerName,
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Command:         []string{"/bin/sh", "-c", "mkdir -p " + workspaceDir + " && chmod 0777 " + workspaceDir},
+		SecurityContext: rootSecurityContext(),
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      workspaceVolumeName(),
+				MountPath: workspaceVolumeRootMountPath,
+			},
+		},
+	}
 }
 
 func imageVolume(name, reference string, pullPolicy corev1.PullPolicy) corev1.Volume {

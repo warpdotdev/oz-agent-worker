@@ -93,7 +93,10 @@ type KubernetesConfig struct {
 	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
-	UnschedulableTimeout  *string           `yaml:"unschedulable_timeout"`
+	// WorkspaceVolume, when set, backs the task workspace with a dedicated per-pod
+	// volume instead of an emptyDir. It cannot be combined with WorkspaceSizeLimit.
+	WorkspaceVolume      *KubernetesWorkspaceVolumeConfig `yaml:"workspace_volume"`
+	UnschedulableTimeout *string                          `yaml:"unschedulable_timeout"`
 	// CodingCLISidecars is a compatibility alias for mappings from the official
 	// Warp CLI and ACP repositories for each harness to a custom image.
 	// It cannot be combined with SidecarImageMappings and does not inject sidecars.
@@ -106,6 +109,17 @@ type KubernetesConfig struct {
 	// PreflightResources holds optional cpu/memory requests and limits for the
 	// startup preflight Job containers.
 	PreflightResources *RawYAMLNode `yaml:"preflight_resources"`
+}
+
+// KubernetesWorkspaceVolumeConfig sizes the dedicated workspace volume. Sizes are
+// Kubernetes quantities such as "20Gi".
+type KubernetesWorkspaceVolumeConfig struct {
+	// StorageClass names the StorageClass to provision from. Empty uses the cluster default.
+	StorageClass string `yaml:"storage_class" validate:"omitempty,no_whitespace"`
+	BaseSize     string `yaml:"base_size" validate:"required"`
+	// SizePerComputeUnit is added to BaseSize once per compute unit of the task
+	// container, where one unit is 1 vCPU or 2 GiB of memory, whichever count is larger.
+	SizePerComputeUnit string `yaml:"size_per_compute_unit"`
 }
 
 // RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation

@@ -194,6 +194,61 @@ containers:
 	}
 }
 
+func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		volume             config.KubernetesWorkspaceVolumeConfig
+		workspaceSizeLimit string
+		wantBaseSize       string
+		wantPerUnit        string
+		wantError          string
+	}{
+		{name: "fixed size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "50Gi"}, wantBaseSize: "50Gi", wantPerUnit: "0"},
+		{name: "scaled size", volume: config.KubernetesWorkspaceVolumeConfig{StorageClass: "standard-rwo", BaseSize: "32Gi", SizePerComputeUnit: "8Gi"}, wantBaseSize: "32Gi", wantPerUnit: "8Gi"},
+		{name: "malformed base size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "lots"}, wantError: "workspace_volume.base_size"},
+		{name: "zero base size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "0"}, wantError: "base_size must be positive"},
+		{name: "malformed per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "some"}, wantError: "workspace_volume.size_per_compute_unit"},
+		{name: "negative per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "-1Gi"}, wantError: "size_per_compute_unit must not be negative"},
+		{name: "combined with workspace_size_limit", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi"}, workspaceSizeLimit: "8Gi", wantError: "cannot be combined"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCLIForTest()
+			t.Cleanup(resetCLIForTest)
+			volume := tt.volume
+			fileConfig := &config.FileConfig{
+				WorkerID: "worker-123",
+				Backend: config.BackendConfig{
+					Kubernetes: &config.KubernetesConfig{
+						WorkspaceSizeLimit: tt.workspaceSizeLimit,
+						WorkspaceVolume:    &volume,
+					},
+				},
+			}
+
+			wc, err := mergeConfig(fileConfig)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want one containing %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := wc.Kubernetes.WorkspaceVolume
+			if got == nil {
+				t.Fatal("expected WorkspaceVolume to be set")
+			}
+			if got.StorageClass != tt.volume.StorageClass {
+				t.Fatalf("StorageClass = %q, want %q", got.StorageClass, tt.volume.StorageClass)
+			}
+			if got.BaseSize.String() != tt.wantBaseSize || got.SizePerComputeUnit.String() != tt.wantPerUnit {
+				t.Fatalf("sizes = %s + %s per unit, want %s + %s", got.BaseSize.String(), got.SizePerComputeUnit.String(), tt.wantBaseSize, tt.wantPerUnit)
+			}
+		})
+	}
+}
+
 func TestMergeConfigKubernetesPreservesImageVolumePreference(t *testing.T) {
 	tests := []struct {
 		name       string

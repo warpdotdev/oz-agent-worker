@@ -110,6 +110,18 @@ kubernetesBackend:
   # the worker sets no TTL, so these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
+  # Optional: back each task pod's /workspace with a dedicated volume (a generic
+  # ephemeral volume, provisioned with the pod and deleted with it) instead of an
+  # emptyDir, so the workspace does not count against the pod's ephemeral-storage
+  # limit. Enabled by setting baseSize; cannot be combined with workspaceSizeLimit.
+  # The size is baseSize plus sizePerComputeUnit for each compute unit of the task
+  # container (1 vCPU or 2 GiB of memory, whichever count is larger). An empty
+  # storageClass uses the cluster default. Requires dynamic volume provisioning and
+  # permission to run a root init container.
+  workspaceVolume:
+    baseSize: ""
+    storageClass: ""
+    sizePerComputeUnit: ""
   unschedulableTimeout: "10m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here
