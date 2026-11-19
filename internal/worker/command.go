@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
@@ -49,11 +48,11 @@ func commandCancelEnvVars(taskID, executionID string) []string {
 // CommandBackendConfig configures the command backend, which dispatches tasks to
 // an operator-owned runtime over any transport by invoking a shell command.
 type CommandBackendConfig struct {
-	// DispatchCommand is the shell command invoked (via /bin/sh -c) to dispatch
-	// a task. It receives the DispatchPayload as JSON on stdin. Required.
+	// DispatchCommand runs via /bin/sh -c on Unix or cmd /C on Windows to
+	// dispatch a task. It receives the DispatchPayload as JSON on stdin. Required.
 	DispatchCommand string
-	// CancelCommand, when set, is invoked (via /bin/sh -c) to best-effort cancel
-	// a previously dispatched task.
+	// CancelCommand, when set, runs via /bin/sh -c on Unix or cmd /C on Windows
+	// to best-effort cancel a previously dispatched task.
 	CancelCommand string
 	// DispatchTimeout bounds the dispatch command's runtime. Zero uses defaultDispatchTimeout.
 	DispatchTimeout time.Duration
@@ -116,7 +115,7 @@ func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) (r
 
 	env := b.commandEnv(commandDispatchEnvVars(params.TaskID, params.ExecutionID, b.config.ServerRootURL, params.DockerImage))
 
-	cmd := exec.CommandContext(dctx, "/bin/sh", "-c", b.config.DispatchCommand) // #nosec G204 -- dispatch command is explicit operator configuration.
+	cmd := newShellCommand(dctx, b.config.DispatchCommand)
 	cmd.Stdin = bytes.NewReader(payloadJSON)
 	cmd.Env = env
 	params.Logs.AddEnvList(env)
@@ -160,7 +159,7 @@ func (b *CommandBackend) CancelTask(ctx context.Context, params *CancelParams) e
 
 	env := b.commandEnv(commandCancelEnvVars(params.TaskID, params.ExecutionID))
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", b.config.CancelCommand) // #nosec G204 -- cancel command is explicit operator configuration.
+	cmd := newShellCommand(ctx, b.config.CancelCommand)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
