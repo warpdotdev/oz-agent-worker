@@ -452,7 +452,8 @@ func (b *DirectBackend) removeWorkspace(ctx context.Context, teardownEnv []strin
 	return teardownErr
 }
 
-// runCommand executes a shell command with the given working directory and environment.
+// runCommand executes a hook via /bin/sh -c on Unix or cmd /C on Windows,
+// with the given working directory and environment.
 // Setup/teardown commands inherit the full worker environment so they can access
 // tools and credentials (e.g. aws, docker) needed for workspace provisioning.
 func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) error {
@@ -466,7 +467,7 @@ func (b *DirectBackend) runCommand(ctx context.Context, command, dir string, env
 }
 
 func newHookCommand(ctx context.Context, command, dir string, env []string, reporter *tasklogs.Reporter) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) // #nosec G204 -- setup/teardown commands are explicit operator configuration.
+	cmd := newShellCommand(ctx, command)
 	cmd.Dir = dir
 	cmd.Env = mergeEnvVars(os.Environ(), env)
 	reporter.AddEnvList(cmd.Env)

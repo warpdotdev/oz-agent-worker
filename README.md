@@ -182,7 +182,9 @@ closing its connection and exiting. If no task is assigned, it remains
 connected until it receives a shutdown signal. Docker, Kubernetes, and Command
 backends reject one-shot mode during worker startup.
 
-The `setup_command` and `teardown_command` hooks run with these variables set, each under both
+The `setup_command` and `teardown_command` hooks run via `/bin/sh -c` on Unix and
+`cmd /C` on Windows (using `%ComSpec%`, falling back to `cmd.exe`). Hooks inherit
+the full worker environment, overlaid with these variables, each under both
 its `OZ_` and its `WARP_` name carrying the same value (`OZ_RUN_ID` and `WARP_RUN_ID`, and so on):
 
 - `OZ_RUN_ID` — the run being executed.
@@ -213,10 +215,14 @@ backend:
 
 Config keys:
 
-- `dispatch_command` (required): shell command (run via `/bin/sh -c`) invoked once per task to dispatch it.
+- `dispatch_command` (required): shell command invoked once per task to dispatch it.
 - `cancel_command` (optional): shell command invoked best-effort when a dispatched task is cancelled. If unset, the worker relies on agent-side cancellation.
 - `dispatch_timeout` (optional): how long the dispatch command may run before it is considered failed (humantime format, e.g. `60s`). Defaults to `60s`.
 - `environment`: extra environment variables exposed to the dispatch/cancel commands (same `name`/`value` semantics as the other backends; omit `value` to inherit from the host).
+
+Both commands run via `/bin/sh -c` on Unix and `cmd /C` on Windows (using
+`%ComSpec%`, falling back to `cmd.exe`). They inherit the full worker environment,
+overlaid with the configured `environment` and worker-owned variables.
 
 The dispatch contract:
 
