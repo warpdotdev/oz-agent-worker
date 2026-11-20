@@ -210,6 +210,9 @@ func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
 		{name: "malformed per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "some"}, wantError: "workspace_volume.size_per_compute_unit"},
 		{name: "negative per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "-1Gi"}, wantError: "size_per_compute_unit must not be negative"},
 		{name: "combined with workspace_size_limit", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi"}, workspaceSizeLimit: "8Gi", wantError: "cannot be combined"},
+		{name: "additional paths", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"/home/agent", "/tmp"}}, wantBaseSize: "32Gi", wantPerUnit: "0"},
+		{name: "relative additional path", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"cache"}}, wantError: "workspace_volume.additional_paths"},
+		{name: "additional path inside the workspace", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"/workspace/cache"}}, wantError: "workspace_volume.additional_paths"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resetCLIForTest()
@@ -244,6 +247,9 @@ func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
 			}
 			if got.BaseSize.String() != tt.wantBaseSize || got.SizePerComputeUnit.String() != tt.wantPerUnit {
 				t.Fatalf("sizes = %s + %s per unit, want %s + %s", got.BaseSize.String(), got.SizePerComputeUnit.String(), tt.wantBaseSize, tt.wantPerUnit)
+			}
+			if strings.Join(got.AdditionalPaths, ",") != strings.Join(tt.volume.AdditionalPaths, ",") {
+				t.Fatalf("AdditionalPaths = %v, want %v", got.AdditionalPaths, tt.volume.AdditionalPaths)
 			}
 		})
 	}

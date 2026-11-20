@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -71,6 +72,10 @@ const (
 	// mounted as the workspace, so filesystem artifacts in the volume root (such as
 	// lost+found) never appear in it.
 	workspaceVolumeSubPath = "workspace"
+	// Directories of a dedicated workspace volume holding the additional paths and the
+	// copied sidecars, one numbered subdirectory each.
+	workspaceVolumeAdditionalPathsDir = "paths"
+	workspaceVolumeSidecarsDir        = "sidecars"
 	// computeUnitMemoryBytes is the memory that counts as one compute unit, alongside 1 vCPU.
 	computeUnitMemoryBytes = int64(2) << 30
 
@@ -150,6 +155,9 @@ type KubernetesWorkspaceVolumeConfig struct {
 	StorageClass       string
 	BaseSize           resource.Quantity
 	SizePerComputeUnit resource.Quantity
+	// AdditionalPaths are absolute paths in the task container that the volume backs
+	// besides the workspace, each from a directory of its own.
+	AdditionalPaths []string
 }
 
 // terminatedExitCode returns the terminated container's exit status,
@@ -234,7 +242,12 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
 	}
 	params.Logs.AddEnv(b.config.TaskEnv)
-	if err := validateTaskSidecars(params.Sidecars); err != nil {
+	workspaceVolumeConfig := b.config.WorkspaceVolume
+	var additionalPaths []string
+	if workspaceVolumeConfig != nil {
+		additionalPaths = workspaceVolumeConfig.AdditionalPaths
+	}
+	if err := validateTaskSidecars(params.Sidecars, additionalPaths); err != nil {
 		return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonSidecarPrep, err))
 	}
 
@@ -277,11 +290,18 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	}
 	mainVolumeMounts := []corev1.VolumeMount{b.workspaceVolumeMount()}
 	setupVolumeMounts := []corev1.VolumeMount{b.workspaceVolumeMount()}
+	for i, additionalPath := range additionalPaths {
+		mount := corev1.VolumeMount{
+			Name:      workspaceVolumeName(),
+			MountPath: additionalPath,
+			SubPath:   workspaceVolumeAdditionalPathSubPath(i),
+		}
+		mainVolumeMounts = append(mainVolumeMounts, mount)
+		setupVolumeMounts = append(setupVolumeMounts, mount)
+	}
 
 	var initContainers []corev1.Container
-	if b.config.WorkspaceVolume != nil {
-		initContainers = append(initContainers, workspaceInitContainer(params.DockerImage, pullPolicy))
-	}
+	var sidecarSubPaths []string
 	for i, sidecar := range params.Sidecars {
 		if b.useImageVolumes && !sidecar.ReadWrite {
 			volumeName := fmt.Sprintf("sidecar-%d-image", i)
@@ -297,13 +317,27 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 			continue
 		}
 
-		dataVolumeName := fmt.Sprintf("sidecar-%d-data", i)
-		volumes = append(volumes, corev1.Volume{
-			Name: dataVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		})
+		// A copied sidecar goes onto the dedicated workspace volume when there is one,
+		// which keeps it out of the pod's ephemeral storage, and into an emptyDir of its
+		// own otherwise.
+		dataMount := corev1.VolumeMount{Name: fmt.Sprintf("sidecar-%d-data", i)}
+		if workspaceVolumeConfig != nil {
+			dataMount = corev1.VolumeMount{Name: workspaceVolumeName(), SubPath: workspaceVolumeSidecarSubPath(i)}
+			sidecarSubPaths = append(sidecarSubPaths, dataMount.SubPath)
+		} else {
+			volumes = append(volumes, corev1.Volume{
+				Name: dataMount.Name,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			})
+		}
+		copyTargetMount := dataMount
+		copyTargetMount.MountPath = sidecarCopyTargetMountPath
+		sidecarMount := dataMount
+		sidecarMount.MountPath = sidecar.MountPath
+		sidecarMount.ReadOnly = !sidecar.ReadWrite
+
 		initContainers = append(initContainers, corev1.Container{
 			Name:            fmt.Sprintf("%s%d", kubernetesSidecarInitPrefix, i),
 			Image:           sidecar.Image,
@@ -314,24 +348,15 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				kubernetesSidecarMaterializationScript(),
 			},
 			SecurityContext: rootSecurityContext(),
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      dataVolumeName,
-					MountPath: sidecarCopyTargetMountPath,
-				},
-			},
+			VolumeMounts:    []corev1.VolumeMount{copyTargetMount},
 		})
 
-		mainVolumeMounts = append(mainVolumeMounts, corev1.VolumeMount{
-			Name:      dataVolumeName,
-			MountPath: sidecar.MountPath,
-			ReadOnly:  !sidecar.ReadWrite,
-		})
-		setupVolumeMounts = append(setupVolumeMounts, corev1.VolumeMount{
-			Name:      dataVolumeName,
-			MountPath: sidecar.MountPath,
-			ReadOnly:  !sidecar.ReadWrite,
-		})
+		mainVolumeMounts = append(mainVolumeMounts, sidecarMount)
+		setupVolumeMounts = append(setupVolumeMounts, sidecarMount)
+	}
+	if workspaceVolumeConfig != nil {
+		prepare := workspaceInitContainer(params.DockerImage, pullPolicy, additionalPaths, sidecarSubPaths)
+		initContainers = append([]corev1.Container{prepare}, initContainers...)
 	}
 
 	if b.config.SetupCommand != "" {
@@ -1011,16 +1036,23 @@ func (b *KubernetesBackend) workspaceVolumeMount() corev1.VolumeMount {
 	return mount
 }
 
-// workspaceInitContainer creates the workspace directory on a dedicated workspace
-// volume. A freshly provisioned volume is owned by root, so the directory is made
-// world-writable to match an emptyDir, which a non-root task user can write to.
-func workspaceInitContainer(image string, pullPolicy corev1.PullPolicy) corev1.Container {
-	workspaceDir := workspaceVolumeRootMountPath + "/" + workspaceVolumeSubPath
+func workspaceVolumeAdditionalPathSubPath(index int) string {
+	return fmt.Sprintf("%s/%d", workspaceVolumeAdditionalPathsDir, index)
+}
+
+func workspaceVolumeSidecarSubPath(index int) string {
+	return fmt.Sprintf("%s/%d", workspaceVolumeSidecarsDir, index)
+}
+
+// workspaceInitContainer lays out a dedicated workspace volume before anything else
+// mounts it. It runs as root on the task image, so it can read what the image holds at
+// each additional path.
+func workspaceInitContainer(image string, pullPolicy corev1.PullPolicy, additionalPaths, sidecarSubPaths []string) corev1.Container {
 	return corev1.Container{
 		Name:            kubernetesWorkspaceInitContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/bin/sh", "-c", "mkdir -p " + workspaceDir + " && chmod 0777 " + workspaceDir},
+		Command:         []string{"/bin/sh", "-c", workspaceInitScript(workspaceVolumeRootMountPath, additionalPaths, sidecarSubPaths)},
 		SecurityContext: rootSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -1029,6 +1061,84 @@ func workspaceInitContainer(image string, pullPolicy corev1.PullPolicy) corev1.C
 			},
 		},
 	}
+}
+
+// workspaceInitScript creates the directories of a dedicated workspace volume mounted at
+// volumeRoot:
+//   - the workspace, world-writable to match an emptyDir, which a non-root task user can
+//     write to, since a freshly provisioned volume is owned by root;
+//   - one per additional path, holding a copy of what the image has at that path with the
+//     same owner and mode, because the mount hides the image's own directory. A path the
+//     image lacks gets an empty root-owned directory;
+//   - one per copied sidecar, readable by a non-root task user. The kubelet would create
+//     a missing subPath directory itself, but without access for other users.
+//
+// A directory that already exists is left alone, so a rerun cannot overwrite what the
+// task has since written.
+func workspaceInitScript(volumeRoot string, additionalPaths, sidecarSubPaths []string) string {
+	workspaceDir := volumeRoot + "/" + workspaceVolumeSubPath
+	lines := []string{
+		"set -e",
+		"mkdir -p " + shellQuote(workspaceDir),
+		"chmod 0777 " + shellQuote(workspaceDir),
+	}
+	if len(additionalPaths) > 0 {
+		lines = append(lines,
+			"seed() {",
+			"  if [ -e \"$2\" ]; then return 0; fi",
+			"  mkdir -p \"$2\"",
+			"  if [ -d \"$1\" ]; then",
+			"    cp -a \"$1/.\" \"$2/\"",
+			"    chown \"$(stat -L -c %u:%g \"$1\")\" \"$2\"",
+			"    chmod \"$(stat -L -c %a \"$1\")\" \"$2\"",
+			"  else",
+			"    chmod 0755 \"$2\"",
+			"  fi",
+			"}",
+		)
+		for i, additionalPath := range additionalPaths {
+			lines = append(lines, "seed "+shellQuote(additionalPath)+" "+shellQuote(volumeRoot+"/"+workspaceVolumeAdditionalPathSubPath(i)))
+		}
+	}
+	for _, subPath := range sidecarSubPaths {
+		dir := shellQuote(volumeRoot + "/" + subPath)
+		lines = append(lines, "mkdir -p "+dir, "chmod 0755 "+dir)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+// ValidateWorkspaceVolumeAdditionalPaths reports whether paths can each be backed by a
+// directory of the workspace volume: clean absolute paths that overlap neither the
+// workspace, the volume's own mount point in the init container, nor each other.
+func ValidateWorkspaceVolumeAdditionalPaths(paths []string) error {
+	for i, additionalPath := range paths {
+		if !path.IsAbs(additionalPath) || path.Clean(additionalPath) != additionalPath {
+			return fmt.Errorf("%q must be a clean absolute path", additionalPath)
+		}
+		if additionalPath == "/" {
+			return fmt.Errorf("%q cannot be the filesystem root", additionalPath)
+		}
+		for _, reserved := range []string{defaultWorkspaceMountPath, workspaceVolumeRootMountPath} {
+			if pathsOverlap(additionalPath, reserved) {
+				return fmt.Errorf("%q overlaps the reserved path %s", additionalPath, reserved)
+			}
+		}
+		for _, other := range paths[:i] {
+			if pathsOverlap(additionalPath, other) {
+				return fmt.Errorf("%q overlaps %q", additionalPath, other)
+			}
+		}
+	}
+	return nil
+}
+
+// pathsOverlap reports whether two clean absolute paths are the same or one contains the other.
+func pathsOverlap(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
 func imageVolume(name, reference string, pullPolicy corev1.PullPolicy) corev1.Volume {
@@ -1047,7 +1157,7 @@ func workspaceVolumeName() string {
 	return "workspace"
 }
 
-func validateTaskSidecars(sidecars []types.SidecarMount) error {
+func validateTaskSidecars(sidecars []types.SidecarMount, workspaceVolumePaths []string) error {
 	seenMountPaths := make(map[string]bool)
 	for _, sidecar := range sidecars {
 		if sidecar.Image == "" {
@@ -1058,6 +1168,11 @@ func validateTaskSidecars(sidecars []types.SidecarMount) error {
 		}
 		if sidecar.MountPath == defaultWorkspaceMountPath {
 			return fmt.Errorf("additional sidecar %s cannot mount at reserved path %s", sidecar.Image, defaultWorkspaceMountPath)
+		}
+		for _, workspaceVolumePath := range workspaceVolumePaths {
+			if pathsOverlap(path.Clean(sidecar.MountPath), workspaceVolumePath) {
+				return fmt.Errorf("additional sidecar %s mount path %s overlaps the workspace volume path %s", sidecar.Image, sidecar.MountPath, workspaceVolumePath)
+			}
 		}
 		if seenMountPaths[sidecar.MountPath] {
 			return fmt.Errorf("duplicate mount path %s for additional sidecar %s", sidecar.MountPath, sidecar.Image)

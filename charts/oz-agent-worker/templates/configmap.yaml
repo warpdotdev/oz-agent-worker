@@ -73,6 +73,10 @@ data:
           {{- if .sizePerComputeUnit }}
           size_per_compute_unit: {{ .sizePerComputeUnit | quote }}
           {{- end }}
+          {{- with .additionalPaths }}
+          additional_paths:
+{{ toYaml . | indent 12 }}
+          {{- end }}
         {{- end }}
         {{- end }}
         {{- if .Values.kubernetesBackend.podTemplate }}

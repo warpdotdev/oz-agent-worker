@@ -438,6 +438,9 @@ backend:
       storage_class: "standard-rwo"
       base_size: "32Gi"
       size_per_compute_unit: "8Gi"
+      additional_paths:
+        - /home/agent
+        - /tmp
 `)
 
 	cfg, err := Load(path)
@@ -450,6 +453,24 @@ backend:
 	}
 	if volume.StorageClass != "standard-rwo" || volume.BaseSize != "32Gi" || volume.SizePerComputeUnit != "8Gi" {
 		t.Fatalf("workspace_volume = %+v, want standard-rwo / 32Gi / 8Gi", *volume)
+	}
+	if got := strings.Join(volume.AdditionalPaths, ","); got != "/home/agent,/tmp" {
+		t.Fatalf("additional_paths = %q, want /home/agent,/tmp", got)
+	}
+}
+
+func TestLoadKubernetesWorkspaceVolumeRejectsEmptyAdditionalPath(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  kubernetes:
+    workspace_volume:
+      base_size: "32Gi"
+      additional_paths:
+        - ""
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an empty additional path")
 	}
 }
 

@@ -120,6 +120,10 @@ type KubernetesWorkspaceVolumeConfig struct {
 	// SizePerComputeUnit is added to BaseSize once per compute unit of the task
 	// container, where one unit is 1 vCPU or 2 GiB of memory, whichever count is larger.
 	SizePerComputeUnit string `yaml:"size_per_compute_unit"`
+	// AdditionalPaths lists absolute paths in the task container, besides the
+	// workspace, to back with the volume, such as a home directory that fills with
+	// package and build caches.
+	AdditionalPaths []string `yaml:"additional_paths" validate:"dive,required"`
 }
 
 // RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation

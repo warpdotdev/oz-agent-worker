@@ -118,10 +118,15 @@ kubernetesBackend:
   # container (1 vCPU or 2 GiB of memory, whichever count is larger). An empty
   # storageClass uses the cluster default. Requires dynamic volume provisioning and
   # permission to run a root init container.
+  # Copied sidecars are stored on the volume as well. additionalPaths lists further
+  # absolute paths in the task container to back with it, for directories that grow
+  # outside the workspace, such as the task user's home directory (package and build
+  # caches) and /tmp. The size above covers all of them.
   workspaceVolume:
     baseSize: ""
     storageClass: ""
     sizePerComputeUnit: ""
+    additionalPaths: []
   unschedulableTimeout: "10m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here

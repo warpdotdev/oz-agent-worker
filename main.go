@@ -457,8 +457,8 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	return wc, nil
 }
 
-// workspaceVolumeFromConfig parses the workspace volume sizes, which must be a positive
-// base size and a non-negative per-unit increment.
+// workspaceVolumeFromConfig parses the workspace volume settings: a positive base size, a
+// non-negative per-unit increment, and additional paths the volume can back.
 func workspaceVolumeFromConfig(cfg *config.KubernetesWorkspaceVolumeConfig) (*worker.KubernetesWorkspaceVolumeConfig, error) {
 	baseSize, err := resource.ParseQuantity(cfg.BaseSize)
 	if err != nil {
@@ -481,6 +481,10 @@ func workspaceVolumeFromConfig(cfg *config.KubernetesWorkspaceVolumeConfig) (*wo
 		}
 		volume.SizePerComputeUnit = sizePerComputeUnit
 	}
+	if err := worker.ValidateWorkspaceVolumeAdditionalPaths(cfg.AdditionalPaths); err != nil {
+		return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.additional_paths: %w", err)
+	}
+	volume.AdditionalPaths = append([]string(nil), cfg.AdditionalPaths...)
 	return volume, nil
 }
 
