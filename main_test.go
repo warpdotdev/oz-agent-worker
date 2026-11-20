@@ -10,6 +10,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
+	"github.com/warpdotdev/oz-agent-worker/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -194,25 +195,27 @@ containers:
 	}
 }
 
-func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
+func TestMergeConfigKubernetesTaskVolume(t *testing.T) {
 	for _, tt := range []struct {
 		name               string
-		volume             config.KubernetesWorkspaceVolumeConfig
+		volume             config.KubernetesTaskVolumeConfig
 		workspaceSizeLimit string
 		wantBaseSize       string
 		wantPerUnit        string
+		wantPaths          string
 		wantError          string
 	}{
-		{name: "fixed size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "50Gi"}, wantBaseSize: "50Gi", wantPerUnit: "0"},
-		{name: "scaled size", volume: config.KubernetesWorkspaceVolumeConfig{StorageClass: "standard-rwo", BaseSize: "32Gi", SizePerComputeUnit: "8Gi"}, wantBaseSize: "32Gi", wantPerUnit: "8Gi"},
-		{name: "malformed base size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "lots"}, wantError: "workspace_volume.base_size"},
-		{name: "zero base size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "0"}, wantError: "base_size must be positive"},
-		{name: "malformed per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "some"}, wantError: "workspace_volume.size_per_compute_unit"},
-		{name: "negative per-unit size", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "-1Gi"}, wantError: "size_per_compute_unit must not be negative"},
-		{name: "combined with workspace_size_limit", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi"}, workspaceSizeLimit: "8Gi", wantError: "cannot be combined"},
-		{name: "additional paths", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"/home/agent", "/tmp"}}, wantBaseSize: "32Gi", wantPerUnit: "0"},
-		{name: "relative additional path", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"cache"}}, wantError: "workspace_volume.additional_paths"},
-		{name: "additional path inside the workspace", volume: config.KubernetesWorkspaceVolumeConfig{BaseSize: "32Gi", AdditionalPaths: []string{"/workspace/cache"}}, wantError: "workspace_volume.additional_paths"},
+		{name: "fixed size", volume: config.KubernetesTaskVolumeConfig{BaseSize: "50Gi"}, wantBaseSize: "50Gi", wantPerUnit: "0", wantPaths: "/workspace"},
+		{name: "scaled size", volume: config.KubernetesTaskVolumeConfig{StorageClass: "standard-rwo", BaseSize: "32Gi", SizePerComputeUnit: "8Gi"}, wantBaseSize: "32Gi", wantPerUnit: "8Gi", wantPaths: "/workspace"},
+		{name: "malformed base size", volume: config.KubernetesTaskVolumeConfig{BaseSize: "lots"}, wantError: "task_volume.base_size"},
+		{name: "zero base size", volume: config.KubernetesTaskVolumeConfig{BaseSize: "0"}, wantError: "base_size must be positive"},
+		{name: "malformed per-unit size", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "some"}, wantError: "task_volume.size_per_compute_unit"},
+		{name: "negative per-unit size", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "-1Gi"}, wantError: "size_per_compute_unit must not be negative"},
+		{name: "combined with workspace_size_limit", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi"}, workspaceSizeLimit: "8Gi", wantError: "task_volume cannot be combined"},
+		{name: "more paths", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", Paths: []string{"/workspace", "/home/agent", "/tmp"}}, wantBaseSize: "32Gi", wantPerUnit: "0", wantPaths: "/workspace,/home/agent,/tmp"},
+		{name: "paths without the workspace", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", Paths: []string{"/home/agent"}}, wantError: "task_volume.paths: must include /workspace"},
+		{name: "relative path", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", Paths: []string{"/workspace", "cache"}}, wantError: "task_volume.paths"},
+		{name: "path inside the workspace", volume: config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", Paths: []string{"/workspace", "/workspace/cache"}}, wantError: "task_volume.paths"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resetCLIForTest()
@@ -223,7 +226,7 @@ func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
 				Backend: config.BackendConfig{
 					Kubernetes: &config.KubernetesConfig{
 						WorkspaceSizeLimit: tt.workspaceSizeLimit,
-						WorkspaceVolume:    &volume,
+						TaskVolume:         &volume,
 					},
 				},
 			}
@@ -238,9 +241,9 @@ func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			got := wc.Kubernetes.WorkspaceVolume
+			got := wc.Kubernetes.TaskVolume
 			if got == nil {
-				t.Fatal("expected WorkspaceVolume to be set")
+				t.Fatal("expected TaskVolume to be set")
 			}
 			if got.StorageClass != tt.volume.StorageClass {
 				t.Fatalf("StorageClass = %q, want %q", got.StorageClass, tt.volume.StorageClass)
@@ -248,11 +251,52 @@ func TestMergeConfigKubernetesWorkspaceVolume(t *testing.T) {
 			if got.BaseSize.String() != tt.wantBaseSize || got.SizePerComputeUnit.String() != tt.wantPerUnit {
 				t.Fatalf("sizes = %s + %s per unit, want %s + %s", got.BaseSize.String(), got.SizePerComputeUnit.String(), tt.wantBaseSize, tt.wantPerUnit)
 			}
-			if strings.Join(got.AdditionalPaths, ",") != strings.Join(tt.volume.AdditionalPaths, ",") {
-				t.Fatalf("AdditionalPaths = %v, want %v", got.AdditionalPaths, tt.volume.AdditionalPaths)
+			if gotPaths := strings.Join(got.Paths, ","); gotPaths != tt.wantPaths {
+				t.Fatalf("Paths = %q, want %q", gotPaths, tt.wantPaths)
 			}
 		})
 	}
+}
+
+func TestMergeConfigKubernetesWorkspaceVolumeAlias(t *testing.T) {
+	merge := func(t *testing.T, kc *config.KubernetesConfig) (worker.Config, error) {
+		t.Helper()
+		resetCLIForTest()
+		t.Cleanup(resetCLIForTest)
+		return mergeConfig(&config.FileConfig{WorkerID: "worker-123", Backend: config.BackendConfig{Kubernetes: kc}})
+	}
+
+	t.Run("configures the task volume", func(t *testing.T) {
+		wc, err := merge(t, &config.KubernetesConfig{
+			WorkspaceVolume: &config.KubernetesTaskVolumeConfig{BaseSize: "32Gi", SizePerComputeUnit: "8Gi"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := wc.Kubernetes.TaskVolume
+		if got == nil || got.BaseSize.String() != "32Gi" || got.SizePerComputeUnit.String() != "8Gi" || strings.Join(got.Paths, ",") != "/workspace" {
+			t.Fatalf("TaskVolume = %+v, want 32Gi + 8Gi per unit backing /workspace", got)
+		}
+	})
+
+	t.Run("errors name the key that was set", func(t *testing.T) {
+		_, err := merge(t, &config.KubernetesConfig{
+			WorkspaceVolume: &config.KubernetesTaskVolumeConfig{BaseSize: "lots"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "workspace_volume.base_size") {
+			t.Fatalf("error = %v, want one naming workspace_volume.base_size", err)
+		}
+	})
+
+	t.Run("cannot be set together with task_volume", func(t *testing.T) {
+		_, err := merge(t, &config.KubernetesConfig{
+			TaskVolume:      &config.KubernetesTaskVolumeConfig{BaseSize: "32Gi"},
+			WorkspaceVolume: &config.KubernetesTaskVolumeConfig{BaseSize: "32Gi"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "set only task_volume") {
+			t.Fatalf("error = %v, want one saying to set only task_volume", err)
+		}
+	})
 }
 
 func TestMergeConfigKubernetesPreservesImageVolumePreference(t *testing.T) {

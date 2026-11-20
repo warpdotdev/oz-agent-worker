@@ -229,7 +229,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			activeDeadlineSeconds *int64
 			ttlSecondsAfterFinish *int32
 			workspaceSizeLimit    *resource.Quantity
-			workspaceVolume       *worker.KubernetesWorkspaceVolumeConfig
+			taskVolume            *worker.KubernetesTaskVolumeConfig
 			unschedulableTimeout  *time.Duration
 			podTemplate           *corev1.PodSpec
 			preflightResources    *corev1.ResourceRequirements
@@ -269,15 +269,22 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 				}
 				workspaceSizeLimit = &quantity
 			}
+			taskVolumeConfig, taskVolumeKey := kc.TaskVolume, "backend.kubernetes.task_volume"
 			if kc.WorkspaceVolume != nil {
-				if kc.WorkspaceSizeLimit != "" {
-					return worker.Config{}, fmt.Errorf("backend.kubernetes.workspace_volume cannot be combined with backend.kubernetes.workspace_size_limit, which only limits an emptyDir workspace")
+				if kc.TaskVolume != nil {
+					return worker.Config{}, fmt.Errorf("backend.kubernetes.workspace_volume is the former name of backend.kubernetes.task_volume; set only task_volume")
 				}
-				volume, err := workspaceVolumeFromConfig(kc.WorkspaceVolume)
+				taskVolumeConfig, taskVolumeKey = kc.WorkspaceVolume, "backend.kubernetes.workspace_volume"
+			}
+			if taskVolumeConfig != nil {
+				if kc.WorkspaceSizeLimit != "" {
+					return worker.Config{}, fmt.Errorf("%s cannot be combined with backend.kubernetes.workspace_size_limit, which only limits an emptyDir workspace", taskVolumeKey)
+				}
+				volume, err := taskVolumeFromConfig(taskVolumeConfig, taskVolumeKey)
 				if err != nil {
 					return worker.Config{}, err
 				}
-				workspaceVolume = volume
+				taskVolume = volume
 			}
 			if kc.UnschedulableTimeout != nil {
 				duration, err := time.ParseDuration(*kc.UnschedulableTimeout)
@@ -327,7 +334,7 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
 			TTLSecondsAfterFinish: ttlSecondsAfterFinish,
 			WorkspaceSizeLimit:    workspaceSizeLimit,
-			WorkspaceVolume:       workspaceVolume,
+			TaskVolume:            taskVolume,
 			UnschedulableTimeout:  unschedulableTimeout,
 			TaskEnv:               copyStringMap(cliEnv),
 			PodTemplate:           podTemplate,
@@ -457,34 +464,38 @@ func mergeConfig(fileConfig *config.FileConfig) (worker.Config, error) {
 	return wc, nil
 }
 
-// workspaceVolumeFromConfig parses the workspace volume settings: a positive base size, a
-// non-negative per-unit increment, and additional paths the volume can back.
-func workspaceVolumeFromConfig(cfg *config.KubernetesWorkspaceVolumeConfig) (*worker.KubernetesWorkspaceVolumeConfig, error) {
+// taskVolumeFromConfig parses the task volume settings found under key: a positive base
+// size, a non-negative per-unit increment, and the paths the volume backs, which default
+// to the workspace alone.
+func taskVolumeFromConfig(cfg *config.KubernetesTaskVolumeConfig, key string) (*worker.KubernetesTaskVolumeConfig, error) {
 	baseSize, err := resource.ParseQuantity(cfg.BaseSize)
 	if err != nil {
-		return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.base_size %q: %w", cfg.BaseSize, err)
+		return nil, fmt.Errorf("invalid %s.base_size %q: %w", key, cfg.BaseSize, err)
 	}
 	if baseSize.Sign() <= 0 {
-		return nil, fmt.Errorf("backend.kubernetes.workspace_volume.base_size must be positive, got %q", cfg.BaseSize)
+		return nil, fmt.Errorf("%s.base_size must be positive, got %q", key, cfg.BaseSize)
 	}
-	volume := &worker.KubernetesWorkspaceVolumeConfig{
+	volume := &worker.KubernetesTaskVolumeConfig{
 		StorageClass: cfg.StorageClass,
 		BaseSize:     baseSize,
 	}
 	if cfg.SizePerComputeUnit != "" {
 		sizePerComputeUnit, err := resource.ParseQuantity(cfg.SizePerComputeUnit)
 		if err != nil {
-			return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.size_per_compute_unit %q: %w", cfg.SizePerComputeUnit, err)
+			return nil, fmt.Errorf("invalid %s.size_per_compute_unit %q: %w", key, cfg.SizePerComputeUnit, err)
 		}
 		if sizePerComputeUnit.Sign() < 0 {
-			return nil, fmt.Errorf("backend.kubernetes.workspace_volume.size_per_compute_unit must not be negative, got %q", cfg.SizePerComputeUnit)
+			return nil, fmt.Errorf("%s.size_per_compute_unit must not be negative, got %q", key, cfg.SizePerComputeUnit)
 		}
 		volume.SizePerComputeUnit = sizePerComputeUnit
 	}
-	if err := worker.ValidateWorkspaceVolumeAdditionalPaths(cfg.AdditionalPaths); err != nil {
-		return nil, fmt.Errorf("invalid backend.kubernetes.workspace_volume.additional_paths: %w", err)
+	volume.Paths = append([]string(nil), cfg.Paths...)
+	if len(volume.Paths) == 0 {
+		volume.Paths = []string{worker.KubernetesWorkspacePath}
 	}
-	volume.AdditionalPaths = append([]string(nil), cfg.AdditionalPaths...)
+	if err := worker.ValidateTaskVolumePaths(volume.Paths); err != nil {
+		return nil, fmt.Errorf("invalid %s.paths: %w", key, err)
+	}
 	return volume, nil
 }
 
