@@ -93,10 +93,13 @@ type KubernetesConfig struct {
 	ActiveDeadlineSeconds *int64            `yaml:"active_deadline_seconds"`
 	TTLSecondsAfterFinish *int32            `yaml:"ttl_seconds_after_finished"`
 	WorkspaceSizeLimit    string            `yaml:"workspace_size_limit"`
-	// WorkspaceVolume, when set, backs the task workspace with a dedicated per-pod
-	// volume instead of an emptyDir. It cannot be combined with WorkspaceSizeLimit.
-	WorkspaceVolume      *KubernetesWorkspaceVolumeConfig `yaml:"workspace_volume"`
-	UnschedulableTimeout *string                          `yaml:"unschedulable_timeout"`
+	// TaskVolume, when set, gives each task pod a dedicated volume that backs the
+	// workspace instead of an emptyDir, along with any other paths it lists. It cannot
+	// be combined with WorkspaceSizeLimit.
+	TaskVolume *KubernetesTaskVolumeConfig `yaml:"task_volume"`
+	// WorkspaceVolume is the former name of TaskVolume. Setting both is an error.
+	WorkspaceVolume      *KubernetesTaskVolumeConfig `yaml:"workspace_volume"`
+	UnschedulableTimeout *string                     `yaml:"unschedulable_timeout"`
 	// CodingCLISidecars is a compatibility alias for mappings from the official
 	// Warp CLI and ACP repositories for each harness to a custom image.
 	// It cannot be combined with SidecarImageMappings and does not inject sidecars.
@@ -111,15 +114,20 @@ type KubernetesConfig struct {
 	PreflightResources *RawYAMLNode `yaml:"preflight_resources"`
 }
 
-// KubernetesWorkspaceVolumeConfig sizes the dedicated workspace volume. Sizes are
+// KubernetesTaskVolumeConfig describes the dedicated per-pod task volume. Sizes are
 // Kubernetes quantities such as "20Gi".
-type KubernetesWorkspaceVolumeConfig struct {
+type KubernetesTaskVolumeConfig struct {
 	// StorageClass names the StorageClass to provision from. Empty uses the cluster default.
 	StorageClass string `yaml:"storage_class" validate:"omitempty,no_whitespace"`
 	BaseSize     string `yaml:"base_size" validate:"required"`
 	// SizePerComputeUnit is added to BaseSize once per compute unit of the task
 	// container, where one unit is 1 vCPU or 2 GiB of memory, whichever count is larger.
 	SizePerComputeUnit string `yaml:"size_per_compute_unit"`
+	// Paths lists the absolute paths in the task container to back with the volume.
+	// It must include the workspace, and may add directories that grow outside it,
+	// such as a home directory that fills with package and build caches. Empty means
+	// the workspace alone.
+	Paths []string `yaml:"paths" validate:"dive,required"`
 }
 
 // RawYAMLNode captures a raw YAML sub-tree without applying KnownFields validation

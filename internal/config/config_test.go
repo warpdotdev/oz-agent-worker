@@ -430,34 +430,80 @@ backend:
 	}
 }
 
-func TestLoadKubernetesWorkspaceVolume(t *testing.T) {
+func TestLoadKubernetesTaskVolume(t *testing.T) {
 	path := writeTestConfig(t, `
 backend:
   kubernetes:
-    workspace_volume:
+    task_volume:
       storage_class: "standard-rwo"
       base_size: "32Gi"
       size_per_compute_unit: "8Gi"
+      paths:
+        - /workspace
+        - /home/agent
+        - /tmp
 `)
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	volume := cfg.Backend.Kubernetes.WorkspaceVolume
+	volume := cfg.Backend.Kubernetes.TaskVolume
 	if volume == nil {
-		t.Fatal("expected workspace_volume to be set")
+		t.Fatal("expected task_volume to be set")
+	}
+	if cfg.Backend.Kubernetes.WorkspaceVolume != nil {
+		t.Fatal("expected workspace_volume to stay unset")
 	}
 	if volume.StorageClass != "standard-rwo" || volume.BaseSize != "32Gi" || volume.SizePerComputeUnit != "8Gi" {
-		t.Fatalf("workspace_volume = %+v, want standard-rwo / 32Gi / 8Gi", *volume)
+		t.Fatalf("task_volume = %+v, want standard-rwo / 32Gi / 8Gi", *volume)
+	}
+	if got := strings.Join(volume.Paths, ","); got != "/workspace,/home/agent,/tmp" {
+		t.Fatalf("paths = %q, want /workspace,/home/agent,/tmp", got)
 	}
 }
 
-func TestLoadKubernetesWorkspaceVolumeRequiresBaseSize(t *testing.T) {
+func TestLoadKubernetesWorkspaceVolumeAlias(t *testing.T) {
 	path := writeTestConfig(t, `
 backend:
   kubernetes:
     workspace_volume:
+      base_size: "32Gi"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Backend.Kubernetes.TaskVolume != nil {
+		t.Fatal("expected task_volume to stay unset")
+	}
+	volume := cfg.Backend.Kubernetes.WorkspaceVolume
+	if volume == nil || volume.BaseSize != "32Gi" {
+		t.Fatalf("workspace_volume = %+v, want a 32Gi volume", volume)
+	}
+}
+
+func TestLoadKubernetesTaskVolumeRejectsEmptyPath(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  kubernetes:
+    task_volume:
+      base_size: "32Gi"
+      paths:
+        - ""
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an empty path")
+	}
+}
+
+func TestLoadKubernetesTaskVolumeRequiresBaseSize(t *testing.T) {
+	path := writeTestConfig(t, `
+backend:
+  kubernetes:
+    task_volume:
       storage_class: "standard-rwo"
 `)
 

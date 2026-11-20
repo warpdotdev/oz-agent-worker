@@ -63,15 +63,29 @@ data:
         {{- if .Values.kubernetesBackend.workspaceSizeLimit }}
         workspace_size_limit: {{ .Values.kubernetesBackend.workspaceSizeLimit | quote }}
         {{- end }}
+        {{- $taskVolume := .Values.kubernetesBackend.taskVolume }}
+        {{- /* workspaceVolume is the former name of taskVolume and is still honoured. */}}
         {{- with .Values.kubernetesBackend.workspaceVolume }}
         {{- if .baseSize }}
-        workspace_volume:
+        {{- if and $taskVolume $taskVolume.baseSize }}
+        {{- fail "kubernetesBackend.workspaceVolume is the former name of kubernetesBackend.taskVolume; set only taskVolume" }}
+        {{- end }}
+        {{- $taskVolume = . }}
+        {{- end }}
+        {{- end }}
+        {{- with $taskVolume }}
+        {{- if .baseSize }}
+        task_volume:
           base_size: {{ .baseSize | quote }}
           {{- if .storageClass }}
           storage_class: {{ .storageClass | quote }}
           {{- end }}
           {{- if .sizePerComputeUnit }}
           size_per_compute_unit: {{ .sizePerComputeUnit | quote }}
+          {{- end }}
+          {{- with .paths }}
+          paths:
+{{ toYaml . | indent 12 }}
           {{- end }}
         {{- end }}
         {{- end }}
