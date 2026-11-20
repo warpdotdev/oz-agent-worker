@@ -75,6 +75,10 @@ func (w *Worker) admitStandbyLocked() (*semaphore.Weighted, string) {
 
 func (w *Worker) handlePrewarmCreate(create *types.PrewarmCreateMessage) {
 	sandboxID := create.SandboxID
+	if create.CredentialProxy != nil {
+		w.rejectPrewarm(sandboxID, "credential proxy does not support standby sandboxes")
+		return
+	}
 	if err := validateStandbyID(sandboxID); err != nil {
 		w.rejectPrewarm(sandboxID, err.Error())
 		return

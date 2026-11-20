@@ -182,7 +182,8 @@ func standbyFailure(reason metrics.TaskFailureReason, exitCode int) error {
 
 func TestStandbyCapabilityHeader(t *testing.T) {
 	const base = "execution-scoped-cancellation-v1"
-	const withStandbys = base + ",prewarmed-sandboxes-v1"
+	const docker = base + ",credential_proxy_v1"
+	const withStandbys = docker + ",prewarmed-sandboxes-v1"
 	supported := backendCapabilities{supportsStandbys: true}
 
 	tests := []struct {
@@ -192,8 +193,8 @@ func TestStandbyCapabilityHeader(t *testing.T) {
 		want         string
 	}{
 		{name: "backend supports standbys", capabilities: supported, want: withStandbys},
-		{name: "backend without standbys", want: base},
-		{name: "one-shot mode", capabilities: supported, config: Config{OneShot: true}, want: base},
+		{name: "backend without standbys", want: docker},
+		{name: "one-shot mode", capabilities: supported, config: Config{OneShot: true}, want: docker},
 		{
 			name:         "direct backend with target dir",
 			capabilities: supported,

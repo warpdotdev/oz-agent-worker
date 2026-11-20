@@ -370,7 +370,7 @@ func TestExecutionCancellationCapabilityHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	if got := <-capability; got != "execution-scoped-cancellation-v1" {
+	if got := <-capability; got != "execution-scoped-cancellation-v1,credential_proxy_v1" {
 		t.Fatalf("capability = %q", got)
 	}
 }

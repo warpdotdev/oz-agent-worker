@@ -98,6 +98,9 @@ func NewCommandBackend(ctx context.Context, config CommandBackendConfig) (*Comma
 // ExecuteTask dispatches the task by invoking the configured dispatch command
 // with the JSON payload on stdin. It returns ExecuteOutcomeSpawned on success.
 func (b *CommandBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	if params.CredentialProxy != nil {
+		return unsupportedCredentialProxy(params)
+	}
 	_, prepare := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.dispatch_prepare",
 		trace.WithAttributes(attribute.String("phase", "dispatch_prepare")))
 	defer func() {

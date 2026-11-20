@@ -70,7 +70,7 @@ def prepare(root):
     if (root / "pending-token").exists():
         read_private(root / "pending-token")
         return
-    with open("/dev/tty", "r+") as terminal:
+    with open("/dev/tty", "w") as terminal:
         token = getpass.getpass("Disposable GitHub token for local Agent Vault: ", stream=terminal).strip()
     if not token or any(character.isspace() for character in token):
         raise ValueError("A nonempty GitHub token without whitespace is required")

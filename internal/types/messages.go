@@ -27,6 +27,18 @@ type WebSocketMessage struct {
 // PrewarmedSandboxesCapability tells the server that this worker can run standby sandboxes.
 const PrewarmedSandboxesCapability = "prewarmed-sandboxes-v1"
 
+const CredentialProxyCapability = "credential_proxy_v1"
+
+// CredentialProxy grants one execution access to a private HTTP credential proxy.
+// ProxyToken is worker-only. SessionToken is the limited agent-facing credential.
+type CredentialProxy struct {
+	Image        string    `json:"image"`
+	ProxyToken   string    `json:"proxy_token"`
+	SessionToken string    `json:"session_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Domain       string    `json:"domain,omitempty"`
+}
+
 const (
 	MessageTypePrewarmCreate   MessageType = "prewarm_create"
 	MessageTypePrewarmDestroy  MessageType = "prewarm_destroy"
@@ -37,6 +49,7 @@ const (
 
 // PrewarmCreateMessage asks the worker to start one standby sandbox.
 type PrewarmCreateMessage struct {
+	CredentialProxy    *CredentialProxy  `json:"credential_proxy,omitempty"`
 	SandboxID          string            `json:"sandbox_id"`
 	DockerImage        string            `json:"docker_image,omitempty"`
 	SidecarImage       string            `json:"sidecar_image,omitempty"`
@@ -168,7 +181,8 @@ type TelemetryBootstrapToken struct {
 
 // TaskAssignmentMessage is sent from server to worker when a task is available
 type TaskAssignmentMessage struct {
-	TaskID string `json:"task_id"`
+	CredentialProxy *CredentialProxy `json:"credential_proxy,omitempty"`
+	TaskID          string           `json:"task_id"`
 	// ExecutionID identifies the concrete run execution being launched. It is
 	// distinct from TaskID/Task.ID, which identify the logical run and can be
 	// reused by follow-up or handoff executions.

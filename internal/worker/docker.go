@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -41,11 +42,13 @@ const (
 
 // DockerBackendConfig holds configuration specific to the Docker backend.
 type DockerBackendConfig struct {
-	WorkerID  string
-	NoCleanup bool
-	Volumes   []string
-	Env       map[string]string
-	Network   string
+	ServerRootURL string
+	ControlURLs   []string
+	WorkerID      string
+	NoCleanup     bool
+	Volumes       []string
+	Env           map[string]string
+	Network       string
 	// ImagePullPolicy controls how the main task image and every Warp/additional sidecar image
 	// are resolved before use: PullPolicyAlways, PullPolicyIfNotPresent, or PullPolicyNever. An
 	// empty value defaults to PullPolicyAlways, preserving the backend's original
@@ -68,12 +71,14 @@ func (b *DockerBackend) containerWasOOMKilled(ctx context.Context, dockerClient 
 
 // DockerBackend executes tasks in Docker containers.
 type DockerBackend struct {
-	config         DockerBackendConfig
-	dockerClient   *client.Client
-	platform       string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
-	platformSpec   ocispec.Platform
-	sidecarVolumes sync.Map // volume name -> *sidecarVolumeState
-	taskContainers sync.Map // taskExecution -> container ID; retained after cleanup failures
+	config                   DockerBackendConfig
+	dockerClient             *client.Client
+	platform                 string // Docker daemon platform (e.g., "linux/amd64" or "linux/arm64")
+	platformSpec             ocispec.Platform
+	sidecarVolumes           sync.Map // volume name -> *sidecarVolumeState
+	taskContainers           sync.Map // taskExecution -> container ID; retained after cleanup failures
+	credentialProxies        sync.Map // taskExecution -> *credentialProxyResources
+	credentialProxyTransport http.RoundTripper
 }
 
 // NewDockerBackend creates a new Docker backend, connecting to the Docker daemon.
@@ -131,6 +136,43 @@ func NewDockerBackend(ctx context.Context, config DockerBackendConfig) (*DockerB
 
 // ExecuteTask runs the agent in a Docker container.
 func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	if err := validateCredentialProxyAssignment("docker", params.CredentialProxy, params.ExecutionID, params.StandbyID, append(append([]string{}, params.EnvVars...), envSliceFromMap(b.config.Env)...), b.config.ServerRootURL); err != nil {
+		return executeError(err)
+	}
+	var proxyResources *credentialProxyResources
+	var proxyCA []byte
+	if proxy := params.CredentialProxy; proxy != nil {
+		expiryCtx, expiryCancel := context.WithDeadline(ctx, proxy.ExpiresAt)
+		defer expiryCancel()
+		proxyCtx, proxyCancel := context.WithCancelCause(expiryCtx)
+		defer proxyCancel(nil)
+		ctx = proxyCtx
+		params.Logs.AddEnv(credentialProxyRedactions(proxy))
+		proxyResources = &credentialProxyResources{}
+		key := taskExecution{params.TaskID, params.ExecutionID}
+		b.credentialProxies.Store(key, proxyResources)
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
+			defer cancel()
+			if err := b.cleanupCredentialProxy(cleanupCtx, key); err != nil {
+				result = executeError(errors.Join(result.Error, err))
+			}
+		}()
+		var err error
+		proxyCA, err = b.startCredentialProxy(ctx, params, proxyResources)
+		if err != nil {
+			return executeError(err)
+		}
+		monitorDone := make(chan struct{})
+		go func() {
+			defer close(monitorDone)
+			b.monitorCredentialProxy(ctx, proxyCancel, proxy, proxyResources.proxyID)
+		}()
+		defer func() {
+			proxyCancel(nil)
+			<-monitorDone
+		}()
+	}
 	if params.StandbyID != "" {
 		if err := validateStandbyID(params.StandbyID); err != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerCreate, err))
@@ -174,6 +216,11 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	for key, value := range b.config.Env {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, value))
 	}
+	if params.CredentialProxy != nil {
+		controls := append([]string{b.config.ServerRootURL}, b.config.ControlURLs...)
+		envVars = append(envVars, credentialProxyAgentEnv(params.CredentialProxy, controls)...)
+		params.Logs.AddEnvList(envVars)
+	}
 
 	// Build Docker-specific command: entrypoint prefix + base args.
 	cmd := append([]string{"/agent/entrypoint.sh"}, params.BaseArgs...)
@@ -197,6 +244,10 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		Resources:   dockerResourcesForShape(params.InstanceShape),
 		NetworkMode: container.NetworkMode(b.config.Network),
 	}
+	if proxyResources != nil {
+		hostConfig.NetworkMode = container.NetworkMode(proxyResources.networkID)
+		containerConfig.Entrypoint = []string{"/bin/sh", "/tmp/oz-credential-proxy-start.sh"}
+	}
 
 	doneContainerStart := params.SetupEvents.startEventAt(ctx, SetupEventContainerStart, time.Now())
 	// Transport and server failures cannot prove that the daemon created no container.
@@ -219,11 +270,16 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}
 
 	containerID := resp.ID
+	if proxyResources != nil {
+		proxyResources.mu.Lock()
+		proxyResources.agentID = containerID
+		proxyResources.mu.Unlock()
+	}
 	b.taskContainers.Store(key, containerID)
 	log.Debugf(ctx, "Created Docker container: %s", containerID)
 
 	defer func() {
-		if containerID != "" && !b.config.NoCleanup {
+		if containerID != "" && (!b.config.NoCleanup || (proxyResources != nil && result.Error != nil)) {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), BackendShutdownTimeout)
 			defer cleanupCancel()
 			_, phase := tracing.Tracer(cleanupCtx).Start(cleanupCtx, "self_hosted_worker.cleanup",
@@ -235,9 +291,26 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			} else {
 				phase.End()
 				b.taskContainers.Delete(key)
+				if proxyResources != nil {
+					proxyResources.mu.Lock()
+					proxyResources.agentID = ""
+					proxyResources.mu.Unlock()
+				}
 			}
 		}
 	}()
+	if proxyResources != nil {
+		archive, archiveErr := credentialProxyArchive(map[string][]byte{
+			"oz-credential-proxy/ca.pem":   proxyCA,
+			"oz-credential-proxy-start.sh": []byte(credentialProxyStartup),
+		})
+		if archiveErr != nil {
+			return executeError(archiveErr)
+		}
+		if _, err := dockerClient.CopyToContainer(ctx, containerID, client.CopyToContainerOptions{DestinationPath: "/tmp", Content: archive}); err != nil {
+			return executeError(errors.New("agent credential proxy CA delivery failed"))
+		}
+	}
 
 	_, start := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.container_start",
 		trace.WithAttributes(attribute.String("phase", "container_start")))
@@ -262,6 +335,8 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 	}()
 	waitResult := dockerClient.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
+	case <-ctx.Done():
+		return executeError(fmt.Errorf("task execution stopped: %w", context.Cause(ctx)))
 	case err := <-waitResult.Error:
 		if err != nil {
 			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonContainerWait, fmt.Errorf("error waiting for container: %w", err)))
@@ -274,7 +349,7 @@ func (b *DockerBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			b.taskContainers.Delete(key)
 		}
 
-		if params.Logs == nil && (zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0) {
+		if params.CredentialProxy == nil && params.Logs == nil && (zerolog.GlobalLevel() <= zerolog.DebugLevel || status.StatusCode != 0) {
 			logOutput, logErr := b.getContainerLogs(ctx, dockerClient, containerID)
 			if logErr != nil {
 				log.Warnf(ctx, "Failed to get container logs: %v", logErr)
@@ -345,9 +420,10 @@ func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) er
 		return nil
 	}
 	key := taskExecution{params.TaskID, params.ExecutionID}
+	proxyErr := b.cleanupCredentialProxy(ctx, key)
 	containerID, ok := b.taskContainers.Load(key)
 	if !ok {
-		return nil
+		return proxyErr
 	}
 	if containerID == "" {
 		return fmt.Errorf("container creation outcome is unknown for execution %s", params.ExecutionID)
@@ -356,13 +432,19 @@ func (b *DockerBackend) CancelTask(ctx context.Context, params *CancelParams) er
 		return err
 	}
 	b.taskContainers.Delete(key)
-	return nil
+	return proxyErr
 }
 
 func (b *DockerBackend) WatchStandbyExits(context.Context, func(string, int, string)) {}
 
 // Shutdown closes the Docker client.
 func (b *DockerBackend) Shutdown(ctx context.Context) {
+	b.credentialProxies.Range(func(key, _ any) bool {
+		if err := b.cleanupCredentialProxy(ctx, key.(taskExecution)); err != nil {
+			log.Warnf(ctx, "Credential proxy cleanup failed during shutdown")
+		}
+		return true
+	})
 	if b.dockerClient != nil {
 		if err := b.dockerClient.Close(); err != nil {
 			log.Warnf(ctx, "Failed to close Docker client: %v", err)

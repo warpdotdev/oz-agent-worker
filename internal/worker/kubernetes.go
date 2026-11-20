@@ -194,6 +194,9 @@ func NewKubernetesBackend(ctx context.Context, config KubernetesBackendConfig) (
 
 // ExecuteTask runs the agent in a Kubernetes Job.
 func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams) (res ExecuteResult) {
+	if params.CredentialProxy != nil {
+		return unsupportedCredentialProxy(params)
+	}
 	configuredEnv := envSliceFromMap(b.config.TaskEnv)
 	if b.config.PodTemplate != nil {
 		for _, container := range b.config.PodTemplate.Containers {

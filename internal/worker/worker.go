@@ -221,6 +221,8 @@ func New(ctx context.Context, config Config) (*Worker, error) {
 		}
 		dockerConfig := *config.Docker
 		dockerConfig.WorkerID = config.WorkerID
+		dockerConfig.ServerRootURL = config.ServerRootURL
+		dockerConfig.ControlURLs = []string{config.WebSocketURL, config.SessionSharingServerURL}
 		backend, err = NewDockerBackend(ctx, dockerConfig)
 	default:
 		return nil, fmt.Errorf("unknown backend type: %q", backendType)
@@ -341,6 +343,9 @@ func (w *Worker) connect() (*websocket.Conn, error) {
 	headers := make(map[string][]string)
 	headers["Authorization"] = []string{fmt.Sprintf("Bearer %s", w.config.APIKey)}
 	capabilities := []string{executionCancellationCapability}
+	if w.config.BackendType == "" || w.config.BackendType == "docker" {
+		capabilities = append(capabilities, types.CredentialProxyCapability)
+	}
 	if w.standbysSupported() {
 		capabilities = append(capabilities, types.PrewarmedSandboxesCapability)
 	}
@@ -670,6 +675,16 @@ func (w *Worker) rememberCompletedLocked(key taskExecution, cancellationAccepted
 }
 
 func (w *Worker) handleTaskAssignment(assignment *types.TaskAssignmentMessage, receivedAt time.Time) {
+	if assignment.CredentialProxy != nil {
+		env := envSliceFromMap(assignment.EnvVars)
+		if w.config.Docker != nil {
+			env = append(env, envSliceFromMap(w.config.Docker.Env)...)
+		}
+		if err := validateCredentialProxyAssignment(w.config.BackendType, assignment.CredentialProxy, assignment.ExecutionID, "", env, w.config.ServerRootURL); err != nil {
+			w.rejectTaskAssignment(w.ctx, assignment.TaskID, err.Error(), metrics.RejectReasonAtCapacity)
+			return
+		}
+	}
 	key := taskExecution{assignment.TaskID, assignment.ExecutionID}
 	log.Infof(w.ctx, "Received task assignment: taskID=%s, title=%s", assignment.TaskID, assignment.Task.Title)
 	taskCtx, session, err := w.config.Tracing.Start(w.ctx, w.config.ServerRootURL, assignment, receivedAt)
@@ -859,15 +874,16 @@ func (w *Worker) prepareTaskParams(assignment *types.TaskAssignmentMessage) *Tas
 	}
 
 	return &TaskParams{
-		TaskID:        assignment.TaskID,
-		ExecutionID:   assignment.ExecutionID,
-		Task:          task,
-		EnvVars:       envVars,
-		BaseArgs:      baseArgs,
-		DockerImage:   dockerImage,
-		Sidecars:      sidecars,
-		InstanceShape: assignment.InstanceShape,
-		SetupEvents:   setupEvents,
+		CredentialProxy: assignment.CredentialProxy,
+		TaskID:          assignment.TaskID,
+		ExecutionID:     assignment.ExecutionID,
+		Task:            task,
+		EnvVars:         envVars,
+		BaseArgs:        baseArgs,
+		DockerImage:     dockerImage,
+		Sidecars:        sidecars,
+		InstanceShape:   assignment.InstanceShape,
+		SetupEvents:     setupEvents,
 	}
 }
 
@@ -981,6 +997,9 @@ func (w *Worker) executeTask(ctx context.Context, taskCancel context.CancelFunc,
 			log.Warnf(ctx, "Task log reporting unavailable for task %s: %v", taskID, err)
 		}
 		if reporter != nil {
+			if proxy := assignment.CredentialProxy; proxy != nil {
+				reporter.AddEnv(credentialProxyRedactions(proxy))
+			}
 			params.Logs = reporter
 			ctx = log.WithOutput(ctx, reporter.ZerologWriter(ctx))
 			backendCtx = log.WithOutput(backendCtx, reporter.ZerologWriter(backendCtx))

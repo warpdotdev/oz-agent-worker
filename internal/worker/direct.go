@@ -180,6 +180,9 @@ func NewDirectBackend(ctx context.Context, config DirectBackendConfig) (*DirectB
 
 // ExecuteTask runs the agent directly on the host.
 func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (result ExecuteResult) {
+	if params.CredentialProxy != nil {
+		return unsupportedCredentialProxy(params)
+	}
 	_, workspace := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.workspace_prepare",
 		trace.WithAttributes(attribute.String("phase", "workspace_prepare")))
 	defer func() {
