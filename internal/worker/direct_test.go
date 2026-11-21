@@ -186,6 +186,66 @@ func TestDirectBackendSetupCommandReceivesIsolatedGitConfig(t *testing.T) {
 	}
 }
 
+func TestDirectBackendLocalRestrictedGitHome(t *testing.T) {
+	requireGit(t)
+	for _, tc := range []struct {
+		name       string
+		local      bool
+		restricted bool
+	}{
+		{"local restricted", true, true},
+		{"local legacy", true, false},
+		{"nonlocal restricted", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host := t.TempDir()
+			t.Setenv("HOME", host)
+			dir := t.TempDir()
+			agent := filepath.Join(dir, "agent")
+			capture := filepath.Join(dir, "agent-home")
+			env := map[string]string{"GH_TOKEN": "test-marker", "GH_CONFIG_DIR": host}
+			if tc.local {
+				env["WITH_LOCAL_SERVER"] = "1"
+			}
+			params := TaskParams{TaskID: "test-run", ExecutionID: "1", BaseArgs: []string{capture}}
+			if tc.restricted {
+				params.EnvVars = []string{"WARP_GITHUB_CREDENTIAL_MODE=restricted_installation"}
+			}
+			check := `test "$GIT_CONFIG_GLOBAL" != "$HOME/.gitconfig" && test -z "${GIT_CONFIG_NOSYSTEM:-}" && test "$GH_TOKEN" = test-marker`
+			if tc.local && tc.restricted {
+				check = `test "$GIT_CONFIG_GLOBAL" = "$HOME/.gitconfig" && test "${GIT_CONFIG_NOSYSTEM:-}" = 1 && test -z "${GH_TOKEN:-}" && test "$GH_CONFIG_DIR" = "$HOME/.config/gh" && test ! -e "$HOME/.gitconfig"`
+			}
+			script := "#!/bin/sh\nset -eu\n" + check + " || exit 1\ngit config --global user.name test\nprintf '%s' \"$HOME\" > \"$1\"\n"
+			if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			backend, err := NewDirectBackend(t.Context(), DirectBackendConfig{
+				WorkspaceRoot: filepath.Join(dir, "workspaces"), OzPath: agent, NoCleanup: true, Env: env,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result := backend.ExecuteTask(t.Context(), &params); result.Error != nil {
+				t.Fatal(result.Error)
+			}
+			home, err := os.ReadFile(capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.local && tc.restricted {
+				if _, err := os.Stat(string(home)); !os.IsNotExist(err) {
+					t.Fatalf("private home was not removed: %v", err)
+				}
+			} else if string(home) != host {
+				t.Fatalf("unaffected run did not keep its original home: %s", home)
+			}
+			if _, err := os.Stat(filepath.Join(host, ".gitconfig")); !os.IsNotExist(err) {
+				t.Fatalf("developer Git config was modified: %v", err)
+			}
+		})
+	}
+}
+
 // The operator's setup and teardown hooks see every well-known variable under both its OZ_
 // and its WARP_ name, carrying the identical value.
 func TestDirectBackendHooksReceiveBothNames(t *testing.T) {

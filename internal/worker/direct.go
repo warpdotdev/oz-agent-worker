@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -100,13 +101,11 @@ func hostBaseEnv() []string {
 // global config keeps writes like `git config --global url.<x>.insteadOf` out of
 // the developer's real ~/.gitconfig (and $XDG_CONFIG_HOME/git/config) without
 // repointing HOME for every tool the agent runs.
-func prepareTaskGitConfig(workspaceDir string, usingTargetDir bool) (string, func(), error) {
-	if !usingTargetDir {
+func prepareTaskGitConfig(workspaceDir string, outsideWorkspace bool) (string, func(), error) {
+	if !outsideWorkspace {
 		return filepath.Join(workspaceDir, ".gitconfig"), func() {}, nil
 	}
 
-	// In shared target-dir mode the workspace is the user's real checkout, so keep
-	// the throwaway global config in a temporary directory outside of it.
 	dir, err := os.MkdirTemp("", "oz-gitconfig-")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temporary git config directory: %w", err)
@@ -235,12 +234,22 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 		}
 		log.Infof(ctx, "Created workspace: %s", workspaceDir)
 	}
-	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir)
+	const restrictedMode = "WARP_GITHUB_CREDENTIAL_MODE=restricted_installation"
+	privateGitHome := b.config.Env["WITH_LOCAL_SERVER"] == "1" && slices.Contains(params.EnvVars, restrictedMode)
+	gitConfigPath, cleanupGitConfig, err := prepareTaskGitConfig(workspaceDir, usingTargetDir || privateGitHome)
 	if err != nil {
 		return executeError(err)
 	}
 	defer cleanupGitConfig()
 	gitConfigEnv := []string{fmt.Sprintf("GIT_CONFIG_GLOBAL=%s", gitConfigPath)}
+	if privateGitHome {
+		// Restricted bootstrap requires $HOME/.gitconfig and must not write its credential store into the retained workspace.
+		home := filepath.Dir(gitConfigPath)
+		gitConfigEnv = append(gitConfigEnv, restrictedMode, "HOME="+home, "GIT_CONFIG_NOSYSTEM=1",
+			"XDG_CONFIG_HOME="+filepath.Join(home, ".config"), "GH_CONFIG_DIR="+filepath.Join(home, ".config", "gh"),
+			"GH_TOKEN=", "GITHUB_TOKEN=", "GITHUB_ACCESS_TOKEN=", "GITHUB_PERSONAL_ACCESS_TOKEN=",
+			"GH_ENTERPRISE_TOKEN=", "GITHUB_ENTERPRISE_TOKEN=", "SSH_AUTH_SOCK=")
+	}
 
 	defer func() {
 		tracing.RecordError(workspace, result.Error)
@@ -249,19 +258,20 @@ func (b *DirectBackend) ExecuteTask(ctx context.Context, params *TaskParams) (re
 			log.Infof(ctx, "Skipping cleanup for workspace: %s", workspaceDir)
 			return
 		}
+		teardownEnv := directTeardownEnvVars(workspaceDir, gitConfigPath, taskID)
+		if standbyID != "" {
+			teardownEnv = directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID)
+		}
+		teardownEnv = mergeEnvVars(teardownEnv, gitConfigEnv)
 		if usingTargetDir {
 			_, cleanup := tracing.Tracer(ctx).Start(ctx, "self_hosted_worker.cleanup",
 				trace.WithAttributes(attribute.String("phase", "cleanup")))
 			// Don't clean up the shared target directory.
-			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs))
+			tracing.RecordError(cleanup, b.runTeardownIfConfigured(ctx, teardownEnv, workspaceDir, params.Logs))
 			cleanup.End()
 			return
 		}
-		if standbyID != "" {
-			_ = b.removeWorkspace(ctx, directStandbyTeardownEnvVars(workspaceDir, gitConfigPath, standbyID), workspaceDir, params.Logs)
-			return
-		}
-		_ = b.removeWorkspace(ctx, directTeardownEnvVars(workspaceDir, gitConfigPath, taskID), workspaceDir, params.Logs)
+		_ = b.removeWorkspace(ctx, teardownEnv, workspaceDir, params.Logs)
 	}()
 
 	// 2. Create temp environment file for setup script to write to.
