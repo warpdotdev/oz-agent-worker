@@ -110,18 +110,27 @@ kubernetesBackend:
   # the worker sets no TTL, so these Jobs remain indefinitely.
   ttlSecondsAfterFinished: 86400
   workspaceSizeLimit: ""
-  # Optional: back each task pod's /workspace with a dedicated volume (a generic
-  # ephemeral volume, provisioned with the pod and deleted with it) instead of an
-  # emptyDir, so the workspace does not count against the pod's ephemeral-storage
-  # limit. Enabled by setting baseSize; cannot be combined with workspaceSizeLimit.
+  # Optional: give each task pod a dedicated volume (a generic ephemeral volume,
+  # provisioned with the pod and deleted with it) for what the task writes, so that
+  # it does not count against the pod's ephemeral-storage limit. Enabled by setting
+  # baseSize; cannot be combined with workspaceSizeLimit.
   # The size is baseSize plus sizePerComputeUnit for each compute unit of the task
   # container (1 vCPU or 2 GiB of memory, whichever count is larger). An empty
   # storageClass uses the cluster default. Requires dynamic volume provisioning and
   # permission to run a root init container.
-  workspaceVolume:
+  # paths lists the absolute paths in the task container to back with the volume.
+  # Empty means /workspace alone. A non-empty list must include /workspace and may
+  # add directories that grow outside it, such as the task user's home directory
+  # (package and build caches) and /tmp, for example
+  # ["/workspace", "/home/agent", "/tmp"]. Copied sidecars are stored on the volume
+  # as well, and the size above covers all of it.
+  # kubernetesBackend.workspaceVolume, the former name of this block, is still
+  # honoured when taskVolume is not set.
+  taskVolume:
     baseSize: ""
     storageClass: ""
     sizePerComputeUnit: ""
+    paths: []
   unschedulableTimeout: "10m"
   # Optional: raw Kubernetes PodSpec YAML for task Jobs. Configure task-pod
   # scheduling, serviceAccountName, imagePullSecrets, resources, and env here

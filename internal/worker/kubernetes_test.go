@@ -2,6 +2,9 @@ package worker
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1392,6 +1395,13 @@ func executeTaskAndCaptureJob(t *testing.T, params *TaskParams) *batchv1.Job {
 // given config.
 func executeTaskWithConfigAndCaptureJob(t *testing.T, config KubernetesBackendConfig, params *TaskParams) *batchv1.Job {
 	t.Helper()
+	return executeTaskOnBackendAndCaptureJob(t, &KubernetesBackend{config: config}, params)
+}
+
+// executeTaskOnBackendAndCaptureJob is executeTaskAndCaptureJob for the given backend,
+// whose clientset it replaces with the fake.
+func executeTaskOnBackendAndCaptureJob(t *testing.T, backend *KubernetesBackend, params *TaskParams) *batchv1.Job {
+	t.Helper()
 	fakeClient := fake.NewSimpleClientset()
 	jobWatch := watch.NewFake()
 	podWatch := watch.NewFake()
@@ -1429,10 +1439,7 @@ func executeTaskWithConfigAndCaptureJob(t *testing.T, config KubernetesBackendCo
 		return true, podWatch, nil
 	})
 
-	backend := &KubernetesBackend{
-		config:    config,
-		clientset: fakeClient,
-	}
+	backend.clientset = fakeClient
 
 	result := backend.ExecuteTask(context.Background(), params)
 	if result.Error != nil {
@@ -1442,6 +1449,25 @@ func executeTaskWithConfigAndCaptureJob(t *testing.T, config KubernetesBackendCo
 		t.Fatal("expected task job to be created")
 	}
 	return createdJob
+}
+
+func mountAt(t *testing.T, container corev1.Container, mountPath string) corev1.VolumeMount {
+	t.Helper()
+	for _, mount := range container.VolumeMounts {
+		if mount.MountPath == mountPath {
+			return mount
+		}
+	}
+	t.Fatalf("expected container %s to mount %s, got %+v", container.Name, mountPath, container.VolumeMounts)
+	return corev1.VolumeMount{}
+}
+
+func initContainerNames(podSpec corev1.PodSpec) []string {
+	names := make([]string, 0, len(podSpec.InitContainers))
+	for _, container := range podSpec.InitContainers {
+		names = append(names, container.Name)
+	}
+	return names
 }
 
 func workspaceVolumeOf(t *testing.T, podSpec corev1.PodSpec) corev1.Volume {
@@ -1488,12 +1514,12 @@ func TestExecuteTaskUsesEmptyDirWorkspaceByDefault(t *testing.T) {
 	}
 }
 
-func TestExecuteTaskMountsDedicatedWorkspaceVolume(t *testing.T) {
+func TestExecuteTaskMountsTaskVolume(t *testing.T) {
 	createdJob := executeTaskWithConfigAndCaptureJob(t, KubernetesBackendConfig{
 		WorkerID:     "worker-123",
 		Namespace:    "agents",
 		SetupCommand: "echo setup",
-		WorkspaceVolume: &KubernetesWorkspaceVolumeConfig{
+		TaskVolume: &KubernetesTaskVolumeConfig{
 			StorageClass:       "fast",
 			BaseSize:           resource.MustParse("32Gi"),
 			SizePerComputeUnit: resource.MustParse("8Gi"),
@@ -1539,18 +1565,268 @@ func TestExecuteTaskMountsDedicatedWorkspaceVolume(t *testing.T) {
 		t.Fatalf("expected prepare-workspace to run as root, got %+v", prepare.SecurityContext)
 	}
 	prepareMount := workspaceMountOf(t, prepare)
-	if prepareMount.MountPath != workspaceVolumeRootMountPath || prepareMount.SubPath != "" {
-		t.Fatalf("prepare-workspace mount = %+v, want the volume root at %s", prepareMount, workspaceVolumeRootMountPath)
+	if prepareMount.MountPath != taskVolumeRootMountPath || prepareMount.SubPath != "" {
+		t.Fatalf("prepare-workspace mount = %+v, want the volume root at %s", prepareMount, taskVolumeRootMountPath)
 	}
-	wantScript := "mkdir -p /oz-workspace-volume/workspace && chmod 0777 /oz-workspace-volume/workspace"
+	wantScript := "set -e\nmkdir -p '/oz-task-volume/workspace'\nchmod 0777 '/oz-task-volume/workspace'"
 	if got := prepare.Command[len(prepare.Command)-1]; got != wantScript {
 		t.Fatalf("prepare-workspace script = %q, want %q", got, wantScript)
 	}
 
 	for _, container := range []corev1.Container{podSpec.InitContainers[1], podSpec.Containers[0]} {
 		mount := workspaceMountOf(t, container)
-		if mount.MountPath != defaultWorkspaceMountPath || mount.SubPath != workspaceVolumeSubPath {
-			t.Fatalf("%s workspace mount = %+v, want %s from subPath %s", container.Name, mount, defaultWorkspaceMountPath, workspaceVolumeSubPath)
+		if mount.MountPath != defaultWorkspaceMountPath || mount.SubPath != taskVolumeWorkspaceSubPath {
+			t.Fatalf("%s workspace mount = %+v, want %s from subPath %s", container.Name, mount, defaultWorkspaceMountPath, taskVolumeWorkspaceSubPath)
+		}
+	}
+}
+
+func TestExecuteTaskBacksPathsWithTaskVolume(t *testing.T) {
+	createdJob := executeTaskWithConfigAndCaptureJob(t, KubernetesBackendConfig{
+		WorkerID:     "worker-123",
+		Namespace:    "agents",
+		SetupCommand: "echo setup",
+		TaskVolume: &KubernetesTaskVolumeConfig{
+			BaseSize: resource.MustParse("32Gi"),
+			Paths:    []string{"/workspace", "/home/agent", "/tmp"},
+		},
+	}, &TaskParams{
+		TaskID:      "task-1",
+		DockerImage: "ubuntu:22.04",
+		BaseArgs:    []string{"run"},
+	})
+	podSpec := createdJob.Spec.Template.Spec
+
+	if len(podSpec.Volumes) != 1 {
+		t.Fatalf("expected the workspace volume alone to back the additional paths, got %+v", podSpec.Volumes)
+	}
+	if got := initContainerNames(podSpec); len(got) != 2 || got[0] != kubernetesWorkspaceInitContainerName || got[1] != kubernetesSetupContainerName {
+		t.Fatalf("init containers = %v, want prepare-workspace then setup", got)
+	}
+	script := podSpec.InitContainers[0].Command[2]
+	for _, want := range []string{
+		"seed '/home/agent' '/oz-task-volume/paths/0'",
+		"seed '/tmp' '/oz-task-volume/paths/1'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("expected prepare-workspace script to contain %q, got:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "seed '/workspace'") {
+		t.Fatalf("expected the workspace to start empty rather than be copied from the image, got:\n%s", script)
+	}
+
+	for _, container := range []corev1.Container{podSpec.InitContainers[1], podSpec.Containers[0]} {
+		if mount := mountAt(t, container, defaultWorkspaceMountPath); mount.SubPath != taskVolumeWorkspaceSubPath {
+			t.Fatalf("%s workspace mount = %+v, want subPath %s", container.Name, mount, taskVolumeWorkspaceSubPath)
+		}
+		for i, additionalPath := range []string{"/home/agent", "/tmp"} {
+			mount := mountAt(t, container, additionalPath)
+			if mount.Name != workspaceVolumeName() || mount.SubPath != taskVolumePathSubPath(i) || mount.ReadOnly {
+				t.Fatalf("%s mount of %s = %+v, want a writable mount of workspace subPath %s", container.Name, additionalPath, mount, taskVolumePathSubPath(i))
+			}
+		}
+	}
+}
+
+func TestExecuteTaskCopiesSidecarsOntoTaskVolume(t *testing.T) {
+	sidecars := []types.SidecarMount{
+		{Image: "registry.internal/agent:1.0", MountPath: "/agent"},
+		{Image: "registry.internal/tools:1.0", MountPath: "/tools", ReadWrite: true},
+	}
+	newBackend := func(useImageVolumes bool) *KubernetesBackend {
+		return &KubernetesBackend{
+			config: KubernetesBackendConfig{
+				WorkerID:     "worker-123",
+				Namespace:    "agents",
+				SetupCommand: "echo setup",
+				TaskVolume:   &KubernetesTaskVolumeConfig{BaseSize: resource.MustParse("32Gi")},
+			},
+			useImageVolumes: useImageVolumes,
+		}
+	}
+	params := func() *TaskParams {
+		return &TaskParams{TaskID: "task-1", DockerImage: "ubuntu:22.04", BaseArgs: []string{"run"}, Sidecars: sidecars}
+	}
+
+	t.Run("copied sidecars", func(t *testing.T) {
+		podSpec := executeTaskOnBackendAndCaptureJob(t, newBackend(false), params()).Spec.Template.Spec
+
+		if len(podSpec.Volumes) != 1 || podSpec.Volumes[0].Name != workspaceVolumeName() {
+			t.Fatalf("expected no per-sidecar volumes beside the workspace volume, got %+v", podSpec.Volumes)
+		}
+		wantInit := []string{kubernetesWorkspaceInitContainerName, "copy-sidecar-0", "copy-sidecar-1", kubernetesSetupContainerName}
+		if got := initContainerNames(podSpec); strings.Join(got, ",") != strings.Join(wantInit, ",") {
+			t.Fatalf("init containers = %v, want %v so the sidecar directories exist before they are filled", got, wantInit)
+		}
+		script := podSpec.InitContainers[0].Command[2]
+		for i := range sidecars {
+			subPath := taskVolumeSidecarSubPath(i)
+			if want := "mkdir -p '/oz-task-volume/" + subPath + "'"; !strings.Contains(script, want) {
+				t.Fatalf("expected prepare-workspace script to contain %q, got:\n%s", want, script)
+			}
+			copyContainer := podSpec.InitContainers[1+i]
+			if len(copyContainer.VolumeMounts) != 1 {
+				t.Fatalf("expected %s to mount only its target, got %+v", copyContainer.Name, copyContainer.VolumeMounts)
+			}
+			target := copyContainer.VolumeMounts[0]
+			if target.Name != workspaceVolumeName() || target.MountPath != sidecarCopyTargetMountPath || target.SubPath != subPath || target.ReadOnly {
+				t.Fatalf("%s target = %+v, want a writable mount of workspace subPath %s at %s", copyContainer.Name, target, subPath, sidecarCopyTargetMountPath)
+			}
+		}
+		for _, container := range []corev1.Container{podSpec.InitContainers[3], podSpec.Containers[0]} {
+			for i, sidecar := range sidecars {
+				mount := mountAt(t, container, sidecar.MountPath)
+				if mount.Name != workspaceVolumeName() || mount.SubPath != taskVolumeSidecarSubPath(i) || mount.ReadOnly == sidecar.ReadWrite {
+					t.Fatalf("%s mount of %s = %+v, want workspace subPath %s with readOnly=%t", container.Name, sidecar.MountPath, mount, taskVolumeSidecarSubPath(i), !sidecar.ReadWrite)
+				}
+			}
+		}
+	})
+
+	t.Run("image volumes still serve read-only sidecars", func(t *testing.T) {
+		podSpec := executeTaskOnBackendAndCaptureJob(t, newBackend(true), params()).Spec.Template.Spec
+
+		wantInit := []string{kubernetesWorkspaceInitContainerName, "copy-sidecar-1", kubernetesSetupContainerName}
+		if got := initContainerNames(podSpec); strings.Join(got, ",") != strings.Join(wantInit, ",") {
+			t.Fatalf("init containers = %v, want %v", got, wantInit)
+		}
+		task := podSpec.Containers[0]
+		if mount := mountAt(t, task, "/agent"); mount.Name != "sidecar-0-image" || !mount.ReadOnly {
+			t.Fatalf("read-only sidecar mount = %+v, want the image volume", mount)
+		}
+		if mount := mountAt(t, task, "/tools"); mount.Name != workspaceVolumeName() || mount.SubPath != taskVolumeSidecarSubPath(1) || mount.ReadOnly {
+			t.Fatalf("writable sidecar mount = %+v, want workspace subPath %s", mount, taskVolumeSidecarSubPath(1))
+		}
+		if script := podSpec.InitContainers[0].Command[2]; strings.Contains(script, taskVolumeSidecarSubPath(0)) {
+			t.Fatalf("expected no directory for the image-volume sidecar, got:\n%s", script)
+		}
+	})
+}
+
+// The script is run for real, because its job is file ownership and modes that a string
+// comparison cannot check.
+func TestTaskVolumeInitScriptLaysOutVolume(t *testing.T) {
+	if err := exec.Command("stat", "-c", "%a", ".").Run(); err != nil {
+		t.Skip("needs a stat that accepts -c, as GNU coreutils and BusyBox provide")
+	}
+	mode := func(path string) os.FileMode {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		return info.Mode() & (os.ModePerm | os.ModeSticky)
+	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	image := t.TempDir()
+	home := filepath.Join(image, "home")
+	// Modes are set with chmod, which the umask of the test process does not alter.
+	must(os.MkdirAll(filepath.Join(home, ".config"), 0o755))
+	must(os.Chmod(filepath.Join(home, ".config"), 0o755))
+	must(os.WriteFile(filepath.Join(home, ".profile"), []byte("from the image"), 0o600))
+	must(os.Chmod(home, 0o750))
+	tmp := filepath.Join(image, "tmp")
+	must(os.Mkdir(tmp, 0o755))
+	must(os.Chmod(tmp, 0o777|os.ModeSticky))
+	absent := filepath.Join(image, "absent")
+
+	volume := t.TempDir()
+	script := taskVolumeInitScript(volume, []string{home, tmp, absent}, []string{taskVolumeSidecarSubPath(0)})
+	run := func() {
+		t.Helper()
+		if output, err := exec.Command("/bin/sh", "-c", script).CombinedOutput(); err != nil {
+			t.Fatalf("script failed: %v\n%s\nscript:\n%s", err, output, script)
+		}
+	}
+	run()
+
+	seededHome := filepath.Join(volume, taskVolumePathSubPath(0))
+	for path, want := range map[string]os.FileMode{
+		filepath.Join(volume, taskVolumeWorkspaceSubPath): 0o777,
+		seededHome:                                         0o750,
+		filepath.Join(seededHome, ".config"):               0o755,
+		filepath.Join(seededHome, ".profile"):              0o600,
+		filepath.Join(volume, taskVolumePathSubPath(1)):    0o777 | os.ModeSticky,
+		filepath.Join(volume, taskVolumePathSubPath(2)):    0o755,
+		filepath.Join(volume, taskVolumeSidecarSubPath(0)): 0o755,
+	} {
+		if got := mode(path); got != want {
+			t.Errorf("mode of %s = %v, want %v", path, got, want)
+		}
+	}
+	profile := filepath.Join(seededHome, ".profile")
+	if content, err := os.ReadFile(profile); err != nil || string(content) != "from the image" {
+		t.Fatalf("seeded .profile = %q, %v; want the image's content", content, err)
+	}
+
+	must(os.WriteFile(profile, []byte("written by the task"), 0o600))
+	run()
+	if content, err := os.ReadFile(profile); err != nil || string(content) != "written by the task" {
+		t.Fatalf(".profile after a rerun = %q, %v; want the task's content left alone", content, err)
+	}
+}
+
+func TestValidateTaskVolumePaths(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		paths     []string
+		wantError string
+	}{
+		{name: "the workspace alone", paths: []string{"/workspace"}},
+		{name: "workspace, home and tmp", paths: []string{"/workspace", "/home/agent", "/tmp"}},
+		{name: "workspace listed last", paths: []string{"/tmp", "/workspace"}},
+		{name: "sibling with a shared prefix", paths: []string{"/workspace", "/home/agent", "/home/agent2"}},
+		{name: "none", wantError: "must include /workspace"},
+		{name: "without the workspace", paths: []string{"/home/agent", "/tmp"}, wantError: "must include /workspace"},
+		{name: "relative", paths: []string{"/workspace", "home/agent"}, wantError: "clean absolute path"},
+		{name: "empty", paths: []string{"/workspace", ""}, wantError: "clean absolute path"},
+		{name: "trailing slash", paths: []string{"/workspace", "/tmp/"}, wantError: "clean absolute path"},
+		{name: "dot segments", paths: []string{"/workspace", "/home/../tmp"}, wantError: "clean absolute path"},
+		{name: "filesystem root", paths: []string{"/workspace", "/"}, wantError: "filesystem root"},
+		{name: "inside the workspace", paths: []string{"/workspace", "/workspace/cache"}, wantError: "overlaps"},
+		{name: "the workspace twice", paths: []string{"/workspace", "/workspace"}, wantError: "overlaps"},
+		{name: "the volume mount point", paths: []string{"/workspace", "/oz-task-volume"}, wantError: "reserved path /oz-task-volume"},
+		{name: "duplicate", paths: []string{"/workspace", "/tmp", "/tmp"}, wantError: "overlaps"},
+		{name: "nested", paths: []string{"/workspace", "/home", "/home/agent"}, wantError: "overlaps"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTaskVolumePaths(tt.paths)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want one containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidateTaskSidecarsRejectsTaskVolumePathOverlap(t *testing.T) {
+	additionalPaths := []string{"/home/agent", "/tmp"}
+	for _, tt := range []struct {
+		mountPath string
+		wantError bool
+	}{
+		{mountPath: "/agent"},
+		{mountPath: "/mnt/tools"},
+		{mountPath: "/tmp", wantError: true},
+		{mountPath: "/tmp/", wantError: true},
+		{mountPath: "/home/agent/tools", wantError: true},
+		{mountPath: "/home", wantError: true},
+	} {
+		err := validateTaskSidecars([]types.SidecarMount{{Image: "registry.internal/tools:1.0", MountPath: tt.mountPath}}, additionalPaths)
+		if (err != nil) != tt.wantError {
+			t.Errorf("validateTaskSidecars(%s) error = %v, wantError %t", tt.mountPath, err, tt.wantError)
 		}
 	}
 }
@@ -1587,7 +1863,7 @@ func TestTaskWorkspaceVolumeSize(t *testing.T) {
 			backend := &KubernetesBackend{
 				config: KubernetesBackendConfig{
 					PodTemplate: tt.podTemplate,
-					WorkspaceVolume: &KubernetesWorkspaceVolumeConfig{
+					TaskVolume: &KubernetesTaskVolumeConfig{
 						BaseSize:           resource.MustParse("32Gi"),
 						SizePerComputeUnit: resource.MustParse(tt.perUnit),
 					},
