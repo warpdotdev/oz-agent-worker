@@ -7,13 +7,17 @@ import (
 
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 const kubernetesStandbyWatchRetryInterval = 5 * time.Second
+const kubernetesStandbyJobUIDIndex = "controllingJobUID"
 
 func kubernetesStandbyJobName(sandboxID string) (string, error) {
 	if err := validateStandbyID(sandboxID); err != nil {
@@ -79,6 +83,18 @@ func (b *KubernetesBackend) cancelStandby(ctx context.Context, sandboxID string)
 
 // WatchStandbyExits reports each standby Job that completes or fails once, until ctx ends.
 func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string)) {
+	pods := b.newStandbyPodInformer()
+	informerCtx, stopInformer := context.WithCancel(ctx)
+	informerDone := make(chan struct{})
+	go func() {
+		defer close(informerDone)
+		pods.Run(informerCtx.Done())
+	}()
+	defer func() {
+		stopInformer()
+		<-informerDone
+	}()
+	waitedForSync := false
 	reported := make(map[k8stypes.UID]bool)
 	selector := fmt.Sprintf("%s,%s=%s", StandbyKubernetesLabel, kubernetesWorkerIDLabel, sanitizeKubernetesLabelValue(b.config.WorkerID))
 	for {
@@ -86,7 +102,15 @@ func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(s
 		if err != nil {
 			log.Warnf(ctx, "Failed to watch standby Jobs: %v", err)
 		} else {
-			b.consumeStandbyJobEvents(ctx, watcher, reported, report)
+			if !waitedForSync {
+				syncCtx, cancelSync := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+				if !cache.WaitForCacheSync(syncCtx.Done(), pods.HasSynced) && ctx.Err() == nil {
+					log.Warnf(ctx, "Standby Pod cache did not sync before timeout; using live lookups until synced")
+				}
+				cancelSync()
+				waitedForSync = true
+			}
+			b.consumeStandbyJobEvents(ctx, watcher, pods, reported, report)
 			watcher.Stop()
 		}
 		select {
@@ -97,7 +121,22 @@ func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(s
 	}
 }
 
-func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher watch.Interface, reported map[k8stypes.UID]bool, report func(sandboxID string, exitCode int, reason string)) {
+func (b *KubernetesBackend) newStandbyPodInformer() cache.SharedIndexInformer {
+	return coreinformers.NewFilteredPodInformer(b.clientset, b.config.Namespace, 0, cache.Indexers{
+		kubernetesStandbyJobUIDIndex: func(obj interface{}) ([]string, error) {
+			pod := obj.(*corev1.Pod)
+			owner := metav1.GetControllerOf(pod)
+			if owner == nil || owner.Kind != "Job" {
+				return nil, nil
+			}
+			return []string{string(owner.UID)}, nil
+		},
+	}, func(options *metav1.ListOptions) {
+		options.LabelSelector = fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
+	})
+}
+
+func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher watch.Interface, pods cache.SharedIndexInformer, reported map[k8stypes.UID]bool, report func(sandboxID string, exitCode int, reason string)) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,41 +158,64 @@ func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher
 				continue
 			}
 			reported[job.UID] = true
-			exitCode, reason := b.kubernetesStandbyExitStatus(ctx, job)
+			exitCode, reason := b.kubernetesStandbyExitStatus(ctx, job, pods)
 			report(sandboxID, exitCode, reason)
 			b.kubernetesStandbyDeleteJob(ctx, job)
 		}
 	}
 }
 
-func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job *batchv1.Job) (int, string) {
+func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job *batchv1.Job, pods cache.SharedIndexInformer) (int, string) {
 	if jobComplete(job) {
-		return b.kubernetesStandbyTaskExitCode(ctx, job, 0), ""
+		return b.kubernetesStandbyTaskExitCode(ctx, job, pods, 0), ""
 	}
-	exitCode := b.kubernetesStandbyTaskExitCode(ctx, job, 1)
+	exitCode := b.kubernetesStandbyTaskExitCode(ctx, job, pods, 1)
 	if exitCode == 0 {
 		exitCode = 1
 	}
 	return exitCode, string(classifyJobFailure(job))
 }
 
-func (b *KubernetesBackend) kubernetesStandbyTaskExitCode(ctx context.Context, job *batchv1.Job, fallback int) int {
-	pods, err := b.listPods(ctx, kubernetesStandbyLabelSelector(job.Labels[StandbyKubernetesLabel]))
-	if err != nil {
-		log.Warnf(ctx, "Failed to list Pods for standby Job %s: %v", job.Name, err)
-		return fallback
-	}
-	for i := range pods {
-		if !metav1.IsControlledBy(&pods[i], job) {
-			continue
-		}
-		for _, status := range pods[i].Status.ContainerStatuses {
-			if status.Name == kubernetesTaskContainerName && status.State.Terminated != nil {
-				return terminatedExitCode(status.State.Terminated)
+func (b *KubernetesBackend) kubernetesStandbyTaskExitCode(ctx context.Context, job *batchv1.Job, pods cache.SharedIndexInformer, fallback int) int {
+	if pods.HasSynced() {
+		objects, err := pods.GetIndexer().ByIndex(kubernetesStandbyJobUIDIndex, string(job.UID))
+		if err == nil {
+			for _, obj := range objects {
+				if code, ok := kubernetesStandbyPodExitCode(obj.(*corev1.Pod), job); ok {
+					return code
+				}
 			}
 		}
 	}
+
+	// Job and Pod watches can deliver updates in either order. Refresh missing
+	// terminal status without waiting for the Pod watch to catch up.
+	lookupCtx, cancel := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	defer cancel()
+	selector := fmt.Sprintf("%s,%s=%s", kubernetesStandbyLabelSelector(job.Labels[StandbyKubernetesLabel]), kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
+	livePods, err := b.listPods(lookupCtx, selector)
+	if err != nil {
+		log.Warnf(ctx, "Failed to list Pods for standby Job %s: %v", job.Name, err)
+	}
+	for i := range livePods {
+		if code, ok := kubernetesStandbyPodExitCode(&livePods[i], job); ok {
+			return code
+		}
+	}
+	log.Warnf(ctx, "Using fallback exit code %d for standby Job %s (uid=%s): terminal task container status unavailable", fallback, job.Name, job.UID)
 	return fallback
+}
+
+func kubernetesStandbyPodExitCode(pod *corev1.Pod, job *batchv1.Job) (int, bool) {
+	if !metav1.IsControlledBy(pod, job) {
+		return 0, false
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == kubernetesTaskContainerName && status.State.Terminated != nil {
+			return terminatedExitCode(status.State.Terminated), true
+		}
+	}
+	return 0, false
 }
 
 func (b *KubernetesBackend) watchStandbyJobs(ctx context.Context, labelSelector string) (watch.Interface, error) {
