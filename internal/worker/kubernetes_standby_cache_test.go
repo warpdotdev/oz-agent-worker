@@ -38,9 +38,9 @@ func TestKubernetesStandbyWatcherUsesCachedPodsFor100Jobs(t *testing.T) {
 	backend, client, _, jobWatch := newKubernetesStandbyTestBackend(t, KubernetesBackendConfig{WorkerID: "worker-a"}, objects...)
 	podWatch := watch.NewRaceFreeFake()
 	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
-		want := kubernetesWorkerHashLabel + "=" + kubernetesLabelHash("worker-a") + "," + StandbyKubernetesLabel
+		want := kubernetesWorkerHashLabel + "=" + kubernetesLabelHash("worker-a")
 		if action.GetNamespace() != standbyTestNamespace || action.(k8stesting.WatchAction).GetWatchRestrictions().Labels.String() != want {
-			t.Errorf("Pod watch not scoped to namespace, worker, and standby Pods: %+v", action)
+			t.Errorf("Pod watch not scoped to namespace and worker: %+v", action)
 		}
 		return true, podWatch, nil
 	})
@@ -100,9 +100,9 @@ func TestKubernetesStandbyWatcherUsesCachedPodsFor100Jobs(t *testing.T) {
 				StandbyKubernetesLabel:    "sb-foreign",
 				kubernetesWorkerHashLabel: kubernetesLabelHash("worker-b"),
 			}
-			if action.GetNamespace() != standbyTestNamespace || selector.Matches(labels.Set(taskPod.Labels)) ||
+			if action.GetNamespace() != standbyTestNamespace || !selector.Matches(labels.Set(taskPod.Labels)) ||
 				selector.Matches(foreign) || !selector.Matches(labels.Set(backend.kubernetesStandbyLabels("sb-0"))) {
-				t.Errorf("Pod list not scoped to namespace, worker, and standby Pods: %+v", action)
+				t.Errorf("Pod list not scoped to namespace and worker: %+v", action)
 			}
 		}
 	}

@@ -157,8 +157,8 @@ func TestKubernetesStandbyExecuteCreatesLabeledJob(t *testing.T) {
 
 	select {
 	case selector := <-podSelectors:
-		if selector != "warp-prewarmed-sandbox-id=sb-1" {
-			t.Fatalf("pod watch selector = %q, want the standby label", selector)
+		if selector != kubernetesWorkerHashLabel+"="+kubernetesLabelHash("Worker A") {
+			t.Fatalf("pod watch selector = %q, want the worker hash", selector)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the pod watch")

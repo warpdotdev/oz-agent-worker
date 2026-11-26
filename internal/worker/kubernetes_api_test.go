@@ -226,7 +226,7 @@ func TestRequestJobExecutionStop(t *testing.T) {
 }
 
 func TestKubernetesAPIOperationsRetry(t *testing.T) {
-	for _, operation := range []string{"get", "list", "watch jobs", "watch pods", "delete"} {
+	for _, operation := range []string{"get", "list", "watch jobs", "delete"} {
 		t.Run(operation, func(t *testing.T) {
 			ctx := context.Background()
 			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "agents", UID: "original"}}
@@ -243,13 +243,7 @@ func TestKubernetesAPIOperationsRetry(t *testing.T) {
 					}
 					return true, watcher, nil
 				})
-				var got watch.Interface
-				var err error
-				if operation == "watch jobs" {
-					got, err = backend.watchJob(ctx, job.Name)
-				} else {
-					got, err = backend.watchPods(ctx, kubernetesExecutionPodSelector("exec"))
-				}
+				got, err := backend.watchJob(ctx, job.Name)
 				if err != nil || got == nil {
 					t.Fatalf("watch=%v err=%v", got, err)
 				}
@@ -320,6 +314,7 @@ func TestExecuteTaskStopsActiveJobOnFailure(t *testing.T) {
 							Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
 						}}},
 					}
+					pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(created, batchv1.SchemeGroupVersion.WithKind("Job"))}
 					if failure == "init exit" {
 						pod.Status.Conditions = nil
 						pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
