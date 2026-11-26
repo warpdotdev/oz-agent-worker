@@ -132,7 +132,7 @@ func (b *KubernetesBackend) newStandbyPodInformer() cache.SharedIndexInformer {
 			return []string{string(owner.UID)}, nil
 		},
 	}, func(options *metav1.ListOptions) {
-		options.LabelSelector = fmt.Sprintf("%s=%s", kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
+		options.LabelSelector = fmt.Sprintf("%s,%s=%s", StandbyKubernetesLabel, kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
 	})
 }
 
