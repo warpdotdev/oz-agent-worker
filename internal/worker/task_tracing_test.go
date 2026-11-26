@@ -17,8 +17,11 @@ import (
 	collector "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -165,14 +168,24 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 	defer blockedCollector.Close()
 	defer close(release)
 	client := fake.NewSimpleClientset()
-	podWatches := make(chan *watch.FakeWatcher, 2)
+	createdJobs := make(chan *batchv1.Job, 2)
+	client.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := action.(k8stesting.CreateAction).GetObject().(*batchv1.Job)
+		job.UID = k8stypes.UID(job.Name)
+		createdJobs <- job.DeepCopy()
+		return false, nil, nil
+	})
+	podWatch := watch.NewRaceFreeFake()
+	observedPods := make(chan string, 10)
+	client.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		observedPods <- action.(k8stesting.ListAction).GetListRestrictions().Fields.String()
+		return false, nil, nil
+	})
 	client.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
 		return true, watch.NewFake(), nil
 	})
 	client.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
-		watcher := watch.NewFake()
-		podWatches <- watcher
-		return true, watcher, nil
+		return true, podWatch, nil
 	})
 	backend := &KubernetesBackend{clientset: client, config: KubernetesBackendConfig{Namespace: "agents", SetupCommand: "setup"}}
 	w := &Worker{
@@ -188,18 +201,31 @@ func TestTaskTraceBoundedShutdown(t *testing.T) {
 			},
 		}, time.Now())
 		select {
-		case watcher := <-podWatches:
+		case job := <-createdJobs:
 			now := time.Now()
 			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: run, CreationTimestamp: metav1.NewTime(now.Add(-time.Second))},
-				Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: kubernetesSetupContainerName}}},
+				ObjectMeta: metav1.ObjectMeta{Name: run, UID: k8stypes.UID(run), CreationTimestamp: metav1.NewTime(now.Add(-time.Second)),
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job"))}},
+				Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: kubernetesSetupContainerName}}},
 				Status: corev1.PodStatus{
+					Phase:                 corev1.PodPending,
 					Conditions:            []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now)}},
 					InitContainerStatuses: []corev1.ContainerStatus{{Name: kubernetesSetupContainerName, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now)}}}},
 				},
 			}
-			watcher.Add(pod)
-			watcher.Modify(pod)
+			podWatch.Add(pod)
+			podWatch.Modify(pod)
+		observed:
+			for {
+				select {
+				case selector := <-observedPods:
+					if selector == "involvedObject.uid="+run {
+						break observed
+					}
+				case <-time.After(time.Second):
+					t.Fatal("task did not observe its setup Pod")
+				}
+			}
 		case <-time.After(time.Second):
 			t.Fatal("task did not reach the Kubernetes pod watch")
 		}

@@ -604,57 +604,6 @@ func TestWatchReconnectsOnChannelClose(t *testing.T) {
 	defer watcher2.Stop()
 }
 
-func TestWatchTaskPodsReceivesEvents(t *testing.T) {
-	fakeClient := fake.NewSimpleClientset()
-	backend := &KubernetesBackend{
-		config: KubernetesBackendConfig{
-			Namespace: "agents",
-		},
-		clientset: fakeClient,
-	}
-
-	executionID := "execution-abc"
-	watcher, err := backend.watchPods(context.Background(), kubernetesExecutionPodSelector(executionID))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer watcher.Stop()
-
-	// Create a pod that matches the label selector.
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "task-pod",
-			Namespace: "agents",
-			Labels: map[string]string{
-				kubernetesExecutionHashLabel: kubernetesLabelHash(executionID),
-			},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: kubernetesTaskContainerName, Image: "ubuntu:22.04"}},
-		},
-	}
-	if _, err := fakeClient.CoreV1().Pods("agents").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create pod: %v", err)
-	}
-
-	// The watch should receive the ADDED event.
-	select {
-	case event := <-watcher.ResultChan():
-		if event.Type != watch.Added {
-			t.Fatalf("expected Added event, got %v", event.Type)
-		}
-		gotPod, ok := event.Object.(*corev1.Pod)
-		if !ok {
-			t.Fatalf("expected Pod object, got %T", event.Object)
-		}
-		if gotPod.Name != "task-pod" {
-			t.Fatalf("pod name = %q, want %q", gotPod.Name, "task-pod")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for pod watch event")
-	}
-}
-
 func TestMergeKubernetesEnvVars(t *testing.T) {
 	t.Run("override wins on key conflict", func(t *testing.T) {
 		base := []corev1.EnvVar{

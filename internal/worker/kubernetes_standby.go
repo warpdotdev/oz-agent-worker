@@ -12,12 +12,10 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
 const kubernetesStandbyWatchRetryInterval = 5 * time.Second
-const kubernetesStandbyJobUIDIndex = "controllingJobUID"
 
 func kubernetesStandbyJobName(sandboxID string) (string, error) {
 	if err := validateStandbyID(sandboxID); err != nil {
@@ -83,17 +81,8 @@ func (b *KubernetesBackend) cancelStandby(ctx context.Context, sandboxID string)
 
 // WatchStandbyExits reports each standby Job that completes or fails once, until ctx ends.
 func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(sandboxID string, exitCode int, reason string)) {
-	pods := b.newStandbyPodInformer()
-	informerCtx, stopInformer := context.WithCancel(ctx)
-	informerDone := make(chan struct{})
-	go func() {
-		defer close(informerDone)
-		pods.Run(informerCtx.Done())
-	}()
-	defer func() {
-		stopInformer()
-		<-informerDone
-	}()
+	pods, releasePods := b.acquirePodObservation(ctx)
+	defer releasePods()
 	waitedForSync := false
 	reported := make(map[k8stypes.UID]bool)
 	selector := fmt.Sprintf("%s,%s=%s", StandbyKubernetesLabel, kubernetesWorkerIDLabel, sanitizeKubernetesLabelValue(b.config.WorkerID))
@@ -119,21 +108,6 @@ func (b *KubernetesBackend) WatchStandbyExits(ctx context.Context, report func(s
 		case <-time.After(kubernetesStandbyWatchRetryInterval):
 		}
 	}
-}
-
-func (b *KubernetesBackend) newStandbyPodInformer() cache.SharedIndexInformer {
-	return coreinformers.NewFilteredPodInformer(b.clientset, b.config.Namespace, 0, cache.Indexers{
-		kubernetesStandbyJobUIDIndex: func(obj interface{}) ([]string, error) {
-			pod := obj.(*corev1.Pod)
-			owner := metav1.GetControllerOf(pod)
-			if owner == nil || owner.Kind != "Job" {
-				return nil, nil
-			}
-			return []string{string(owner.UID)}, nil
-		},
-	}, func(options *metav1.ListOptions) {
-		options.LabelSelector = fmt.Sprintf("%s,%s=%s", StandbyKubernetesLabel, kubernetesWorkerHashLabel, kubernetesLabelHash(b.config.WorkerID))
-	})
 }
 
 func (b *KubernetesBackend) consumeStandbyJobEvents(ctx context.Context, watcher watch.Interface, pods cache.SharedIndexInformer, reported map[k8stypes.UID]bool, report func(sandboxID string, exitCode int, reason string)) {
@@ -178,7 +152,7 @@ func (b *KubernetesBackend) kubernetesStandbyExitStatus(ctx context.Context, job
 
 func (b *KubernetesBackend) kubernetesStandbyTaskExitCode(ctx context.Context, job *batchv1.Job, pods cache.SharedIndexInformer, fallback int) int {
 	if pods.HasSynced() {
-		objects, err := pods.GetIndexer().ByIndex(kubernetesStandbyJobUIDIndex, string(job.UID))
+		objects, err := pods.GetIndexer().ByIndex(kubernetesJobUIDIndex, string(job.UID))
 		if err == nil {
 			for _, obj := range objects {
 				if code, ok := kubernetesStandbyPodExitCode(obj.(*corev1.Pod), job); ok {

@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -187,9 +189,11 @@ func terminatedExitCode(terminated *corev1.ContainerStateTerminated) int {
 
 // KubernetesBackend executes tasks in Kubernetes Jobs.
 type KubernetesBackend struct {
-	config          KubernetesBackendConfig
-	clientset       kubernetes.Interface
-	useImageVolumes bool
+	config           KubernetesBackendConfig
+	clientset        kubernetes.Interface
+	useImageVolumes  bool
+	podObservationMu sync.Mutex
+	podObservation   *kubernetesPodObservation
 }
 
 func (b *KubernetesBackend) Capabilities() backendCapabilities {
@@ -462,9 +466,10 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 	doneJobCreate(false)
 
 	// Derive the remaining setup phases (scheduling, sidecar prep, setup
-	// command, task container start) from pod status snapshots delivered by
-	// the pod watch and the safety poll below.
+	// command, task container start) from cached pod status snapshots.
 	setupPhases := newKubernetesSetupPhaseTracker(params.SetupEvents)
+	pods, releasePods := b.acquirePodObservation(ctx)
+	defer releasePods()
 
 	defer func() {
 		if ctx.Err() != nil {
@@ -540,16 +545,18 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 		}
 	}()
 
-	podWatcher, err := b.watchPods(ctx, podSelector)
-	if err != nil {
-		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to watch Pods for Job %s: %w", jobName, err))
+	syncCtx, cancelSync := context.WithTimeout(ctx, kubernetesAPIRequestTimeout)
+	synced := cache.WaitForCacheSync(syncCtx.Done(), pods.HasSynced)
+	cancelSync()
+	if !synced {
+		if ctx.Err() != nil {
+			return executeError(newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonTaskCancelled, ctx.Err()))
+		}
+		failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to sync Pod cache for Job %s", jobName))
 		return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
 	}
-	defer func() {
-		if podWatcher != nil {
-			podWatcher.Stop()
-		}
-	}()
+	podUpdates, unsubscribe := pods.subscribe(createdJob.UID)
+	defer unsubscribe()
 
 	safetyTicker := time.NewTicker(watchSafetyInterval)
 	defer safetyTicker.Stop()
@@ -594,39 +601,14 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				return result.outcome()
 			}
 
-		case event, ok := <-podWatcher.ResultChan():
-			if !ok {
-				// Watch closed; reopen.
-				podWatcher.Stop()
-				podWatcher, err = b.watchPods(ctx, podSelector)
-				if err != nil {
-					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
-					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
-				}
-				continue
+		case <-podUpdates:
+			cachedPods := pods.podsForJob(createdJob.UID)
+			for i := range cachedPods {
+				setupPhases.observePod(ctx, &cachedPods[i])
+				logStreams.observePod(&cachedPods[i])
 			}
-			if event.Type == watch.Error {
-				log.Warnf(ctx, "Pod watch error for Job %s, reopening", jobName)
-				podWatcher.Stop()
-				podWatcher, err = b.watchPods(ctx, podSelector)
-				if err != nil {
-					failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to re-watch Pods for Job %s: %w", jobName, err))
-					return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourcePodWatch, job, nil, nil)))
-				}
-				continue
-			}
-			pod, ok := event.Object.(*corev1.Pod)
-			if !ok {
-				continue
-			}
-			setupPhases.observePod(ctx, pod)
-			logStreams.observePod(pod)
-			if failure := b.inspectPodFailureAt(ctx, pod, job, kubernetesFailureSourcePodWatch); failure != nil {
+			if failure := b.detectPodFailureAt(ctx, cachedPods, job, kubernetesFailureSourcePodWatch); failure != nil {
 				b.refreshFailureJobDetails(ctx, failure, jobName)
-				logs := b.collectPodLogs(ctx, []corev1.Pod{*pod})
-				if logs != "" {
-					log.Infof(ctx, "Pod %s output:\n%s", pod.Name, logs)
-				}
 				return executeError(failure)
 			}
 
@@ -649,16 +631,12 @@ func (b *KubernetesBackend) ExecuteTask(ctx context.Context, params *TaskParams)
 				return result.outcome()
 			}
 
-			pods, err := b.listPods(ctx, podSelector)
-			if err != nil {
-				failure := newBackendFailure(metrics.TaskFailurePhaseBackend, metrics.TaskFailureReasonPodWatch, fmt.Errorf("failed to list task pods for Job %s: %w", jobName, err))
-				return executeError(withFailureDetails(failure, b.kubernetesFailureDetails(ctx, kubernetesFailureSourceSafetyPoll, jobState, nil, nil)))
+			cachedPods := pods.podsForJob(createdJob.UID)
+			for i := range cachedPods {
+				setupPhases.observePod(ctx, &cachedPods[i])
+				logStreams.observePod(&cachedPods[i])
 			}
-			for i := range pods {
-				setupPhases.observePod(ctx, &pods[i])
-				logStreams.observePod(&pods[i])
-			}
-			if failure := b.detectPodFailureAt(ctx, pods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
+			if failure := b.detectPodFailureAt(ctx, cachedPods, jobState, kubernetesFailureSourceSafetyPoll); failure != nil {
 				return executeError(failure)
 			}
 		}
@@ -779,16 +757,6 @@ func (b *KubernetesBackend) watchJob(ctx context.Context, jobName string) (watch
 		return openKubernetesWatch(ctx, kubernetesAPIRequestTimeout, func(watchCtx context.Context) (watch.Interface, error) {
 			return b.clientset.BatchV1().Jobs(b.config.Namespace).Watch(watchCtx, metav1.ListOptions{
 				FieldSelector: fmt.Sprintf("metadata.name=%s", jobName),
-			})
-		})
-	})
-}
-
-func (b *KubernetesBackend) watchPods(ctx context.Context, labelSelector string) (watch.Interface, error) {
-	return retryKubernetesAPI(ctx, kubernetesAPIBackoff(), func() (watch.Interface, error) {
-		return openKubernetesWatch(ctx, kubernetesAPIRequestTimeout, func(watchCtx context.Context) (watch.Interface, error) {
-			return b.clientset.CoreV1().Pods(b.config.Namespace).Watch(watchCtx, metav1.ListOptions{
-				LabelSelector: labelSelector,
 			})
 		})
 	})
