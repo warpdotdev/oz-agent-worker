@@ -346,7 +346,10 @@ func standbyExitTestPod(jobName, jobUID, sandboxID string, exitCode int32) *core
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName + "-pod",
 			Namespace: standbyTestNamespace,
-			Labels:    map[string]string{StandbyKubernetesLabel: sandboxID},
+			Labels: map[string]string{
+				StandbyKubernetesLabel:    sandboxID,
+				kubernetesWorkerHashLabel: kubernetesLabelHash("worker-a"),
+			},
 			OwnerReferences: []metav1.OwnerReference{{
 				Kind:       "Job",
 				Name:       jobName,
